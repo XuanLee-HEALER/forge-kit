@@ -1,0 +1,46 @@
+# {{WORKBENCH_NAME}} Instance Configuration (Private — never overwritten by `forge sync`)
+name: "{{WORKBENCH_NAME}}"
+git_org: "{{GIT_ORG}}"
+
+# Registered business repos subject to dev task ledger hooks.
+# Managed via `forge add-repo <path>` or edited manually.
+repos: []
+
+ledger:
+  enabled: true
+  retention_days: 90
+  exempt_max_files: 3
+  exempt_max_lines: 40
+  exempt_allowed_globs:
+    - "*.md"
+    - "*.txt"
+    - "docs/**"
+    - "*.example"
+    - ".gitignore"
+  protected_code_globs:
+    - "*.go"
+    - "*.ts"
+    - "*.tsx"
+    - "*.js"
+    - "*.jsx"
+    - "*.svelte"
+    - "*.py"
+    - "*.sql"
+    - "*.proto"
+
+guard:
+  # Add all prod database hosts (PostgreSQL, MySQL, ClickHouse, etc.) here
+  prod_db_hosts: []
+  prod_db_targets: []
+  # Set to true once prod DB environments exist so missing host config fails closed
+  require_prod_db_hosts: false
+  protected_branches:
+    - "main"
+    - "master"
+  prod_tag_patterns:
+    - "^api-v"
+    - "^crontab-v"
+    - "^release-v"
+    - "^v\\d+\\.\\d+"
+  block_shared_worktree_ops: true
+  block_ledger_direct_edits: true

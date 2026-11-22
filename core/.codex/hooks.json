@@ -1,0 +1,48 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/guard\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/ledger-hook\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/ledger-hook\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/ledger-hook\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+# Forge-Kit Codex Workbench Configuration (Local Overrides Global)
+model = "{{STANDARD_MODEL}}"
+model_reasoning_effort = "{{STANDARD_EFFORT}}"
+
+# Keep project docs lean; AGENTS.md stays well under 32 KiB.
+project_doc_max_bytes = 32768

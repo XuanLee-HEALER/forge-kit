@@ -1,0 +1,14 @@
+# Logical model tier mapping for {{WORKBENCH_NAME}} (Private — never overwritten by `forge sync`)
+# Reference tiers in workflows; update actual model IDs here only.
+
+[tiers.mechanical]
+model = "gpt-6.1-terra"
+effort = "medium"
+
+[tiers.standard]
+model = "gpt-6.2-sol"
+effort = "medium"
+
+[tiers.deep]
+model = "gpt-6.2-astra"
+effort = "high"

@@ -1,0 +1,65 @@
+[kit]
+name = "forge-kit"
+version = "0.1.0"
+runtime = "codex"
+
+[managed]
+# Synced idempotently by `forge sync`; NEVER include instance-private paths here.
+rendered_files = [
+  "AGENTS.md",
+  ".codex/hooks.json",
+]
+
+copied_dirs = [
+  ".codex/agents",
+  ".agents/skills/ready",
+  ".agents/skills/feature",
+  ".agents/skills/bugfix",
+  ".agents/skills/wrapup",
+  ".agents/skills/ship",
+  ".agents/skills/business-analysis",
+  ".agents/skills/form-ux",
+  ".agents/skills/test-environment",
+]
+
+copied_files = [
+  ".codex/config.toml",
+]
+
+bin_bundles = [
+  "ledger.js",
+  "guard.js",
+  "ledger-hook.js",
+  "wb-git.js",
+  "dbcred.js",
+  "cmdfmt.js",
+]
+
+bin_wrappers = [
+  "ledger",
+  "guard",
+  "ledger-hook",
+  "wb-git",
+  "dbcred",
+  "cmdfmt",
+]
+
+[private]
+# Created ONLY on `forge init` if missing; `forge sync` NEVER overwrites these.
+init_only = [
+  "AGENTS.local.md",
+  ".workbench/workbench.yaml",
+  ".workbench/models.toml",
+  ".workbench/env/environments.example.json",
+  "one-off-scripts/README.md",
+]
+
+[packs.dbop]
+copied_dirs = [
+  ".agents/skills/dbop",
+]
+
+[packs.comm-lark]
+copied_dirs = [
+  ".agents/skills/work-communication",
+]

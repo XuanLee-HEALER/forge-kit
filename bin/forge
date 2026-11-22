@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUN="${BUN_BIN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
+if [[ -f "$ROOT/dist/cli.js" ]]; then
+  exec "$BUN" "$ROOT/dist/cli.js" "$@"
+fi
+exec "$BUN" "$ROOT/src/bin/cli.ts" "$@"

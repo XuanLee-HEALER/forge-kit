@@ -1,0 +1,20 @@
+{
+  "name": "forge-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "forge": "./bin/forge"
+  },
+  "scripts": {
+    "build": "bun build --target=bun --outdir=dist src/bin/cli.ts src/bin/ledger.ts src/bin/guard.ts src/bin/ledger-hook.ts src/bin/wb-git.ts src/bin/dbcred.ts src/bin/cmdfmt.ts",
+    "check": "bunx --bun tsc --noEmit",
+    "test": "bun test ./tests",
+    "test:all": "bun test ./tests && (cd review-agents && bun test)",
+    "forge": "bun src/bin/cli.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.0"
+  }
+}

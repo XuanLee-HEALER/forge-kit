@@ -1,0 +1,276 @@
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+
+export interface ProdDbTarget {
+  name: string;
+  engine?: "postgres" | "mysql" | "clickhouse" | string;
+  host: string;
+}
+
+export interface LedgerConfig {
+  enabled: boolean;
+  retention_days: number;
+  exempt_max_files: number;
+  exempt_max_lines: number;
+  exempt_allowed_globs: string[];
+  protected_code_globs: string[];
+}
+
+export interface GuardConfig {
+  prod_db_hosts: string[];
+  prod_db_targets: ProdDbTarget[];
+  require_prod_db_hosts: boolean;
+  protected_branches: string[];
+  prod_tag_patterns: string[];
+  block_shared_worktree_ops: boolean;
+  block_ledger_direct_edits: boolean;
+}
+
+export interface WorkbenchConfig {
+  name: string;
+  git_org?: string;
+  repos: string[];
+  ledger: LedgerConfig;
+  guard: GuardConfig;
+}
+
+export interface ModelTier {
+  model: string;
+  effort: "medium" | "high";
+}
+
+export interface ModelsConfig {
+  tiers: {
+    mechanical: ModelTier;
+    standard: ModelTier;
+    deep: ModelTier;
+  };
+}
+
+export interface DbEnvEntry {
+  host?: string;
+  port?: number;
+  user?: string;
+  password?: string;
+  database?: string;
+  sslmode?: string;
+  engine?: string;
+}
+
+const DEFAULT_LEDGER: LedgerConfig = {
+  enabled: true,
+  retention_days: 90,
+  exempt_max_files: 3,
+  exempt_max_lines: 40,
+  exempt_allowed_globs: ["*.md", "*.txt", "docs/**", "*.example", ".gitignore"],
+  protected_code_globs: [
+    "*.go",
+    "*.ts",
+    "*.tsx",
+    "*.js",
+    "*.jsx",
+    "*.svelte",
+    "*.py",
+    "*.sql",
+    "*.proto",
+  ],
+};
+
+const DEFAULT_GUARD: GuardConfig = {
+  prod_db_hosts: [],
+  prod_db_targets: [],
+  require_prod_db_hosts: false,
+  protected_branches: ["main", "master"],
+  prod_tag_patterns: ["^api-v", "^crontab-v", "^release-v", "^v\\d+\\.\\d+"],
+  block_shared_worktree_ops: true,
+  block_ledger_direct_edits: true,
+};
+
+export function findWorkbenchRoot(startDir?: string): string {
+  const explicit = process.env.FORGE_WORKBENCH_ROOT;
+  if (explicit && existsSync(explicit)) {
+    return realpathSync(explicit);
+  }
+
+  let cur = resolve(startDir ?? process.cwd());
+  if (existsSync(cur)) {
+    try {
+      cur = realpathSync(cur);
+    } catch {
+      // Keep resolved path when realpath fails.
+    }
+  }
+
+  while (true) {
+    if (
+      existsSync(join(cur, ".workbench", "workbench.yaml")) ||
+      existsSync(join(cur, ".workbench", "kit-lock.json"))
+    ) {
+      return cur;
+    }
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+
+  // Fallback: script located at <workbench>/.workbench/bin/*.js
+  const scriptDir = import.meta.dir;
+  const candidate = resolve(scriptDir, "../..");
+  if (
+    existsSync(join(candidate, ".workbench", "workbench.yaml")) ||
+    existsSync(join(candidate, ".workbench", "kit-lock.json"))
+  ) {
+    return realpathSync(candidate);
+  }
+
+  return resolve(startDir ?? process.cwd());
+}
+
+export function parseYamlFile<T>(filePath: string): T | null {
+  if (!existsSync(filePath)) return null;
+  const raw = readFileSync(filePath, "utf8");
+  if (!raw.trim()) return null;
+  return Bun.YAML.parse(raw) as T;
+}
+
+export function parseTomlFile<T>(filePath: string): T | null {
+  if (!existsSync(filePath)) return null;
+  const raw = readFileSync(filePath, "utf8");
+  if (!raw.trim()) return null;
+  return Bun.TOML.parse(raw) as T;
+}
+
+export function loadWorkbenchConfig(root: string): WorkbenchConfig {
+  const raw = parseYamlFile<Partial<WorkbenchConfig>>(
+    join(root, ".workbench", "workbench.yaml"),
+  );
+  const ledgerRaw = (raw?.ledger ?? {}) as Partial<LedgerConfig>;
+  const guardRaw = (raw?.guard ?? {}) as Partial<GuardConfig>;
+
+  return {
+    name: raw?.name || "workbench",
+    git_org: raw?.git_org,
+    repos: Array.isArray(raw?.repos) ? raw.repos.map(String) : [],
+    ledger: {
+      enabled: ledgerRaw.enabled ?? DEFAULT_LEDGER.enabled,
+      retention_days:
+        typeof ledgerRaw.retention_days === "number"
+          ? ledgerRaw.retention_days
+          : DEFAULT_LEDGER.retention_days,
+      exempt_max_files:
+        typeof ledgerRaw.exempt_max_files === "number"
+          ? ledgerRaw.exempt_max_files
+          : DEFAULT_LEDGER.exempt_max_files,
+      exempt_max_lines:
+        typeof ledgerRaw.exempt_max_lines === "number"
+          ? ledgerRaw.exempt_max_lines
+          : DEFAULT_LEDGER.exempt_max_lines,
+      exempt_allowed_globs: Array.isArray(ledgerRaw.exempt_allowed_globs)
+        ? ledgerRaw.exempt_allowed_globs.map(String)
+        : DEFAULT_LEDGER.exempt_allowed_globs,
+      protected_code_globs: Array.isArray(ledgerRaw.protected_code_globs)
+        ? ledgerRaw.protected_code_globs.map(String)
+        : DEFAULT_LEDGER.protected_code_globs,
+    },
+    guard: {
+      prod_db_hosts: Array.isArray(guardRaw.prod_db_hosts)
+        ? guardRaw.prod_db_hosts.map(String)
+        : DEFAULT_GUARD.prod_db_hosts,
+      prod_db_targets: Array.isArray(guardRaw.prod_db_targets)
+        ? guardRaw.prod_db_targets
+            .filter((t) => t && typeof t.host === "string" && t.host.trim())
+            .map((t) => ({
+              name: String(t.name || t.host),
+              engine: t.engine ? String(t.engine) : undefined,
+              host: String(t.host),
+            }))
+        : DEFAULT_GUARD.prod_db_targets,
+      require_prod_db_hosts:
+        guardRaw.require_prod_db_hosts ?? DEFAULT_GUARD.require_prod_db_hosts,
+      protected_branches: Array.isArray(guardRaw.protected_branches)
+        ? guardRaw.protected_branches.map(String)
+        : DEFAULT_GUARD.protected_branches,
+      prod_tag_patterns: Array.isArray(guardRaw.prod_tag_patterns)
+        ? guardRaw.prod_tag_patterns.map(String)
+        : DEFAULT_GUARD.prod_tag_patterns,
+      block_shared_worktree_ops:
+        guardRaw.block_shared_worktree_ops ??
+        DEFAULT_GUARD.block_shared_worktree_ops,
+      block_ledger_direct_edits:
+        guardRaw.block_ledger_direct_edits ??
+        DEFAULT_GUARD.block_ledger_direct_edits,
+    },
+  };
+}
+
+export function loadDbEnvironments(
+  root: string,
+  opts?: { strict?: boolean },
+): Record<string, DbEnvEntry> {
+  const candidates = [
+    join(root, ".workbench", "env", "environments.json"),
+    join(root, ".agents", "skills", "dbop", "environments.json"),
+  ];
+  for (const p of candidates) {
+    if (!existsSync(p)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(p, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, DbEnvEntry>;
+      }
+      if (opts?.strict) {
+        throw new Error(`Invalid DB environments JSON object in ${p}`);
+      }
+    } catch (err) {
+      if (opts?.strict) {
+        throw new Error(
+          `Failed to parse DB environments file ${p}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+  return {};
+}
+
+export function collectProdDbHosts(
+  root: string,
+  cfg: WorkbenchConfig,
+  opts?: { strict?: boolean },
+): string[] {
+  const hosts = new Set<string>();
+  for (const h of cfg.guard.prod_db_hosts) {
+    if (h.trim()) hosts.add(h.trim());
+  }
+  for (const t of cfg.guard.prod_db_targets) {
+    if (t.host.trim()) hosts.add(t.host.trim());
+  }
+  const envs = loadDbEnvironments(root, opts);
+  for (const [key, entry] of Object.entries(envs)) {
+    if (key.toLowerCase().includes("prod") && entry?.host?.trim()) {
+      hosts.add(entry.host.trim());
+    }
+  }
+  return [...hosts];
+}
+
+export function loadModelsConfig(root: string): ModelsConfig {
+  const parsed = parseTomlFile<Partial<ModelsConfig>>(
+    join(root, ".workbench", "models.toml"),
+  );
+  return {
+    tiers: {
+      mechanical: parsed?.tiers?.mechanical ?? {
+        model: "gpt-6.1-terra",
+        effort: "medium",
+      },
+      standard: parsed?.tiers?.standard ?? {
+        model: "gpt-6.2-sol",
+        effort: "medium",
+      },
+      deep: parsed?.tiers?.deep ?? {
+        model: "gpt-6.2-astra",
+        effort: "high",
+      },
+    },
+  };
+}
