@@ -4,7 +4,7 @@
 
 ## 目录与基本规矩
 
-- **Git**：根目录无默认仓库，执行 Git 一律用 `git -C <仓库路径>` 或在目标仓/worktree 目录内执行；commit 遵循 `<type>(<scope>): <subject>`。
+- **Git**：根目录无默认仓库，执行 Git 一律用 `git -C <仓库路径>` 或在目标仓/worktree 目录内执行；commit 遵循 `<type>(<scope>): <subject>`。新建 worktree 一律用 `git -C <仓> worktree add` 置于 `<仓>.worktrees/<name>`，**禁止调用 Codex Desktop 内置 `create_worktree`**（会把会话 `cwd` 切离工作台导致 `.codex/hooks.json` 失效）；合并部署后及时清理 worktree 与本地已合分支。
 - **共享工作树红线**：禁止 `git stash`、`git checkout --`、`git restore`、`git reset`、`git commit --amend`、`git add -A`、`git add .`。提交前检查 `git status`，逐文件 `git add` 并带 pathspec 提交。
 - **PR 格式**：标题 `type: 一句话描述`；正文固定三节：「改动内容」（直白业务语言）、「关键文件改动」、「对历史影响」（无影响写「无」）。
 - **一次性脚本**：未另指定位置时归档至 `one-off-scripts/`，按职责分目录并更新该目录 `README.md`，不散放工作台根目录。

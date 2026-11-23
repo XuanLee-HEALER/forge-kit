@@ -15,7 +15,8 @@ description: >
 
 1. **锁定工作台根目录**：
    - 从当前 `cwd` 向上查找 `.workbench/workbench.yaml`（或 `.workbench/kit-lock.json`）确定工作台根路径 `<WB_ROOT>`。
-   - 若用户指定了目标仓库、分支或 worktree，一并核对对应绝对路径是否存在；后续所有命令统一用 `workdir` 或 `git -C <目标路径>` 锚定到正确目录（若当前会话开在非工作台目录，明确提醒用户）。
+   - 若用户指定了目标仓库、分支或 worktree，一并核对对应绝对路径是否存在；后续所有命令统一用 `workdir` 或 `git -C <目标路径>` 锚定到正确目录。
+   - **护栏可达性提醒**：若当前会话 `cwd` 不在 `<WB_ROOT>`（例如开在旧目录或漂移到了 `~/.codex/worktrees/...`），在就绪卡片首行明确提醒用户——Codex 仅在会话启动于 `<WB_ROOT>` 且已在 `/hooks`（或 Codex Desktop 设置）信任 `.codex/hooks.json` 时才会自动触发底层 `guard`/`ledger-hook` 护栏；后续新建 worktree 一律走 `git -C <仓> worktree add` 放到 `<仓>.worktrees/<name>`，不调用内置 `create_worktree`。
 
 2. **补齐私有规则与受管清单（禁止全量灌入）**：
    - 读取 `<WB_ROOT>/AGENTS.local.md`（若存在）与 `<WB_ROOT>/.workbench/workbench.yaml`，确认本工作台私有约定、受管业务仓清单与环境边界。

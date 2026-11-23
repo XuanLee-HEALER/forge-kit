@@ -12,7 +12,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { addRepo, doctorWorkbench, initWorkbench, syncWorkbench } from "../src/cli";
+import {
+  addRepo,
+  checkCodexHooksTrust,
+  doctorWorkbench,
+  initWorkbench,
+  syncWorkbench,
+} from "../src/cli";
 import { loadWorkbenchConfig } from "../src/config";
 import { runGit } from "../src/git";
 import { Ledger } from "../src/ledger";
@@ -152,5 +158,74 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     expect(() => addRepo({ repoPath: linkedWt, workbenchDir: res.root })).toThrow(
       "linked git worktree",
     );
+  });
+
+  test("checkCodexHooksTrust detects untrusted vs trusted hooks in Codex config.toml", () => {
+    const res = initWorkbench({
+      targetDir: target,
+      name: "trust-check",
+      skipReviewAgents: true,
+    });
+    const fakeCodexHome = mkdtempSync(join(tmpdir(), "forge-codex-home-"));
+    try {
+      const cfgPath = join(fakeCodexHome, "config.toml");
+      writeFileSync(cfgPath, 'model = "gpt-6.2-sol"\n', "utf8");
+      const untrusted = checkCodexHooksTrust(res.root, fakeCodexHome);
+      expect(untrusted.checked).toBe(true);
+      expect(untrusted.totalCount).toBe(4);
+      expect(untrusted.trustedCount).toBe(0);
+
+      const hooksPath = untrusted.hooksPath;
+      writeFileSync(
+        cfgPath,
+        [
+          `[hooks.state."${hooksPath}:pre_tool_use:0:0"]`,
+          'trusted_hash = "sha256:aaa"',
+          `[hooks.state."file:${hooksPath}:post_tool_use:0:0"]`,
+          'trusted_hash = "sha256:bbb"',
+          `[hooks.state."${hooksPath}:session_start:0:0"]`,
+          "enabled = false",
+          'trusted_hash = "sha256:ccc"',
+        ].join("\n") + "\n",
+        "utf8",
+      );
+      const partial = checkCodexHooksTrust(res.root, fakeCodexHome);
+      expect(partial.checked).toBe(true);
+      expect(partial.totalCount).toBe(4);
+      expect(partial.trustedCount).toBe(2);
+    } finally {
+      rmSync(fakeCodexHome, { recursive: true, force: true });
+    }
+  });
+
+  test("ledger CLI ignores --role for non-review evidence kinds", () => {
+    const res = initWorkbench({
+      targetDir: target,
+      name: "role-check",
+      skipReviewAgents: true,
+    });
+    const ledgerBin = join(res.root, ".workbench", "bin", "ledger");
+    const opened = Bun.spawnSync(
+      [ledgerBin, "open", "--id", "role-test-1", "--title", "Role test", "--endpoint", "local", "--depth", "targeted"],
+      { cwd: res.root },
+    );
+    expect(opened.exitCode).toBe(0);
+
+    const lintRec = Bun.spawnSync(
+      [ledgerBin, "record", "role-test-1", "--kind", "lint", "--status", "pass", "--role", "review-quality", "--summary", "tsc pass"],
+      { cwd: res.root },
+    );
+    expect(lintRec.exitCode).toBe(0);
+    expect(lintRec.stderr.toString()).toContain("--role only applies to --kind review");
+    const lintEv = JSON.parse(lintRec.stdout.toString()) as { payload_json: string };
+    expect(JSON.parse(lintEv.payload_json).meta).toBeUndefined();
+
+    const revRec = Bun.spawnSync(
+      [ledgerBin, "record", "role-test-1", "--kind", "review", "--status", "pass", "--role", "review-quality", "--summary", "quality pass"],
+      { cwd: res.root },
+    );
+    expect(revRec.exitCode).toBe(0);
+    const revEv = JSON.parse(revRec.stdout.toString()) as { payload_json: string };
+    expect(JSON.parse(revEv.payload_json).meta).toEqual({ role: "quality" });
   });
 });

@@ -2113,7 +2113,13 @@ Commands:
         ? (JSON.parse(values.meta) as Record<string, unknown>)
         : {};
       if (values.role) {
-        parsedMeta.role = normalizeReviewRole(values.role);
+        if (values.kind === "review") {
+          parsedMeta.role = normalizeReviewRole(values.role);
+        } else {
+          console.error(
+            `Warning: --role only applies to --kind review; ignored for --kind ${values.kind}`,
+          );
+        }
       }
       const ev = ledger.recordEvidence({
         task_id,

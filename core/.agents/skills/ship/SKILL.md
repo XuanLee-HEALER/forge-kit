@@ -19,7 +19,7 @@ description: >
 ## 1. 上测试环境（FAT）
 
 1. 确认当前 `HEAD SHA` 已通过 `wrapup` 且账本无未关闭 blocker。
-2. 使用临时 detached worktree 合并至测试分支（不在共享工作树切分支；若仓库配置指定了 cherry-pick 规则，按仓库配置执行）：
+2. 使用 `<仓>.worktrees/<临时名>` 下的 detached worktree 合并至测试分支（不在共享工作树切分支，**禁止调用 Codex Desktop 内置 `create_worktree`** 切离工作台根目录；若仓库配置指定了 cherry-pick 规则，按仓库配置执行）：
    ```bash
    git -C <仓> fetch origin
    git -C <仓> worktree add --detach <临时目录> origin/fat
@@ -61,5 +61,6 @@ description: >
 
 ## 4. 清理与收尾
 
-1. 合并部署完成后清理本次分支与 worktree，执行 `.workbench/bin/ledger close <task_id>` 归档本次账本。
-2. 仅汇报实际发生的 PR、tag、部署、验收与清理结果。
+1. PR 已合并且部署确认成功后，立刻清理本次创建的 `<仓>.worktrees/<name>`、`git -C <仓> worktree prune` 及已合入远端的本地临时分支（或运行 `.workbench/bin/wb-git sweep`），核验 `git -C <仓> worktree list` 无本次残留；若 PR 尚未合并则明确标注留待合并后清理。
+2. 执行 `.workbench/bin/ledger close <task_id>` 归档本次账本。
+3. 仅汇报实际发生的 PR、tag、部署、验收与清理结果。

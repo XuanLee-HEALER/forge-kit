@@ -15,6 +15,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import {
@@ -937,6 +938,60 @@ export function doctorWorkbench(targetDir?: string): {
   };
 }
 
+export function checkCodexHooksTrust(
+  workbenchRoot: string,
+  codexHome?: string,
+): { checked: boolean; trustedCount: number; totalCount: number; hooksPath: string } {
+  const hooksPath = join(workbenchRoot, ".codex", "hooks.json");
+  const resolvedHooksPath = existsSync(hooksPath) ? realpathSync(hooksPath) : hooksPath;
+  const homeDir = codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex");
+  const configPath = join(homeDir, "config.toml");
+
+  if (!existsSync(resolvedHooksPath) || !existsSync(configPath)) {
+    return { checked: false, trustedCount: 0, totalCount: 0, hooksPath: resolvedHooksPath };
+  }
+
+  try {
+    const hooksJson = JSON.parse(readFileSync(resolvedHooksPath, "utf8")) as {
+      hooks?: Record<string, Array<{ hooks?: unknown[] }>>;
+    };
+    let totalCount = 0;
+    for (const groups of Object.values(hooksJson.hooks ?? {})) {
+      if (!Array.isArray(groups)) continue;
+      for (const g of groups) {
+        if (Array.isArray(g?.hooks)) totalCount += g.hooks.length;
+      }
+    }
+    if (totalCount === 0) {
+      return { checked: true, trustedCount: 0, totalCount: 0, hooksPath: resolvedHooksPath };
+    }
+
+    const parsedConfig = Bun.TOML.parse(readFileSync(configPath, "utf8")) as {
+      hooks?: {
+        state?: Record<string, { enabled?: boolean; trusted_hash?: string }>;
+      };
+    };
+    const stateMap = parsedConfig.hooks?.state ?? {};
+    let trustedCount = 0;
+    for (const [key, state] of Object.entries(stateMap)) {
+      if (
+        (key.startsWith(`${resolvedHooksPath}:`) ||
+          key.startsWith(`file:${resolvedHooksPath}:`) ||
+          key.startsWith(`${hooksPath}:`) ||
+          key.startsWith(`file:${hooksPath}:`)) &&
+        state?.enabled !== false &&
+        typeof state?.trusted_hash === "string" &&
+        state.trusted_hash.length > 0
+      ) {
+        trustedCount++;
+      }
+    }
+    return { checked: true, trustedCount, totalCount, hooksPath: resolvedHooksPath };
+  } catch {
+    return { checked: false, trustedCount: 0, totalCount: 0, hooksPath: resolvedHooksPath };
+  }
+}
+
 export async function runForgeCli(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   if (!cmd || cmd === "--help" || cmd === "-h") {
@@ -1004,6 +1059,12 @@ Usage:
         console.log(`  [${issue.level.toUpperCase()}] (${issue.check}) ${issue.message}`);
       }
       if (res.issues.length === 0) console.log("  All checks passed.");
+      const trust = checkCodexHooksTrust(res.root);
+      if (trust.checked && trust.totalCount > 0 && trust.trustedCount < trust.totalCount) {
+        console.log(
+          `  [HINT] (hooks-trust) Codex hooks in ${trust.hooksPath} have ${trust.trustedCount}/${trust.totalCount} trusted handler(s) in ~/.codex/config.toml. Open Codex in this workbench and approve via /hooks (or Codex Desktop Settings -> Hooks) to activate guard & ledger hooks.`,
+        );
+      }
     }
     if (!res.ok) process.exitCode = 1;
   } else {
