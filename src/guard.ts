@@ -2092,14 +2092,84 @@ function extractPatchFileTargets(
       return null;
     };
 
+    const AT_AT_PREFIX = Buffer.from("@@ ");
+    let hunkOldRem = 0;
+    let hunkNewRem = 0;
+
     // Scan lines at the byte level and strictly UTF-8 decode header lines (fatal + ignoreBOM)
-    // so invalid literal bytes (e.g. 0xff) are never silently mangled into U+FFFD before validation!
+    // while tracking unified-diff hunk line counts so hunk body lines starting with `+++ `/`--- `
+    // are never misclassified as file headers!
     let lineStart = 0;
     while (lineStart <= rawBuf.length) {
       let lineEnd = rawBuf.indexOf(0x0a, lineStart);
       if (lineEnd < 0) lineEnd = rawBuf.length;
       const trimmedEnd =
         lineEnd > lineStart && rawBuf[lineEnd - 1] === 0x0d ? lineEnd - 1 : lineEnd;
+
+      // Consume unified-diff hunk body lines before header matching
+      if (hunkOldRem > 0 || hunkNewRem > 0) {
+        if (lineStart === trimmedEnd) {
+          if (hunkOldRem > 0 && hunkNewRem > 0) {
+            hunkOldRem--;
+            hunkNewRem--;
+          }
+          if (lineEnd === rawBuf.length) break;
+          lineStart = lineEnd + 1;
+          continue;
+        }
+        const firstByte = rawBuf[lineStart];
+        if (firstByte === 0x20 && hunkOldRem > 0 && hunkNewRem > 0) {
+          hunkOldRem--;
+          hunkNewRem--;
+          if (lineEnd === rawBuf.length) break;
+          lineStart = lineEnd + 1;
+          continue;
+        }
+        if (firstByte === 0x2d && hunkOldRem > 0) {
+          hunkOldRem--;
+          if (lineEnd === rawBuf.length) break;
+          lineStart = lineEnd + 1;
+          continue;
+        }
+        if (firstByte === 0x2b && hunkNewRem > 0) {
+          hunkNewRem--;
+          if (lineEnd === rawBuf.length) break;
+          lineStart = lineEnd + 1;
+          continue;
+        }
+        if (firstByte === 0x5c) {
+          // `\ No newline at end of file` inside hunk
+          if (lineEnd === rawBuf.length) break;
+          lineStart = lineEnd + 1;
+          continue;
+        }
+        // Unexpected non-hunk line ends hunk tracking so following headers are never skipped
+        hunkOldRem = 0;
+        hunkNewRem = 0;
+      }
+
+      if (bufferStartsWith(rawBuf, lineStart, trimmedEnd, AT_AT_PREFIX)) {
+        try {
+          const hunkHdr = STRICT_UTF8_DECODER.decode(rawBuf.subarray(lineStart, trimmedEnd));
+          const hm = hunkHdr.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);
+          if (hm) {
+            hunkOldRem = hm[1] !== undefined ? Number(hm[1]) : 1;
+            hunkNewRem = hm[2] !== undefined ? Number(hm[2]) : 1;
+          }
+        } catch {
+          // Non-UTF-8 trailing function context after `@@`: still extract counts from ASCII prefix
+          const asciiPrefix = rawBuf.subarray(lineStart, Math.min(trimmedEnd, lineStart + 64)).toString("latin1");
+          const hm = asciiPrefix.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);
+          if (hm) {
+            hunkOldRem = hm[1] !== undefined ? Number(hm[1]) : 1;
+            hunkNewRem = hm[2] !== undefined ? Number(hm[2]) : 1;
+          }
+        }
+        if (lineEnd === rawBuf.length) break;
+        lineStart = lineEnd + 1;
+        continue;
+      }
+
       const isHeader = PATCH_HEADER_PREFIXES.some((pfx) =>
         bufferStartsWith(rawBuf, lineStart, trimmedEnd, pfx),
       );

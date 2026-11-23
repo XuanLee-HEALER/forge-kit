@@ -988,14 +988,14 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
       }),
     ).toContain("冻结测试防篡改");
 
-    // 13. Leading U+FEFF (BOM bytes \357\273\277) in quoted rename pathname is preserved (NOT stripped)
-    // and single-space delimiter in `rename to  tests/smoke.hurl` preserves leading space (no spurious match)!
+    // 13. Leading U+FEFF (BOM bytes \357\273\277 at byte 0 of quoted token!) in `rename to` is preserved
+    // (NOT stripped by TextDecoder), and single-space delimiter in `rename to  tests/smoke.hurl` preserves leading space!
     const bomRenamePatch = join(wb, "bom-rename.patch");
     writeFileSync(
       bomRenamePatch,
-      'diff --git "a/\\357\\273\\277tests/smoke.hurl" "b/\\357\\273\\277tests/smoke.hurl"\nold mode 100644\nnew mode 100755\n',
+      'rename from other.md\nrename to "\\357\\273\\277tests/smoke.hurl"\n',
     );
-    // `\uFEFFtests/smoke.hurl` does NOT start with `tests/`, so preserving BOM keeps it distinct from `tests/smoke.hurl`!
+    // `\uFEFFtests/smoke.hurl` starts with U+FEFF (at byte 0 of token), distinct from `tests/smoke.hurl`!
     expect(
       evaluatePreToolUse(wb, {
         hook_event_name: "PreToolUse",
@@ -1017,6 +1017,45 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         cwd: wtFeat,
         tool_name: "exec_command",
         tool_input: { command: `git apply ${leadingSpaceRenamePatch}` },
+      }),
+    ).toBeNull();
+
+    // Round 8 regressions:
+    // 14. Hunk body lines starting with `+++ <FF>` or `--- <FF>` inside an ordinary `readme` patch
+    // MUST NOT be misclassified as malformed headers (no false-positive denial in locked worktree)!
+    const hunkPlusFfPatch = join(wb, "hunk-plus-ff.patch");
+    writeFileSync(
+      hunkPlusFfPatch,
+      Buffer.concat([
+        Buffer.from("diff --git a/readme b/readme\n--- a/readme\n+++ b/readme\n@@ -1 +1 @@\n-old\n+++ "),
+        Buffer.from([0xff]),
+        Buffer.from("\n"),
+      ]),
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${hunkPlusFfPatch}` },
+      }),
+    ).toBeNull();
+
+    const hunkMinusFfPatch = join(wb, "hunk-minus-ff.patch");
+    writeFileSync(
+      hunkMinusFfPatch,
+      Buffer.concat([
+        Buffer.from("diff --git a/readme b/readme\n--- a/readme\n+++ b/readme\n@@ -1 +1 @@\n--- "),
+        Buffer.from([0xff]),
+        Buffer.from("\n+new\n"),
+      ]),
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${hunkMinusFfPatch}` },
       }),
     ).toBeNull();
   });
