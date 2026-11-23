@@ -1058,5 +1058,28 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         tool_input: { command: `git apply ${hunkMinusFfPatch}` },
       }),
     ).toBeNull();
+
+    // Round 9 regression: >64-byte zero-padded hunk header with non-UTF-8 trailing context parses cleanly!
+    const longHunkHdrPatch = join(wb, "long-hunk-hdr.patch");
+    writeFileSync(
+      longHunkHdrPatch,
+      Buffer.concat([
+        Buffer.from("--- a/readme\n+++ b/readme\n@@ -"),
+        Buffer.from("0".repeat(60)),
+        Buffer.from("1 +1 @@ "),
+        Buffer.from([0xff]),
+        Buffer.from("\n-old\n+++ "),
+        Buffer.from([0xff]),
+        Buffer.from("\n"),
+      ]),
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${longHunkHdrPatch}` },
+      }),
+    ).toBeNull();
   });
 });

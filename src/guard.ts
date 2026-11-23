@@ -2149,21 +2149,11 @@ function extractPatchFileTargets(
       }
 
       if (bufferStartsWith(rawBuf, lineStart, trimmedEnd, AT_AT_PREFIX)) {
-        try {
-          const hunkHdr = STRICT_UTF8_DECODER.decode(rawBuf.subarray(lineStart, trimmedEnd));
-          const hm = hunkHdr.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);
-          if (hm) {
-            hunkOldRem = hm[1] !== undefined ? Number(hm[1]) : 1;
-            hunkNewRem = hm[2] !== undefined ? Number(hm[2]) : 1;
-          }
-        } catch {
-          // Non-UTF-8 trailing function context after `@@`: still extract counts from ASCII prefix
-          const asciiPrefix = rawBuf.subarray(lineStart, Math.min(trimmedEnd, lineStart + 64)).toString("latin1");
-          const hm = asciiPrefix.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);
-          if (hm) {
-            hunkOldRem = hm[1] !== undefined ? Number(hm[1]) : 1;
-            hunkNewRem = hm[2] !== undefined ? Number(hm[2]) : 1;
-          }
+        const hunkHdr = rawBuf.subarray(lineStart, trimmedEnd).toString("latin1");
+        const hm = hunkHdr.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);
+        if (hm) {
+          hunkOldRem = hm[1] !== undefined ? Number(hm[1]) : 1;
+          hunkNewRem = hm[2] !== undefined ? Number(hm[2]) : 1;
         }
         if (lineEnd === rawBuf.length) break;
         lineStart = lineEnd + 1;
