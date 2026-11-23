@@ -67,30 +67,45 @@ function parseLangCheckInvocation(cmdToks: string[]): {
 
   let mode: "static" | "dynamic" | "all" = "all";
   let targetPositional: string | null = null;
+  let endFlags = false;
   for (let i = argsStart; i < cmdToks.length; i++) {
     const t = cmdToks[i];
-    if (t === "--") break;
-    if (t === "--mode") {
-      const v = cmdToks[++i];
-      if (v === "static" || v === "dynamic" || v === "all") mode = v;
-      else return null;
+    if (!endFlags && t === "--") {
+      endFlags = true;
       continue;
     }
-    if (t.startsWith("--mode=")) {
-      const v = t.slice("--mode=".length);
-      if (v === "static" || v === "dynamic" || v === "all") mode = v;
-      else return null;
-      continue;
+    if (!endFlags) {
+      if (t === "--mode") {
+        const v = cmdToks[++i];
+        if (v === "static" || v === "dynamic" || v === "all") mode = v;
+        else return null;
+        continue;
+      }
+      if (t.startsWith("--mode=")) {
+        const v = t.slice("--mode=".length);
+        if (v === "static" || v === "dynamic" || v === "all") mode = v;
+        else return null;
+        continue;
+      }
+      if (t === "--lang") {
+        i++;
+        continue;
+      }
+      if (t.startsWith("--lang=") || t === "--json") continue;
+      if (t.startsWith("-")) continue;
     }
-    if (t === "--lang") {
-      i++;
-      continue;
-    }
-    if (t.startsWith("--lang=") || t === "--json") continue;
-    if (t.startsWith("-")) continue;
     if (!targetPositional) targetPositional = t;
   }
   return { argsStart, mode, targetPositional };
+}
+
+function extractEslintArgs(cmdToks: string[]): string[] | null {
+  const [c0 = "", c1 = "", c2 = ""] = cmdToks;
+  const bin0 = c0.split("/").pop() ?? "";
+  if (bin0 === "eslint") return cmdToks.slice(1);
+  if ((bin0 === "npx" || bin0 === "bunx") && c1 === "eslint") return cmdToks.slice(2);
+  if (bin0 === "bunx" && c1 === "--bun" && c2 === "eslint") return cmdToks.slice(3);
+  return null;
 }
 
 function extractTscArgs(cmdToks: string[]): string[] | null {
@@ -194,8 +209,9 @@ function classifyVerifyCommand(metaToks: ShellToken[]): {
     (bin0 === "bun" && c1 === "run" && (c2 === "check" || c2.startsWith("check:") || c2 === "lint" || c2.startsWith("lint:"))) ||
     (bin0 === "npm" && c1 === "run" && (c2 === "lint" || c2.startsWith("lint:") || c2 === "check" || c2.startsWith("check:"))) ||
     extractTscArgs(cmdToks) !== null ||
-    (bin0 === "npx" && (c1 === "eslint" || (c1 === "biome" && c2 === "check"))) ||
-    (bin0 === "bunx" && (c1 === "eslint" || (c1 === "biome" && c2 === "check") || (c1 === "--bun" && c2 === "biome" && cmdToks[3] === "check"))) ||
+    extractEslintArgs(cmdToks) !== null ||
+    (bin0 === "npx" && c1 === "biome" && c2 === "check") ||
+    (bin0 === "bunx" && ((c1 === "biome" && c2 === "check") || (c1 === "--bun" && c2 === "biome" && cmdToks[3] === "check"))) ||
     (bin0 === "biome" && c1 === "check") ||
     (bin0 === "ruff" && c1 === "check") ||
     bin0 === "pyright" ||
@@ -783,11 +799,23 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
     return Array.from(tscFlags.values()).some(Boolean);
   }
 
-  if (bin0 === "npx" && c1 === "eslint") {
-    for (let i = 2; i < cmdToks.length; i++) {
-      const tok = cmdToks[i];
+  const eslintArgs = extractEslintArgs(cmdToks);
+  if (eslintArgs) {
+    for (let i = 0; i < eslintArgs.length; i++) {
+      const tok = eslintArgs[i];
       if (tok === "--") break;
-      if (tok === "--print-config" || tok === "--init" || tok === "-v") return true;
+      if (
+        tok === "--print-config" ||
+        tok.startsWith("--print-config=") ||
+        tok === "--init" ||
+        tok === "--inspect-config" ||
+        tok === "-v" ||
+        tok === "--version" ||
+        tok === "-h" ||
+        tok === "--help"
+      ) {
+        return true;
+      }
     }
     return false;
   }
@@ -1071,21 +1099,85 @@ function resolveVerifyTargetDir(
     for (const d of goInv.preDirs) {
       dir = resolve(dir, d);
     }
+    const GO_VALUE_FLAGS = new Set([
+      "-o",
+      "-p",
+      "-asmflags",
+      "-buildmode",
+      "-buildvcs",
+      "-compiler",
+      "-gccgoflags",
+      "-gcflags",
+      "-installsuffix",
+      "-ldflags",
+      "-mod",
+      "-modfile",
+      "-overlay",
+      "-pgo",
+      "-pkgdir",
+      "-tags",
+      "-toolexec",
+      "-workfile",
+      "-vet",
+      "-vettool",
+      "-bench",
+      "-benchtime",
+      "-blockprofile",
+      "-blockprofilerate",
+      "-count",
+      "-covermode",
+      "-coverpkg",
+      "-coverprofile",
+      "-cpu",
+      "-cpuprofile",
+      "-exec",
+      "-fuzz",
+      "-fuzzminimizetime",
+      "-fuzztime",
+      "-list",
+      "-memprofile",
+      "-memprofilerate",
+      "-mutexprofile",
+      "-mutexprofilefraction",
+      "-outputdir",
+      "-parallel",
+      "-run",
+      "-shuffle",
+      "-skip",
+      "-timeout",
+      "-trace",
+    ]);
     const pkgPaths: string[] = [];
     for (let i = goInv.argsStart; i < cmdToks.length; i++) {
       const tok = cmdToks[i];
-      if (tok === "--") break;
+      if (tok === "--" || tok === "-args" || tok === "--args") break;
       if (tok === "-C" || tok === "--C") {
         const val = cmdToks[++i];
         if (!val) return null;
         dir = resolve(dir, val);
-      } else if (tok.startsWith("-C=") || tok.startsWith("--C=")) {
+        continue;
+      }
+      if (tok.startsWith("-C=") || tok.startsWith("--C=")) {
         const val = tok.slice(tok.indexOf("=") + 1);
         if (!val) return null;
         dir = resolve(dir, val);
-      } else if (
-        !tok.startsWith("-") &&
-        (tok.startsWith("./") || tok.startsWith("../") || tok.startsWith("/"))
+        continue;
+      }
+      if (tok.startsWith("-")) {
+        const eqIdx = tok.indexOf("=");
+        const rawFlag = eqIdx >= 0 ? tok.slice(0, eqIdx) : tok;
+        const normFlag = rawFlag.startsWith("--") ? rawFlag.slice(1) : rawFlag;
+        if (eqIdx < 0 && GO_VALUE_FLAGS.has(normFlag)) {
+          i++;
+        }
+        continue;
+      }
+      if (
+        tok === "." ||
+        tok === "./..." ||
+        tok.startsWith("./") ||
+        tok.startsWith("../") ||
+        tok.startsWith("/")
       ) {
         pkgPaths.push(tok);
       }
@@ -1151,11 +1243,13 @@ function resolveVerifyTargetDir(
     const listValueOpts = isBuildMode ? TSC_BUILD_LIST_OPTS : TSC_NORMAL_LIST_OPTS;
     let projectPath: string | null = null;
     const buildProjects: string[] = [];
+    const sourceFiles: string[] = [];
     for (let i = isBuildMode ? 1 : 0; i < tscArgs.length; i++) {
       const tok = tscArgs[i];
       const optName = stripTscOpt(tok);
       if (!optName) {
         if (isBuildMode) buildProjects.push(tok);
+        else sourceFiles.push(tok);
         continue;
       }
       if (!isBuildMode && (optName === "p" || optName === "project")) {
@@ -1179,6 +1273,9 @@ function resolveVerifyTargetDir(
     if (!isBuildMode && projectPath) {
       const resolved = resolve(curDir, projectPath);
       return resolved.endsWith(".json") ? dirname(resolved) : resolved;
+    }
+    if (!isBuildMode && sourceFiles.length > 0) {
+      return commonDirAncestor(sourceFiles.map((f) => resolvePathArgToDir(f, curDir)));
     }
     if (isBuildMode && buildProjects.length > 0) {
       const dirs = new Set(
@@ -1288,8 +1385,9 @@ function resolveVerifyTargetDir(
     });
   }
 
-  if ((bin0 === "npx" || bin0 === "bunx") && c1 === "eslint") {
-    return resolvePositionalTargetDir(cmdToks.slice(2), curDir, {
+  const eslintTargetArgs = extractEslintArgs(cmdToks);
+  if (eslintTargetArgs) {
+    return resolvePositionalTargetDir(eslintTargetArgs, curDir, {
       valueFlags: new Set([
         "-c",
         "--config",
@@ -2170,13 +2268,17 @@ export function classifyPostToolEvidence(
           if (nonCdSegments.length > 1) continue;
           const trimmedOut = outputText.trim();
           let parsedReport: {
+            ok?: boolean;
             executed?: number;
+            failed?: number;
             checks?: Array<{ phase?: string; status?: string }>;
           } | null = null;
           if (trimmedOut.startsWith("{")) {
             try {
               parsedReport = JSON.parse(trimmedOut) as {
+                ok?: boolean;
                 executed?: number;
+                failed?: number;
                 checks?: Array<{ phase?: string; status?: string }>;
               };
             } catch {
@@ -2193,11 +2295,15 @@ export function classifyPostToolEvidence(
             const dynamicRan = parsedReport.checks.filter(
               (c) => c.phase === "dynamic" && c.status !== "skipped",
             );
-            const allJsonPass =
-              staticRan.every((c) => c.status === "pass") &&
-              dynamicRan.every((c) => c.status === "pass");
-            // Fail closed if non-zero exit contradicts all-passing JSON payload
-            if (!passed && allJsonPass) continue;
+            const totalRan = staticRan.length + dynamicRan.length;
+            const totalFailed =
+              staticRan.filter((c) => c.status !== "pass").length +
+              dynamicRan.filter((c) => c.status !== "pass").length;
+            const countsConsistent =
+              (typeof parsedReport.executed !== "number" || parsedReport.executed === totalRan) &&
+              (typeof parsedReport.failed !== "number" || parsedReport.failed === totalFailed) &&
+              (typeof parsedReport.ok !== "boolean" || parsedReport.ok === passed);
+            if (!countsConsistent || (!passed && totalFailed === 0)) continue;
             if (staticRan.length > 0) {
               phases.push({
                 kind: "lint",
@@ -2211,14 +2317,32 @@ export function classifyPostToolEvidence(
               });
             }
           } else {
-            // Non-JSON summary output: require explicit `[PASS]`/`[FAIL]` `(lang/phase)` lines.
-            // Fail closed (emit nothing) when output is empty/truncated so no phase is fabricated!
+            // Non-JSON summary output: require a complete `lang-check (...) -> executed=N, failed=M, ok=...`
+            // header AND reconcile the exact count of parsed `[PASS]`/`[FAIL]` rows against declared totals
+            // so truncated reports can NEVER flip a missing failure into a false phase pass!
+            const headerMatch = outputText.match(
+              /lang-check\s+\((?:static|dynamic|all)\)\s+\[[^\]]*\]\s*->\s*executed=(\d+),\s*failed=(\d+),\s*ok=(true|false)/,
+            );
+            if (!headerMatch) continue;
+            const declaredExecuted = Number(headerMatch[1]);
+            const declaredFailed = Number(headerMatch[2]);
+            const declaredOk = headerMatch[3] === "true";
             const staticMatches = [...outputText.matchAll(/\[(PASS|FAIL)\]\s+\([^/]+\/static\)/g)];
             const dynamicMatches = [...outputText.matchAll(/\[(PASS|FAIL)\]\s+\([^/]+\/dynamic\)/g)];
-            const allTextPass =
-              staticMatches.every((m) => m[1] === "PASS") &&
-              dynamicMatches.every((m) => m[1] === "PASS");
-            if (!passed && allTextPass) continue;
+            const totalParsed = staticMatches.length + dynamicMatches.length;
+            const totalFailed =
+              staticMatches.filter((m) => m[1] !== "PASS").length +
+              dynamicMatches.filter((m) => m[1] !== "PASS").length;
+            if (
+              declaredExecuted <= 0 ||
+              totalParsed !== declaredExecuted ||
+              totalFailed !== declaredFailed ||
+              declaredOk !== passed ||
+              (passed && declaredFailed > 0) ||
+              (!passed && declaredFailed === 0)
+            ) {
+              continue;
+            }
             if (staticMatches.length > 0) {
               phases.push({
                 kind: "lint",

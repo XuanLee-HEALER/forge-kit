@@ -45,6 +45,13 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks) and ledg
     );
     writeFileSync(join(jsRepo, "index.js"), "export const ok = true;\n");
     expect(detectRepoLanguages(jsRepo)).toEqual(["ts"]);
+
+    // Pure JS package with deeply nested source file (depth 3+: src/lib/client/index.mjs) is also detected!
+    const deepJsRepo = join(dir, "deep-js-pkg");
+    mkdirSync(join(deepJsRepo, "src", "lib", "client"), { recursive: true });
+    writeFileSync(join(deepJsRepo, "package.json"), JSON.stringify({ name: "deep-js-pkg" }));
+    writeFileSync(join(deepJsRepo, "src", "lib", "client", "index.mjs"), "export const x = 1;\n");
+    expect(detectRepoLanguages(deepJsRepo)).toEqual(["ts"]);
   });
 
   test("classifies lang-check, go vet, biome check, pyright, mypy, bunx tsc, and python -m pytest in ledger-hook", () => {
@@ -151,5 +158,59 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks) and ledg
     expect(globalGoVet.length).toBe(1);
     expect(globalGoVet[0]?.kind).toBe("lint");
     expect(globalGoVet[0]?.targetDir).toBe(repoA);
+
+    // Round 2 regressions:
+    // 1. `lang-check --mode static --json -- ../mock-api` resolves positional after `--` to mock-api (NOT cwd mock-web!)
+    const lcAfterDash = classifyPostToolEvidence(
+      `../.workbench/bin/lang-check --mode static --json -- ../mock-api`,
+      repoB,
+      0,
+      JSON.stringify({ ok: true, executed: 1, failed: 0, checks: [{ phase: "static", status: "pass" }] }),
+    );
+    expect(lcAfterDash.length).toBe(1);
+    expect(lcAfterDash[0]?.targetDir).toBe(repoA);
+
+    // 2. `go test -coverprofile ../mock-api/coverage.out .` stays attributed to repoB (NOT mock-api!)
+    const goCov = classifyPostToolEvidence(
+      "go test -coverprofile ../mock-api/coverage.out .",
+      repoB,
+      0,
+      "ok",
+    );
+    expect(goCov.length).toBe(1);
+    expect(goCov[0]?.targetDir).toBe(repoB);
+
+    // 3. `tsc ../mock-api/index.ts --noEmit` attributes to mock-api (NOT cwd mock-web!)
+    const tscFile = classifyPostToolEvidence("tsc ../mock-api/index.ts --noEmit", repoB, 0, "");
+    expect(tscFile.length).toBe(1);
+    expect(tscFile[0]?.targetDir).toBe(repoA);
+
+    // 4. Truncated `--mode all` text report (header says executed=3, failed=2, only 2 rows visible) MUST fail closed!
+    const fullAllText = [
+      "lang-check (all) [ts, python] -> executed=3, failed=2, ok=false",
+      "  [PASS] (ts/static) tsc-noEmit",
+      "  [FAIL] (ts/dynamic) bun-test-strict",
+      "  [FAIL] (python/static) ruff-check",
+    ].join("\n");
+    const fullAllRes = classifyPostToolEvidence(`.workbench/bin/lang-check ${repoA}`, dir, 1, fullAllText);
+    expect(fullAllRes.map((e) => `${e.kind}:${e.status}`)).toEqual(["lint:fail", "test:fail"]);
+
+    const truncatedAllText = [
+      "lang-check (all) [ts, python] -> executed=3, failed=2, ok=false",
+      "  [PASS] (ts/static) tsc-noEmit",
+      "  [FAIL] (ts/dynamic) bun-test-strict",
+    ].join("\n");
+    expect(
+      classifyPostToolEvidence(`.workbench/bin/lang-check ${repoA}`, dir, 1, truncatedAllText),
+    ).toEqual([]);
+
+    // 5. `bunx eslint --print-config` is rejected; bare `eslint ../mock-api` is recognized & attributed!
+    expect(
+      classifyPostToolEvidence("bunx eslint --print-config ../mock-api/index.ts", repoB, 0, "{}"),
+    ).toEqual([]);
+    const bareEslint = classifyPostToolEvidence("eslint ../mock-api", repoB, 0, "");
+    expect(bareEslint.length).toBe(1);
+    expect(bareEslint[0]?.kind).toBe("lint");
+    expect(bareEslint[0]?.targetDir).toBe(repoA);
   });
 });

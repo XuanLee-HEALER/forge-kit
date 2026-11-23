@@ -1224,7 +1224,17 @@ export class Ledger {
         const specDirAbs = resolve(wbReal, specDir);
         if (existsSync(specDirAbs)) {
           try {
-            realSpecDir = realpathSync(specDirAbs);
+            const candidateReal = realpathSync(specDirAbs);
+            const relRealDir = relative(wbReal, candidateReal).replace(/\\/g, "/");
+            if (
+              statSync(candidateReal).isDirectory() &&
+              relRealDir &&
+              !relRealDir.startsWith("..") &&
+              !isAbsolute(relRealDir) &&
+              relRealDir === specDir
+            ) {
+              realSpecDir = candidateReal;
+            }
           } catch {
             realSpecDir = null;
           }

@@ -43,10 +43,18 @@ function whichBin(name: string, targetDir: string): string | null {
   return null;
 }
 
-function hasFileMatching(dir: string, predicate: (name: string) => boolean, maxDepth = 2): boolean {
+function hasFileMatching(
+  dir: string,
+  predicate: (name: string) => boolean,
+  maxDepth = 5,
+  maxDirs = 500,
+): boolean {
   if (!existsSync(dir)) return false;
   const skip = new Set([".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__"]);
+  let visitedDirs = 0;
   const walk = (cur: string, depth: number): boolean => {
+    if (visitedDirs >= maxDirs) return false;
+    visitedDirs++;
     let entries;
     try {
       entries = readdirSync(cur, { withFileTypes: true });
@@ -65,18 +73,45 @@ function hasFileMatching(dir: string, predicate: (name: string) => boolean, maxD
   return walk(dir, 0);
 }
 
+function hasNodePackageSignal(targetDir: string): boolean {
+  const pkgPath = join(targetDir, "package.json");
+  if (!existsSync(pkgPath)) return false;
+  if (
+    hasFileMatching(targetDir, (n) =>
+      /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|svelte)$/.test(n),
+    )
+  ) {
+    return true;
+  }
+  if (
+    [
+      "biome.json",
+      "biome.jsonc",
+      "eslint.config.js",
+      "eslint.config.mjs",
+      "eslint.config.ts",
+      ".eslintrc",
+      ".eslintrc.js",
+      ".eslintrc.json",
+    ].some((f) => existsSync(join(targetDir, f)))
+  ) {
+    return true;
+  }
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { scripts?: Record<string, string> };
+    const testScript = pkg?.scripts?.["test:unit"] ?? pkg?.scripts?.test ?? "";
+    return Boolean(testScript.trim()) && !testScript.includes("no test specified");
+  } catch {
+    return false;
+  }
+}
+
 export function detectRepoLanguages(targetDir: string): CheckLanguage[] {
   const langs: CheckLanguage[] = [];
   if (existsSync(join(targetDir, "go.mod"))) {
     langs.push("go");
   }
-  if (
-    existsSync(join(targetDir, "tsconfig.json")) ||
-    (existsSync(join(targetDir, "package.json")) &&
-      hasFileMatching(targetDir, (n) =>
-        /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|svelte)$/.test(n),
-      ))
-  ) {
+  if (existsSync(join(targetDir, "tsconfig.json")) || hasNodePackageSignal(targetDir)) {
     langs.push("ts");
   }
   if (

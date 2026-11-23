@@ -1913,11 +1913,13 @@ function extractPatchFileTargets(
   patchAbsPath: string,
   baseDir: string,
   stripLevel: number | null,
-): string[] {
-  if (!existsSync(patchAbsPath)) return [];
+): { targets: string[]; uninspectable: boolean } {
+  if (!existsSync(patchAbsPath)) return { targets: [], uninspectable: true };
   try {
     const st = statSync(patchAbsPath);
-    if (!st.isFile() || st.size > 512 * 1024) return [];
+    if (!st.isFile() || st.size > 4 * 1024 * 1024) {
+      return { targets: [], uninspectable: true };
+    }
     const content = readFileSync(patchAbsPath, "utf8");
     const out: string[] = [];
     for (const line of content.split(/\r?\n/)) {
@@ -1938,9 +1940,9 @@ function extractPatchFileTargets(
         out.push(canonicalizeMaybePath(resolve(baseDir, rel)));
       }
     }
-    return out;
+    return { targets: out, uninspectable: false };
   } catch {
-    return [];
+    return { targets: [], uninspectable: true };
   }
 }
 
@@ -2237,6 +2239,33 @@ export function checkSpecAndTestLocks(
 
         const candidateTargets: string[] = [];
 
+        const failClosedForUninspectablePatchDir = (dirPath: string): string | null => {
+          const canonDir = canonicalizeMaybePath(dirPath);
+          for (const lock of resolvedLocks) {
+            for (const sf of lock.lockedSpecFiles) {
+              if (
+                dirname(sf.abs) === canonDir ||
+                sf.abs.startsWith(canonDir + "/") ||
+                canonDir.startsWith(dirname(sf.abs) + "/")
+              ) {
+                return matchLockedPath(sf.abs);
+              }
+            }
+            if (lock.lockedTestGlobs.length > 0) {
+              const dirInsideLock = resolveRelWithinLock(lock, canonDir) !== null;
+              const lockInsideDir = lock.explicitRoots.some(
+                (rr) => rr === canonDir || rr.startsWith(canonDir + "/"),
+              );
+              if (dirInsideLock || lockInsideDir) {
+                return (
+                  `物理锁（冻结测试防篡改）：无法在预检查阶段安全解析补丁目标，禁止在包含锁定测试文件的目录 (${relative(wbReal, canonDir) || "."}) 中应用未检视补丁（任务 ${lock.task_id}）。`
+                );
+              }
+            }
+          }
+          return null;
+        };
+
         if (bin === "cp" || bin === "install") {
           const valFlags =
             bin === "install"
@@ -2397,6 +2426,8 @@ export function checkSpecAndTestLocks(
         } else if (bin === "patch") {
           let stripLevel: number | null = null;
           let patchDir = effectiveCwd;
+          let dryRun = false;
+          let hasOutputFlag = false;
           const patchInputs: string[] = [...redirReads];
           const positionals: string[] = [];
           for (let j = 0; j < args.length; j++) {
@@ -2404,6 +2435,10 @@ export function checkSpecAndTestLocks(
             if (a === "--") {
               positionals.push(...args.slice(j + 1));
               break;
+            }
+            if (a === "--dry-run" || a === "--check" || a === "-C") {
+              dryRun = true;
+              continue;
             }
             if (a === "-p" && args[j + 1] !== undefined) {
               const n = Number(args[++j]);
@@ -2431,6 +2466,7 @@ export function checkSpecAndTestLocks(
               continue;
             }
             if (a === "-o" || a === "--output") {
+              hasOutputFlag = true;
               if (args[j + 1]) candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, args[++j])));
               continue;
             }
@@ -2441,25 +2477,25 @@ export function checkSpecAndTestLocks(
             if (a.startsWith("-")) continue;
             positionals.push(a);
           }
+          if (dryRun && !hasOutputFlag) continue;
           if (positionals[0]) {
             candidateTargets.push(canonicalizeMaybePath(resolve(patchDir, positionals[0])));
           }
           if (positionals[1]) {
             patchInputs.push(canonicalizeMaybePath(resolve(effectiveCwd, positionals[1])));
           }
+          let anyUninspectable = false;
           for (const pf of patchInputs) {
-            candidateTargets.push(...extractPatchFileTargets(pf, patchDir, stripLevel));
+            const parsed = extractPatchFileTargets(pf, patchDir, stripLevel);
+            candidateTargets.push(...parsed.targets);
+            if (parsed.uninspectable) anyUninspectable = true;
           }
-          // If stdin-driven patch with no explicit target or readable patch file inside a locked spec dir, fail closed
-          if (candidateTargets.length === 0 && patchInputs.length === 0) {
-            const canonPatchDir = canonicalizeMaybePath(patchDir);
-            for (const lock of resolvedLocks) {
-              for (const sf of lock.lockedSpecFiles) {
-                if (dirname(sf.abs) === canonPatchDir || sf.abs.startsWith(canonPatchDir + "/")) {
-                  candidateTargets.push(sf.abs);
-                }
-              }
-            }
+          if (
+            anyUninspectable ||
+            (candidateTargets.length === 0 && patchInputs.length === 0)
+          ) {
+            const failHit = failClosedForUninspectablePatchDir(patchDir);
+            if (failHit) return failHit;
           }
         } else if (bin === "git") {
           const git = extractGitSubcommand(cmdToks);
@@ -2489,6 +2525,7 @@ export function checkSpecAndTestLocks(
             } else if (git.subcmd === "apply") {
               let stripLevel: number | null = 1;
               let applyDir = gitDir;
+              let readOnlyCheck = false;
               const patchFiles: string[] = [...redirReads];
               for (let j = 0; j < subArgs.length; j++) {
                 const a = subArgs[j];
@@ -2497,6 +2534,10 @@ export function checkSpecAndTestLocks(
                     patchFiles.push(canonicalizeMaybePath(resolve(effectiveCwd, pf)));
                   }
                   break;
+                }
+                if (a === "--check" || a === "--stat" || a === "--numstat" || a === "--summary") {
+                  readOnlyCheck = true;
+                  continue;
                 }
                 if (/^-p\d+$/.test(a)) {
                   stripLevel = Number(a.slice(2));
@@ -2509,8 +2550,16 @@ export function checkSpecAndTestLocks(
                 if (a.startsWith("-")) continue;
                 patchFiles.push(canonicalizeMaybePath(resolve(effectiveCwd, a)));
               }
+              if (readOnlyCheck) continue;
+              let anyUninspectable = false;
               for (const pf of patchFiles) {
-                candidateTargets.push(...extractPatchFileTargets(pf, applyDir, stripLevel));
+                const parsed = extractPatchFileTargets(pf, applyDir, stripLevel);
+                candidateTargets.push(...parsed.targets);
+                if (parsed.uninspectable) anyUninspectable = true;
+              }
+              if (anyUninspectable || patchFiles.length === 0) {
+                const failHit = failClosedForUninspectablePatchDir(applyDir);
+                if (failHit) return failHit;
               }
             }
           }
@@ -2579,8 +2628,11 @@ export function checkSpecAndTestLocks(
                 }
                 if (lock.lockedTestGlobs.length > 0) {
                   const cwdInLock = resolveRelWithinLock(lock, canonEffCwd) !== null;
+                  const hasDynamicPathBuild =
+                    /\+|\$\{|\#\{|\b(?:join|resolve|format)\s*\(|f["']/.test(combinedScript);
                   if (
                     cwdInLock &&
+                    hasDynamicPathBuild &&
                     lock.lockedTestGlobs.some((g) => g.includes(".hurl")) &&
                     combinedScript.includes(".hurl")
                   ) {

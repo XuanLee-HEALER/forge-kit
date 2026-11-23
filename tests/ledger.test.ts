@@ -807,6 +807,27 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       writeFileSync(join(specDir, "test-spec.md"), "# Test\nok v2\n");
       const f2 = ledger.freezeSpec({ task_id: "20261123-hard" });
       expect(f2.spec.state).toBe("FROZEN");
+
+      // Replacing the entire spec directory with a symlink pointing outside workbench MUST be caught as drift!
+      const outsideDir = mkdtempSync(join(tmpdir(), "forge-outside-spec-"));
+      try {
+        writeFileSync(join(outsideDir, "ssot.md"), "# SSOT\nINV-1: server decides\n");
+        writeFileSync(join(outsideDir, "tech-spec.md"), "# Tech\nok\n");
+        writeFileSync(join(outsideDir, "test-spec.md"), "# Test\nok v2\n");
+        rmSync(specDir, { recursive: true, force: true });
+        symlinkSync(outsideDir, specDir);
+        const dirDrifted = ledger.getSpecState("20261123-hard");
+        expect(dirDrifted.drifted_files.length).toBe(3);
+        expect(
+          ledger.checkPushReadiness({
+            task_id: "20261123-hard",
+            repo: "api-svc",
+            head_sha: "bbbb2222",
+          }).ready,
+        ).toBe(false);
+      } finally {
+        rmSync(outsideDir, { recursive: true, force: true });
+      }
       expect(ledger.verify().ok).toBe(true);
     } finally {
       ledger.closeDb();

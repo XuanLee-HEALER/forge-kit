@@ -681,6 +681,8 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
       `dd if=.workbench/specs/20261123-wt/ssot.md of=/tmp/backup-ssot.md`,
       `node -e 'console.log("example.hurl")'`,
       `sh -c 'cat .workbench/specs/20261123-wt/ssot.md'`,
+      `patch --dry-run -p0 -i ${patchFile}`,
+      `git apply --check ${patchFile}`,
     ];
     for (const c of mustAllowReadOnly) {
       expect(
@@ -692,5 +694,47 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         }),
       ).toBeNull();
     }
+
+    // Writing unrelated text mentioning "example.hurl" to /tmp/out inside wtFeat MUST be allowed
+    // while dynamic path construction targeting .hurl inside wtFeat MUST still be denied!
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: {
+          command: `node -e 'require("fs").writeFileSync("/tmp/out.txt", "example.hurl")'`,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: {
+          command: `node -e 'require("fs").writeFileSync("tests/" + "a.hurl", "HTTP 500")'`,
+        },
+      }),
+    ).toContain("冻结测试防篡改");
+
+    // Uninspectable / oversized (>4 MiB) or missing patch file targeting a locked dir MUST fail closed!
+    const missingPatch = join(wb, "missing-or-fifo.patch");
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${missingPatch}` },
+      }),
+    ).toContain("冻结测试防篡改");
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: specDir,
+        tool_name: "exec_command",
+        tool_input: { command: `patch -p0 -i ${missingPatch}` },
+      }),
+    ).toContain("冻结 Spec 保护");
   });
 });
