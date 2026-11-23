@@ -7,7 +7,7 @@
     "forge": "./bin/forge"
   },
   "scripts": {
-    "build": "bun build --target=bun --outdir=dist src/bin/cli.ts src/bin/ledger.ts src/bin/guard.ts src/bin/ledger-hook.ts src/bin/wb-git.ts src/bin/dbcred.ts src/bin/cmdfmt.ts",
+    "build": "bun build --target=bun --outdir=dist src/bin/cli.ts src/bin/ledger.ts src/bin/guard.ts src/bin/ledger-hook.ts src/bin/wb-git.ts src/bin/dbcred.ts src/bin/cmdfmt.ts src/bin/lang-check.ts",
     "check": "bunx --bun tsc --noEmit",
     "test": "bun test ./tests",
     "test:all": "bun test ./tests && (cd review-agents && bun test)",

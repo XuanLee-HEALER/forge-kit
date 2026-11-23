@@ -39,11 +39,11 @@
 
 - **资金与权益的服务端权威原则**：金额、积分、额度、折扣、结算或权益发放，客户端输入仅作意图声明，服务端必须依据自身状态、可信计量或已校验凭据独立裁决，且**核验、计价与实际执行必须绑定同一业务对象与状态**；无法取得可信依据时不得静默采信客户端数据。
 - **什么时候动手与连续推进**：业务口径类改动须等用户明确“开工/按方案做”（确认问题存在不等于批准）；架构性、外部依赖或 SSOT 变更先落设计文档确认后再实现；**已经用户裁决的待办队列不清空不停，完成一项立刻推进下一项**；未要求新建分支/worktree 时在当前分支修改；方案与汇报不写人天估算；第三方库行为先查源码或文档。
-- **验证与测试纪律**：
-  - 单测通过不等于验收通过，汇报须区分「已执行」「仅编译/静态检查」「未验证」，并将本地单测与环境验收分开列示。
-  - **按风险分层验证**：日常不默认跑全量集成测试；未实际运行测试时用真正不执行测试初始化的编译检查（如 Go `go test -c -tags=integration`），不把筛选零用例当无副作用编译；涉及事务、锁、约束、序列化或 Redis 原子语义时选最小必要真实验证。
-  - 契约或持久化格式变化须沿依赖同步现有测试、mock、fixture 及 build-tag 测试，不靠弱化断言或跳过用例消错；协议上下线顺序未知须明确标出待确认，生成器缺少支持先报告 gap 不擅自扩大修改范围。
-  - 提交的测试/回归资产必须可移植：消除个人路径、本机隐式状态与真实凭据，准备/执行/清理步骤可复现。
+- **验证与测试纪律（AI-Native 契约优先）**：
+  - **刻意克制低价值 Mock 单测**：业务 CRUD 与胶水层不堆砌 Mock 单元测试，优先用独立上下文生成的黑盒 **Hurl / 集成测试** 验证真实接口与不变量；**仅对纯算法、计费/额度公式、状态机跃迁或并发不变量**编写无 Mock 表驱动单测。
+  - **静态与动态基线前置**：`full` 深度任务在推分支/提 PR 前必须具备当前 SHA 的静态检查（`lint`/typecheck，可用仓原生命令或 `.workbench/bin/lang-check`）与执行验证通过证据；未实际运行集成测试时用真正不执行初始化的编译检查（如 Go `go test -c -tags=integration`）。
+  - 单测通过不等于验收通过，汇报须区分「已执行」「仅编译/静态检查」「未验证」，并将本地检查与 FAT/Hurl 验收分开列示。
+  - 契约或持久化格式变化须同步相关测试与接口文档，不靠弱化断言或偷改冻结 Hurl 消错；提交的测试/回归资产必须可移植（无个人路径、本机隐式状态与真实凭据）。
   - **网页/浏览器自动化测试必须由用户主动要求**，适用于所有项目与环境；不得因开发或验收授权自行打开浏览器测试。
   - 表单任务默认遵循 `.agents/skills/form-ux/SKILL.md`；本机隔离组件实验默认遵循 `.agents/skills/test-environment/SKILL.md`。
 
@@ -53,12 +53,12 @@
 - **凭据不回显**：读取配置或接口返回时只输出键名或脱敏摘要，不打印密钥、token 或完整敏感字段。
 - **物理保险丝由 `.codex/hooks.json` 强制执行**：prod 库写操作、非只读 `kubectl`、读取 k8s `secret`、`gh pr merge`、推送生产发布 tag、破坏共享工作树命令及直接编辑 `.workbench/ledger/` 原始文件均由底层护栏拦截。
 
-## 开发任务账本（Ledger）与被动机制
+## 开发任务账本（Ledger）、Spec 冻结与被动机制
 
 - 仅针对 `.workbench/workbench.yaml` 登记的**业务仓库开发任务**；运维查数、查日志、沟通与 `one-off-scripts/` 无需开账本。
 - 账本通过 `.workbench/bin/ledger` 管理，**按任务建账、以 `(repo, branch)` 唯一路由**（跨仓任务用 `ledger attach` 挂入同一 `task_id`）。
-- 被动 Hook 自动在 `git commit` / `git push` / `gh pr create` 前校验账本与验证证据，在测试/构建/评审后自动旁路落证，并在新会话或压缩后回注活跃任务摘要。
-- 不涉及逻辑与设定的极小改动（纯文档/注释/typo）可用 `ledger exempt` 豁免；拿不准是否需要开账本时向用户确认。
+- `full` 开发周期的三件套文档（`ssot.md`、`tech-spec.md`、`test-spec.md`）默认存于 `.workbench/specs/<task_id>/`（仅用户主动要求时移入业务仓）；定稿后通过 `ledger freeze` 写入哈希链并由 `guard` 物理锁定（含锁定 Hurl 测试防篡改），周期内确需修改须经用户确认执行 `ledger amend` 并按依赖辐射重跑下游。
+- 被动 Hook 在 `git commit` / `git push` / `gh pr create` 前校验账本、静态检查与证据（`PostToolUse` 自动落证），并在新会话或压缩后回注活跃任务摘要；纯文档/注释/typo 极小改动可用 `ledger exempt` 豁免。
 
 ## 模型与子代理调度
 
@@ -68,13 +68,13 @@
 |---|---|---|
 | `mechanical` | 边界清晰的检索、机械整理 | `.codex/agents/scanner.toml` |
 | `standard` | 常规开发、修复、测试、常规评审与文档整理 | `.codex/agents/dev.toml` |
-| `deep` | 复杂架构权衡、高不确定性根因、高风险深度审查（需写明具体理由） | `.codex/agents/analyst.toml` |
+| `deep` | 复杂架构权衡、高不确定性根因、高风险深度审查、Paperwork 独立评审（需写明具体理由） | `.codex/agents/analyst.toml` / `spec-reviewer.toml` |
 
 优先编排独立代理完成实现与评审，自己负责范围、核验与验收；直接完成成本明显更低的小任务可直接处理。独立 review CLI 必须实际调用并保留隔离上下文，不可用自审替代。
 
 ## 流程 Skills 与仓库配置
 
-- **开发与交付**：`ready`（新会话快速热身与现场定位）、`feature`（新需求）、`bugfix`（修缺陷）、`wrapup`（按风险收尾与独立评审）、`ship`（FAT/PR/发布交付）、`business-analysis`（口径权衡）、`form-ux`（表单规范）、`test-environment`（隔离容器实验）。
-- **独立只读评审 CLI**：`implementation-review`、`simplicity-performance-review`、`code-simplification-review`、`comment-normalization-review`（位于 `.agents/skills/` 相对软链）。
-- **仓库配置**：见 `.workbench/repos/`；多仓分支与清理用 `.workbench/bin/wb-git`。
+- **开发与交付**：`ready`（新会话热身定位）、`grill`（需求追问与 `ssot.md` 定稿）、`feature`（双轨/5阶段规范驱动开发）、`bugfix`（需求变更全周期 vs 局部 `amend` 辐射 + 缺陷棘轮）、`wrapup`（静态/动态检查 + 四层独立评审）、`ship`（FAT/PR/发布交付）、`business-analysis`（口径权衡）、`form-ux`（表单规范）、`test-environment`（隔离容器实验）。
+- **独立只读评审 CLI**：`implementation-review`（自动注入 Go/TS/Python 坑点）、`simplicity-performance-review`、`code-simplification-review`、`comment-normalization-review`（位于 `.agents/skills/` 相对软链）。
+- **工具与仓库配置**：仓库卡见 `.workbench/repos/`；多仓分支与清理用 `.workbench/bin/wb-git`；跨语言静态/动态检查用 `.workbench/bin/lang-check`。
 - **工作台特有规则**：如存在 `AGENTS.local.md`，开工一并读取。

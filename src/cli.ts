@@ -746,6 +746,7 @@ export function doctorWorkbench(targetDir?: string): {
     "dev.toml": models.tiers.standard,
     "scanner.toml": models.tiers.mechanical,
     "analyst.toml": models.tiers.deep,
+    "spec-reviewer.toml": models.tiers.deep,
   };
   const agentsDir = join(root, ".codex", "agents");
   if (existsSync(agentsDir)) {
@@ -838,7 +839,7 @@ export function doctorWorkbench(targetDir?: string): {
   }
 
   // 5. Binaries & review-agents launchers check
-  for (const binName of ["ledger", "guard", "ledger-hook", "wb-git", "dbcred", "cmdfmt"]) {
+  for (const binName of ["ledger", "guard", "ledger-hook", "wb-git", "dbcred", "cmdfmt", "lang-check"]) {
     const p = join(root, ".workbench", "bin", binName);
     if (!existsSync(p)) {
       issues.push({

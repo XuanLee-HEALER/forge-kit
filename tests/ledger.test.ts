@@ -138,7 +138,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         }).ready,
       ).toBe(false);
 
-      // Re-pass test + fallback review + FAT delivery evidence on BOTH repos
+      // Re-pass test + static lint + fallback review + FAT delivery evidence on BOTH repos
       for (const [repo, sha] of [
         ["canvas", "cccc2222"],
         ["web-app", "dddd2222"],
@@ -148,6 +148,15 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
           kind: "test",
           status: "pass",
           summary: "tests pass",
+          repo,
+          branch: "fix/audio-billing",
+          sha,
+        });
+        ledger.recordEvidence({
+          task_id: "20261121-audio-billing",
+          kind: "lint",
+          status: "pass",
+          summary: "static check pass",
           repo,
           branch: "fix/audio-billing",
           sha,
@@ -508,6 +517,152 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       expect(() => ledger.closeTask({ task_id: "20261121-fat-revoke" })).toThrow(
         "latest fat delivery verification failed",
       );
+    } finally {
+      ledger.closeDb();
+    }
+  });
+
+  test("spec freeze, disk drift detection, amend scope radiation, and full-depth static lint gate", () => {
+    const ledger = new Ledger(dir);
+    try {
+      const specDir = join(dir, ".workbench", "specs", "20261123-cycle");
+      Bun.spawnSync(["mkdir", "-p", specDir]);
+      ledger.openTask({
+        task_id: "20261123-cycle",
+        title: "Spec-driven dev cycle",
+        endpoint: "fat",
+        depth: "full",
+        repo: "api-svc",
+        branch: "feat/cycle",
+        base_sha: "1111aaaa",
+        head_sha: "2222bbbb",
+      });
+
+      // Missing spec files -> freeze fails closed
+      expect(() => ledger.freezeSpec({ task_id: "20261123-cycle" })).toThrow(
+        "Missing required spec document",
+      );
+
+      const { writeFileSync } = require("node:fs") as typeof import("node:fs");
+      writeFileSync(join(specDir, "ssot.md"), "# SSOT\nINV-1: server decides billing\n");
+      writeFileSync(join(specDir, "tech-spec.md"), "# Tech Spec\nTransactional debit\n");
+      writeFileSync(join(specDir, "test-spec.md"), "# Test Spec\nHurl case for INV-1\n");
+
+      const frozen = ledger.freezeSpec({
+        task_id: "20261123-cycle",
+        locked_test_globs: ["*.hurl"],
+      });
+      expect(frozen.spec.state).toBe("FROZEN");
+      expect(frozen.spec.drifted_files).toEqual([]);
+      expect(frozen.spec.locked_test_globs).toEqual(["*.hurl"]);
+
+      // Full-depth task requires static lint + exec verify (hurl/test/build) + review!
+      ledger.recordEvidence({
+        task_id: "20261123-cycle",
+        kind: "hurl",
+        status: "pass",
+        summary: "hurl ok",
+        repo: "api-svc",
+        sha: "2222bbbb",
+      });
+      ledger.recordEvidence({
+        task_id: "20261123-cycle",
+        kind: "review",
+        status: "pass",
+        summary: "quality ok",
+        repo: "api-svc",
+        sha: "2222bbbb",
+        meta: { role: "quality" },
+      });
+      const missingLint = ledger.checkPushReadiness({
+        task_id: "20261123-cycle",
+        repo: "api-svc",
+        head_sha: "2222bbbb",
+        checkEndpoint: true,
+      });
+      expect(missingLint.ready).toBe(false);
+      expect(missingLint.missing.join(" ")).toContain("static check (lint)");
+
+      // Record static lint -> now ready=true (pure Hurl without unit tests works cleanly!)
+      ledger.recordEvidence({
+        task_id: "20261123-cycle",
+        kind: "lint",
+        status: "pass",
+        summary: "go vet pass",
+        repo: "api-svc",
+        sha: "2222bbbb",
+      });
+      expect(
+        ledger.checkPushReadiness({
+          task_id: "20261123-cycle",
+          repo: "api-svc",
+          head_sha: "2222bbbb",
+          checkEndpoint: true,
+        }).ready,
+      ).toBe(true);
+
+      // Silent disk tamper of ssot.md is caught immediately as drift!
+      writeFileSync(join(specDir, "ssot.md"), "# SSOT\nINV-1: TAMPERED\n");
+      const drifted = ledger.checkPushReadiness({
+        task_id: "20261123-cycle",
+        repo: "api-svc",
+        head_sha: "2222bbbb",
+      });
+      expect(drifted.ready).toBe(false);
+      expect(drifted.missing.join(" ")).toContain("frozen spec drifted");
+
+      // Restore ssot.md, then run explicit `amend --scope test_spec` -> blocks until re-frozen
+      writeFileSync(join(specDir, "ssot.md"), "# SSOT\nINV-1: server decides billing\n");
+      const amended = ledger.amendSpec({
+        task_id: "20261123-cycle",
+        scope: "test_spec",
+        reason: "add boundary Hurl case",
+      });
+      expect(amended.spec.state).toBe("AMENDED");
+      expect(amended.spec.stale_stages).toEqual(["test", "fat"]);
+      expect(
+        ledger.checkPushReadiness({
+          task_id: "20261123-cycle",
+          repo: "api-svc",
+          head_sha: "2222bbbb",
+        }).ready,
+      ).toBe(false);
+
+      // Revise test-spec.md and re-freeze -> preserves lint & review, but invalidates prior test/hurl/fat!
+      writeFileSync(join(specDir, "test-spec.md"), "# Test Spec\nHurl case 1 & 2\n");
+      const refrozen = ledger.freezeSpec({ task_id: "20261123-cycle" });
+      expect(refrozen.spec.state).toBe("FROZEN");
+      expect(refrozen.spec.locked_test_globs).toEqual(["*.hurl"]); // preserved across re-freeze
+      const postAmend = ledger.checkPushReadiness({
+        task_id: "20261123-cycle",
+        repo: "api-svc",
+        head_sha: "2222bbbb",
+        checkEndpoint: true,
+      });
+      expect(postAmend.ready).toBe(false);
+      // Prior lint & review remain valid (NOT in missing!), while test/fat must be re-run!
+      expect(postAmend.missing.join(" ")).not.toContain("static check (lint)");
+      expect(postAmend.missing.join(" ")).not.toContain("review");
+      expect(postAmend.missing.join(" ")).toContain("hurl");
+
+      // Re-run Hurl after re-freeze -> task is ready again & hash chain verifies!
+      ledger.recordEvidence({
+        task_id: "20261123-cycle",
+        kind: "hurl",
+        status: "pass",
+        summary: "hurl re-run pass",
+        repo: "api-svc",
+        sha: "2222bbbb",
+      });
+      expect(
+        ledger.checkPushReadiness({
+          task_id: "20261123-cycle",
+          repo: "api-svc",
+          head_sha: "2222bbbb",
+          checkEndpoint: true,
+        }).ready,
+      ).toBe(true);
+      expect(ledger.verify().ok).toBe(true);
     } finally {
       ledger.closeDb();
     }

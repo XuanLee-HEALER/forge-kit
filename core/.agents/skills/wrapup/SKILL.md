@@ -21,24 +21,26 @@ description: >
 
 ## 完整收尾步骤
 
-1. **固定范围**：记录目标仓库、`base..head` SHA 与工作树状态；评审期间不改被审代码，不混入他人未提交改动。
-2. **业务评审（隔离上下文）**：
-   - 使用原生 `codex review`（只读、固定 `--base <base-SHA>`、显式设置模型与 effort，用 `-c project_doc_max_bytes=0` 避免被审仓旧入口干扰，通过 `-c developer_instructions=...` 传入工作台入口、目标仓配置、已确认需求与固定范围）。不可用时回退到全新只读 subagent（`fork_turns="none"`），并标注回退原因。
-   - 必查项：需求满足与边界、资金/权益服务端权威原则、测试与实现同步及可移植性、接口文档同步。
+1. **固定范围与静态/动态基线**：
+   - 记录目标仓库、`base..head` SHA 与工作树状态；评审期间不改被审代码，不混入他人未提交改动。
+   - 在启动 AI 评审前，先跑完对应语言的静态与动态检查（仓内原生命令或 `.workbench/bin/lang-check <repo> --mode all`：Go `go vet`/`go test -race`、TS `tsc`/`biome`/`eslint`、Python `ruff`/`pyright`/`PYTHONDEVMODE=1 pytest`），让确定性工具先扫清语法、类型、lint 与数据竞争问题（`full` 深度任务推送前强依赖当前 SHA 的 `lint` 通过证据）。
+2. **业务对齐评审（隔离上下文）**：
+   - 使用原生 `codex review`（只读、固定 `--base <base-SHA>`、显式设置模型与 effort，用 `-c project_doc_max_bytes=0` 避免被审仓旧入口干扰，通过 `-c developer_instructions=...` 传入工作台入口、目标仓配置、`.workbench/specs/<task_id>/ssot.md`（如有）与固定范围）。不可用时回退到全新只读 subagent（`fork_turns="none"`），并标注回退原因。
+   - 必查项：对照 `ssot.md` 逐条核验 `INV-*` 业务不变量与外部契约、资金/权益服务端权威原则、测试与实现同步及可移植性、接口文档同步。
    - **逐条核实**：每条发现回到代码与数据自行确认（确认存在 / 误报），业务口径分歧交用户裁决；修复确认问题后固定新 `head` 并复审修复范围。
-3. **并行专项评审（独立只读 CLI）**：
-   - 读取 `.agents/skills/implementation-review/SKILL.md` 与 `.agents/skills/simplicity-performance-review/SKILL.md`，对同一固定 `base..head` 并行启动 `review-quality` 与 `review-performance`（按 `.workbench/models.toml` 显式传 `--model` 与 `--effort`，不传业务需求或前序结论）。
+3. **并行专项评审（独立只读 CLI，自动注入语言坑点）**：
+   - 读取 `.agents/skills/implementation-review/SKILL.md` 与 `.agents/skills/simplicity-performance-review/SKILL.md`，对同一固定 `base..head` 并行启动 `review-quality`（自动按 diff 后缀加载 Go/TS/Python 常见深坑清单）与 `review-performance`（按 `.workbench/models.toml` 显式传 `--model` 与 `--effort`，不传业务需求或前序结论）。
    - 汇总去重（按根因合并，同一问题多报不升阻断级别），验证并修复确认阻断项，固定新 `head` 后复审。
-4. **代码精简**：
+4. **代码精简（性能与简单平衡 + AI-Legibility）**：
    - 读取 `.agents/skills/code-simplification-review/SKILL.md`，对当前 `base..head` 启动 `review-simplify`。
-   - 逐条核对行为等价性后，优先委派 `dev` 实施采纳项并重跑验证（允许全部不采纳并说明理由）。
-5. **后端注释与接口文档 Refine（纯前端跳过）**：
+   - 优先减少状态复杂度、冗余抽象与低信噪比 Mock 堆砌单测（保留纯算法/计费/状态机/并发不变量的无 Mock 表驱动单测）；逐条核对行为等价性后委派 `dev` 实施采纳项并重跑验证（允许全部不采纳并说明理由）。
+5. **注释精简与接口文档完备化（纯前端跳过）**：
    - 先读 `review-agents/prompts/comments.md` 的通用文档质量标准；启动 `review-comments` 审查当前 `base..head`。
-   - 沿受影响接口链路检查（含 diff 外的契约、生成源与接入说明）：不引用外部需求/用例编号、实现注释解释为什么、字段/枚举/示例与真实序列化一致、新旧协议兼容边界明确。
+   - 原则：**内部注释更少更准**（删掉复述代码的废话，只保留非显然的 Why/不变量/权衡），**对外接口文档更完备并始终反映最新实现**；沿受影响接口链路检查（含 diff 外的契约、生成源与接入说明）。
    - 核实后委派 `dev` 修改并执行仓内生成命令，逐项核对「行为变化—文档位置—生成结果」（纯文档变更核对协议结构未变）。
 6. **收敛核对与记账**：
    - 确认最终 `HEAD SHA` 与已审范围一致；精简若意外改变逻辑须补审。
-   - 确认账本（`.workbench/bin/ledger status`）中当前 SHA 的验证与评审证据齐备、无未关闭 blocker。
+   - 确认 `.workbench/bin/ledger spec-status <task_id>`（如有冻结 Spec）无漂移，且 `ledger status` 中当前 SHA 的静态检查（`lint`）、验证与评审证据齐备、无未关闭 blocker。
 
 ## 余额不足时的统一自动回退（全 4 角色适用）
 

@@ -1113,7 +1113,17 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
       expect(failRec.recorded).toBe(1);
     }
 
-    // Record passing test + PR on feat/work
+    // Record passing static check (lint) + test + PR on feat/work
+    expect(
+      handleLedgerHook(wb, {
+        hook_event_name: "PostToolUse",
+        cwd: repoDir,
+        tool_name: "exec_command",
+        tool_use_id: "tu-pass-lint",
+        tool_input: { command: "bunx --bun tsc --noEmit", workdir: repoDir },
+        tool_response: { exit_code: 0, output: "" },
+      }).recorded,
+    ).toBe(1);
     expect(
       handleLedgerHook(wb, {
         hook_event_name: "PostToolUse",

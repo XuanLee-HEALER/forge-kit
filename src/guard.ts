@@ -1,5 +1,5 @@
-import { appendFileSync, mkdirSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import {
   collectProdDbHosts,
   findWorkbenchRoot,
@@ -1607,15 +1607,249 @@ export function checkLedgerGate(
   return null;
 }
 
+function canonicalizeMaybePath(p: string): string {
+  const abs = resolve(p);
+  if (existsSync(abs)) {
+    try {
+      return realpathSync(abs);
+    } catch {
+      return abs;
+    }
+  }
+  const parent = dirname(abs);
+  if (parent !== abs && existsSync(parent)) {
+    try {
+      return join(realpathSync(parent), abs.slice(parent.length + 1));
+    } catch {
+      return abs;
+    }
+  }
+  return abs;
+}
+
+function extractShellWriteTargetPaths(seg: string, segCwd: string): string[] {
+  const paths: string[] = [];
+  const toks = splitShellTokens(seg);
+  if (toks) {
+    for (let i = 0; i < toks.length; i++) {
+      const t = toks[i];
+      if (!t || t.startsWith("-")) continue;
+      // Handle shell redirection tokens like `>file`, `>>file`, `1>file`, `foo>file`
+      const redirAttached = t.match(/^(?:.*?)?(?:\d?>>?)(.+)$/);
+      if (redirAttached?.[1] && !t.includes("://") && !t.endsWith("&1") && !t.endsWith("&2")) {
+        paths.push(canonicalizeMaybePath(resolve(segCwd, redirAttached[1])));
+        continue;
+      }
+      if (/^\d?>>?$/.test(t) && toks[i + 1]) {
+        paths.push(canonicalizeMaybePath(resolve(segCwd, toks[++i])));
+        continue;
+      }
+      if (i > 0) {
+        paths.push(canonicalizeMaybePath(resolve(segCwd, t)));
+      }
+    }
+  }
+  return paths;
+}
+
+export function checkSpecAndTestLocks(
+  workbenchRoot: string,
+  input: CodexHookInput,
+  cfg: WorkbenchConfig,
+): string | null {
+  if (!cfg.ledger.enabled) return null;
+  const dbPath = join(workbenchRoot, ".workbench", "ledger", "ledger.sqlite");
+  if (!existsSync(dbPath)) return null;
+
+  const wbReal = canonicalizeMaybePath(workbenchRoot);
+  const baseWorkdir = extractToolWorkdir(input);
+  const touchedFilePaths = extractTouchedFilePaths(input).map((p) =>
+    canonicalizeMaybePath(resolve(baseWorkdir, p)),
+  );
+  const cmd = extractShellCommand(input);
+  if (touchedFilePaths.length === 0 && !cmd) return null;
+
+  let ledger: Ledger | null = null;
+  try {
+    ledger = new Ledger(workbenchRoot);
+    const activeLocks = ledger.listActiveSpecLocks();
+    if (activeLocks.length === 0) return null;
+
+    type ResolvedLock = {
+      task_id: string;
+      lockedSpecFiles: Array<{ kind: "ssot" | "tech_spec" | "test_spec"; abs: string; rel: string }>;
+      lockedTestGlobs: string[];
+      taskRepoRoots: string[];
+    };
+
+    const resolvedLocks: ResolvedLock[] = activeLocks.map((st) => {
+      const scope = st.state === "AMENDED" ? st.amend_scope : null;
+      const unlockedSsot = scope === "requirement" || scope === "invariant";
+      const unlockedTech = scope === "requirement" || scope === "invariant" || scope === "tech_spec";
+      const unlockedTest = scope === "requirement" || scope === "invariant" || scope === "test_spec";
+
+      const lockedSpecFiles: ResolvedLock["lockedSpecFiles"] = [];
+      if (st.files) {
+        if (!unlockedSsot) {
+          lockedSpecFiles.push({
+            kind: "ssot",
+            rel: st.files.ssot,
+            abs: canonicalizeMaybePath(resolve(wbReal, st.files.ssot)),
+          });
+        }
+        if (!unlockedTech) {
+          lockedSpecFiles.push({
+            kind: "tech_spec",
+            rel: st.files.tech_spec,
+            abs: canonicalizeMaybePath(resolve(wbReal, st.files.tech_spec)),
+          });
+        }
+        if (!unlockedTest) {
+          lockedSpecFiles.push({
+            kind: "test_spec",
+            rel: st.files.test_spec,
+            abs: canonicalizeMaybePath(resolve(wbReal, st.files.test_spec)),
+          });
+        }
+      }
+
+      const taskRepos = ledger!.getTaskRepos(st.task_id);
+      const taskRepoRoots: string[] = [];
+      for (const r of taskRepos) {
+        taskRepoRoots.push(canonicalizeMaybePath(resolve(wbReal, r.repo)));
+        taskRepoRoots.push(canonicalizeMaybePath(resolve(wbReal, `${r.repo}.worktrees`)));
+        if (r.worktree) taskRepoRoots.push(canonicalizeMaybePath(r.worktree));
+      }
+
+      return {
+        task_id: st.task_id,
+        lockedSpecFiles,
+        lockedTestGlobs: unlockedTest ? [] : st.locked_test_globs,
+        taskRepoRoots,
+      };
+    });
+
+    const matchLockedPath = (absTarget: string): string | null => {
+      for (const lock of resolvedLocks) {
+        for (const sf of lock.lockedSpecFiles) {
+          if (absTarget === sf.abs) {
+            const suggestedScope =
+              sf.kind === "ssot" ? "requirement|invariant" : sf.kind;
+            return (
+              `物理锁（冻结 Spec 保护）：任务 ${lock.task_id} 的 ${sf.rel} 处于周期冻结态，禁止直接修改。\n` +
+              `如确需变更，请先经用户确认并执行：ledger amend ${lock.task_id} --scope ${suggestedScope} --reason "<变更原因>"`
+            );
+          }
+        }
+        if (lock.lockedTestGlobs.length > 0) {
+          const relFromWb = relative(wbReal, absTarget).replace(/\\/g, "/");
+          let relWithinTask: string | null = null;
+          if (lock.taskRepoRoots.length === 0) {
+            if (relFromWb && !relFromWb.startsWith("..")) relWithinTask = relFromWb;
+          } else {
+            for (const rr of lock.taskRepoRoots) {
+              if (absTarget === rr || absTarget.startsWith(rr + "/")) {
+                relWithinTask = relative(rr, absTarget).replace(/\\/g, "/");
+                break;
+              }
+            }
+          }
+          if (
+            relWithinTask &&
+            lock.lockedTestGlobs.some(
+              (g) => matchesGlob(relWithinTask!, g) || matchesGlob(relFromWb, g),
+            )
+          ) {
+            return (
+              `物理锁（冻结测试防篡改）：任务 ${lock.task_id} 已锁定测试文件 (${relFromWb})，实现/修 bug 阶段禁止私自修改测试断言迎合代码。\n` +
+              `如确认是测试用例本身有误，请经用户确认后执行：ledger amend ${lock.task_id} --scope test_spec --reason "<原因>"`
+            );
+          }
+        }
+      }
+      return null;
+    };
+
+    // 1. Check direct file-edit & apply_patch targets
+    for (const abs of touchedFilePaths) {
+      const hit = matchLockedPath(abs);
+      if (hit) return hit;
+    }
+
+    // 2. Check mutating shell segments
+    if (cmd) {
+      const segments = splitShellSegments(cmd);
+      for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        const toks = splitShellTokens(seg);
+        const first = toks?.[0]?.split("/").pop() ?? "";
+        const isLedgerCli =
+          first === "ledger" ||
+          ((first === "bun" || first === "node") &&
+            Boolean(toks?.[1]?.endsWith("/ledger.js") || toks?.[1]?.endsWith("/ledger.ts")));
+        if (isLedgerCli) continue;
+
+        const hasMutation =
+          /\b(rm|mv|cp|truncate|chmod|python3?|perl|sed|awk|tee|dd|bun|node|touch)\b/.test(seg) ||
+          hasUnquotedRedirect(seg, ">");
+        if (!hasMutation) continue;
+
+        const segCwd = resolveSegmentCwd(segments, i, baseWorkdir);
+        for (const candidateAbs of extractShellWriteTargetPaths(seg, segCwd)) {
+          const hit = matchLockedPath(candidateAbs);
+          if (hit) return hit;
+        }
+        // Catch inline scripting edits (`python3 -c 'open("...ssot.md","w")...'`, `bun -e ...`)
+        if (
+          /^(python3?|node|bun|perl|ruby)$/.test(first) &&
+          /(?:^|\s)-(?:c|e)\b/.test(seg)
+        ) {
+          for (const lock of resolvedLocks) {
+            for (const sf of lock.lockedSpecFiles) {
+              const baseName = sf.rel.split("/").pop() ?? sf.rel;
+              const inSpecDir =
+                canonicalizeMaybePath(segCwd) === dirname(sf.abs);
+              if (
+                seg.includes(sf.rel) ||
+                seg.includes(sf.abs) ||
+                (inSpecDir && seg.includes(baseName))
+              ) {
+                const suggestedScope =
+                  sf.kind === "ssot" ? "requirement|invariant" : sf.kind;
+                return (
+                  `物理锁（冻结 Spec 保护）：禁止通过内联脚本修改任务 ${lock.task_id} 的冻结文档 (${sf.rel})。\n` +
+                  `如确需变更，请先经用户确认并执行：ledger amend ${lock.task_id} --scope ${suggestedScope} --reason "<变更原因>"`
+                );
+              }
+            }
+            if (lock.lockedTestGlobs.some((g) => g.includes(".hurl")) && seg.includes(".hurl")) {
+              return (
+                `物理锁（冻结测试防篡改）：禁止通过内联脚本修改任务 ${lock.task_id} 锁定的 .hurl 测试文件。\n` +
+                `如确认是测试用例本身有误，请经用户确认后执行：ledger amend ${lock.task_id} --scope test_spec --reason "<原因>"`
+              );
+            }
+          }
+        }
+      }
+    }
+  } finally {
+    ledger?.closeDb();
+  }
+
+  return null;
+}
+
 export function evaluatePreToolUse(
   workbenchRoot: string,
   input: CodexHookInput,
 ): string | null {
   const cfg = loadWorkbenchConfig(workbenchRoot);
 
-  // Tier 1a: Ledger immutability (applies to ALL tools: file-edit, apply_patch, shell)
+  // Tier 1a: Ledger immutability & frozen spec/test physical locks (applies to ALL tools: file-edit, apply_patch, shell)
   const tamper = checkLedgerTamper(workbenchRoot, input, cfg);
   if (tamper) return tamper;
+  const specLock = checkSpecAndTestLocks(workbenchRoot, input, cfg);
+  if (specLock) return specLock;
 
   // Shell-only checks (never run on apply_patch / file-edit tools!)
   const cmd = extractShellCommand(input);

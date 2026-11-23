@@ -13,6 +13,7 @@ rendered_files = [
 copied_dirs = [
   ".codex/agents",
   ".agents/skills/ready",
+  ".agents/skills/grill",
   ".agents/skills/feature",
   ".agents/skills/bugfix",
   ".agents/skills/wrapup",
@@ -33,6 +34,7 @@ bin_bundles = [
   "wb-git.js",
   "dbcred.js",
   "cmdfmt.js",
+  "lang-check.js",
 ]
 
 bin_wrappers = [
@@ -42,6 +44,7 @@ bin_wrappers = [
   "wb-git",
   "dbcred",
   "cmdfmt",
+  "lang-check",
 ]
 
 [private]

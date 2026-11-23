@@ -48,59 +48,135 @@ export interface CapturedEvidence {
   meta?: Record<string, unknown>;
 }
 
+function parseLangCheckInvocation(cmdToks: string[]): {
+  argsStart: number;
+  mode: "static" | "dynamic" | "all";
+  targetPositional: string | null;
+} | null {
+  const [c0 = "", c1 = ""] = cmdToks;
+  let argsStart = -1;
+  if (c0 === "lang-check" || c0.endsWith("/lang-check")) {
+    argsStart = 1;
+  } else if (
+    (c0 === "bun" || c0.endsWith("/bun")) &&
+    (c1.endsWith("/lang-check.js") || c1.endsWith("/lang-check.ts"))
+  ) {
+    argsStart = 2;
+  }
+  if (argsStart < 0) return null;
+
+  let mode: "static" | "dynamic" | "all" = "all";
+  let targetPositional: string | null = null;
+  for (let i = argsStart; i < cmdToks.length; i++) {
+    const t = cmdToks[i];
+    if (t === "--") break;
+    if (t === "--mode") {
+      const v = cmdToks[++i];
+      if (v === "static" || v === "dynamic" || v === "all") mode = v;
+      else return null;
+      continue;
+    }
+    if (t.startsWith("--mode=")) {
+      const v = t.slice("--mode=".length);
+      if (v === "static" || v === "dynamic" || v === "all") mode = v;
+      else return null;
+      continue;
+    }
+    if (t === "--lang") {
+      i++;
+      continue;
+    }
+    if (t.startsWith("--lang=") || t === "--json") continue;
+    if (t.startsWith("-")) continue;
+    if (!targetPositional) targetPositional = t;
+  }
+  return { argsStart, mode, targetPositional };
+}
+
+function extractTscArgs(cmdToks: string[]): string[] | null {
+  const [c0 = "", c1 = "", c2 = ""] = cmdToks;
+  if (c0 === "npx" && c1 === "tsc") return cmdToks.slice(2);
+  if (c0 === "bunx" && c1 === "tsc") return cmdToks.slice(2);
+  if (c0 === "bunx" && c1 === "--bun" && c2 === "tsc") return cmdToks.slice(3);
+  if (c0 === "tsc" || c0.endsWith("/tsc")) return cmdToks.slice(1);
+  return null;
+}
+
+function isPytestInvocation(cmdToks: string[]): { argsStart: number } | null {
+  const [c0 = "", c1 = "", c2 = ""] = cmdToks;
+  const bin = c0.split("/").pop() ?? "";
+  if (bin === "pytest") return { argsStart: 1 };
+  if (/^python3?(?:\.\d+)?$/.test(bin) && c1 === "-m" && c2 === "pytest") {
+    return { argsStart: 3 };
+  }
+  return null;
+}
+
 /**
  * Token-based verification command classifier (handles line continuations, quoting, and leading ENV=VAL assignments).
  * Anchored strictly at command start so `echo "bun test"` / grep text never false-positives.
  */
 function classifyVerifyCommand(metaToks: ShellToken[]): {
-  kind: "test" | "build" | "lint" | "hurl";
+  kind: "test" | "build" | "lint" | "hurl" | "lang-check";
   cmdToks: string[];
   envToks: string[];
 } | null {
   const { envToks, cmdToks } = splitLeadingEnv(metaToks);
   if (cmdToks.length === 0) return null;
   const [c0, c1 = "", c2 = ""] = cmdToks;
-  const makeTarget = c0 === "make" ? extractMakeFirstTarget(cmdToks.slice(1)) : null;
+  const bin0 = c0.split("/").pop() ?? "";
+  const makeTarget = bin0 === "make" ? extractMakeFirstTarget(cmdToks.slice(1)) : null;
+
+  // lang-check (forge-kit unified Go/TS/Python static & dynamic checker)
+  if (parseLangCheckInvocation(cmdToks)) {
+    return { kind: "lang-check", cmdToks, envToks };
+  }
 
   // test
   if (
-    (c0 === "go" && c1 === "test") ||
-    (c0 === "bun" && c1 === "test") ||
-    (c0 === "bun" && c1 === "run" && (c2 === "test" || c2.startsWith("test:"))) ||
-    (c0 === "npm" && c1 === "run" && (c2 === "test" || c2.startsWith("test:"))) ||
-    c0 === "pytest" ||
-    (c0 === "just" && c1 === "test") ||
-    (c0 === "make" && makeTarget === "test")
+    (bin0 === "go" && c1 === "test") ||
+    (bin0 === "bun" && c1 === "test") ||
+    (bin0 === "bun" && c1 === "run" && (c2 === "test" || c2.startsWith("test:"))) ||
+    (bin0 === "npm" && c1 === "run" && (c2 === "test" || c2.startsWith("test:"))) ||
+    isPytestInvocation(cmdToks) !== null ||
+    (bin0 === "just" && c1 === "test") ||
+    (bin0 === "make" && makeTarget === "test")
   ) {
     return { kind: "test", cmdToks, envToks };
   }
 
-  // lint
+  // lint / static checks
   if (
-    (c0 === "make" && (makeTarget === "lint" || makeTarget === "harness-guard")) ||
-    (c0 === "just" && (c1 === "check" || c1 === "lint" || c1 === "typecheck")) ||
-    (c0 === "bun" && c1 === "run" && (c2 === "check" || c2.startsWith("check:"))) ||
-    (c0 === "npm" && c1 === "run" && (c2 === "lint" || c2.startsWith("lint:"))) ||
-    (c0 === "npx" && (c1 === "tsc" || c1 === "eslint")) ||
-    (c0 === "ruff" && c1 === "check") ||
-    (c0 === "golangci-lint" && c1 === "run")
+    (bin0 === "go" && c1 === "vet") ||
+    (bin0 === "make" && (makeTarget === "lint" || makeTarget === "harness-guard")) ||
+    (bin0 === "just" && (c1 === "check" || c1 === "lint" || c1 === "typecheck" || c1 === "typecheck-server")) ||
+    (bin0 === "bun" && c1 === "run" && (c2 === "check" || c2.startsWith("check:") || c2 === "lint" || c2.startsWith("lint:"))) ||
+    (bin0 === "npm" && c1 === "run" && (c2 === "lint" || c2.startsWith("lint:") || c2 === "check" || c2.startsWith("check:"))) ||
+    extractTscArgs(cmdToks) !== null ||
+    (bin0 === "npx" && (c1 === "eslint" || (c1 === "biome" && c2 === "check"))) ||
+    (bin0 === "bunx" && (c1 === "eslint" || (c1 === "biome" && c2 === "check") || (c1 === "--bun" && c2 === "biome" && cmdToks[3] === "check"))) ||
+    (bin0 === "biome" && c1 === "check") ||
+    (bin0 === "ruff" && c1 === "check") ||
+    bin0 === "pyright" ||
+    bin0 === "mypy" ||
+    (bin0 === "golangci-lint" && c1 === "run")
   ) {
     return { kind: "lint", cmdToks, envToks };
   }
 
   // build
   if (
-    (c0 === "go" && c1 === "build") ||
-    (c0 === "make" && (makeTarget === "build" || makeTarget === "compile")) ||
-    (c0 === "just" && c1 === "build") ||
-    (c0 === "bun" && c1 === "run" && (c2 === "build" || c2.startsWith("build:"))) ||
-    (c0 === "npm" && c1 === "run" && /^(?:local:|fat:|prod:)?build(?::|$)/.test(c2))
+    (bin0 === "go" && c1 === "build") ||
+    (bin0 === "make" && (makeTarget === "build" || makeTarget === "compile")) ||
+    (bin0 === "just" && c1 === "build") ||
+    (bin0 === "bun" && c1 === "run" && (c2 === "build" || c2.startsWith("build:"))) ||
+    (bin0 === "npm" && c1 === "run" && /^(?:local:|fat:|prod:)?build(?::|$)/.test(c2))
   ) {
     return { kind: "build", cmdToks, envToks };
   }
 
   // hurl
-  if (c0 === "hurl") {
+  if (bin0 === "hurl") {
     return { kind: "hurl", cmdToks, envToks };
   }
 
@@ -566,7 +642,7 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
     return false;
   }
 
-  if (c0 === "go" && (c1 === "test" || c1 === "build")) {
+  if (c0 === "go" && (c1 === "test" || c1 === "build" || c1 === "vet")) {
     const isGoBoolOn = (norm: string, name: string): boolean => {
       if (norm === name) return true;
       if (!norm.startsWith(`${name}=`)) return false;
@@ -588,7 +664,8 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
     return false;
   }
 
-  if (c0 === "pytest") {
+  const pytestInv = isPytestInvocation(cmdToks);
+  if (pytestInv) {
     const pytestNonExec = new Set([
       "--collect-only",
       "--co",
@@ -598,7 +675,7 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
       "--setup-only",
       "--setup-plan",
     ]);
-    for (let i = 1; i < cmdToks.length; i++) {
+    for (let i = pytestInv.argsStart; i < cmdToks.length; i++) {
       const tok = cmdToks[i];
       if (tok === "--") break;
       if (pytestNonExec.has(tok)) return true;
@@ -606,8 +683,8 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
     return false;
   }
 
-  if (c0 === "npx" && c1 === "tsc") {
-    const tscArgs = cmdToks.slice(2);
+  const tscArgs = extractTscArgs(cmdToks);
+  if (tscArgs) {
     const stripTscOpt = (tok: string): string | null => {
       if (!tok.startsWith("-") || tok.startsWith("---")) return null;
       const name = (tok.startsWith("--") ? tok.slice(2) : tok.slice(1)).toLowerCase();
@@ -835,7 +912,14 @@ function resolveVerifyTargetDir(
     return curDir;
   }
 
-  if (c0 === "go" && (c1 === "test" || c1 === "build")) {
+  const langCheckInv = parseLangCheckInvocation(cmdToks);
+  if (langCheckInv) {
+    return langCheckInv.targetPositional
+      ? resolve(curDir, langCheckInv.targetPositional)
+      : curDir;
+  }
+
+  if (c0 === "go" && (c1 === "test" || c1 === "build" || c1 === "vet")) {
     let dir = curDir;
     for (let i = 2; i < cmdToks.length; i++) {
       const tok = cmdToks[i];
@@ -889,8 +973,8 @@ function resolveVerifyTargetDir(
     return dir;
   }
 
-  if (c0 === "npx" && c1 === "tsc") {
-    const tscArgs = cmdToks.slice(2);
+  const tscArgs = extractTscArgs(cmdToks);
+  if (tscArgs) {
     const stripTscOpt = (tok: string): string | null => {
       if (!tok.startsWith("-") || tok.startsWith("---")) return null;
       const name = (tok.startsWith("--") ? tok.slice(2) : tok.slice(1)).toLowerCase();
@@ -1725,14 +1809,14 @@ export function classifyPostToolEvidence(
       continue;
     }
 
-    // 3. Direct build / test / lint / hurl execution (token-based; handles line continuations & unquoted env prefixes)
+    // 3. Direct build / test / lint / hurl / lang-check execution (token-based; handles line continuations & unquoted env prefixes)
     const verifyHit = classifyVerifyCommand(metaToks);
     if (verifyHit) {
       // Never record `--help` / `--version` / `help` / dry-run / collect-only commands as passing verification!
-      // Note: `npx tsc` handles its own `--help`/`--version` boolean values (e.g. `--help false` still typechecks).
-      const isNpxTsc = verifyHit.cmdToks[0] === "npx" && verifyHit.cmdToks[1] === "tsc";
+      // Note: `tsc` handles its own `--help`/`--version` boolean values (e.g. `--help false` still typechecks).
+      const isTscCmd = extractTscArgs(verifyHit.cmdToks) !== null;
       if (
-        (!isNpxTsc && hasInfoOnlyFlag(verifyHit.cmdToks)) ||
+        (!isTscCmd && hasInfoOnlyFlag(verifyHit.cmdToks)) ||
         hasNonExecutingVerifyFlag(verifyHit.cmdToks, verifyHit.envToks)
       ) {
         continue;
@@ -1745,6 +1829,84 @@ export function classifyPostToolEvidence(
       }
       const targetDir = resolveVerifyTargetDir(verifyHit.cmdToks, verifyHit.envToks, curDir);
       if (!targetDir) {
+        continue;
+      }
+      if (verifyHit.kind === "lang-check") {
+        // Exit 2 means no applicable checks executed (fail-closed) -> never record pass/fail!
+        if (exitCode === 2) continue;
+        const parsedLc = parseLangCheckInvocation(verifyHit.cmdToks);
+        if (!parsedLc) continue;
+        // For `--mode all`, check JSON/text report if present to record per-phase outcomes accurately
+        let phases: Array<{ kind: "lint" | "test"; status: "pass" | "fail" }> = [];
+        if (parsedLc.mode === "static") {
+          phases = [{ kind: "lint", status: passed ? "pass" : "fail" }];
+        } else if (parsedLc.mode === "dynamic") {
+          phases = [{ kind: "test", status: passed ? "pass" : "fail" }];
+        } else {
+          // mode === "all": parse JSON report if available so static-only repos don't fabricate test/pass
+          const trimmedOut = outputText.trim();
+          let parsedReport: {
+            checks?: Array<{ phase?: string; status?: string }>;
+          } | null = null;
+          if (trimmedOut.startsWith("{")) {
+            try {
+              parsedReport = JSON.parse(trimmedOut) as {
+                checks?: Array<{ phase?: string; status?: string }>;
+              };
+            } catch {
+              parsedReport = null;
+            }
+          }
+          if (parsedReport?.checks) {
+            const staticRan = parsedReport.checks.filter(
+              (c) => c.phase === "static" && c.status !== "skipped",
+            );
+            const dynamicRan = parsedReport.checks.filter(
+              (c) => c.phase === "dynamic" && c.status !== "skipped",
+            );
+            if (staticRan.length > 0) {
+              phases.push({
+                kind: "lint",
+                status: staticRan.every((c) => c.status === "pass") ? "pass" : "fail",
+              });
+            }
+            if (dynamicRan.length > 0) {
+              phases.push({
+                kind: "test",
+                status: dynamicRan.every((c) => c.status === "pass") ? "pass" : "fail",
+              });
+            }
+          } else {
+            // Non-JSON summary output: inspect `[PASS]`/`[FAIL]` `(lang/phase)` lines so static-only runs don't fabricate dynamic test/pass!
+            const staticMatches = [...outputText.matchAll(/\[(PASS|FAIL)\]\s+\([^/]+\/static\)/g)];
+            const dynamicMatches = [...outputText.matchAll(/\[(PASS|FAIL)\]\s+\([^/]+\/dynamic\)/g)];
+            if (staticMatches.length > 0) {
+              phases.push({
+                kind: "lint",
+                status: staticMatches.every((m) => m[1] === "PASS") ? "pass" : "fail",
+              });
+            }
+            if (dynamicMatches.length > 0) {
+              phases.push({
+                kind: "test",
+                status: dynamicMatches.every((m) => m[1] === "PASS") ? "pass" : "fail",
+              });
+            }
+            if (phases.length === 0) {
+              // Fallback when output was truncated: record lint (never fabricate both without proof)
+              phases = [{ kind: "lint", status: passed ? "pass" : "fail" }];
+            }
+          }
+        }
+        for (const ph of phases) {
+          results.push({
+            kind: ph.kind,
+            status: ph.status,
+            summary: `${redactSecrets(seg).slice(0, 140)} (exit=${exitCode})`,
+            targetDir,
+            meta: { exit_code: exitCode, mode: parsedLc.mode },
+          });
+        }
         continue;
       }
       results.push({

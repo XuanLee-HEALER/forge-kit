@@ -19,11 +19,12 @@ export interface RepoLocation {
 
 export function runProcess(
   argv: string[],
-  opts?: { cwd?: string; timeoutMs?: number },
+  opts?: { cwd?: string; env?: Record<string, string | undefined>; timeoutMs?: number },
 ): GitRunResult {
   try {
     const proc = Bun.spawnSync(argv, {
       cwd: opts?.cwd,
+      env: opts?.env,
       stdout: "pipe",
       stderr: "pipe",
       timeout: opts?.timeoutMs ?? 10_000,

@@ -421,4 +421,129 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
       evaluatePreToolUse(wb, shellInput(`bash -c 'curl -XGET "http://10.0.0.5:9000/health"'`)),
     ).toBeNull();
   });
+
+  test("physically locks frozen spec documents and locked test globs across apply_patch, shell redirects, and inline scripts, unlocking strictly per amend scope", () => {
+    const head = runGit(repoDir, ["rev-parse", "HEAD"]).stdout.trim();
+    const specDir = join(wb, ".workbench", "specs", "20261123-spec");
+    mkdirSync(specDir, { recursive: true });
+    writeFileSync(join(specDir, "ssot.md"), "# SSOT\nINV-1: server decides price\n");
+    writeFileSync(join(specDir, "tech-spec.md"), "# Tech Spec\nUse SQLite WAL\n");
+    writeFileSync(join(specDir, "test-spec.md"), "# Test Spec\nHurl case for INV-1\n");
+    mkdirSync(join(repoDir, "tests"), { recursive: true });
+    writeFileSync(join(repoDir, "tests", "api.hurl"), "GET http://localhost/health\nHTTP 200\n");
+
+    const ledger = new Ledger(wb);
+    ledger.openTask({
+      task_id: "20261123-spec",
+      title: "Spec lock guard test",
+      endpoint: "local",
+      depth: "full",
+      repo: "app-api",
+      branch: "feat/demo",
+      base_sha: head,
+      head_sha: head,
+    });
+    ledger.freezeSpec({
+      task_id: "20261123-spec",
+      locked_test_globs: ["*.hurl"],
+    });
+    ledger.closeDb();
+
+    // 1. Frozen specs are physically locked against apply_patch, shell redirection, and inline script writes!
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wb,
+        tool_name: "apply_patch",
+        tool_input: {
+          patch:
+            "*** Begin Patch\n*** Update File: .workbench/specs/20261123-spec/ssot.md\n@@\n-INV-1\n+INV-1 modified\n*** End Patch",
+        },
+      }),
+    ).toContain("冻结 Spec 保护");
+    expect(
+      evaluatePreToolUse(
+        wb,
+        shellInput('echo "tamper" >> .workbench/specs/20261123-spec/tech-spec.md'),
+      ),
+    ).toContain("冻结 Spec 保护");
+    expect(
+      evaluatePreToolUse(
+        wb,
+        shellInput(`python3 -c 'open(".workbench/specs/20261123-spec/test-spec.md","w").write("x")'`),
+      ),
+    ).toContain("冻结 Spec 保护");
+
+    // 2. Locked *.hurl test files inside the task repo are physically locked, while read-only `hurl` execution and app `.ts` edits are ALLOWED!
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: repoDir,
+        tool_name: "apply_patch",
+        tool_input: {
+          patch: "*** Begin Patch\n*** Update File: tests/api.hurl\n@@\n-HTTP 200\n+HTTP 500\n*** End Patch",
+        },
+      }),
+    ).toContain("冻结测试防篡改");
+    expect(
+      evaluatePreToolUse(wb, shellInput('echo "HTTP 500" > app-api/tests/api.hurl')),
+    ).toContain("冻结测试防篡改");
+    expect(
+      evaluatePreToolUse(wb, shellInput("hurl app-api/tests/api.hurl")),
+    ).toBeNull();
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: repoDir,
+        tool_name: "apply_patch",
+        tool_input: {
+          patch: "*** Begin Patch\n*** Update File: src/app.ts\n@@\n+export const x = 1;\n*** End Patch",
+        },
+      }),
+    ).toBeNull();
+
+    // 3. `ledger amend --scope tech_spec` unlocks ONLY tech-spec.md while keeping ssot.md, test-spec.md, and *.hurl locked!
+    const ledger2 = new Ledger(wb);
+    ledger2.amendSpec({
+      task_id: "20261123-spec",
+      scope: "tech_spec",
+      reason: "switch cache key format",
+    });
+    ledger2.closeDb();
+
+    expect(
+      evaluatePreToolUse(
+        wb,
+        shellInput('echo "revised" >> .workbench/specs/20261123-spec/tech-spec.md'),
+      ),
+    ).toBeNull();
+    expect(
+      evaluatePreToolUse(
+        wb,
+        shellInput('echo "tamper" >> .workbench/specs/20261123-spec/ssot.md'),
+      ),
+    ).toContain("冻结 Spec 保护");
+    expect(
+      evaluatePreToolUse(wb, shellInput('echo "HTTP 500" > app-api/tests/api.hurl')),
+    ).toContain("冻结测试防篡改");
+
+    // 4. `ledger amend --scope test_spec` unlocks test-spec.md and *.hurl while keeping ssot.md and tech-spec.md locked!
+    const ledger3 = new Ledger(wb);
+    ledger3.amendSpec({
+      task_id: "20261123-spec",
+      scope: "test_spec",
+      reason: "fix wrong Hurl status assertion",
+    });
+    ledger3.closeDb();
+
+    expect(
+      evaluatePreToolUse(wb, shellInput('echo "HTTP 201" > app-api/tests/api.hurl')),
+    ).toBeNull();
+    expect(
+      evaluatePreToolUse(
+        wb,
+        shellInput('echo "tamper" >> .workbench/specs/20261123-spec/tech-spec.md'),
+      ),
+    ).toContain("冻结 Spec 保护");
+  });
 });

@@ -1,22 +1,58 @@
 ---
 name: feature
 description: >
-  做需求流程：分析现状并列出待定口径、等用户明确确认后开工、必要时落设计文档、
-  开开发任务账本、编排实现与验证、按风险执行 wrapup 收尾并交付至授权终点。
+  AI-Native 规范驱动需求开发流程：区分轻量轨（targeted）与完整开发周期轨（full）：
+  grill 产出 ssot.md -> 双独立隔离上下文并行生成 tech-spec.md 与 test-spec.md -> 独立只读评审 ->
+  ledger freeze 物理锁 -> 并行代码实现（四层 review + 静态/动态检查）与独立 Hurl 编写 -> FAT/Container 验收交付。
   触发词：做需求、新需求、新功能、加个功能、开发一个、实现一下、feature、开工。
 ---
 
-# feature：做需求
+# feature：做需求（双轨分流）
 
-遵守工作台根 `AGENTS.md`（共享工作树红线、交付终点×验证深度、服务端权威原则、模型档位、表单规范与禁自动网页测试）及目标仓 `.workbench/repos/<repo>.md`。
+遵守工作台根 `AGENTS.md`（共享工作树红线、交付终点×验证深度、服务端权威原则、新测试纪律、模型档位、表单规范与禁自动网页测试）及目标仓 `.workbench/repos/<repo>.md`。
 
-## 步骤
+## 轨道分流
 
-1. **定终点与深度**：接单先明确本次「交付终点」（默认 `local`）与「验证深度」（`targeted` / `full`）。仅发布已有改动时直接转 `ship`。
-2. **分析现状与口径**：读相关代码和文档（线上现状只查 prod，不拿测试环境推断），列出待定口径（字段语义、可见范围、计算口径、兼容边界），每项给出现状与推荐方案。
-3. **停下等确认**：只有用户明确回复“开工 / 按默认做 / 按某方案做”才进入实现；用户确认现状或问题存在不等于批准。若用户已在单轮指令中给出完整目标、无歧义口径并一次性授权直接实现，则无需机械二次追问。
-4. **设计文档关卡**：涉及架构、外部依赖或 SSOT 变更时，先在目标仓 `docs/` 落设计文档（背景、调研、方案、决策、待办与外部依赖）并等用户确认后再写代码；其余需求跳过此步。
-5. **分支与开账**：复用指定或已有分支/worktree，未要求新建时不自动创建；确需新建时从 `origin/main` 切出。进入业务仓开发后，用 `.workbench/bin/ledger open` 开任务账本并记录已确认口径（`ledger decide`）；跨仓需求用 `ledger attach` 挂入同一 `task_id`。
-6. **委派实现与验证**：优先委派 `.codex/agents/dev.toml` 实现（小任务可直接完成），任务书必须写清：目标与验收标准、已定口径、实际仓库/worktree 路径、不许动的边界、未写明细节的默认处理方式、已获授权终点与保留检查。涉及后端接口变更须产出可重复执行且自带清理的测试/Hurl 资产；跑受影响的构建与测试（PostToolUse 自动落证）。实现中新冒出的口径问题停下问用户；已裁决队列完成后立刻推进下一项。
-7. **收尾与交付**：按风险执行 `wrapup`；`local` 终点直接汇报，`fat` / `pr` / `prod` 按 `ship` 推进；任务完成后执行 `ledger close` 归档。
-8. **汇报**：分开列出本地验证与环境验收，写清已执行/仅编译/未验证项、已达成终点与遗留缺口；不写人天估算。
+- **轻量轨（`targeted`）**：风险边界清晰的局部改动、低风险小修、纯文档/注释。核清口径经用户确认后，开账本（或合规 `exempt`）直接实现、跑受影响构建/测试与定向 `wrapup` 即可，不强迫写三件套 Paperwork。
+- **完整开发周期轨（`full` Dev Cycle）**：涉及业务规则、资金/权限、协议/接口、迁移、并发或跨模块的新需求，严格按以下 **5 阶段状态机** 执行。
+
+---
+
+## Full Dev Cycle 五阶段
+
+### Stage 0：需求定稿（`grill`）
+- 调用 `.agents/skills/grill/SKILL.md`，与用户对齐口径并落盘 `.workbench/specs/<task_id>/ssot.md`（编号业务不变量 `INV-*` + 衍生流程 + **冻结的外部接口契约**，不含内部实现）。
+- 开立任务账本 `.workbench/bin/ledger open --id <task_id> --title "..." --endpoint <ep> --depth full --repo <r> --branch <b>`（跨仓用 `ledger attach`）。
+
+### Stage 1：独立双上下文派生 Paperwork + 评审 + 冻结
+1. **双独立派生（严禁同一上下文或互相参照生成）**：
+   同时派生 **2 个上下文完全隔离的 subagent（`fork_turns="none"`）**，两者**互相不可见**、各自只读 `ssot.md` 与现有代码事实：
+   - **Agent A（技术方案）**：只读 `ssot.md` + 目标仓代码，产出 `.workbench/specs/<task_id>/tech-spec.md`（细枝末节的实现选择、技术选型、数据模型、事务/并发、兼容与性能设计）。
+   - **Agent B（测试用例规格）**：只读 `ssot.md` + 现有接口/夹具约定（**严禁读取 `tech-spec.md`**），产出 `.workbench/specs/<task_id>/test-spec.md`（逐条映射到 `INV-*` 的 Hurl 黑盒场景矩阵、正反/边界用例与夹具清理契约；仅纯算法/计费公式/状态机/并发不变量允许列少量无 Mock 表驱动单测）。
+2. **独立只读 Paperwork 评审**：
+   派生 `.codex/agents/spec-reviewer.toml`（`fork_turns="none"`，只读）分别评审：
+   - `tech-spec.md`：审**正确性、性能、兼容性、简单性**（以 AI-Legibility / 低状态复杂度为准，不审传统人工美学）；
+   - `test-spec.md`：对照 `ssot.md` 审**完备性、正确性**（顺带反向揪出 `ssot.md` 的遗漏或歧义）。
+   核实并 refine 直到两份评审零阻断项，向用户汇报三件套定稿。
+3. **周期冻结（物理锁生效）**：
+   执行：
+   ```bash
+   .workbench/bin/ledger freeze <task_id> --lock-tests "*.hurl"
+   ```
+   （如 Hurl 尚未创建，可在 Stage 2 Hurl 落盘后再追加 `--lock-tests` 锁定，或冻结三件套并在 Hurl 就绪后重冻锁定）。此后整个 Dev Cycle 内三件套只读，`guard` 物理拦截静默修改；确需偏离必须经用户批准走 `ledger amend`。
+
+### Stage 2：并行实现（代码 + 静态/动态检查 + 四层 Review ∥ Hurl 编写）
+并行派生两条独立轨道（文件所有权互不重叠，必要时用独立 worktree）：
+- **轨道 A（代码实现）**：委派 `.codex/agents/dev.toml` 按 `tech-spec.md` 与 `ssot.md` 实施（**刻意克制 Mock 堆砌型单测**；保持代码简单自解释）。实现后：
+  1. 跑对应语言静态与动态检查（仓内原生命令或 `.workbench/bin/lang-check <repo> --mode all`：Go `go vet`/`go test -race`、TS `tsc`/`biome`/`eslint`、Python `ruff`/`pyright`/`PYTHONDEVMODE=1 pytest`）；
+  2. 执行完整四层 `wrapup`（业务对齐 `ssot.md` → 语言特化实现 bug `review-quality` → 性能与简单平衡 `review-performance` + `review-simplify` → 精简内部注释 + 完备最新接口文档 `review-comments`）。
+- **轨道 B（独立测试实现，并行）**：派生独立 subagent（`fork_turns="none"`），**仅读 `ssot.md` 与 `test-spec.md`**（不读实现代码），编写可执行 Hurl 脚本与幂等夹具清理逻辑；完成后如尚未锁定测试文件，执行 `ledger freeze <task_id> --lock-tests "<hurl-glob>"` 上锁防篡改。
+
+### Stage 3：FAT / Container 集成、冒烟与性能验证
+- 按 `.agents/skills/ship/SKILL.md` 合入 FAT（或按 `test-environment` 用 Apple `container` 搭隔离环境），执行轨道 B 产出的 Hurl 集成/冒烟测试（以及按需的性能测试）。
+- **只修实现，不偷改测试**：Hurl 失败时回到实现代码修复并重跑检查与评审，**禁止私自放宽 Hurl 断言凑绿灯**（`guard` 物理拦截）；确属用例或方案本身有误须经用户确认走 `ledger amend` 并辐射重跑受影响环节。
+- 循环直至本阶段 bug-free、测试夹具残留清零，推进移交 QA（若终点为 `pr` 则同步开好 PR）。
+
+### Stage 4：收尾与汇报
+- 确认 `.workbench/bin/ledger spec-status <task_id>` 无漂移且 `ledger status` 证据齐全；完成后执行 `ledger close <task_id>`。
+- 汇报分开列出：本地静态/动态检查、四层 Review 结果、FAT/Hurl 集成验收结果与夹具清零状态、已达成终点与剩余缺口；不写人天估算。

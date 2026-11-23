@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { findWorkbenchRoot } from "./config";
 import { runGit } from "./git";
@@ -16,6 +16,62 @@ export function normalizeReviewRole(role?: string | null): string {
 export type TaskStatus = "OPEN" | "CLOSED" | "CANCELLED";
 export type DeliveryEndpoint = "investigation" | "local" | "fat" | "pr" | "prod";
 export type VerificationDepth = "targeted" | "full";
+export type SpecAmendScope = "requirement" | "invariant" | "tech_spec" | "test_spec";
+
+export interface SpecFrozenPayload {
+  spec_dir: string;
+  files: { ssot: string; tech_spec: string; test_spec: string };
+  hashes: { ssot: string; tech_spec: string; test_spec: string };
+  locked_test_globs: string[];
+}
+
+export interface SpecAmendedPayload {
+  scope: SpecAmendScope;
+  reason: string;
+  stale_stages: string[];
+}
+
+export interface TaskSpecState {
+  task_id: string;
+  state: "NONE" | "FROZEN" | "AMENDED";
+  freeze_seq: number | null;
+  amend_seq: number | null;
+  spec_dir: string | null;
+  files: { ssot: string; tech_spec: string; test_spec: string } | null;
+  hashes: { ssot: string; tech_spec: string; test_spec: string } | null;
+  locked_test_globs: string[];
+  amend_scope: SpecAmendScope | null;
+  amend_reason: string | null;
+  stale_stages: string[];
+  drifted_files: string[];
+  evidence_floor_seq: { lint: number; test: number; review: number; fat: number };
+}
+
+export const SPEC_AMEND_STALE_MAP: Record<SpecAmendScope, string[]> = {
+  requirement: ["ssot", "tech_spec", "test_spec", "lint", "test", "review", "fat"],
+  invariant: ["tech_spec", "test_spec", "lint", "test", "review", "fat"],
+  tech_spec: ["lint", "test", "review", "fat"],
+  test_spec: ["test", "fat"],
+};
+
+const VALID_SPEC_AMEND_SCOPES = new Set<string>([
+  "requirement",
+  "invariant",
+  "tech_spec",
+  "test_spec",
+]);
+
+function sha256File(absPath: string): string | null {
+  if (!existsSync(absPath)) return null;
+  try {
+    const st = statSync(absPath);
+    if (!st.isFile()) return null;
+    const buf = readFileSync(absPath);
+    return createHash("sha256").update(buf).digest("hex");
+  } catch {
+    return null;
+  }
+}
 
 export interface TaskRecord {
   task_id: string;
@@ -866,11 +922,267 @@ export class Ledger {
   }
 
   /**
+   * Freeze the 3-document dev cycle spec package (ssot.md, tech-spec.md, test-spec.md)
+   * by recording their SHA-256 digests and optional locked test globs in the task hash chain.
+   */
+  freezeSpec(params: {
+    task_id: string;
+    spec_dir?: string;
+    locked_test_globs?: string[];
+    actor?: string;
+    session_id?: string | null;
+  }): { event: EventRecord; spec: TaskSpecState } {
+    const ev = this.withImmediateTx(() => {
+      const task = this.getTask(params.task_id);
+      if (!task) throw new Error(`Task not found: ${params.task_id}`);
+      if (task.status !== "OPEN") {
+        throw new Error(`Cannot freeze spec on ${task.status} task ${params.task_id}`);
+      }
+
+      const wbReal = realpathSync(this.workbenchRoot);
+      const rawDir = params.spec_dir?.trim() || join(".workbench", "specs", params.task_id);
+      const absDir = resolve(wbReal, rawDir);
+      if (!existsSync(absDir)) {
+        throw new Error(`Spec directory does not exist: ${rawDir}`);
+      }
+      const realDir = realpathSync(absDir);
+      const relDir = relative(wbReal, realDir).replace(/\\/g, "/");
+      if (!relDir || relDir.startsWith("..")) {
+        throw new Error(`Spec directory must reside inside workbench root: ${rawDir}`);
+      }
+
+      const fileNames = {
+        ssot: "ssot.md",
+        tech_spec: "tech-spec.md",
+        test_spec: "test-spec.md",
+      } as const;
+      const files = {
+        ssot: `${relDir}/${fileNames.ssot}`,
+        tech_spec: `${relDir}/${fileNames.tech_spec}`,
+        test_spec: `${relDir}/${fileNames.test_spec}`,
+      };
+      const hashes = { ssot: "", tech_spec: "", test_spec: "" };
+
+      for (const [key, fname] of Object.entries(fileNames) as Array<
+        [keyof typeof fileNames, string]
+      >) {
+        const absFile = join(realDir, fname);
+        if (!existsSync(absFile)) {
+          throw new Error(`Missing required spec document: ${files[key]}`);
+        }
+        const realFile = realpathSync(absFile);
+        const relFile = relative(wbReal, realFile).replace(/\\/g, "/");
+        if (!relFile || relFile.startsWith("..")) {
+          throw new Error(`Spec document escapes workbench root via symlink: ${files[key]}`);
+        }
+        const rawText = readFileSync(realFile, "utf8");
+        if (!rawText.trim()) {
+          throw new Error(`Spec document is empty: ${files[key]}`);
+        }
+        const digest = sha256File(realFile);
+        if (!digest) {
+          throw new Error(`Failed to hash spec document: ${files[key]}`);
+        }
+        hashes[key] = digest;
+      }
+
+      const prevSpec = this.getSpecState(params.task_id);
+      const lockedGlobs =
+        params.locked_test_globs !== undefined
+          ? [...new Set(params.locked_test_globs.map((g) => g.trim()).filter(Boolean))]
+          : prevSpec.locked_test_globs;
+
+      const payload: SpecFrozenPayload = {
+        spec_dir: relDir,
+        files,
+        hashes,
+        locked_test_globs: lockedGlobs,
+      };
+      return this.appendEventInTx({
+        task_id: params.task_id,
+        event_type: "SPEC_FROZEN",
+        actor: params.actor ?? "agent",
+        session_id: params.session_id,
+        payload: payload as unknown as Record<string, unknown>,
+      });
+    });
+
+    return { event: ev, spec: this.getSpecState(params.task_id) };
+  }
+
+  /**
+   * Explicitly amend a frozen spec package (requires prior SPEC_FROZEN and non-empty reason).
+   * Unlocks editing for the declared scope and marks downstream stages STALE until re-frozen & re-verified.
+   */
+  amendSpec(params: {
+    task_id: string;
+    scope: SpecAmendScope;
+    reason: string;
+    actor?: string;
+    session_id?: string | null;
+  }): { event: EventRecord; spec: TaskSpecState } {
+    if (!VALID_SPEC_AMEND_SCOPES.has(params.scope)) {
+      throw new Error(
+        `Invalid amend scope: ${params.scope}. Must be one of: requirement, invariant, tech_spec, test_spec`,
+      );
+    }
+    if (!params.reason?.trim()) {
+      throw new Error("ledger amend requires a non-empty --reason");
+    }
+
+    const ev = this.withImmediateTx(() => {
+      const task = this.getTask(params.task_id);
+      if (!task) throw new Error(`Task not found: ${params.task_id}`);
+      if (task.status !== "OPEN") {
+        throw new Error(`Cannot amend spec on ${task.status} task ${params.task_id}`);
+      }
+      const cur = this.getSpecState(params.task_id);
+      if (cur.state === "NONE") {
+        throw new Error(`Task ${params.task_id} has no frozen spec yet; run ledger freeze first`);
+      }
+
+      const payload: SpecAmendedPayload = {
+        scope: params.scope,
+        reason: params.reason.trim(),
+        stale_stages: [...SPEC_AMEND_STALE_MAP[params.scope]],
+      };
+      return this.appendEventInTx({
+        task_id: params.task_id,
+        event_type: "SPEC_AMENDED",
+        actor: params.actor ?? "agent",
+        session_id: params.session_id,
+        payload: payload as unknown as Record<string, unknown>,
+      });
+    });
+
+    return { event: ev, spec: this.getSpecState(params.task_id) };
+  }
+
+  /**
+   * Inspect current spec freeze/amend state, disk SHA-256 drift, and per-stage stale floors.
+   */
+  getSpecState(task_id: string): TaskSpecState {
+    const rows = this.db
+      .query(
+        `SELECT seq, event_type, payload_json FROM events
+         WHERE task_id = ? AND event_type IN ('SPEC_FROZEN', 'SPEC_AMENDED')
+         ORDER BY seq ASC`,
+      )
+      .all(task_id) as Array<{ seq: number; event_type: string; payload_json: string }>;
+
+    let freezeSeq: number | null = null;
+    let amendSeq: number | null = null;
+    let specDir: string | null = null;
+    let files: { ssot: string; tech_spec: string; test_spec: string } | null = null;
+    let hashes: { ssot: string; tech_spec: string; test_spec: string } | null = null;
+    let lockedTestGlobs: string[] = [];
+    let amendScope: SpecAmendScope | null = null;
+    let amendReason: string | null = null;
+    let pendingStaleStages = new Set<string>();
+    const floors = { lint: 0, test: 0, review: 0, fat: 0 };
+
+    for (const row of rows) {
+      try {
+        if (row.event_type === "SPEC_FROZEN") {
+          const p = JSON.parse(row.payload_json) as Partial<SpecFrozenPayload>;
+          freezeSeq = row.seq;
+          specDir = p.spec_dir ?? specDir;
+          if (p.files) files = p.files;
+          if (p.hashes) hashes = p.hashes;
+          if (Array.isArray(p.locked_test_globs)) {
+            lockedTestGlobs = p.locked_test_globs.map(String);
+          }
+          if (pendingStaleStages.has("lint")) floors.lint = Math.max(floors.lint, row.seq);
+          if (pendingStaleStages.has("test")) floors.test = Math.max(floors.test, row.seq);
+          if (pendingStaleStages.has("review")) floors.review = Math.max(floors.review, row.seq);
+          if (pendingStaleStages.has("fat")) floors.fat = Math.max(floors.fat, row.seq);
+          pendingStaleStages = new Set<string>();
+        } else if (row.event_type === "SPEC_AMENDED") {
+          const p = JSON.parse(row.payload_json) as Partial<SpecAmendedPayload>;
+          amendSeq = row.seq;
+          if (p.scope && VALID_SPEC_AMEND_SCOPES.has(p.scope)) {
+            amendScope = p.scope;
+          }
+          amendReason = p.reason ?? null;
+          for (const st of p.stale_stages ?? []) {
+            pendingStaleStages.add(String(st));
+          }
+        }
+      } catch {
+        // Ignore malformed payload
+      }
+    }
+
+    if (freezeSeq === null) {
+      return {
+        task_id,
+        state: "NONE",
+        freeze_seq: null,
+        amend_seq: null,
+        spec_dir: null,
+        files: null,
+        hashes: null,
+        locked_test_globs: [],
+        amend_scope: null,
+        amend_reason: null,
+        stale_stages: [],
+        drifted_files: [],
+        evidence_floor_seq: floors,
+      };
+    }
+
+    const isAmended = amendSeq !== null && amendSeq > freezeSeq;
+    const driftedFiles: string[] = [];
+    if (!isAmended && files && hashes) {
+      for (const key of ["ssot", "tech_spec", "test_spec"] as const) {
+        const relPath = files[key];
+        const expectedHash = hashes[key];
+        const actualHash = sha256File(resolve(this.workbenchRoot, relPath));
+        if (!actualHash || actualHash !== expectedHash) {
+          driftedFiles.push(relPath);
+        }
+      }
+    }
+
+    return {
+      task_id,
+      state: isAmended ? "AMENDED" : "FROZEN",
+      freeze_seq: freezeSeq,
+      amend_seq: amendSeq,
+      spec_dir: specDir,
+      files,
+      hashes,
+      locked_test_globs: lockedTestGlobs,
+      amend_scope: isAmended ? amendScope : null,
+      amend_reason: isAmended ? amendReason : null,
+      stale_stages: isAmended ? [...pendingStaleStages] : [],
+      drifted_files: driftedFiles,
+      evidence_floor_seq: floors,
+    };
+  }
+
+  /**
+   * Return spec states for all OPEN tasks that currently have a frozen or amended spec package.
+   */
+  listActiveSpecLocks(): TaskSpecState[] {
+    const open = this.listOpenTasks();
+    const out: TaskSpecState[] = [];
+    for (const t of open) {
+      const st = this.getSpecState(t.task_id);
+      if (st.state !== "NONE") out.push(st);
+    }
+    return out;
+  }
+
+  /**
    * Check readiness for a specific (task, repo, head_sha):
    * - Zero open blockers;
-   * - Latest status of each executed verification kind (test/build/lint) for this exact (repo, head_sha)
-   *   must not be `fail`, and at least one must be `pass`;
-   * - For `full` depth, latest review status for this exact (repo, head_sha) must be `pass` or `fallback`.
+   * - If spec package is frozen: zero silent disk drift and not left in un-refrozen AMENDED state;
+   * - Latest post-amend status of each executed verification kind (test/build/lint/hurl) for this exact
+   *   (repo, head_sha) must not be `fail`;
+   * - For `targeted`: at least one of test/build/lint/hurl must be `pass`;
+   * - For `full`: static check (`lint`) MUST be `pass`, at least one of test/build/hurl MUST be `pass`,
+   *   and latest review status must be `pass` or `fallback`.
    */
   checkPushReadiness(params: {
     task_id: string;
@@ -898,6 +1210,18 @@ export class Ledger {
       );
     }
 
+    const specState = this.getSpecState(params.task_id);
+    if (specState.state === "AMENDED") {
+      missing.push(
+        `spec is in AMENDED state (scope=${specState.amend_scope ?? "unknown"}); finish revisions and run \`ledger freeze ${params.task_id}\` before delivery`,
+      );
+    } else if (specState.state === "FROZEN" && specState.drifted_files.length > 0) {
+      hasExplicitFailure = true;
+      missing.push(
+        `frozen spec drifted on disk (${specState.drifted_files.join(", ")}); restore files or run \`ledger amend ${params.task_id} --scope ... --reason "..."\` then re-freeze`,
+      );
+    }
+
     const events = this.db
       .query(
         `SELECT seq, payload_json FROM events
@@ -910,6 +1234,7 @@ export class Ledger {
       payload_json: string;
     }>;
 
+    const floors = specState.evidence_floor_seq;
     const latestByKind = new Map<string, string>();
     const latestReviewByRole = new Map<string, string>();
     let latestEndpointStatus: string | null = null;
@@ -922,19 +1247,26 @@ export class Ledger {
           meta?: { role?: string };
         };
         if (!p.kind || !p.status) continue;
-        if (p.kind === "test" || p.kind === "build" || p.kind === "lint") {
-          latestByKind.set(p.kind, p.status);
+        if (p.kind === "lint") {
+          if (ev.seq >= floors.lint) latestByKind.set("lint", p.status);
+        } else if (p.kind === "test" || p.kind === "build") {
+          if (ev.seq >= floors.test) latestByKind.set(p.kind, p.status);
+        } else if (p.kind === "hurl") {
+          if (ev.seq >= floors.test) latestByKind.set("hurl", p.status);
         }
         if (p.kind === "review") {
-          const roleKey = normalizeReviewRole(p.meta?.role);
-          latestReviewByRole.set(roleKey, p.status);
+          if (ev.seq >= floors.review) {
+            const roleKey = normalizeReviewRole(p.meta?.role);
+            latestReviewByRole.set(roleKey, p.status);
+          }
         }
         if (
           (task.endpoint === "pr" && p.kind === "pr") ||
           (task.endpoint === "fat" && (p.kind === "fat" || p.kind === "hurl")) ||
           (task.endpoint === "prod" && p.kind === "prod")
         ) {
-          if (p.status === "pass" || p.status === "fail") {
+          const endpointFloor = task.endpoint === "fat" ? floors.fat : 0;
+          if (ev.seq >= endpointFloor && (p.status === "pass" || p.status === "fail")) {
             latestEndpointStatus = p.status;
           }
         }
@@ -947,15 +1279,30 @@ export class Ledger {
       .filter(([, st]) => st === "fail")
       .map(([k]) => k);
     const hasPassingVerify = [...latestByKind.values()].some((st) => st === "pass");
+    const hasPassingExecVerify =
+      latestByKind.get("test") === "pass" ||
+      latestByKind.get("build") === "pass" ||
+      latestByKind.get("hurl") === "pass";
 
     if (failedKinds.length > 0) {
       hasExplicitFailure = true;
       missing.push(
         `latest ${failedKinds.join("/")} failed for ${params.repo}@${params.head_sha.slice(0, 8)}`,
       );
+    } else if (task.verification_depth === "full") {
+      if (latestByKind.get("lint") !== "pass") {
+        missing.push(
+          `full verification requires passing static check (lint) evidence for ${params.repo}@${params.head_sha.slice(0, 8)} (run repo lint/typecheck or .workbench/bin/lang-check --mode static)`,
+        );
+      }
+      if (!hasPassingExecVerify) {
+        missing.push(
+          `no passing build/test/hurl evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
+        );
+      }
     } else if (!hasPassingVerify) {
       missing.push(
-        `no passing build/test/lint evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
+        `no passing build/test/lint/hurl evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
       );
     }
 
@@ -1411,8 +1758,16 @@ export class Ledger {
         .map((d) => `${d.key}=${d.summary}`)
         .join("; ");
 
+      const specState = this.getSpecState(t.task_id);
+      const specBadge =
+        specState.state === "FROZEN"
+          ? ` | spec:FROZEN${specState.drifted_files.length ? `(DRIFT:${specState.drifted_files.length})` : ""}`
+          : specState.state === "AMENDED"
+            ? ` | spec:AMENDED(${specState.amend_scope ?? "?"})`
+            : "";
+
       lines.push(
-        `- ${t.task_id} (${t.endpoint}/${t.verification_depth}): ${t.title} [${repoDesc}]${blockerText}${activeDecs ? ` | decisions: ${activeDecs}` : ""}`,
+        `- ${t.task_id} (${t.endpoint}/${t.verification_depth}): ${t.title} [${repoDesc}]${specBadge}${blockerText}${activeDecs ? ` | decisions: ${activeDecs}` : ""}`,
       );
     }
     return lines.join("\n");
@@ -1423,9 +1778,12 @@ export async function runLedgerCli(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   const USAGE = `Usage: ledger <command> [options]
 Commands:
-  open      --id <id> --title <title> --endpoint <investigation|local|fat|pr|prod> --depth <targeted|full> [--repo <r> --branch <b> --base <sha> --head <sha> --worktree <p>]
-  attach    <task_id> --repo <r> --branch <b> [--base <sha> --head <sha> --worktree <p>]
-  decide    <task_id> --key <k> --summary <text> [--supersedes <seq>]
+  open        --id <id> --title <title> --endpoint <investigation|local|fat|pr|prod> --depth <targeted|full> [--repo <r> --branch <b> --base <sha> --head <sha> --worktree <p>]
+  attach      <task_id> --repo <r> --branch <b> [--base <sha> --head <sha> --worktree <p>]
+  freeze      <task_id> [--spec-dir <dir>] [--lock-tests <glob>]...
+  amend       <task_id> --scope <requirement|invariant|tech_spec|test_spec> --reason <text>
+  spec-status <task_id>
+  decide      <task_id> --key <k> --summary <text> [--supersedes <seq>]
   blocker   <task_id> <open|close> --id <bid> --summary <text>
   record    <task_id> --kind <commit|build|test|lint|review|hurl|pr|fat|prod|note> --status <pass|fail|fallback|info> --summary <text> [--role <role> --repo <r> --branch <b> --sha <sha> --meta <json>]
   exempt    --repo <r> --branch <b> --reason <text> [--sha <sha> --ttl-hours <n>]
@@ -1503,6 +1861,56 @@ Commands:
         actor: values.actor,
       });
       console.log(JSON.stringify(ev, null, 2));
+    } else if (cmd === "freeze") {
+      const task_id = rest[0];
+      const { values } = parseArgs({
+        args: rest.slice(1),
+        options: {
+          "spec-dir": { type: "string" },
+          "lock-tests": { type: "string", multiple: true },
+          actor: { type: "string", default: "agent" },
+        },
+      });
+      if (!task_id) {
+        throw new Error(
+          "Usage: ledger freeze <task_id> [--spec-dir <dir>] [--lock-tests <glob>]...",
+        );
+      }
+      const res = ledger.freezeSpec({
+        task_id,
+        spec_dir: values["spec-dir"],
+        locked_test_globs: values["lock-tests"] as string[] | undefined,
+        actor: values.actor,
+      });
+      console.log(JSON.stringify(res, null, 2));
+    } else if (cmd === "amend") {
+      const task_id = rest[0];
+      const { values } = parseArgs({
+        args: rest.slice(1),
+        options: {
+          scope: { type: "string" },
+          reason: { type: "string" },
+          actor: { type: "string", default: "agent" },
+        },
+      });
+      if (!task_id || !values.scope || !values.reason) {
+        throw new Error(
+          "Usage: ledger amend <task_id> --scope <requirement|invariant|tech_spec|test_spec> --reason <text>",
+        );
+      }
+      const res = ledger.amendSpec({
+        task_id,
+        scope: values.scope as SpecAmendScope,
+        reason: values.reason,
+        actor: values.actor,
+      });
+      console.log(JSON.stringify(res, null, 2));
+    } else if (cmd === "spec-status") {
+      const task_id = rest[0];
+      if (!task_id) throw new Error("Usage: ledger spec-status <task_id>");
+      const task = ledger.getTask(task_id);
+      if (!task) throw new Error(`Task not found: ${task_id}`);
+      console.log(JSON.stringify(ledger.getSpecState(task_id), null, 2));
     } else if (cmd === "decide") {
       const task_id = rest[0];
       const { values } = parseArgs({

@@ -53,6 +53,9 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     expect(existsSync(join(res.root, ".workbench", "env", ".gitignore"))).toBe(true);
     expect(existsSync(join(res.root, ".workbench", "ledger", ".gitignore"))).toBe(true);
     expect(existsSync(join(res.root, ".agents", "skills", "ready", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(res.root, ".agents", "skills", "grill", "SKILL.md"))).toBe(true);
+    expect(existsSync(join(res.root, ".codex", "agents", "spec-reviewer.toml"))).toBe(true);
+    expect(existsSync(join(res.root, ".workbench", "bin", "lang-check"))).toBe(true);
 
     // Customize private rules + models.toml + inline YAML repos array
     writeFileSync(join(res.root, "AGENTS.local.md"), "# My Private Local Rules\n");
