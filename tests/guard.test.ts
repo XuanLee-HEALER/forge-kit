@@ -965,5 +965,59 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         tool_input: { command: `git apply ${trailingSpacePatch}` },
       }),
     ).toBeNull();
+
+    // Round 7 regressions:
+    // 12. Literal invalid UTF-8 byte (0xff) in header fails closed BEFORE lossy UTF-8 decoding!
+    const rawInvalidBytePatch = join(wb, "raw-ff.patch");
+    writeFileSync(
+      rawInvalidBytePatch,
+      Buffer.concat([
+        Buffer.from('diff --git a/x'),
+        Buffer.from([0xff]),
+        Buffer.from('.md b/x'),
+        Buffer.from([0xff]),
+        Buffer.from('.md\nold mode 100644\nnew mode 100755\n'),
+      ]),
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${rawInvalidBytePatch}` },
+      }),
+    ).toContain("冻结测试防篡改");
+
+    // 13. Leading U+FEFF (BOM bytes \357\273\277) in quoted rename pathname is preserved (NOT stripped)
+    // and single-space delimiter in `rename to  tests/smoke.hurl` preserves leading space (no spurious match)!
+    const bomRenamePatch = join(wb, "bom-rename.patch");
+    writeFileSync(
+      bomRenamePatch,
+      'diff --git "a/\\357\\273\\277tests/smoke.hurl" "b/\\357\\273\\277tests/smoke.hurl"\nold mode 100644\nnew mode 100755\n',
+    );
+    // `\uFEFFtests/smoke.hurl` does NOT start with `tests/`, so preserving BOM keeps it distinct from `tests/smoke.hurl`!
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${bomRenamePatch}` },
+      }),
+    ).toBeNull();
+
+    const leadingSpaceRenamePatch = join(wb, "leading-space-rename.patch");
+    writeFileSync(
+      leadingSpaceRenamePatch,
+      "rename from other.md\nrename to  tests/smoke.hurl\n",
+    );
+    // ` tests/smoke.hurl` has a leading space so it does NOT falsely match `tests/**/*.hurl`!
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${leadingSpaceRenamePatch}` },
+      }),
+    ).toBeNull();
   });
 });

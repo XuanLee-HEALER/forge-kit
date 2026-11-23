@@ -1909,6 +1909,20 @@ function parseShellRedirections(
   return { writeTargets, readInputs, strippedSeg: strippedParts.join("") };
 }
 
+const STRICT_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+const PATCH_HEADER_PREFIXES = [
+  Buffer.from("diff --git "),
+  Buffer.from("--- "),
+  Buffer.from("+++ "),
+  Buffer.from("*** "),
+  Buffer.from("rename from "),
+  Buffer.from("rename to "),
+  Buffer.from("copy from "),
+  Buffer.from("copy to "),
+  Buffer.from("Index: "),
+];
+
 function decodeGitCQuotedPath(quoted: string): string | null {
   if (!quoted.startsWith('"') || !quoted.endsWith('"') || quoted.length < 2) return null;
   const inner = quoted.slice(1, -1);
@@ -1947,7 +1961,7 @@ function decodeGitCQuotedPath(quoted: string): string | null {
     }
   }
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+    return STRICT_UTF8_DECODER.decode(new Uint8Array(bytes));
   } catch {
     return null;
   }
@@ -1979,6 +1993,14 @@ function readGitDiffHeaderToken(
   return { value: s.slice(start, end), nextIdx: end };
 }
 
+function bufferStartsWith(buf: Uint8Array, start: number, end: number, prefix: Uint8Array): boolean {
+  if (end - start < prefix.length) return false;
+  for (let i = 0; i < prefix.length; i++) {
+    if (buf[start + i] !== prefix[i]) return false;
+  }
+  return true;
+}
+
 function extractPatchFileTargets(
   patchAbsPath: string,
   baseDir: string,
@@ -1990,7 +2012,7 @@ function extractPatchFileTargets(
     if (!st.isFile() || st.size > 4 * 1024 * 1024) {
       return { targets: [], uninspectable: true };
     }
-    const content = readFileSync(patchAbsPath, "utf8");
+    const rawBuf = readFileSync(patchAbsPath);
     const out: string[] = [];
     let anyUninspectableHeader = false;
 
@@ -2070,31 +2092,54 @@ function extractPatchFileTargets(
       return null;
     };
 
-    for (const line of content.split(/\r?\n/)) {
-      if (line.startsWith("diff --git ")) {
-        const pair = parseDiffGitLine(line);
-        if (!pair) {
-          // Fail closed unconditionally on any ambiguous or malformed `diff --git` header
+    // Scan lines at the byte level and strictly UTF-8 decode header lines (fatal + ignoreBOM)
+    // so invalid literal bytes (e.g. 0xff) are never silently mangled into U+FFFD before validation!
+    let lineStart = 0;
+    while (lineStart <= rawBuf.length) {
+      let lineEnd = rawBuf.indexOf(0x0a, lineStart);
+      if (lineEnd < 0) lineEnd = rawBuf.length;
+      const trimmedEnd =
+        lineEnd > lineStart && rawBuf[lineEnd - 1] === 0x0d ? lineEnd - 1 : lineEnd;
+      const isHeader = PATCH_HEADER_PREFIXES.some((pfx) =>
+        bufferStartsWith(rawBuf, lineStart, trimmedEnd, pfx),
+      );
+      if (isHeader) {
+        let line: string;
+        try {
+          line = STRICT_UTF8_DECODER.decode(rawBuf.subarray(lineStart, trimmedEnd));
+        } catch {
           anyUninspectableHeader = true;
-        } else {
-          const r1 = pushPath(pair[0], true, true);
-          const r2 = pushPath(pair[1], true, true);
-          if (r1 === "invalid" || r2 === "invalid") anyUninspectableHeader = true;
+          lineStart = lineEnd + 1;
+          continue;
         }
-        continue;
+        if (line.startsWith("diff --git ")) {
+          const pair = parseDiffGitLine(line);
+          if (!pair) {
+            // Fail closed unconditionally on any ambiguous or malformed `diff --git` header
+            anyUninspectableHeader = true;
+          } else {
+            const r1 = pushPath(pair[0], true, true);
+            const r2 = pushPath(pair[1], true, true);
+            if (r1 === "invalid" || r2 === "invalid") anyUninspectableHeader = true;
+          }
+        } else {
+          const std = line.match(/^(?:---|\+\+\+|\*\*\*) ([^\t\r\n]+)/);
+          if (std) {
+            const res = pushPath(std[1], true);
+            if (res === "invalid") anyUninspectableHeader = true;
+          } else {
+            const metaPath = line.match(
+              /^(?:rename from|rename to|copy from|copy to|Index:) ([^\r\n]+)/,
+            );
+            if (metaPath) {
+              const res = pushPath(metaPath[1], false);
+              if (res === "invalid") anyUninspectableHeader = true;
+            }
+          }
+        }
       }
-      const std = line.match(/^(?:---|\+\+\+|\*\*\*)[ ]+([^\t\r\n]+)/);
-      if (std) {
-        const res = pushPath(std[1], true);
-        if (res === "invalid") anyUninspectableHeader = true;
-        continue;
-      }
-      const metaPath = line.match(/^(?:rename from|rename to|copy from|copy to|Index:)[ ]+([^\r\n]+)/);
-      if (metaPath) {
-        const res = pushPath(metaPath[1], false);
-        if (res === "invalid") anyUninspectableHeader = true;
-        continue;
-      }
+      if (lineEnd === rawBuf.length) break;
+      lineStart = lineEnd + 1;
     }
     // Fail closed if a readable patch yielded zero recognized target paths or any header was uninspectable
     if (out.length === 0 || anyUninspectableHeader) {
