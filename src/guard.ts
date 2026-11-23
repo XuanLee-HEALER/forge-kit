@@ -1912,11 +1912,13 @@ function parseShellRedirections(
 function decodeGitCQuotedPath(quoted: string): string | null {
   if (!quoted.startsWith('"') || !quoted.endsWith('"') || quoted.length < 2) return null;
   const inner = quoted.slice(1, -1);
+  if (inner.includes("\0")) return null;
   const bytes: number[] = [];
   for (let i = 0; i < inner.length; i++) {
     const ch = inner[i];
     if (ch !== "\\") {
       const cp = inner.codePointAt(i)!;
+      if (cp === 0) return null;
       const full = String.fromCodePoint(cp);
       pushUtf8Bytes(bytes, full);
       if (full.length > 1) i += full.length - 1;
@@ -1944,7 +1946,11 @@ function decodeGitCQuotedPath(quoted: string): string | null {
       return null;
     }
   }
-  return Buffer.from(bytes).toString("utf8");
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+  } catch {
+    return null;
+  }
 }
 
 function readGitDiffHeaderToken(
@@ -1986,22 +1992,24 @@ function extractPatchFileTargets(
     }
     const content = readFileSync(patchAbsPath, "utf8");
     const out: string[] = [];
-    let anyUnresolvedAmbiguousSection = false;
-    let currentSectionAmbiguous = false;
+    let anyUninspectableHeader = false;
 
     const pushPath = (
       rawPath: string,
       defaultStripIfPrefixed: boolean,
       alreadyDecoded = false,
     ): "pushed" | "devnull" | "invalid" => {
-      let raw = rawPath.trim();
-      if (!alreadyDecoded && raw.startsWith('"')) {
-        const decoded = decodeGitCQuotedPath(raw);
-        if (decoded === null) return "invalid";
-        raw = decoded;
+      let raw = rawPath;
+      if (!alreadyDecoded) {
+        if (raw.startsWith('"')) {
+          const decoded = decodeGitCQuotedPath(raw);
+          if (decoded === null) return "invalid";
+          raw = decoded;
+        }
       }
+      if (raw.includes("\0")) return "invalid";
       if (!raw || raw === "/dev/null") return "devnull";
-      const parts = raw.split("/").filter(Boolean);
+      const parts = raw.split("/").filter((seg) => seg.length > 0);
       const effectiveStrip =
         stripLevel !== null
           ? defaultStripIfPrefixed
@@ -2018,7 +2026,7 @@ function extractPatchFileTargets(
 
     const parseDiffGitLine = (line: string): [string, string] | null => {
       const rest = line.slice("diff --git ".length);
-      if (!rest) return null;
+      if (!rest || rest.includes("\0")) return null;
       // 1. C-quoted path(s) (handles spaces, escaped quotes, and octal UTF-8 bytes like `\303\251`)
       if (rest.includes('"')) {
         const first = readGitDiffHeaderToken(rest, 0);
@@ -2064,36 +2072,32 @@ function extractPatchFileTargets(
 
     for (const line of content.split(/\r?\n/)) {
       if (line.startsWith("diff --git ")) {
-        if (currentSectionAmbiguous) anyUnresolvedAmbiguousSection = true;
-        currentSectionAmbiguous = false;
         const pair = parseDiffGitLine(line);
-        if (pair) {
+        if (!pair) {
+          // Fail closed unconditionally on any ambiguous or malformed `diff --git` header
+          anyUninspectableHeader = true;
+        } else {
           const r1 = pushPath(pair[0], true, true);
           const r2 = pushPath(pair[1], true, true);
-          if (r1 === "invalid" || r2 === "invalid") currentSectionAmbiguous = true;
-        } else {
-          currentSectionAmbiguous = true;
+          if (r1 === "invalid" || r2 === "invalid") anyUninspectableHeader = true;
         }
         continue;
       }
-      const std = line.match(/^(?:---|\+\+\+|\*\*\*)\s+([^\t\r\n]+)/);
+      const std = line.match(/^(?:---|\+\+\+|\*\*\*)[ ]+([^\t\r\n]+)/);
       if (std) {
         const res = pushPath(std[1], true);
-        if (res === "invalid") anyUnresolvedAmbiguousSection = true;
-        else if (res === "pushed") currentSectionAmbiguous = false;
+        if (res === "invalid") anyUninspectableHeader = true;
         continue;
       }
-      const metaPath = line.match(/^(?:rename from|rename to|copy from|copy to|Index:)\s+([^\r\n]+)/);
+      const metaPath = line.match(/^(?:rename from|rename to|copy from|copy to|Index:)[ ]+([^\r\n]+)/);
       if (metaPath) {
         const res = pushPath(metaPath[1], false);
-        if (res === "invalid") anyUnresolvedAmbiguousSection = true;
-        else if (res === "pushed") currentSectionAmbiguous = false;
+        if (res === "invalid") anyUninspectableHeader = true;
         continue;
       }
     }
-    if (currentSectionAmbiguous) anyUnresolvedAmbiguousSection = true;
-    // Fail closed if a readable patch yielded zero recognized target paths or any section stayed ambiguous
-    if (out.length === 0 || anyUnresolvedAmbiguousSection) {
+    // Fail closed if a readable patch yielded zero recognized target paths or any header was uninspectable
+    if (out.length === 0 || anyUninspectableHeader) {
       return { targets: [], uninspectable: true };
     }
     return { targets: [...new Set(out)], uninspectable: false };

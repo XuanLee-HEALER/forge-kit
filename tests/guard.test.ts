@@ -881,5 +881,89 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         tool_input: { command: `git apply ${utf8ModePatch}` },
       }),
     ).toContain("冻结测试防篡改");
+
+    // Round 6 regressions:
+    // 9. Mixed-format patch (ambiguous mode-only section + blank line + traditional `---`/`+++`) fails closed!
+    const mixedFormatPatch = join(wb, "mixed-format.patch");
+    writeFileSync(
+      mixedFormatPatch,
+      [
+        "diff --git old/plan notes.md newer/plan notes.md",
+        "old mode 100644",
+        "new mode 100755",
+        "",
+        "--- a/readme.md",
+        "+++ b/readme.md",
+        "@@ -1 +1 @@",
+        "-a",
+        "+b",
+      ].join("\n") + "\n",
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${mixedFormatPatch}` },
+      }),
+    ).toContain("冻结测试防篡改");
+
+    // 10. Invalid UTF-8 octal (`\377`), literal NUL byte, and malformed `\q` header followed by `---`/`+++` ALL fail closed!
+    const badUtf8Patch = join(wb, "bad-utf8.patch");
+    writeFileSync(
+      badUtf8Patch,
+      'diff --git "a/x\\377.md" "b/x\\377.md"\nold mode 100644\nnew mode 100755\n',
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${badUtf8Patch}` },
+      }),
+    ).toContain("冻结测试防篡改");
+
+    const litNulPatch = join(wb, "lit-nul.patch");
+    writeFileSync(
+      litNulPatch,
+      'diff --git "a/x\0z.md" "b/x\0z.md"\nold mode 100644\nnew mode 100755\n',
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${litNulPatch}` },
+      }),
+    ).toContain("冻结测试防篡改");
+
+    const badEscWithStdPatch = join(wb, "bad-esc-std.patch");
+    writeFileSync(
+      badEscWithStdPatch,
+      'diff --git "a/\\q.md" "b/\\q.md"\n--- a/readme.md\n+++ b/readme.md\n@@ -1 +1 @@\n-a\n+b\n',
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${badEscWithStdPatch}` },
+      }),
+    ).toContain("冻结测试防篡改");
+
+    // 11. Trailing space in quoted filename is preserved (does NOT silently match `tests/café.hurl` without space!)
+    const trailingSpacePatch = join(wb, "trailing-space.patch");
+    writeFileSync(
+      trailingSpacePatch,
+      'diff --git "a/tests/caf\\303\\251.hurl " "b/tests/caf\\303\\251.hurl "\nold mode 100644\nnew mode 100755\n',
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${trailingSpacePatch}` },
+      }),
+    ).toBeNull();
   });
 });
