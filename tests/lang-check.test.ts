@@ -275,6 +275,42 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks) and ledg
       ),
     ).toEqual([]);
 
+    // Round 4 regression: malformed skipped row or null entry in JSON `checks` MUST fail closed (never throw or pass)!
+    expect(
+      classifyPostToolEvidence(
+        `.workbench/bin/lang-check ${repoA} --mode all --json`,
+        dir,
+        1,
+        JSON.stringify({
+          executed: 2,
+          failed: 1,
+          ok: false,
+          checks: [
+            { phase: "static", status: "pass" },
+            { phase: "dynamic", status: "fail" },
+            { phase: "typo", status: "skipped" },
+          ],
+        }),
+      ),
+    ).toEqual([]);
+    expect(
+      classifyPostToolEvidence(
+        `.workbench/bin/lang-check ${repoA} --mode all --json`,
+        dir,
+        1,
+        JSON.stringify({
+          executed: 2,
+          failed: 1,
+          ok: false,
+          checks: [
+            { phase: "static", status: "pass" },
+            { phase: "dynamic", status: "fail" },
+            null,
+          ],
+        }),
+      ),
+    ).toEqual([]);
+
     // 8. Go boolean `-buildvcs` does NOT consume `../mock-api` package operand!
     const goBuildVcs = classifyPostToolEvidence("go test -buildvcs ../mock-api", repoB, 0, "ok");
     expect(goBuildVcs.length).toBe(1);

@@ -1941,28 +1941,74 @@ function extractPatchFileTargets(
       }
     };
 
+    let ambiguousDiffGit = false;
+    let sawExplicitTargetLine = false;
+    const parseDiffGitLine = (line: string): [string, string] | null => {
+      const rest = line.slice("diff --git ".length);
+      if (!rest) return null;
+      // 1. Quoted path(s): parse two shell-like tokens supporting C-quoted `"..."`
+      if (rest.includes('"')) {
+        const toks = splitShellTokens(rest);
+        if (toks && toks.length === 2 && toks[0] && toks[1]) {
+          return [toks[0], toks[1]];
+        }
+        return null;
+      }
+      // 2. Unquoted identical path with optional spaces (e.g. `a/plan notes.md b/plan notes.md`)
+      if (rest.length % 2 === 1) {
+        const mid = (rest.length - 1) / 2;
+        if (rest[mid] === " ") {
+          const left = rest.slice(0, mid);
+          const right = rest.slice(mid + 1);
+          const lSlash = left.indexOf("/");
+          const rSlash = right.indexOf("/");
+          if (lSlash > 0 && rSlash > 0 && left.slice(lSlash + 1) === right.slice(rSlash + 1)) {
+            return [left, right];
+          }
+        }
+      }
+      // 3. Unquoted rename/different paths with spaces separated by unique ` b/` boundary
+      const bMatches = [...rest.matchAll(/ (b\/)/g)];
+      if (bMatches.length === 1 && bMatches[0].index !== undefined) {
+        const idx = bMatches[0].index;
+        const left = rest.slice(0, idx);
+        const right = rest.slice(idx + 1);
+        if (left && right) return [left, right];
+      }
+      // 4. Plain two whitespace-separated paths without internal spaces
+      const plain = rest.split(" ");
+      if (plain.length === 2 && plain[0] && plain[1]) {
+        return [plain[0], plain[1]];
+      }
+      return null;
+    };
+
     for (const line of content.split(/\r?\n/)) {
       const std = line.match(/^(?:---|\+\+\+|\*\*\*)\s+([^\t\r\n]+)/);
       if (std) {
+        sawExplicitTargetLine = true;
         pushPath(std[1], true);
         continue;
       }
-      const gitDiff = line.match(/^diff --git\s+(?:"([^"]+)"|(\S+))\s+(?:"([^"]+)"|(\S+))/);
-      if (gitDiff) {
-        const p1 = gitDiff[1] ?? gitDiff[2];
-        const p2 = gitDiff[3] ?? gitDiff[4];
-        if (p1) pushPath(p1, true);
-        if (p2) pushPath(p2, true);
+      if (line.startsWith("diff --git ")) {
+        const pair = parseDiffGitLine(line);
+        if (pair) {
+          pushPath(pair[0], true);
+          pushPath(pair[1], true);
+        } else {
+          ambiguousDiffGit = true;
+        }
         continue;
       }
       const metaPath = line.match(/^(?:rename from|rename to|copy from|copy to|Index:)\s+([^\r\n]+)/);
       if (metaPath) {
+        sawExplicitTargetLine = true;
         pushPath(metaPath[1], false);
         continue;
       }
     }
-    // Fail closed if a readable patch yielded zero recognized target paths (e.g. unknown diff format)
-    if (out.length === 0) {
+    // Fail closed if a readable patch yielded zero recognized target paths or an unparseable diff --git header
+    if (out.length === 0 || (ambiguousDiffGit && !sawExplicitTargetLine)) {
       return { targets: [], uninspectable: true };
     }
     return { targets: [...new Set(out)], uninspectable: false };
@@ -2558,7 +2604,7 @@ export function checkSpecAndTestLocks(
                 const a = subArgs[j];
                 if (a === "--") {
                   for (const pf of subArgs.slice(j + 1)) {
-                    patchFiles.push(canonicalizeMaybePath(resolve(effectiveCwd, pf)));
+                    patchFiles.push(canonicalizeMaybePath(resolve(gitDir, pf)));
                   }
                   break;
                 }
@@ -2570,9 +2616,20 @@ export function checkSpecAndTestLocks(
                   hasExplicitApplyFlag = true;
                   continue;
                 }
-                if (a === "--build-fake-ancestor" || a.startsWith("--build-fake-ancestor=")) {
+                if (a === "--build-fake-ancestor") {
                   hasFakeAncestorFlag = true;
-                  if (a === "--build-fake-ancestor") j++;
+                  const target = subArgs[++j];
+                  if (target) {
+                    candidateTargets.push(canonicalizeMaybePath(resolve(gitDir, target)));
+                  }
+                  continue;
+                }
+                if (a.startsWith("--build-fake-ancestor=")) {
+                  hasFakeAncestorFlag = true;
+                  const target = a.slice("--build-fake-ancestor=".length);
+                  if (target) {
+                    candidateTargets.push(canonicalizeMaybePath(resolve(gitDir, target)));
+                  }
                   continue;
                 }
                 if (a === "-p" && subArgs[j + 1] !== undefined) {
@@ -2584,12 +2641,25 @@ export function checkSpecAndTestLocks(
                   stripLevel = Number(a.slice(2));
                   continue;
                 }
+                if (a === "--directory" && subArgs[j + 1] !== undefined) {
+                  applyDir = resolve(gitDir, subArgs[++j]);
+                  continue;
+                }
                 if (a.startsWith("--directory=")) {
                   applyDir = resolve(gitDir, a.slice("--directory=".length));
                   continue;
                 }
+                if (
+                  a === "--include" ||
+                  a === "--exclude" ||
+                  a === "--whitespace" ||
+                  a === "-C"
+                ) {
+                  j++;
+                  continue;
+                }
                 if (a.startsWith("-")) continue;
-                patchFiles.push(canonicalizeMaybePath(resolve(effectiveCwd, a)));
+                patchFiles.push(canonicalizeMaybePath(resolve(gitDir, a)));
               }
               // In git apply, `--apply` overrides `--stat`/`--numstat`/`--summary`/`--check` regardless of flag order!
               if (hasReportOrCheckFlag && !hasExplicitApplyFlag && !hasFakeAncestorFlag) continue;

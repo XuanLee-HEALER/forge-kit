@@ -2286,8 +2286,8 @@ export function classifyPostToolEvidence(
             }
           }
           if (parsedReport !== null) {
-            // Strict JSON schema & total reconciliation: require valid types for checks/executed/failed/ok
-            // and exact agreement between rows, declared counts, ok flag, and exit code!
+            // Strict JSON schema & total reconciliation: require valid types for checks/executed/failed/ok,
+            // validate EVERY entry in `checks` (including skipped rows), and enforce exact agreement!
             if (
               !Array.isArray(parsedReport.checks) ||
               typeof parsedReport.executed !== "number" ||
@@ -2300,16 +2300,18 @@ export function classifyPostToolEvidence(
             ) {
               continue;
             }
-            const nonSkipped = parsedReport.checks.filter((c) => c.status !== "skipped");
-            if (
-              !nonSkipped.every(
-                (c) =>
-                  (c.phase === "static" || c.phase === "dynamic") &&
-                  (c.status === "pass" || c.status === "fail"),
-              )
-            ) {
+            const allEntriesValid = parsedReport.checks.every(
+              (c): c is { phase: "static" | "dynamic"; status: "pass" | "fail" | "skipped" } =>
+                c !== null &&
+                typeof c === "object" &&
+                !Array.isArray(c) &&
+                (c.phase === "static" || c.phase === "dynamic") &&
+                (c.status === "pass" || c.status === "fail" || c.status === "skipped"),
+            );
+            if (!allEntriesValid) {
               continue;
             }
+            const nonSkipped = parsedReport.checks.filter((c) => c.status !== "skipped");
             const staticRan = nonSkipped.filter((c) => c.phase === "static");
             const dynamicRan = nonSkipped.filter((c) => c.phase === "dynamic");
             const totalRan = staticRan.length + dynamicRan.length;

@@ -787,5 +787,58 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         tool_input: { command: `git apply ${unknownPatch}` },
       }),
     ).toContain("冻结测试防篡改");
+
+    // Round 4 regressions:
+    // 4. Mode-only Git patch with spaces in filename targeting locked Hurl MUST be caught!
+    const spacedModePatch = join(wb, "spaced-mode.patch");
+    writeFileSync(
+      spacedModePatch,
+      `diff --git a/tests/smoke case.hurl b/tests/smoke case.hurl\nold mode 100644\nnew mode 100755\n`,
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${spacedModePatch}` },
+      }),
+    ).toContain("冻结测试防篡改");
+
+    // 5. `--build-fake-ancestor` destination file is checked against lock matching (both spaced & `=` forms)!
+    const benignPatch = join(wb, "benign.patch");
+    writeFileSync(
+      benignPatch,
+      `--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old\n+new\n`,
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wb,
+        tool_name: "exec_command",
+        tool_input: {
+          command: `git apply --build-fake-ancestor .workbench/specs/20261123-wt/ssot.md ${benignPatch}`,
+        },
+      }),
+    ).toContain("冻结 Spec 保护");
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wb,
+        tool_name: "exec_command",
+        tool_input: {
+          command: `git apply --build-fake-ancestor=.workbench/specs/20261123-wt/ssot.md ${benignPatch}`,
+        },
+      }),
+    ).toContain("冻结 Spec 保护");
+
+    // 6. Spaced `git apply --directory app-api` resolves benign patch cleanly without false denial!
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wb,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply --directory app-api ${benignPatch}` },
+      }),
+    ).toBeNull();
   });
 });
