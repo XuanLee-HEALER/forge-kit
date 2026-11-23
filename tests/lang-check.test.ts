@@ -89,6 +89,7 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks) and ledg
       JSON.stringify({
         ok: true,
         executed: 2,
+        failed: 0,
         checks: [
           { phase: "static", status: "pass" },
           { phase: "dynamic", status: "pass" },
@@ -105,6 +106,7 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks) and ledg
       JSON.stringify({
         ok: true,
         executed: 1,
+        failed: 0,
         checks: [{ phase: "static", status: "pass" }],
       }),
     );
@@ -204,13 +206,78 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks) and ledg
       classifyPostToolEvidence(`.workbench/bin/lang-check ${repoA}`, dir, 1, truncatedAllText),
     ).toEqual([]);
 
-    // 5. `bunx eslint --print-config` is rejected; bare `eslint ../mock-api` is recognized & attributed!
+    // 5. `bunx eslint --print-config` & `eslint --env-info` are rejected; bare `eslint ../mock-api` is recognized & attributed!
     expect(
       classifyPostToolEvidence("bunx eslint --print-config ../mock-api/index.ts", repoB, 0, "{}"),
+    ).toEqual([]);
+    expect(
+      classifyPostToolEvidence("eslint --env-info", repoB, 0, "Environment Info:"),
     ).toEqual([]);
     const bareEslint = classifyPostToolEvidence("eslint ../mock-api", repoB, 0, "");
     expect(bareEslint.length).toBe(1);
     expect(bareEslint[0]?.kind).toBe("lint");
     expect(bareEslint[0]?.targetDir).toBe(repoA);
+
+    // Round 3 regressions:
+    // 6. Indented diagnostic quoting `[FAIL] (ts/dynamic)` is NOT counted as a check row!
+    const diagQuotedTruncated = [
+      "lang-check (all) [ts, python] -> executed=3, failed=2, ok=false",
+      "  [PASS] (ts/static) tsc-noEmit",
+      "  [FAIL] (ts/dynamic) bun-test-strict",
+      "    AssertionError: expected [FAIL] (ts/dynamic) in output",
+    ].join("\n");
+    expect(
+      classifyPostToolEvidence(`.workbench/bin/lang-check ${repoA}`, dir, 1, diagQuotedTruncated),
+    ).toEqual([]);
+    const diagQuotedComplete = [
+      diagQuotedTruncated,
+      "  [FAIL] (python/static) ruff-check",
+    ].join("\n");
+    expect(
+      classifyPostToolEvidence(`.workbench/bin/lang-check ${repoA}`, dir, 1, diagQuotedComplete).map(
+        (e) => `${e.kind}:${e.status}`,
+      ),
+    ).toEqual(["lint:fail", "test:fail"]);
+
+    // 7. Incomplete / string-typed / contradictory JSON reports MUST fail closed!
+    expect(
+      classifyPostToolEvidence(
+        `.workbench/bin/lang-check ${repoA} --mode all --json`,
+        dir,
+        1,
+        JSON.stringify({ checks: [{ phase: "static", status: "pass" }, { phase: "dynamic", status: "fail" }] }),
+      ),
+    ).toEqual([]);
+    expect(
+      classifyPostToolEvidence(
+        `.workbench/bin/lang-check ${repoA} --mode all --json`,
+        dir,
+        1,
+        JSON.stringify({
+          executed: "3",
+          failed: "2",
+          ok: "false",
+          checks: [{ phase: "static", status: "pass" }, { phase: "dynamic", status: "fail" }],
+        }),
+      ),
+    ).toEqual([]);
+    expect(
+      classifyPostToolEvidence(
+        `.workbench/bin/lang-check ${repoA} --mode all --json`,
+        dir,
+        0,
+        JSON.stringify({
+          executed: 2,
+          failed: 1,
+          ok: true,
+          checks: [{ phase: "static", status: "pass" }, { phase: "dynamic", status: "fail" }],
+        }),
+      ),
+    ).toEqual([]);
+
+    // 8. Go boolean `-buildvcs` does NOT consume `../mock-api` package operand!
+    const goBuildVcs = classifyPostToolEvidence("go test -buildvcs ../mock-api", repoB, 0, "ok");
+    expect(goBuildVcs.length).toBe(1);
+    expect(goBuildVcs[0]?.targetDir).toBe(repoA);
   });
 });

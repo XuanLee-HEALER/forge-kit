@@ -809,6 +809,7 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
         tok.startsWith("--print-config=") ||
         tok === "--init" ||
         tok === "--inspect-config" ||
+        tok === "--env-info" ||
         tok === "-v" ||
         tok === "--version" ||
         tok === "-h" ||
@@ -1104,7 +1105,6 @@ function resolveVerifyTargetDir(
       "-p",
       "-asmflags",
       "-buildmode",
-      "-buildvcs",
       "-compiler",
       "-gccgoflags",
       "-gcflags",
@@ -2285,25 +2285,43 @@ export function classifyPostToolEvidence(
               parsedReport = null;
             }
           }
-          if (
-            parsedReport?.checks &&
-            (typeof parsedReport.executed !== "number" || parsedReport.executed > 0)
-          ) {
-            const staticRan = parsedReport.checks.filter(
-              (c) => c.phase === "static" && c.status !== "skipped",
-            );
-            const dynamicRan = parsedReport.checks.filter(
-              (c) => c.phase === "dynamic" && c.status !== "skipped",
-            );
+          if (parsedReport !== null) {
+            // Strict JSON schema & total reconciliation: require valid types for checks/executed/failed/ok
+            // and exact agreement between rows, declared counts, ok flag, and exit code!
+            if (
+              !Array.isArray(parsedReport.checks) ||
+              typeof parsedReport.executed !== "number" ||
+              !Number.isInteger(parsedReport.executed) ||
+              parsedReport.executed <= 0 ||
+              typeof parsedReport.failed !== "number" ||
+              !Number.isInteger(parsedReport.failed) ||
+              parsedReport.failed < 0 ||
+              typeof parsedReport.ok !== "boolean"
+            ) {
+              continue;
+            }
+            const nonSkipped = parsedReport.checks.filter((c) => c.status !== "skipped");
+            if (
+              !nonSkipped.every(
+                (c) =>
+                  (c.phase === "static" || c.phase === "dynamic") &&
+                  (c.status === "pass" || c.status === "fail"),
+              )
+            ) {
+              continue;
+            }
+            const staticRan = nonSkipped.filter((c) => c.phase === "static");
+            const dynamicRan = nonSkipped.filter((c) => c.phase === "dynamic");
             const totalRan = staticRan.length + dynamicRan.length;
-            const totalFailed =
-              staticRan.filter((c) => c.status !== "pass").length +
-              dynamicRan.filter((c) => c.status !== "pass").length;
-            const countsConsistent =
-              (typeof parsedReport.executed !== "number" || parsedReport.executed === totalRan) &&
-              (typeof parsedReport.failed !== "number" || parsedReport.failed === totalFailed) &&
-              (typeof parsedReport.ok !== "boolean" || parsedReport.ok === passed);
-            if (!countsConsistent || (!passed && totalFailed === 0)) continue;
+            const totalFailed = nonSkipped.filter((c) => c.status === "fail").length;
+            if (
+              totalRan !== parsedReport.executed ||
+              totalFailed !== parsedReport.failed ||
+              parsedReport.ok !== (parsedReport.failed === 0) ||
+              parsedReport.ok !== passed
+            ) {
+              continue;
+            }
             if (staticRan.length > 0) {
               phases.push({
                 kind: "lint",
@@ -2318,41 +2336,59 @@ export function classifyPostToolEvidence(
             }
           } else {
             // Non-JSON summary output: require a complete `lang-check (...) -> executed=N, failed=M, ok=...`
-            // header AND reconcile the exact count of parsed `[PASS]`/`[FAIL]` rows against declared totals
-            // so truncated reports can NEVER flip a missing failure into a false phase pass!
-            const headerMatch = outputText.match(
-              /lang-check\s+\((?:static|dynamic|all)\)\s+\[[^\]]*\]\s*->\s*executed=(\d+),\s*failed=(\d+),\s*ok=(true|false)/,
-            );
-            if (!headerMatch) continue;
-            const declaredExecuted = Number(headerMatch[1]);
-            const declaredFailed = Number(headerMatch[2]);
-            const declaredOk = headerMatch[3] === "true";
-            const staticMatches = [...outputText.matchAll(/\[(PASS|FAIL)\]\s+\([^/]+\/static\)/g)];
-            const dynamicMatches = [...outputText.matchAll(/\[(PASS|FAIL)\]\s+\([^/]+\/dynamic\)/g)];
-            const totalParsed = staticMatches.length + dynamicMatches.length;
+            // header line AND match ONLY 2-space-indented check rows (`  [PASS|FAIL] (lang/phase) ...`)
+            // after the header (never 4-space diagnostic excerpt lines!), reconciling exact row & fail counts.
+            const lines = outputText.split(/\r?\n/);
+            let headerIdx = -1;
+            let declaredExecuted = -1;
+            let declaredFailed = -1;
+            let declaredOk = false;
+            for (let li = 0; li < lines.length; li++) {
+              const hm = lines[li].match(
+                /^lang-check\s+\((?:static|dynamic|all)\)\s+\[[^\]]*\]\s*->\s*executed=(\d+),\s*failed=(\d+),\s*ok=(true|false)$/,
+              );
+              if (hm) {
+                headerIdx = li;
+                declaredExecuted = Number(hm[1]);
+                declaredFailed = Number(hm[2]);
+                declaredOk = hm[3] === "true";
+                break;
+              }
+            }
+            if (headerIdx < 0) continue;
+            const staticStatuses: Array<"PASS" | "FAIL"> = [];
+            const dynamicStatuses: Array<"PASS" | "FAIL"> = [];
+            for (let li = headerIdx + 1; li < lines.length; li++) {
+              const rm = lines[li].match(
+                /^  \[(PASS|FAIL)\] \((?:go|ts|python)\/(static|dynamic)\) .+$/,
+              );
+              if (!rm) continue;
+              if (rm[2] === "static") staticStatuses.push(rm[1] as "PASS" | "FAIL");
+              else dynamicStatuses.push(rm[1] as "PASS" | "FAIL");
+            }
+            const totalParsed = staticStatuses.length + dynamicStatuses.length;
             const totalFailed =
-              staticMatches.filter((m) => m[1] !== "PASS").length +
-              dynamicMatches.filter((m) => m[1] !== "PASS").length;
+              staticStatuses.filter((s) => s !== "PASS").length +
+              dynamicStatuses.filter((s) => s !== "PASS").length;
             if (
               declaredExecuted <= 0 ||
               totalParsed !== declaredExecuted ||
               totalFailed !== declaredFailed ||
-              declaredOk !== passed ||
-              (passed && declaredFailed > 0) ||
-              (!passed && declaredFailed === 0)
+              declaredOk !== (declaredFailed === 0) ||
+              declaredOk !== passed
             ) {
               continue;
             }
-            if (staticMatches.length > 0) {
+            if (staticStatuses.length > 0) {
               phases.push({
                 kind: "lint",
-                status: staticMatches.every((m) => m[1] === "PASS") ? "pass" : "fail",
+                status: staticStatuses.every((s) => s === "PASS") ? "pass" : "fail",
               });
             }
-            if (dynamicMatches.length > 0) {
+            if (dynamicStatuses.length > 0) {
               phases.push({
                 kind: "test",
-                status: dynamicMatches.every((m) => m[1] === "PASS") ? "pass" : "fail",
+                status: dynamicStatuses.every((s) => s === "PASS") ? "pass" : "fail",
               });
             }
           }

@@ -736,5 +736,56 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         tool_input: { command: `patch -p0 -i ${missingPatch}` },
       }),
     ).toContain("冻结 Spec 保护");
+
+    // Round 3 regressions:
+    // 1. `git apply --stat --apply` (and `--apply --check`) ACTUALLY applies -> MUST be denied!
+    const gitSpecPatch = join(wb, "git-spec.patch");
+    writeFileSync(
+      gitSpecPatch,
+      `--- a/.workbench/specs/20261123-wt/ssot.md\n+++ b/.workbench/specs/20261123-wt/ssot.md\n@@ -1 +1 @@\n-# SSOT\n+# HACKED\n`,
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wb,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply --stat --apply ${gitSpecPatch}` },
+      }),
+    ).toContain("冻结 Spec 保护");
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wb,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply -p0 --apply --check ${patchFile}` },
+      }),
+    ).toContain("冻结 Spec 保护");
+
+    // 2. Metadata-only Git rename patch (no `---`/`+++` headers) targeting locked Hurl MUST be caught!
+    const renamePatch = join(wb, "rename.patch");
+    writeFileSync(
+      renamePatch,
+      `diff --git a/tests/smoke.hurl b/tests/renamed.hurl\nsimilarity index 100%\nrename from tests/smoke.hurl\nrename to tests/renamed.hurl\n`,
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${renamePatch}` },
+      }),
+    ).toContain("冻结测试防篡改");
+
+    // 3. Readable patch with unrecognized/empty headers MUST fail closed on locked dir!
+    const unknownPatch = join(wb, "unknown.patch");
+    writeFileSync(unknownPatch, "GIT binary patch\nliteral 0\n");
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${unknownPatch}` },
+      }),
+    ).toContain("冻结测试防篡改");
   });
 });

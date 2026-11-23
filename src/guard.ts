@@ -1922,25 +1922,50 @@ function extractPatchFileTargets(
     }
     const content = readFileSync(patchAbsPath, "utf8");
     const out: string[] = [];
-    for (const line of content.split(/\r?\n/)) {
-      const m = line.match(/^(?:---|\+\+\+)\s+([^\t\r\n]+)/);
-      if (!m) continue;
-      let raw = m[1].trim();
+    const pushPath = (rawPath: string, defaultStripIfPrefixed: boolean): void => {
+      let raw = rawPath.trim();
       if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1);
-      if (!raw || raw === "/dev/null") continue;
+      if (!raw || raw === "/dev/null") return;
       const parts = raw.replace(/\\/g, "/").split("/").filter(Boolean);
       const effectiveStrip =
         stripLevel !== null
-          ? stripLevel
-          : parts[0] === "a" || parts[0] === "b"
+          ? defaultStripIfPrefixed
+            ? stripLevel
+            : 0
+          : defaultStripIfPrefixed && (parts[0] === "a" || parts[0] === "b")
             ? 1
             : 0;
       const rel = parts.slice(effectiveStrip).join("/");
       if (rel) {
         out.push(canonicalizeMaybePath(resolve(baseDir, rel)));
       }
+    };
+
+    for (const line of content.split(/\r?\n/)) {
+      const std = line.match(/^(?:---|\+\+\+|\*\*\*)\s+([^\t\r\n]+)/);
+      if (std) {
+        pushPath(std[1], true);
+        continue;
+      }
+      const gitDiff = line.match(/^diff --git\s+(?:"([^"]+)"|(\S+))\s+(?:"([^"]+)"|(\S+))/);
+      if (gitDiff) {
+        const p1 = gitDiff[1] ?? gitDiff[2];
+        const p2 = gitDiff[3] ?? gitDiff[4];
+        if (p1) pushPath(p1, true);
+        if (p2) pushPath(p2, true);
+        continue;
+      }
+      const metaPath = line.match(/^(?:rename from|rename to|copy from|copy to|Index:)\s+([^\r\n]+)/);
+      if (metaPath) {
+        pushPath(metaPath[1], false);
+        continue;
+      }
     }
-    return { targets: out, uninspectable: false };
+    // Fail closed if a readable patch yielded zero recognized target paths (e.g. unknown diff format)
+    if (out.length === 0) {
+      return { targets: [], uninspectable: true };
+    }
+    return { targets: [...new Set(out)], uninspectable: false };
   } catch {
     return { targets: [], uninspectable: true };
   }
@@ -2525,7 +2550,9 @@ export function checkSpecAndTestLocks(
             } else if (git.subcmd === "apply") {
               let stripLevel: number | null = 1;
               let applyDir = gitDir;
-              let readOnlyCheck = false;
+              let hasReportOrCheckFlag = false;
+              let hasExplicitApplyFlag = false;
+              let hasFakeAncestorFlag = false;
               const patchFiles: string[] = [...redirReads];
               for (let j = 0; j < subArgs.length; j++) {
                 const a = subArgs[j];
@@ -2536,7 +2563,21 @@ export function checkSpecAndTestLocks(
                   break;
                 }
                 if (a === "--check" || a === "--stat" || a === "--numstat" || a === "--summary") {
-                  readOnlyCheck = true;
+                  hasReportOrCheckFlag = true;
+                  continue;
+                }
+                if (a === "--apply") {
+                  hasExplicitApplyFlag = true;
+                  continue;
+                }
+                if (a === "--build-fake-ancestor" || a.startsWith("--build-fake-ancestor=")) {
+                  hasFakeAncestorFlag = true;
+                  if (a === "--build-fake-ancestor") j++;
+                  continue;
+                }
+                if (a === "-p" && subArgs[j + 1] !== undefined) {
+                  const n = Number(subArgs[++j]);
+                  if (Number.isInteger(n) && n >= 0) stripLevel = n;
                   continue;
                 }
                 if (/^-p\d+$/.test(a)) {
@@ -2550,7 +2591,8 @@ export function checkSpecAndTestLocks(
                 if (a.startsWith("-")) continue;
                 patchFiles.push(canonicalizeMaybePath(resolve(effectiveCwd, a)));
               }
-              if (readOnlyCheck) continue;
+              // In git apply, `--apply` overrides `--stat`/`--numstat`/`--summary`/`--check` regardless of flag order!
+              if (hasReportOrCheckFlag && !hasExplicitApplyFlag && !hasFakeAncestorFlag) continue;
               let anyUninspectable = false;
               for (const pf of patchFiles) {
                 const parsed = extractPatchFileTargets(pf, applyDir, stripLevel);
