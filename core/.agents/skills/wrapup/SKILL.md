@@ -40,7 +40,8 @@ description: >
    - 核实后委派 `dev` 修改并执行仓内生成命令，逐项核对「行为变化—文档位置—生成结果」（纯文档变更核对协议结构未变）。
 6. **收敛核对与记账**：
    - 确认最终 `HEAD SHA` 与已审范围一致；精简若意外改变逻辑须补审。
-   - 确认 `.workbench/bin/ledger spec-status <task_id>`（如有冻结 Spec）无漂移，且 `ledger status` 中当前 SHA 的静态检查（`lint`）、验证与评审证据齐备、无未关闭 blocker。
+   - 确认 `.workbench/bin/ledger spec-status <task_id>`（如有冻结 Spec）无漂移，且无未关闭 blocker。
+   - **区分账本底线门禁与四层流程完备度**：账本的自动推送门禁仅核验最低机械底线（当前 SHA 静态检查 `lint` + 执行验证 `build/test/hurl` + 至少一项核心业务/质量评审通过且无任一失败角色），因为多轮精简/文档提交可能产生新 SHA；**`ready=true` 不等同于四层评审全部执行**，主线程仍须按本 SOP 完成四层评审（纯前端可跳过 `comments`），并在 `ledger status --task <task_id>` 与汇报中逐层列明各角色评审记录与最终 SHA。
 
 ## 余额不足时的统一自动回退（全 4 角色适用）
 

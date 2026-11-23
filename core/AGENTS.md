@@ -58,7 +58,7 @@
 - 仅针对 `.workbench/workbench.yaml` 登记的**业务仓库开发任务**；运维查数、查日志、沟通与 `one-off-scripts/` 无需开账本。
 - 账本通过 `.workbench/bin/ledger` 管理，**按任务建账、以 `(repo, branch)` 唯一路由**（跨仓任务用 `ledger attach` 挂入同一 `task_id`）。
 - `full` 开发周期的三件套文档（`ssot.md`、`tech-spec.md`、`test-spec.md`）默认存于 `.workbench/specs/<task_id>/`（仅用户主动要求时移入业务仓）；定稿后通过 `ledger freeze` 写入哈希链并由 `guard` 物理锁定（含锁定 Hurl 测试防篡改），周期内确需修改须经用户确认执行 `ledger amend` 并按依赖辐射重跑下游。
-- 被动 Hook 在 `git commit` / `git push` / `gh pr create` 前校验账本、静态检查与证据（`PostToolUse` 自动落证），并在新会话或压缩后回注活跃任务摘要；纯文档/注释/typo 极小改动可用 `ledger exempt` 豁免。
+- 被动 Hook 在 `git commit` / `git push` / `gh pr create` 前校验账本底线门禁（静态检查、执行验证、核心评审通过且无失败角色；完整四层评审覆盖由 `wrapup` SOP 推进并在 `ledger status` 审计），并在新会话或压缩后回注活跃任务摘要；纯文档/注释/typo 极小改动可用 `ledger exempt` 豁免。
 
 ## 模型与子代理调度
 

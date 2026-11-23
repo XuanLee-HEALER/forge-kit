@@ -654,14 +654,159 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         repo: "api-svc",
         sha: "2222bbbb",
       });
+      const readyAfter = ledger.checkPushReadiness({
+        task_id: "20261123-cycle",
+        repo: "api-svc",
+        head_sha: "2222bbbb",
+        checkEndpoint: true,
+      });
+      expect(readyAfter.ready).toBe(true);
+      expect(readyAfter.recordedReviewRoles).toEqual(["quality"]);
+      expect(ledger.verify().ok).toBe(true);
+    } finally {
+      ledger.closeDb();
+    }
+  });
+
+  test("freeze hardening: invalidates pre-freeze evidence, blocks re-freeze of drift/out-of-scope edits, and anchors symlinks to spec_dir", () => {
+    const ledger = new Ledger(dir);
+    try {
+      const { writeFileSync, symlinkSync, unlinkSync } = require("node:fs") as typeof import("node:fs");
+      const specDir = join(dir, ".workbench", "specs", "20261123-hard");
+      Bun.spawnSync(["mkdir", "-p", specDir]);
+      writeFileSync(join(dir, "AGENTS.md"), "# Workbench Agents\n");
+
+      ledger.openTask({
+        task_id: "20261123-hard",
+        title: "Freeze hardening checks",
+        endpoint: "local",
+        depth: "full",
+        repo: "api-svc",
+        branch: "feat/hard",
+        base_sha: "aaaa1111",
+        head_sha: "bbbb2222",
+      });
+
+      // Record lint + hurl + quality review BEFORE first freeze
+      ledger.recordEvidence({
+        task_id: "20261123-hard",
+        kind: "lint",
+        status: "pass",
+        summary: "pre-freeze lint",
+        repo: "api-svc",
+        sha: "bbbb2222",
+      });
+      ledger.recordEvidence({
+        task_id: "20261123-hard",
+        kind: "hurl",
+        status: "pass",
+        summary: "pre-freeze hurl",
+        repo: "api-svc",
+        sha: "bbbb2222",
+      });
+      ledger.recordEvidence({
+        task_id: "20261123-hard",
+        kind: "review",
+        status: "pass",
+        summary: "pre-freeze review",
+        repo: "api-svc",
+        sha: "bbbb2222",
+        meta: { role: "quality" },
+      });
       expect(
         ledger.checkPushReadiness({
-          task_id: "20261123-cycle",
+          task_id: "20261123-hard",
           repo: "api-svc",
-          head_sha: "2222bbbb",
-          checkEndpoint: true,
+          head_sha: "bbbb2222",
         }).ready,
       ).toBe(true);
+
+      // Symlink pointing inside workbench root (AGENTS.md) but OUTSIDE spec_dir MUST be rejected!
+      symlinkSync(join(dir, "AGENTS.md"), join(specDir, "ssot.md"));
+      writeFileSync(join(specDir, "tech-spec.md"), "# Tech\nok\n");
+      writeFileSync(join(specDir, "test-spec.md"), "# Test\nok\n");
+      expect(() => ledger.freezeSpec({ task_id: "20261123-hard" })).toThrow(
+        "resolves outside selected spec directory",
+      );
+
+      // Replace symlink with real file and perform first freeze -> MUST invalidate pre-freeze evidence!
+      unlinkSync(join(specDir, "ssot.md"));
+      writeFileSync(join(specDir, "ssot.md"), "# SSOT\nINV-1: server decides\n");
+      const f1 = ledger.freezeSpec({ task_id: "20261123-hard" });
+      expect(f1.spec.evidence_floor_seq.lint).toBe(f1.event.seq);
+      expect(f1.spec.evidence_floor_seq.test).toBe(f1.event.seq);
+      expect(f1.spec.evidence_floor_seq.review).toBe(f1.event.seq);
+      expect(f1.spec.evidence_floor_seq.fat).toBe(f1.event.seq);
+      const afterFirstFreeze = ledger.checkPushReadiness({
+        task_id: "20261123-hard",
+        repo: "api-svc",
+        head_sha: "bbbb2222",
+      });
+      expect(afterFirstFreeze.ready).toBe(false);
+      expect(afterFirstFreeze.missing.join(" ")).toContain("lint");
+
+      // Record post-freeze evidence -> ready=true
+      for (const [kind, role] of [
+        ["lint", undefined],
+        ["hurl", undefined],
+        ["review", "quality"],
+      ] as const) {
+        ledger.recordEvidence({
+          task_id: "20261123-hard",
+          kind,
+          status: "pass",
+          summary: `post-freeze ${kind}`,
+          repo: "api-svc",
+          sha: "bbbb2222",
+          meta: role ? { role } : undefined,
+        });
+      }
+      expect(
+        ledger.checkPushReadiness({
+          task_id: "20261123-hard",
+          repo: "api-svc",
+          head_sha: "bbbb2222",
+        }).ready,
+      ).toBe(true);
+
+      // Lock-only re-freeze adding --lock-tests preserves post-freeze evidence and rejects dropping locks
+      const fLock = ledger.freezeSpec({
+        task_id: "20261123-hard",
+        locked_test_globs: ["tests/**/*.hurl"],
+      });
+      expect(fLock.spec.locked_test_globs).toEqual(["tests/**/*.hurl"]);
+      expect(
+        ledger.checkPushReadiness({
+          task_id: "20261123-hard",
+          repo: "api-svc",
+          head_sha: "bbbb2222",
+        }).ready,
+      ).toBe(true);
+      expect(() =>
+        ledger.freezeSpec({ task_id: "20261123-hard", locked_test_globs: [] }),
+      ).toThrow("Cannot remove locked test glob");
+
+      // Silent drift cannot be approved by calling freezeSpec again without amend!
+      writeFileSync(join(specDir, "ssot.md"), "# SSOT\nINV-1: DRIFTED\n");
+      expect(() => ledger.freezeSpec({ task_id: "20261123-hard" })).toThrow(
+        "Cannot re-freeze drifted spec document(s)",
+      );
+
+      // Even after `amend --scope test_spec`, out-of-scope drift in ssot.md still blocks re-freeze!
+      ledger.amendSpec({
+        task_id: "20261123-hard",
+        scope: "test_spec",
+        reason: "adjust hurl assertion",
+      });
+      expect(() => ledger.freezeSpec({ task_id: "20261123-hard" })).toThrow(
+        "out-of-scope spec document(s) changed",
+      );
+
+      // Restoring ssot.md and editing only test-spec.md allows re-freeze cleanly
+      writeFileSync(join(specDir, "ssot.md"), "# SSOT\nINV-1: server decides\n");
+      writeFileSync(join(specDir, "test-spec.md"), "# Test\nok v2\n");
+      const f2 = ledger.freezeSpec({ task_id: "20261123-hard" });
+      expect(f2.spec.state).toBe("FROZEN");
       expect(ledger.verify().ok).toBe(true);
     } finally {
       ledger.closeDb();

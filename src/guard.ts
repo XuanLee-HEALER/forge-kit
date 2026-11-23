@@ -1,5 +1,5 @@
-import { appendFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   collectProdDbHosts,
   findWorkbenchRoot,
@@ -370,6 +370,12 @@ export function splitShellSegments(cmd: string): string[] {
       continue;
     }
     if (ch === "|") {
+      if (cmd[i - 1] === ">") {
+        // Clobber redirection `>|` is part of the current command, NOT a pipe!
+        cur += ch;
+        atWordStart = false;
+        continue;
+      }
       const trimmed = trimAsciiWhitespace(cur);
       if (trimmed) segs.push(trimmed);
       cur = "";
@@ -420,14 +426,39 @@ function hasUnquotedRedirect(cmd: string, char: "<" | ">"): boolean {
 }
 
 function matchesGlob(filePath: string, glob: string): boolean {
-  const normalized = filePath.replace(/\\/g, "/");
+  const normalized = filePath.replace(/\\/g, "/").replace(/^\/+/, "");
   const base = normalized.split("/").pop() ?? normalized;
-  const target = glob.includes("/") ? normalized : base;
-  const escaped = glob
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, ".*")
-    .replace(/\*/g, "[^/]*");
-  return new RegExp(`^${escaped}$`).test(target);
+  const normGlob = glob.replace(/\\/g, "/").replace(/^\.\//, "");
+  const target = normGlob.includes("/") ? normalized : base;
+  let re = "^";
+  let i = 0;
+  while (i < normGlob.length) {
+    const ch = normGlob[i];
+    if (ch === "*") {
+      if (normGlob[i + 1] === "*") {
+        if (normGlob[i + 2] === "/") {
+          re += "(?:.*/)?";
+          i += 3;
+          continue;
+        }
+        re += ".*";
+        i += 2;
+        continue;
+      }
+      re += "[^/]*";
+      i += 1;
+      continue;
+    }
+    if (ch === "?") {
+      re += "[^/]";
+      i += 1;
+      continue;
+    }
+    re += /[.+^${}()|[\]\\]/.test(ch) ? `\\${ch}` : ch;
+    i += 1;
+  }
+  re += "$";
+  return new RegExp(re).test(target);
 }
 
 export function checkLedgerTamper(
@@ -1609,47 +1640,382 @@ export function checkLedgerGate(
 
 function canonicalizeMaybePath(p: string): string {
   const abs = resolve(p);
-  if (existsSync(abs)) {
-    try {
-      return realpathSync(abs);
-    } catch {
-      return abs;
-    }
+  let cur = abs;
+  const tail: string[] = [];
+  while (!existsSync(cur)) {
+    const parent = dirname(cur);
+    if (parent === cur) return abs;
+    tail.unshift(basename(cur));
+    cur = parent;
   }
-  const parent = dirname(abs);
-  if (parent !== abs && existsSync(parent)) {
-    try {
-      return join(realpathSync(parent), abs.slice(parent.length + 1));
-    } catch {
-      return abs;
-    }
+  try {
+    const real = realpathSync(cur);
+    return tail.length > 0 ? join(real, ...tail) : real;
+  } catch {
+    return abs;
   }
-  return abs;
 }
 
-function extractShellWriteTargetPaths(seg: string, segCwd: string): string[] {
-  const paths: string[] = [];
-  const toks = splitShellTokens(seg);
-  if (toks) {
-    for (let i = 0; i < toks.length; i++) {
-      const t = toks[i];
-      if (!t || t.startsWith("-")) continue;
-      // Handle shell redirection tokens like `>file`, `>>file`, `1>file`, `foo>file`
-      const redirAttached = t.match(/^(?:.*?)?(?:\d?>>?)(.+)$/);
-      if (redirAttached?.[1] && !t.includes("://") && !t.endsWith("&1") && !t.endsWith("&2")) {
-        paths.push(canonicalizeMaybePath(resolve(segCwd, redirAttached[1])));
+const INLINE_WRITE_INDICATOR_RE =
+  /\b(open|write|writelines|writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|truncate|truncateSync|unlink|unlinkSync|rm|rmSync|rmdir|rename|renameSync|replace|copyFile|copyFileSync|cpSync|chmod|chmodSync|shutil|pathlib|Path|os\.remove|os\.unlink|os\.rename|os\.replace|os\.system|subprocess|child_process|exec|execSync|spawn|spawnSync|Bun\.write|File\.write|File\.open|File\.delete|File\.unlink|File\.rename|IO\.write|FileUtils|syswrite|system|qx)\b|['"]\s*,\s*['"][wax+]/;
+
+function unwrapCommandPrefix(
+  metaToks: ShellToken[],
+  startCwd: string,
+): { bin: string; cmdToks: string[]; effectiveCwd: string; readOnly: boolean } {
+  let idx = 0;
+  let cwd = startCwd;
+  let readOnly = false;
+  while (idx < metaToks.length) {
+    if (metaToks[idx].isEnvAssign) {
+      idx++;
+      continue;
+    }
+    const val = metaToks[idx].value;
+    const base = val.split("/").pop() ?? "";
+    if (base === "env") {
+      idx++;
+      while (idx < metaToks.length) {
+        const t = metaToks[idx].value;
+        if (t === "--") {
+          idx++;
+          break;
+        }
+        if (t === "-C" || t === "--chdir") {
+          const dir = metaToks[idx + 1]?.value;
+          if (dir) cwd = resolve(cwd, dir);
+          idx += 2;
+          continue;
+        }
+        if (t.startsWith("--chdir=")) {
+          const dir = t.slice("--chdir=".length);
+          if (dir) cwd = resolve(cwd, dir);
+          idx++;
+          continue;
+        }
+        if (t === "-u" || t === "--unset") {
+          idx += 2;
+          continue;
+        }
+        if (t.startsWith("-")) {
+          idx++;
+          continue;
+        }
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+          idx++;
+          continue;
+        }
+        break;
+      }
+      continue;
+    }
+    if (base === "command") {
+      idx++;
+      while (idx < metaToks.length && metaToks[idx].value.startsWith("-")) {
+        const flag = metaToks[idx].value;
+        if (flag === "--") {
+          idx++;
+          break;
+        }
+        if (flag.includes("v") || flag.includes("V")) readOnly = true;
+        idx++;
+      }
+      continue;
+    }
+    if (base === "nohup" || base === "time") {
+      idx++;
+      while (idx < metaToks.length && metaToks[idx].value.startsWith("-")) idx++;
+      continue;
+    }
+    if (base === "nice") {
+      idx++;
+      while (idx < metaToks.length && metaToks[idx].value.startsWith("-")) {
+        if (metaToks[idx].value === "-n") idx += 2;
+        else idx++;
+      }
+      continue;
+    }
+    break;
+  }
+  const cmdToks = metaToks.slice(idx).map((t) => t.value);
+  const bin = cmdToks[0]?.split("/").pop() ?? "";
+  return { bin, cmdToks, effectiveCwd: cwd, readOnly };
+}
+
+function parseShellRedirections(
+  seg: string,
+  segCwd: string,
+): { writeTargets: string[]; readInputs: string[]; strippedSeg: string } {
+  const writeTargets: string[] = [];
+  const readInputs: string[] = [];
+  const strippedParts: string[] = [];
+  let quote: "'" | '"' | "$'" | null = null;
+  let escape = false;
+  let i = 0;
+
+  const readWord = (start: number): { word: string; nextIdx: number } => {
+    let j = start;
+    while (j < seg.length && (seg[j] === " " || seg[j] === "\t")) j++;
+    let w = "";
+    let q: "'" | '"' | null = null;
+    let esc = false;
+    while (j < seg.length) {
+      const c = seg[j];
+      if (esc) {
+        w += c;
+        esc = false;
+        j++;
         continue;
       }
-      if (/^\d?>>?$/.test(t) && toks[i + 1]) {
-        paths.push(canonicalizeMaybePath(resolve(segCwd, toks[++i])));
+      if (q === "'") {
+        if (c === "'") q = null;
+        else w += c;
+        j++;
         continue;
       }
-      if (i > 0) {
-        paths.push(canonicalizeMaybePath(resolve(segCwd, t)));
+      if (q === '"') {
+        if (c === "\\") {
+          if (j + 1 < seg.length) w += seg[++j];
+        } else if (c === '"') {
+          q = null;
+        } else {
+          w += c;
+        }
+        j++;
+        continue;
+      }
+      if (c === "\\") {
+        esc = true;
+        j++;
+        continue;
+      }
+      if (c === "'" || c === '"') {
+        q = c;
+        j++;
+        continue;
+      }
+      if (c === " " || c === "\t" || c === "\n" || c === ";" || c === "&" || c === "|" || c === ">" || c === "<") {
+        break;
+      }
+      w += c;
+      j++;
+    }
+    return { word: w, nextIdx: j };
+  };
+
+  while (i < seg.length) {
+    const ch = seg[i];
+    const next = seg[i + 1];
+    if (escape) {
+      strippedParts.push(ch);
+      escape = false;
+      i++;
+      continue;
+    }
+    if (quote === "'") {
+      strippedParts.push(ch);
+      if (ch === "'") quote = null;
+      i++;
+      continue;
+    }
+    if (quote === "$'") {
+      strippedParts.push(ch);
+      if (ch === "\\") escape = true;
+      else if (ch === "'") quote = null;
+      i++;
+      continue;
+    }
+    if (quote === '"') {
+      strippedParts.push(ch);
+      if (ch === "\\") escape = true;
+      else if (ch === '"') quote = null;
+      i++;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      strippedParts.push(ch);
+      i++;
+      continue;
+    }
+    if (ch === "$" && next === "'") {
+      quote = "$'";
+      strippedParts.push("$'");
+      i += 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      strippedParts.push(ch);
+      i++;
+      continue;
+    }
+
+    // Output redirections: `>`, `>>`, `>|`, `<>`, `&>`, `&>>`, `[fd]>`, `[fd]>>`, `[fd]>|`
+    const isAmpRedir = ch === "&" && next === ">";
+    const isOutRedir = ch === ">";
+    const isReadWriteRedir = ch === "<" && next === ">";
+    const isInRedir = ch === "<" && next !== "<" && next !== "&" && next !== ">";
+
+    if (isAmpRedir || isOutRedir || isReadWriteRedir) {
+      // Strip optional preceding single-digit fd from strippedParts when at word boundary
+      if (
+        isOutRedir &&
+        strippedParts.length > 0 &&
+        /^[0-9]$/.test(strippedParts[strippedParts.length - 1]) &&
+        (strippedParts.length === 1 ||
+          strippedParts[strippedParts.length - 2] === " " ||
+          strippedParts[strippedParts.length - 2] === "\t")
+      ) {
+        strippedParts.pop();
+      }
+      let opLen = 1;
+      if (isAmpRedir) {
+        opLen = seg[i + 2] === ">" ? 3 : 2;
+      } else if (isReadWriteRedir) {
+        opLen = 2;
+      } else if (next === ">" || next === "|") {
+        opLen = 2;
+      } else if (next === "&") {
+        // fd dup like `2>&1` or `>&2` or `>&-` -> skip operator and target fd
+        const { nextIdx } = readWord(i + 2);
+        strippedParts.push(" ");
+        i = nextIdx;
+        continue;
+      }
+      const { word, nextIdx } = readWord(i + opLen);
+      if (word && !word.includes("://") && word !== "/dev/null") {
+        writeTargets.push(canonicalizeMaybePath(resolve(segCwd, word)));
+      }
+      strippedParts.push(" ");
+      i = nextIdx;
+      continue;
+    }
+
+    if (isInRedir) {
+      const { word, nextIdx } = readWord(i + 1);
+      if (word && word !== "/dev/null") {
+        readInputs.push(canonicalizeMaybePath(resolve(segCwd, word)));
+      }
+      strippedParts.push(" ");
+      i = nextIdx;
+      continue;
+    }
+
+    strippedParts.push(ch);
+    i++;
+  }
+
+  return { writeTargets, readInputs, strippedSeg: strippedParts.join("") };
+}
+
+function extractPatchFileTargets(
+  patchAbsPath: string,
+  baseDir: string,
+  stripLevel: number | null,
+): string[] {
+  if (!existsSync(patchAbsPath)) return [];
+  try {
+    const st = statSync(patchAbsPath);
+    if (!st.isFile() || st.size > 512 * 1024) return [];
+    const content = readFileSync(patchAbsPath, "utf8");
+    const out: string[] = [];
+    for (const line of content.split(/\r?\n/)) {
+      const m = line.match(/^(?:---|\+\+\+)\s+([^\t\r\n]+)/);
+      if (!m) continue;
+      let raw = m[1].trim();
+      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1);
+      if (!raw || raw === "/dev/null") continue;
+      const parts = raw.replace(/\\/g, "/").split("/").filter(Boolean);
+      const effectiveStrip =
+        stripLevel !== null
+          ? stripLevel
+          : parts[0] === "a" || parts[0] === "b"
+            ? 1
+            : 0;
+      const rel = parts.slice(effectiveStrip).join("/");
+      if (rel) {
+        out.push(canonicalizeMaybePath(resolve(baseDir, rel)));
       }
     }
+    return out;
+  } catch {
+    return [];
   }
-  return paths;
+}
+
+function extractQuotedStrings(script: string): string[] {
+  const out: string[] = [];
+  const re = /'([^'\n]{1,300})'|"([^"\n]{1,300})"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(script)) !== null) {
+    const s = m[1] ?? m[2] ?? "";
+    if (s) out.push(s);
+  }
+  return out;
+}
+
+function collectDestOperands(
+  args: string[],
+  valueFlags: Set<string>,
+): { operands: string[]; targetDir: string | null } {
+  const operands: string[] = [];
+  let targetDir: string | null = null;
+  let endFlags = false;
+  for (let i = 0; i < args.length; i++) {
+    const t = args[i];
+    if (!endFlags && t === "--") {
+      endFlags = true;
+      continue;
+    }
+    if (!endFlags && t.startsWith("-") && t.length > 1) {
+      if (t === "-t" || t === "--target-directory") {
+        targetDir = args[++i] ?? null;
+        continue;
+      }
+      if (t.startsWith("--target-directory=")) {
+        targetDir = t.slice("--target-directory=".length);
+        continue;
+      }
+      if (t.startsWith("-t") && t.length > 2) {
+        targetDir = t.slice(2);
+        continue;
+      }
+      if (valueFlags.has(t)) {
+        i++;
+        continue;
+      }
+      continue;
+    }
+    operands.push(t);
+  }
+  return { operands, targetDir };
+}
+
+function expandCopyDestPaths(
+  srcs: string[],
+  dest: string,
+  cwd: string,
+): string[] {
+  const destAbs = canonicalizeMaybePath(resolve(cwd, dest));
+  const out = [destAbs];
+  const destIsDir =
+    dest.endsWith("/") ||
+    (existsSync(destAbs) &&
+      (() => {
+        try {
+          return statSync(destAbs).isDirectory();
+        } catch {
+          return false;
+        }
+      })());
+  if (destIsDir) {
+    for (const s of srcs) {
+      const b = basename(s);
+      if (b) out.push(canonicalizeMaybePath(join(destAbs, b)));
+    }
+  }
+  return out;
 }
 
 export function checkSpecAndTestLocks(
@@ -1675,18 +2041,29 @@ export function checkSpecAndTestLocks(
     const activeLocks = ledger.listActiveSpecLocks();
     if (activeLocks.length === 0) return null;
 
+    const allOpenBoundWorktrees = new Set<string>();
+    for (const openTask of ledger.listOpenTasks()) {
+      for (const r of ledger.getTaskRepos(openTask.task_id)) {
+        if (r.worktree) {
+          allOpenBoundWorktrees.add(canonicalizeMaybePath(r.worktree));
+        }
+      }
+    }
+
+    type UnboundWorktreeMatcher = { worktreesDir: string; branch: string };
     type ResolvedLock = {
       task_id: string;
       lockedSpecFiles: Array<{ kind: "ssot" | "tech_spec" | "test_spec"; abs: string; rel: string }>;
       lockedTestGlobs: string[];
-      taskRepoRoots: string[];
+      explicitRoots: string[];
+      unboundWorktrees: UnboundWorktreeMatcher[];
     };
 
     const resolvedLocks: ResolvedLock[] = activeLocks.map((st) => {
-      const scope = st.state === "AMENDED" ? st.amend_scope : null;
-      const unlockedSsot = scope === "requirement" || scope === "invariant";
-      const unlockedTech = scope === "requirement" || scope === "invariant" || scope === "tech_spec";
-      const unlockedTest = scope === "requirement" || scope === "invariant" || scope === "test_spec";
+      const scopes = new Set(st.state === "AMENDED" ? st.amend_scopes : []);
+      const unlockedSsot = scopes.has("requirement") || scopes.has("invariant");
+      const unlockedTech = unlockedSsot || scopes.has("tech_spec");
+      const unlockedTest = unlockedSsot || scopes.has("test_spec");
 
       const lockedSpecFiles: ResolvedLock["lockedSpecFiles"] = [];
       if (st.files) {
@@ -1714,20 +2091,64 @@ export function checkSpecAndTestLocks(
       }
 
       const taskRepos = ledger!.getTaskRepos(st.task_id);
-      const taskRepoRoots: string[] = [];
+      const explicitRoots: string[] = [];
+      const unboundWorktrees: UnboundWorktreeMatcher[] = [];
       for (const r of taskRepos) {
-        taskRepoRoots.push(canonicalizeMaybePath(resolve(wbReal, r.repo)));
-        taskRepoRoots.push(canonicalizeMaybePath(resolve(wbReal, `${r.repo}.worktrees`)));
-        if (r.worktree) taskRepoRoots.push(canonicalizeMaybePath(r.worktree));
+        if (r.worktree) {
+          explicitRoots.push(canonicalizeMaybePath(r.worktree));
+        } else {
+          explicitRoots.push(canonicalizeMaybePath(resolve(wbReal, r.repo)));
+          unboundWorktrees.push({
+            worktreesDir: canonicalizeMaybePath(resolve(wbReal, `${r.repo}.worktrees`)),
+            branch: r.branch,
+          });
+        }
       }
+      explicitRoots.sort((a, b) => b.length - a.length);
 
       return {
         task_id: st.task_id,
         lockedSpecFiles,
         lockedTestGlobs: unlockedTest ? [] : st.locked_test_globs,
-        taskRepoRoots,
+        explicitRoots,
+        unboundWorktrees,
       };
     });
+
+    const wtBranchCache = new Map<string, string | null>();
+    const getWorktreeBranch = (wtRoot: string): string | null => {
+      if (wtBranchCache.has(wtRoot)) return wtBranchCache.get(wtRoot)!;
+      const res = runGit(wtRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
+      const b = res.code === 0 ? res.stdout.trim() : null;
+      wtBranchCache.set(wtRoot, b);
+      return b;
+    };
+
+    const resolveRelWithinLock = (lock: ResolvedLock, absTarget: string): string | null => {
+      const relFromWb = relative(wbReal, absTarget).replace(/\\/g, "/");
+      if (lock.explicitRoots.length === 0 && lock.unboundWorktrees.length === 0) {
+        return relFromWb && !relFromWb.startsWith("..") ? relFromWb : null;
+      }
+      for (const rr of lock.explicitRoots) {
+        if (absTarget === rr || absTarget.startsWith(rr + "/")) {
+          return relative(rr, absTarget).replace(/\\/g, "/");
+        }
+      }
+      for (const uw of lock.unboundWorktrees) {
+        if (absTarget.startsWith(uw.worktreesDir + "/")) {
+          const sub = relative(uw.worktreesDir, absTarget).replace(/\\/g, "/");
+          const wtName = sub.split("/")[0];
+          if (!wtName) continue;
+          const wtRoot = canonicalizeMaybePath(join(uw.worktreesDir, wtName));
+          if (allOpenBoundWorktrees.has(wtRoot)) continue;
+          const b = getWorktreeBranch(wtRoot);
+          if (b && b === uw.branch) {
+            return relative(wtRoot, absTarget).replace(/\\/g, "/");
+          }
+        }
+      }
+      return null;
+    };
 
     const matchLockedPath = (absTarget: string): string | null => {
       for (const lock of resolvedLocks) {
@@ -1743,22 +2164,10 @@ export function checkSpecAndTestLocks(
         }
         if (lock.lockedTestGlobs.length > 0) {
           const relFromWb = relative(wbReal, absTarget).replace(/\\/g, "/");
-          let relWithinTask: string | null = null;
-          if (lock.taskRepoRoots.length === 0) {
-            if (relFromWb && !relFromWb.startsWith("..")) relWithinTask = relFromWb;
-          } else {
-            for (const rr of lock.taskRepoRoots) {
-              if (absTarget === rr || absTarget.startsWith(rr + "/")) {
-                relWithinTask = relative(rr, absTarget).replace(/\\/g, "/");
-                break;
-              }
-            }
-          }
+          const relWithinTask = resolveRelWithinLock(lock, absTarget);
           if (
             relWithinTask &&
-            lock.lockedTestGlobs.some(
-              (g) => matchesGlob(relWithinTask!, g) || matchesGlob(relFromWb, g),
-            )
+            lock.lockedTestGlobs.some((g) => matchesGlob(relWithinTask, g))
           ) {
             return (
               `物理锁（冻结测试防篡改）：任务 ${lock.task_id} 已锁定测试文件 (${relFromWb})，实现/修 bug 阶段禁止私自修改测试断言迎合代码。\n` +
@@ -1776,61 +2185,427 @@ export function checkSpecAndTestLocks(
       if (hit) return hit;
     }
 
-    // 2. Check mutating shell segments
-    if (cmd) {
-      const segments = splitShellSegments(cmd);
+    // 2. Check mutating shell commands (with bounded recursion for `sh -c` / `bash -c` / `zsh -c`)
+    const checkShellString = (shellCmd: string, cwdStart: string, depth: number): string | null => {
+      if (depth > 3) return null;
+      const segments = splitShellSegments(shellCmd);
       for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
-        const toks = splitShellTokens(seg);
-        const first = toks?.[0]?.split("/").pop() ?? "";
-        const isLedgerCli =
-          first === "ledger" ||
-          ((first === "bun" || first === "node") &&
-            Boolean(toks?.[1]?.endsWith("/ledger.js") || toks?.[1]?.endsWith("/ledger.ts")));
-        if (isLedgerCli) continue;
+        const segCwd = resolveSegmentCwd(segments, i, cwdStart);
 
-        const hasMutation =
-          /\b(rm|mv|cp|truncate|chmod|python3?|perl|sed|awk|tee|dd|bun|node|touch)\b/.test(seg) ||
-          hasUnquotedRedirect(seg, ">");
-        if (!hasMutation) continue;
-
-        const segCwd = resolveSegmentCwd(segments, i, baseWorkdir);
-        for (const candidateAbs of extractShellWriteTargetPaths(seg, segCwd)) {
-          const hit = matchLockedPath(candidateAbs);
+        // Always inspect unquoted shell output redirections (`>`, `>>`, `>|`, `&>`, `<>`, etc.)
+        const { writeTargets: redirWrites, readInputs: redirReads, strippedSeg } =
+          parseShellRedirections(seg, segCwd);
+        for (const targetAbs of redirWrites) {
+          const hit = matchLockedPath(targetAbs);
           if (hit) return hit;
         }
-        // Catch inline scripting edits (`python3 -c 'open("...ssot.md","w")...'`, `bun -e ...`)
-        if (
-          /^(python3?|node|bun|perl|ruby)$/.test(first) &&
-          /(?:^|\s)-(?:c|e)\b/.test(seg)
-        ) {
-          for (const lock of resolvedLocks) {
-            for (const sf of lock.lockedSpecFiles) {
-              const baseName = sf.rel.split("/").pop() ?? sf.rel;
-              const inSpecDir =
-                canonicalizeMaybePath(segCwd) === dirname(sf.abs);
-              if (
-                seg.includes(sf.rel) ||
-                seg.includes(sf.abs) ||
-                (inSpecDir && seg.includes(baseName))
-              ) {
-                const suggestedScope =
-                  sf.kind === "ssot" ? "requirement|invariant" : sf.kind;
-                return (
-                  `物理锁（冻结 Spec 保护）：禁止通过内联脚本修改任务 ${lock.task_id} 的冻结文档 (${sf.rel})。\n` +
-                  `如确需变更，请先经用户确认并执行：ledger amend ${lock.task_id} --scope ${suggestedScope} --reason "<变更原因>"`
-                );
+
+        const metaToks = splitShellTokensWithMeta(strippedSeg);
+        if (!metaToks || metaToks.length === 0) continue;
+        const { bin, cmdToks, effectiveCwd, readOnly } = unwrapCommandPrefix(metaToks, segCwd);
+        if (readOnly || !bin) continue;
+
+        const isLedgerCli =
+          bin === "ledger" ||
+          ((bin === "bun" || bin === "node") &&
+            Boolean(cmdToks[1]?.endsWith("/ledger.js") || cmdToks[1]?.endsWith("/ledger.ts")));
+        if (isLedgerCli) continue;
+
+        const args = cmdToks.slice(1);
+
+        // Nested shell invocation (`sh -c`, `bash -lc`, `zsh -c`, `dash -c`, `ksh -c`)
+        if (/^(sh|bash|zsh|dash|ksh)$/.test(bin)) {
+          for (let j = 0; j < args.length; j++) {
+            const a = args[j];
+            if (a === "--") break;
+            if (a === "-o" || a === "+o") {
+              j++;
+              continue;
+            }
+            if (a.startsWith("-") && !a.startsWith("--") && a.includes("c")) {
+              const nested = args[j + 1];
+              if (nested) {
+                const nestedHit = checkShellString(nested, effectiveCwd, depth + 1);
+                if (nestedHit) return nestedHit;
+              }
+              break;
+            }
+          }
+          continue;
+        }
+
+        const candidateTargets: string[] = [];
+
+        if (bin === "cp" || bin === "install") {
+          const valFlags =
+            bin === "install"
+              ? new Set(["-m", "-o", "-g", "-S", "-B", "--mode", "--owner", "--group", "--suffix"])
+              : new Set(["-S", "--suffix", "--backup"]);
+          const { operands, targetDir } = collectDestOperands(args, valFlags);
+          if (targetDir) {
+            candidateTargets.push(...expandCopyDestPaths(operands, targetDir, effectiveCwd));
+          } else if (operands.length >= 2) {
+            const dest = operands[operands.length - 1];
+            const srcs = operands.slice(0, -1);
+            candidateTargets.push(...expandCopyDestPaths(srcs, dest, effectiveCwd));
+          }
+        } else if (bin === "mv") {
+          const { operands, targetDir } = collectDestOperands(
+            args,
+            new Set(["-S", "--suffix", "--backup"]),
+          );
+          if (targetDir) {
+            for (const s of operands) {
+              candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, s)));
+            }
+            candidateTargets.push(...expandCopyDestPaths(operands, targetDir, effectiveCwd));
+          } else if (operands.length >= 2) {
+            const dest = operands[operands.length - 1];
+            const srcs = operands.slice(0, -1);
+            for (const s of srcs) {
+              candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, s)));
+            }
+            candidateTargets.push(...expandCopyDestPaths(srcs, dest, effectiveCwd));
+          }
+        } else if (bin === "rm" || bin === "touch" || bin === "tee") {
+          const { operands } = collectDestOperands(args, new Set());
+          for (const op of operands) {
+            candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, op)));
+          }
+        } else if (bin === "truncate") {
+          const { operands } = collectDestOperands(
+            args,
+            new Set(["-s", "--size", "-r", "--reference"]),
+          );
+          for (const op of operands) {
+            candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, op)));
+          }
+        } else if (bin === "chmod" || bin === "chown") {
+          const hasRef = args.some((a) => a === "--reference" || a.startsWith("--reference="));
+          const { operands } = collectDestOperands(args, new Set(["--reference"]));
+          const files = hasRef ? operands : operands.slice(1);
+          for (const f of files) {
+            candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, f)));
+          }
+        } else if (bin === "dd") {
+          for (const a of args) {
+            if (a.startsWith("of=") && a.length > 3) {
+              candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, a.slice(3))));
+            }
+          }
+        } else if (bin === "sed") {
+          let inPlace = false;
+          let hasExplicitScript = false;
+          const scripts: string[] = [];
+          const positionals: string[] = [];
+          let endFlags = false;
+          for (let j = 0; j < args.length; j++) {
+            const a = args[j];
+            if (!endFlags && a === "--") {
+              endFlags = true;
+              continue;
+            }
+            if (!endFlags && a.startsWith("-") && a.length > 1) {
+              if (a === "--in-place" || a.startsWith("--in-place=")) {
+                inPlace = true;
+                continue;
+              }
+              if (a === "-i") {
+                inPlace = true;
+                // GNU vs BSD sed `-i ''` or `-i .bak`: if next arg is empty string, consume it
+                if (args[j + 1] === "") j++;
+                continue;
+              }
+              if (!a.startsWith("--") && /^-[a-zA-Z]*i/.test(a)) {
+                inPlace = true;
+                continue;
+              }
+              if (a === "-e" || a === "--expression") {
+                hasExplicitScript = true;
+                if (args[j + 1]) scripts.push(args[++j]);
+                continue;
+              }
+              if (a === "-f" || a === "--file") {
+                hasExplicitScript = true;
+                j++;
+                continue;
+              }
+              continue;
+            }
+            positionals.push(a);
+          }
+          let fileArgs = positionals;
+          if (!hasExplicitScript && positionals.length > 0) {
+            scripts.push(positionals[0]);
+            fileArgs = positionals.slice(1);
+          }
+          if (inPlace) {
+            for (const f of fileArgs) {
+              candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, f)));
+            }
+          }
+          for (const sc of scripts) {
+            const wm = sc.match(/(?:^|[;\n\s])w\s+([^\s;]+)/);
+            if (wm?.[1]) {
+              candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, wm[1])));
+            }
+          }
+        } else if (bin === "awk" || bin === "gawk" || bin === "mawk") {
+          let inPlace = false;
+          let hasProgFile = false;
+          const progs: string[] = [];
+          const positionals: string[] = [];
+          for (let j = 0; j < args.length; j++) {
+            const a = args[j];
+            if (a === "--") {
+              positionals.push(...args.slice(j + 1));
+              break;
+            }
+            if (a === "-i" && args[j + 1] === "inplace") {
+              inPlace = true;
+              j++;
+              continue;
+            }
+            if (a === "-f" || a === "--file") {
+              hasProgFile = true;
+              j++;
+              continue;
+            }
+            if (a === "-F" || a === "-v") {
+              j++;
+              continue;
+            }
+            if (a.startsWith("-")) continue;
+            positionals.push(a);
+          }
+          let fileArgs = positionals;
+          if (!hasProgFile && positionals.length > 0) {
+            progs.push(positionals[0]);
+            fileArgs = positionals.slice(1);
+          }
+          if (inPlace) {
+            for (const f of fileArgs) {
+              candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, f)));
+            }
+          }
+          for (const pr of progs) {
+            for (const m of pr.matchAll(/>>?\s*["']([^"'\n]+)["']/g)) {
+              if (m[1]) candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, m[1])));
+            }
+          }
+        } else if (bin === "patch") {
+          let stripLevel: number | null = null;
+          let patchDir = effectiveCwd;
+          const patchInputs: string[] = [...redirReads];
+          const positionals: string[] = [];
+          for (let j = 0; j < args.length; j++) {
+            const a = args[j];
+            if (a === "--") {
+              positionals.push(...args.slice(j + 1));
+              break;
+            }
+            if (a === "-p" && args[j + 1] !== undefined) {
+              const n = Number(args[++j]);
+              if (Number.isInteger(n) && n >= 0) stripLevel = n;
+              continue;
+            }
+            if (/^-p\d+$/.test(a)) {
+              stripLevel = Number(a.slice(2));
+              continue;
+            }
+            if (a === "-d" || a === "--directory") {
+              if (args[j + 1]) patchDir = resolve(effectiveCwd, args[++j]);
+              continue;
+            }
+            if (a.startsWith("--directory=")) {
+              patchDir = resolve(effectiveCwd, a.slice("--directory=".length));
+              continue;
+            }
+            if (a === "-i" || a === "--input") {
+              if (args[j + 1]) patchInputs.push(canonicalizeMaybePath(resolve(effectiveCwd, args[++j])));
+              continue;
+            }
+            if (a.startsWith("--input=")) {
+              patchInputs.push(canonicalizeMaybePath(resolve(effectiveCwd, a.slice("--input=".length))));
+              continue;
+            }
+            if (a === "-o" || a === "--output") {
+              if (args[j + 1]) candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, args[++j])));
+              continue;
+            }
+            if (a === "-r" || a === "-b" || a === "-B" || a === "-z" || a === "-V") {
+              if (a !== "-b") j++;
+              continue;
+            }
+            if (a.startsWith("-")) continue;
+            positionals.push(a);
+          }
+          if (positionals[0]) {
+            candidateTargets.push(canonicalizeMaybePath(resolve(patchDir, positionals[0])));
+          }
+          if (positionals[1]) {
+            patchInputs.push(canonicalizeMaybePath(resolve(effectiveCwd, positionals[1])));
+          }
+          for (const pf of patchInputs) {
+            candidateTargets.push(...extractPatchFileTargets(pf, patchDir, stripLevel));
+          }
+          // If stdin-driven patch with no explicit target or readable patch file inside a locked spec dir, fail closed
+          if (candidateTargets.length === 0 && patchInputs.length === 0) {
+            const canonPatchDir = canonicalizeMaybePath(patchDir);
+            for (const lock of resolvedLocks) {
+              for (const sf of lock.lockedSpecFiles) {
+                if (dirname(sf.abs) === canonPatchDir || sf.abs.startsWith(canonPatchDir + "/")) {
+                  candidateTargets.push(sf.abs);
+                }
               }
             }
-            if (lock.lockedTestGlobs.some((g) => g.includes(".hurl")) && seg.includes(".hurl")) {
-              return (
-                `物理锁（冻结测试防篡改）：禁止通过内联脚本修改任务 ${lock.task_id} 锁定的 .hurl 测试文件。\n` +
-                `如确认是测试用例本身有误，请经用户确认后执行：ledger amend ${lock.task_id} --scope test_spec --reason "<原因>"`
-              );
+          }
+        } else if (bin === "git") {
+          const git = extractGitSubcommand(cmdToks);
+          if (git) {
+            const gitDir = git.gitDirFlag ? resolve(effectiveCwd, git.gitDirFlag) : effectiveCwd;
+            const subArgs = git.subArgs;
+            if (git.subcmd === "checkout" || git.subcmd === "restore") {
+              const ddIdx = subArgs.indexOf("--");
+              let pathArgs: string[] = [];
+              if (ddIdx >= 0) {
+                pathArgs = subArgs.slice(ddIdx + 1);
+              } else if (git.subcmd === "restore") {
+                const { operands } = collectDestOperands(subArgs, new Set(["-s", "--source"]));
+                pathArgs = operands;
+              } else {
+                const { operands } = collectDestOperands(subArgs, new Set(["-b", "-B", "--orphan"]));
+                pathArgs = operands.slice(1);
+              }
+              for (const p of pathArgs) {
+                candidateTargets.push(canonicalizeMaybePath(resolve(gitDir, p)));
+              }
+            } else if (git.subcmd === "rm" || git.subcmd === "mv") {
+              const { operands } = collectDestOperands(subArgs, new Set());
+              for (const p of operands) {
+                candidateTargets.push(canonicalizeMaybePath(resolve(gitDir, p)));
+              }
+            } else if (git.subcmd === "apply") {
+              let stripLevel: number | null = 1;
+              let applyDir = gitDir;
+              const patchFiles: string[] = [...redirReads];
+              for (let j = 0; j < subArgs.length; j++) {
+                const a = subArgs[j];
+                if (a === "--") {
+                  for (const pf of subArgs.slice(j + 1)) {
+                    patchFiles.push(canonicalizeMaybePath(resolve(effectiveCwd, pf)));
+                  }
+                  break;
+                }
+                if (/^-p\d+$/.test(a)) {
+                  stripLevel = Number(a.slice(2));
+                  continue;
+                }
+                if (a.startsWith("--directory=")) {
+                  applyDir = resolve(gitDir, a.slice("--directory=".length));
+                  continue;
+                }
+                if (a.startsWith("-")) continue;
+                patchFiles.push(canonicalizeMaybePath(resolve(effectiveCwd, a)));
+              }
+              for (const pf of patchFiles) {
+                candidateTargets.push(...extractPatchFileTargets(pf, applyDir, stripLevel));
+              }
+            }
+          }
+        } else if (/^(python3?(?:\.\d+)?|node|bun|perl|ruby)$/.test(bin)) {
+          let inPlace = false;
+          const inlineScripts: string[] = [];
+          const fileArgs: string[] = [];
+          let endFlags = false;
+          for (let j = 0; j < args.length; j++) {
+            const a = args[j];
+            if (!endFlags && a === "--") {
+              endFlags = true;
+              continue;
+            }
+            if (!endFlags && a.startsWith("-") && a.length > 1) {
+              if ((bin === "perl" || bin === "ruby") && /^-[a-zA-Z]*i/.test(a)) {
+                inPlace = true;
+              }
+              if (
+                a === "-c" ||
+                a === "-e" ||
+                a === "-E" ||
+                a === "--eval" ||
+                ((bin === "perl" || bin === "ruby") && /^-[a-zA-Z]*[eE]$/.test(a))
+              ) {
+                if (args[j + 1] !== undefined) inlineScripts.push(args[++j]);
+                continue;
+              }
+              continue;
+            }
+            fileArgs.push(a);
+          }
+
+          if (inPlace) {
+            for (const f of fileArgs) {
+              candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, f)));
+            }
+          }
+
+          if (inlineScripts.length > 0) {
+            const combinedScript = inlineScripts.join("\n");
+            const looksMutating = inPlace || INLINE_WRITE_INDICATOR_RE.test(combinedScript);
+            if (looksMutating) {
+              // 1. Resolve all quoted string literals as candidate paths
+              for (const lit of extractQuotedStrings(combinedScript)) {
+                candidateTargets.push(canonicalizeMaybePath(resolve(effectiveCwd, lit)));
+              }
+              // 2. Check explicit spec file / task-owned locked glob references
+              const canonEffCwd = canonicalizeMaybePath(effectiveCwd);
+              for (const lock of resolvedLocks) {
+                for (const sf of lock.lockedSpecFiles) {
+                  const baseName = sf.rel.split("/").pop() ?? sf.rel;
+                  const inSpecDir = canonEffCwd === dirname(sf.abs);
+                  if (
+                    combinedScript.includes(sf.rel) ||
+                    combinedScript.includes(sf.abs) ||
+                    (inSpecDir && combinedScript.includes(baseName))
+                  ) {
+                    const suggestedScope =
+                      sf.kind === "ssot" ? "requirement|invariant" : sf.kind;
+                    return (
+                      `物理锁（冻结 Spec 保护）：禁止通过内联脚本修改任务 ${lock.task_id} 的冻结文档 (${sf.rel})。\n` +
+                      `如确需变更，请先经用户确认并执行：ledger amend ${lock.task_id} --scope ${suggestedScope} --reason "<变更原因>"`
+                    );
+                  }
+                }
+                if (lock.lockedTestGlobs.length > 0) {
+                  const cwdInLock = resolveRelWithinLock(lock, canonEffCwd) !== null;
+                  if (
+                    cwdInLock &&
+                    lock.lockedTestGlobs.some((g) => g.includes(".hurl")) &&
+                    combinedScript.includes(".hurl")
+                  ) {
+                    return (
+                      `物理锁（冻结测试防篡改）：禁止通过内联脚本修改任务 ${lock.task_id} 锁定的 .hurl 测试文件。\n` +
+                      `如确认是测试用例本身有误，请经用户确认后执行：ledger amend ${lock.task_id} --scope test_spec --reason "<原因>"`
+                    );
+                  }
+                }
+              }
             }
           }
         }
+
+        for (const candidateAbs of candidateTargets) {
+          const hit = matchLockedPath(candidateAbs);
+          if (hit) return hit;
+        }
       }
+      return null;
+    };
+
+    if (cmd) {
+      const shellHit = checkShellString(cmd, baseWorkdir, 0);
+      if (shellHit) return shellHit;
     }
   } finally {
     ledger?.closeDb();

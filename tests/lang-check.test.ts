@@ -35,6 +35,16 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks) and ledg
     const pyFail = runLangChecks({ targetDir: pyRepo, mode: "static" });
     expect(pyFail.ok).toBe(false);
     expect(pyFail.failed).toBeGreaterThanOrEqual(1);
+
+    // Pure JS Node package (package.json + .js + test script, no tsconfig/.ts) is auto-detected as ts family
+    const jsRepo = join(dir, "js-pkg");
+    mkdirSync(jsRepo, { recursive: true });
+    writeFileSync(
+      join(jsRepo, "package.json"),
+      JSON.stringify({ name: "js-pkg", scripts: { test: "node -e 'process.exit(0)'" } }),
+    );
+    writeFileSync(join(jsRepo, "index.js"), "export const ok = true;\n");
+    expect(detectRepoLanguages(jsRepo)).toEqual(["ts"]);
   });
 
   test("classifies lang-check, go vet, biome check, pyright, mypy, bunx tsc, and python -m pytest in ledger-hook", () => {
@@ -111,5 +121,35 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks) and ledg
     expect(classifyPostToolEvidence("mypy .", repoDir, 0, "")[0]?.kind).toBe("lint");
     expect(classifyPostToolEvidence("PYTHONDEVMODE=1 .venv/bin/python -m pytest -W error::RuntimeWarning tests/", repoDir, 0, "")[0]?.kind).toBe("test");
     expect(classifyPostToolEvidence("python3 -m pytest --collect-only", repoDir, 0, "")).toEqual([]);
+
+    // Chained `lang-check` in --mode all NEVER cross-credits phases across repositories
+    const repoA = join(dir, "mock-api");
+    const repoB = join(dir, "mock-web");
+    mkdirSync(join(repoA, "tests"), { recursive: true });
+    mkdirSync(repoB, { recursive: true });
+    expect(
+      classifyPostToolEvidence(
+        `.workbench/bin/lang-check ${repoA} && .workbench/bin/lang-check ${repoB}`,
+        dir,
+        0,
+        "  [PASS] (go/static) go-vet\n  [PASS] (ts/dynamic) bun-test-strict",
+      ),
+    ).toEqual([]);
+    // Standalone `lang-check --mode all` with empty/truncated output MUST NOT fabricate lint:pass!
+    expect(
+      classifyPostToolEvidence(`.workbench/bin/lang-check ${repoA} --mode all`, dir, 0, ""),
+    ).toEqual([]);
+
+    // Cross-repo positional paths attribute to the actual target repo, NOT cwd!
+    expect(classifyPostToolEvidence("mypy ../mock-api", repoB, 0, "")[0]?.targetDir).toBe(repoA);
+    expect(
+      classifyPostToolEvidence("python3 -m pytest ../mock-api/tests", repoB, 0, "")[0]?.targetDir,
+    ).toBe(join(repoA, "tests"));
+    // Absolute-path `go vet -n` is filtered as dry-run; global `go -C <repo> vet` is recognized & attributed!
+    expect(classifyPostToolEvidence("/usr/local/go/bin/go vet -n ./...", repoB, 0, "")).toEqual([]);
+    const globalGoVet = classifyPostToolEvidence("go -C ../mock-api vet ./...", repoB, 0, "");
+    expect(globalGoVet.length).toBe(1);
+    expect(globalGoVet[0]?.kind).toBe("lint");
+    expect(globalGoVet[0]?.targetDir).toBe(repoA);
   });
 });

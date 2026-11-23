@@ -73,7 +73,9 @@ export function detectRepoLanguages(targetDir: string): CheckLanguage[] {
   if (
     existsSync(join(targetDir, "tsconfig.json")) ||
     (existsSync(join(targetDir, "package.json")) &&
-      hasFileMatching(targetDir, (n) => n.endsWith(".ts") || n.endsWith(".tsx") || n.endsWith(".svelte")))
+      hasFileMatching(targetDir, (n) =>
+        /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|svelte)$/.test(n),
+      ))
   ) {
     langs.push("ts");
   }
@@ -216,7 +218,7 @@ function runTsChecks(targetDir: string, mode: CheckMode): LangCheckItem[] {
       existsSync(join(targetDir, "bunfig.toml"));
     const hasTestFiles = hasFileMatching(
       targetDir,
-      (n) => /\.(test|spec)\.(ts|tsx|js|jsx)$/.test(n),
+      (n) => /\.(test|spec)\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.test(n),
       3,
     );
     const bunBin = whichBin("bun", targetDir);

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { findWorkbenchRoot } from "./config";
 import { runGit } from "./git";
@@ -41,6 +41,7 @@ export interface TaskSpecState {
   hashes: { ssot: string; tech_spec: string; test_spec: string } | null;
   locked_test_globs: string[];
   amend_scope: SpecAmendScope | null;
+  amend_scopes: SpecAmendScope[];
   amend_reason: string | null;
   stale_stages: string[];
   drifted_files: string[];
@@ -946,8 +947,11 @@ export class Ledger {
         throw new Error(`Spec directory does not exist: ${rawDir}`);
       }
       const realDir = realpathSync(absDir);
+      if (!statSync(realDir).isDirectory()) {
+        throw new Error(`Spec path is not a directory: ${rawDir}`);
+      }
       const relDir = relative(wbReal, realDir).replace(/\\/g, "/");
-      if (!relDir || relDir.startsWith("..")) {
+      if (!relDir || relDir.startsWith("..") || isAbsolute(relDir)) {
         throw new Error(`Spec directory must reside inside workbench root: ${rawDir}`);
       }
 
@@ -971,9 +975,14 @@ export class Ledger {
           throw new Error(`Missing required spec document: ${files[key]}`);
         }
         const realFile = realpathSync(absFile);
-        const relFile = relative(wbReal, realFile).replace(/\\/g, "/");
-        if (!relFile || relFile.startsWith("..")) {
-          throw new Error(`Spec document escapes workbench root via symlink: ${files[key]}`);
+        if (!statSync(realFile).isFile()) {
+          throw new Error(`Spec document is not a regular file: ${files[key]}`);
+        }
+        const relToSpecDir = relative(realDir, realFile).replace(/\\/g, "/");
+        if (!relToSpecDir || relToSpecDir.startsWith("..") || isAbsolute(relToSpecDir)) {
+          throw new Error(
+            `Spec document resolves outside selected spec directory (${relDir}): ${files[key]}`,
+          );
         }
         const rawText = readFileSync(realFile, "utf8");
         if (!rawText.trim()) {
@@ -991,6 +1000,66 @@ export class Ledger {
         params.locked_test_globs !== undefined
           ? [...new Set(params.locked_test_globs.map((g) => g.trim()).filter(Boolean))]
           : prevSpec.locked_test_globs;
+
+      if (prevSpec.state === "FROZEN") {
+        if (prevSpec.spec_dir && relDir !== prevSpec.spec_dir) {
+          throw new Error(
+            `Cannot change spec_dir from ${prevSpec.spec_dir} to ${relDir} while spec is FROZEN; run \`ledger amend ${params.task_id} --scope requirement --reason "..."\` first`,
+          );
+        }
+        const changedDocs: string[] = [];
+        for (const key of ["ssot", "tech_spec", "test_spec"] as const) {
+          if (prevSpec.hashes && hashes[key] !== prevSpec.hashes[key]) {
+            changedDocs.push(files[key]);
+          }
+        }
+        if (changedDocs.length > 0) {
+          throw new Error(
+            `Cannot re-freeze drifted spec document(s) (${changedDocs.join(", ")}) without an explicit amendment; restore files or run \`ledger amend ${params.task_id} --scope ... --reason "..."\` first`,
+          );
+        }
+        if (params.locked_test_globs !== undefined) {
+          const dropped = prevSpec.locked_test_globs.filter((g) => !lockedGlobs.includes(g));
+          if (dropped.length > 0) {
+            throw new Error(
+              `Cannot remove locked test glob(s) (${dropped.join(", ")}) while spec is FROZEN; run \`ledger amend ${params.task_id} --scope test_spec --reason "..."\` first`,
+            );
+          }
+        }
+      } else if (prevSpec.state === "AMENDED") {
+        const scopes = new Set<SpecAmendScope>(prevSpec.amend_scopes);
+        const allowSsot = scopes.has("requirement") || scopes.has("invariant");
+        const allowTech = allowSsot || scopes.has("tech_spec");
+        const allowTest = allowSsot || scopes.has("test_spec");
+        if (!allowSsot && prevSpec.spec_dir && relDir !== prevSpec.spec_dir) {
+          throw new Error(
+            `Cannot change spec_dir from ${prevSpec.spec_dir} to ${relDir} outside requirement/invariant amend scope`,
+          );
+        }
+        const unauthorizedDocs: string[] = [];
+        if (!allowSsot && prevSpec.hashes && hashes.ssot !== prevSpec.hashes.ssot) {
+          unauthorizedDocs.push(files.ssot);
+        }
+        if (!allowTech && prevSpec.hashes && hashes.tech_spec !== prevSpec.hashes.tech_spec) {
+          unauthorizedDocs.push(files.tech_spec);
+        }
+        if (!allowTest && prevSpec.hashes && hashes.test_spec !== prevSpec.hashes.test_spec) {
+          unauthorizedDocs.push(files.test_spec);
+        }
+        if (unauthorizedDocs.length > 0) {
+          throw new Error(
+            `Cannot re-freeze: out-of-scope spec document(s) changed (${unauthorizedDocs.join(", ")}) outside amend scope(s) [${[...scopes].join(", ")}]; restore them or add an authorizing \`ledger amend\``,
+          );
+        }
+        if (!allowTest && params.locked_test_globs !== undefined) {
+          const dropped = prevSpec.locked_test_globs.filter((g) => !lockedGlobs.includes(g));
+          if (dropped.length > 0) {
+            throw new Error(
+              `Cannot remove locked test glob(s) (${dropped.join(", ")}) outside test_spec/invariant/requirement amend scope`,
+            );
+          }
+        }
+      }
 
       const payload: SpecFrozenPayload = {
         spec_dir: relDir,
@@ -1078,6 +1147,8 @@ export class Ledger {
     let lockedTestGlobs: string[] = [];
     let amendScope: SpecAmendScope | null = null;
     let amendReason: string | null = null;
+    let firstFreezeSeen = false;
+    let pendingAmendScopes = new Set<SpecAmendScope>();
     let pendingStaleStages = new Set<string>();
     const floors = { lint: 0, test: 0, review: 0, fat: 0 };
 
@@ -1092,16 +1163,26 @@ export class Ledger {
           if (Array.isArray(p.locked_test_globs)) {
             lockedTestGlobs = p.locked_test_globs.map(String);
           }
-          if (pendingStaleStages.has("lint")) floors.lint = Math.max(floors.lint, row.seq);
-          if (pendingStaleStages.has("test")) floors.test = Math.max(floors.test, row.seq);
-          if (pendingStaleStages.has("review")) floors.review = Math.max(floors.review, row.seq);
-          if (pendingStaleStages.has("fat")) floors.fat = Math.max(floors.fat, row.seq);
+          if (!firstFreezeSeen) {
+            firstFreezeSeen = true;
+            floors.lint = Math.max(floors.lint, row.seq);
+            floors.test = Math.max(floors.test, row.seq);
+            floors.review = Math.max(floors.review, row.seq);
+            floors.fat = Math.max(floors.fat, row.seq);
+          } else {
+            if (pendingStaleStages.has("lint")) floors.lint = Math.max(floors.lint, row.seq);
+            if (pendingStaleStages.has("test")) floors.test = Math.max(floors.test, row.seq);
+            if (pendingStaleStages.has("review")) floors.review = Math.max(floors.review, row.seq);
+            if (pendingStaleStages.has("fat")) floors.fat = Math.max(floors.fat, row.seq);
+          }
           pendingStaleStages = new Set<string>();
+          pendingAmendScopes = new Set<SpecAmendScope>();
         } else if (row.event_type === "SPEC_AMENDED") {
           const p = JSON.parse(row.payload_json) as Partial<SpecAmendedPayload>;
           amendSeq = row.seq;
           if (p.scope && VALID_SPEC_AMEND_SCOPES.has(p.scope)) {
             amendScope = p.scope;
+            pendingAmendScopes.add(p.scope);
           }
           amendReason = p.reason ?? null;
           for (const st of p.stale_stages ?? []) {
@@ -1124,6 +1205,7 @@ export class Ledger {
         hashes: null,
         locked_test_globs: [],
         amend_scope: null,
+        amend_scopes: [],
         amend_reason: null,
         stale_stages: [],
         drifted_files: [],
@@ -1134,10 +1216,41 @@ export class Ledger {
     const isAmended = amendSeq !== null && amendSeq > freezeSeq;
     const driftedFiles: string[] = [];
     if (!isAmended && files && hashes) {
+      const wbReal = existsSync(this.workbenchRoot)
+        ? realpathSync(this.workbenchRoot)
+        : resolve(this.workbenchRoot);
+      let realSpecDir: string | null = null;
+      if (specDir) {
+        const specDirAbs = resolve(wbReal, specDir);
+        if (existsSync(specDirAbs)) {
+          try {
+            realSpecDir = realpathSync(specDirAbs);
+          } catch {
+            realSpecDir = null;
+          }
+        }
+      }
       for (const key of ["ssot", "tech_spec", "test_spec"] as const) {
         const relPath = files[key];
         const expectedHash = hashes[key];
-        const actualHash = sha256File(resolve(this.workbenchRoot, relPath));
+        const absFile = resolve(wbReal, relPath);
+        if (!existsSync(absFile) || !realSpecDir) {
+          driftedFiles.push(relPath);
+          continue;
+        }
+        let realFile: string;
+        try {
+          realFile = realpathSync(absFile);
+        } catch {
+          driftedFiles.push(relPath);
+          continue;
+        }
+        const relToDir = relative(realSpecDir, realFile).replace(/\\/g, "/");
+        if (!relToDir || relToDir.startsWith("..") || isAbsolute(relToDir)) {
+          driftedFiles.push(relPath);
+          continue;
+        }
+        const actualHash = sha256File(realFile);
         if (!actualHash || actualHash !== expectedHash) {
           driftedFiles.push(relPath);
         }
@@ -1154,6 +1267,7 @@ export class Ledger {
       hashes,
       locked_test_globs: lockedTestGlobs,
       amend_scope: isAmended ? amendScope : null,
+      amend_scopes: isAmended ? [...pendingAmendScopes] : [],
       amend_reason: isAmended ? amendReason : null,
       stale_stages: isAmended ? [...pendingStaleStages] : [],
       drifted_files: driftedFiles,
@@ -1189,13 +1303,19 @@ export class Ledger {
     repo: string;
     head_sha: string;
     checkEndpoint?: boolean;
-  }): { ready: boolean; missing: string[]; hasExplicitFailure: boolean } {
+  }): {
+    ready: boolean;
+    missing: string[];
+    hasExplicitFailure: boolean;
+    recordedReviewRoles: string[];
+  } {
     const task = this.getTask(params.task_id);
     if (!task) {
       return {
         ready: false,
         missing: [`Task ${params.task_id} not found`],
         hasExplicitFailure: false,
+        recordedReviewRoles: [],
       };
     }
 
@@ -1352,7 +1472,12 @@ export class Ledger {
       }
     }
 
-    return { ready: missing.length === 0, missing, hasExplicitFailure };
+    return {
+      ready: missing.length === 0,
+      missing,
+      hasExplicitFailure,
+      recordedReviewRoles: passingRoles,
+    };
   }
 
   closeTask(params: {
@@ -2039,6 +2164,7 @@ Commands:
         if (!task) throw new Error(`Task not found: ${values.task}`);
         const data = {
           task,
+          spec: ledger.getSpecState(values.task),
           repos: ledger.getTaskRepos(values.task),
           blockers: ledger.getTaskBlockers(values.task),
           events: ledger.getTaskEvents(values.task),

@@ -22,7 +22,7 @@ description: >
 
 ### Stage 0：需求定稿（`grill`）
 - 调用 `.agents/skills/grill/SKILL.md`，与用户对齐口径并落盘 `.workbench/specs/<task_id>/ssot.md`（编号业务不变量 `INV-*` + 衍生流程 + **冻结的外部接口契约**，不含内部实现）。
-- 开立任务账本 `.workbench/bin/ledger open --id <task_id> --title "..." --endpoint <ep> --depth full --repo <r> --branch <b>`（跨仓用 `ledger attach`）。
+- 若 `grill` 阶段已建账则直接复用该 `task_id`（不重复 `ledger open`，跨仓仅补 `ledger attach`）；若尚未建账则执行 `.workbench/bin/ledger open --id <task_id> --title "..." --endpoint <ep> --depth full --repo <r> --branch <b>`。
 
 ### Stage 1：独立双上下文派生 Paperwork + 评审 + 冻结
 1. **双独立派生（严禁同一上下文或互相参照生成）**：
@@ -34,19 +34,19 @@ description: >
    - `tech-spec.md`：审**正确性、性能、兼容性、简单性**（以 AI-Legibility / 低状态复杂度为准，不审传统人工美学）；
    - `test-spec.md`：对照 `ssot.md` 审**完备性、正确性**（顺带反向揪出 `ssot.md` 的遗漏或歧义）。
    核实并 refine 直到两份评审零阻断项，向用户汇报三件套定稿。
-3. **周期冻结（物理锁生效）**：
-   执行：
+3. **周期冻结（三件套物理锁生效）**：
+   先冻结三件套文档（此时**不要**提前加 `--lock-tests "*.hurl"`，以免阻断 Stage 2 轨道 B 新建 Hurl 脚本；仅当目标 Hurl 已存在且需即刻锁定时才一并传入 `--lock-tests`）：
    ```bash
-   .workbench/bin/ledger freeze <task_id> --lock-tests "*.hurl"
+   .workbench/bin/ledger freeze <task_id>
    ```
-   （如 Hurl 尚未创建，可在 Stage 2 Hurl 落盘后再追加 `--lock-tests` 锁定，或冻结三件套并在 Hurl 就绪后重冻锁定）。此后整个 Dev Cycle 内三件套只读，`guard` 物理拦截静默修改；确需偏离必须经用户批准走 `ledger amend`。
+   此后整个 Dev Cycle 内三件套只读，`guard` 物理拦截静默修改，且冻结前的旧验证证据不自动放行冻结后的周期；确需偏离必须经用户批准走 `ledger amend`。
 
 ### Stage 2：并行实现（代码 + 静态/动态检查 + 四层 Review ∥ Hurl 编写）
 并行派生两条独立轨道（文件所有权互不重叠，必要时用独立 worktree）：
 - **轨道 A（代码实现）**：委派 `.codex/agents/dev.toml` 按 `tech-spec.md` 与 `ssot.md` 实施（**刻意克制 Mock 堆砌型单测**；保持代码简单自解释）。实现后：
   1. 跑对应语言静态与动态检查（仓内原生命令或 `.workbench/bin/lang-check <repo> --mode all`：Go `go vet`/`go test -race`、TS `tsc`/`biome`/`eslint`、Python `ruff`/`pyright`/`PYTHONDEVMODE=1 pytest`）；
   2. 执行完整四层 `wrapup`（业务对齐 `ssot.md` → 语言特化实现 bug `review-quality` → 性能与简单平衡 `review-performance` + `review-simplify` → 精简内部注释 + 完备最新接口文档 `review-comments`）。
-- **轨道 B（独立测试实现，并行）**：派生独立 subagent（`fork_turns="none"`），**仅读 `ssot.md` 与 `test-spec.md`**（不读实现代码），编写可执行 Hurl 脚本与幂等夹具清理逻辑；完成后如尚未锁定测试文件，执行 `ledger freeze <task_id> --lock-tests "<hurl-glob>"` 上锁防篡改。
+- **轨道 B（独立测试实现，并行）**：派生独立 subagent（`fork_turns="none"`），**仅读 `ssot.md` 与 `test-spec.md`**（不读实现代码），编写可执行 Hurl 脚本与幂等夹具清理逻辑；Hurl 落盘完成后执行纯加锁重冻 `.workbench/bin/ledger freeze <task_id> --lock-tests "*.hurl"`（校验三件套零漂移、保留冻结后已有证据并立即锁定 Hurl 防篡改）。
 
 ### Stage 3：FAT / Container 集成、冒烟与性能验证
 - 按 `.agents/skills/ship/SKILL.md` 合入 FAT（或按 `test-environment` 用 Apple `container` 搭隔离环境），执行轨道 B 产出的 Hurl 集成/冒烟测试（以及按需的性能测试）。

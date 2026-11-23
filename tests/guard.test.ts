@@ -527,8 +527,9 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
       evaluatePreToolUse(wb, shellInput('echo "HTTP 500" > app-api/tests/api.hurl')),
     ).toContain("冻结测试防篡改");
 
-    // 4. `ledger amend --scope test_spec` unlocks test-spec.md and *.hurl while keeping ssot.md and tech-spec.md locked!
+    // 4. Re-freeze, then `ledger amend --scope test_spec` unlocks ONLY test-spec.md & *.hurl while keeping ssot.md & tech-spec.md locked!
     const ledger3 = new Ledger(wb);
+    ledger3.freezeSpec({ task_id: "20261123-spec" });
     ledger3.amendSpec({
       task_id: "20261123-spec",
       scope: "test_spec",
@@ -545,5 +546,151 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         shellInput('echo "tamper" >> .workbench/specs/20261123-spec/tech-spec.md'),
       ),
     ).toContain("冻结 Spec 保护");
+    expect(
+      evaluatePreToolUse(
+        wb,
+        shellInput('echo "tamper" >> .workbench/specs/20261123-spec/ssot.md'),
+      ),
+    ).toContain("冻结 Spec 保护");
+
+    // 5. Consecutive un-refrozen amends (test_spec + tech_spec) unlock the union while keeping ssot.md locked
+    const ledger4 = new Ledger(wb);
+    ledger4.amendSpec({
+      task_id: "20261123-spec",
+      scope: "tech_spec",
+      reason: "also adjust endpoint note",
+    });
+    ledger4.closeDb();
+    expect(
+      evaluatePreToolUse(
+        wb,
+        shellInput('echo "ok" >> .workbench/specs/20261123-spec/tech-spec.md'),
+      ),
+    ).toBeNull();
+    expect(
+      evaluatePreToolUse(wb, shellInput('echo "HTTP 201" > app-api/tests/api.hurl')),
+    ).toBeNull();
+    expect(
+      evaluatePreToolUse(
+        wb,
+        shellInput('echo "tamper" >> .workbench/specs/20261123-spec/ssot.md'),
+      ),
+    ).toContain("冻结 Spec 保护");
+  });
+
+  test("guard lock hardening: catches install/dd/clobber/patch/env/ruby/sh/git, matches recursive globs & bound worktrees without sibling false positives or read-only blocks", () => {
+    const wtFeat = join(wb, "app-api.worktrees", "feat");
+    const wtOther = join(wb, "app-api.worktrees", "other");
+    mkdirSync(join(wb, "app-api.worktrees"), { recursive: true });
+    mkdirSync(join(repoDir, "tests", "sub"), { recursive: true });
+    writeFileSync(join(repoDir, "tests", "smoke.hurl"), "GET http://localhost/health\nHTTP 200\n");
+    writeFileSync(join(repoDir, "tests", "sub", "a.hurl"), "GET http://localhost/a\nHTTP 200\n");
+    runGit(repoDir, ["add", "tests"]);
+    runGit(repoDir, ["commit", "-m", "chore: add hurl tests"]);
+    runGit(repoDir, ["worktree", "add", "-b", "feat/wt", wtFeat, "HEAD"]);
+    runGit(repoDir, ["worktree", "add", "-b", "feat/other", wtOther, "HEAD"]);
+
+    const specDir = join(wb, ".workbench", "specs", "20261123-wt");
+    mkdirSync(specDir, { recursive: true });
+    writeFileSync(join(specDir, "ssot.md"), "# SSOT\nINV-1: immutable\n");
+    writeFileSync(join(specDir, "tech-spec.md"), "# Tech\nok\n");
+    writeFileSync(join(specDir, "test-spec.md"), "# Test\nok\n");
+
+    const ledger = new Ledger(wb);
+    ledger.openTask({
+      task_id: "20261123-wt",
+      title: "Worktree & shell mutation lock test",
+      endpoint: "local",
+      depth: "full",
+      repo: "app-api",
+      branch: "feat/wt",
+      worktree: wtFeat,
+    });
+    ledger.freezeSpec({
+      task_id: "20261123-wt",
+      locked_test_globs: ["tests/**/*.hurl"],
+    });
+    ledger.closeDb();
+
+    // 1. Shell mutation forms on frozen ssot.md MUST all be denied
+    const patchFile = join(wb, "tamper.patch");
+    writeFileSync(
+      patchFile,
+      `--- .workbench/specs/20261123-wt/ssot.md\n+++ .workbench/specs/20261123-wt/ssot.md\n@@ -1 +1 @@\n-# SSOT\n+# HACKED\n`,
+    );
+    const mustDenySpec = [
+      `install /tmp/x .workbench/specs/20261123-wt/ssot.md`,
+      `dd if=/dev/zero of=.workbench/specs/20261123-wt/ssot.md`,
+      `echo bad >| .workbench/specs/20261123-wt/ssot.md`,
+      `patch -p0 -i ${patchFile}`,
+      `env python3 -c 'open(".workbench/specs/20261123-wt/ssot.md","w").write("x")'`,
+      `ruby -e 'File.write(".workbench/specs/20261123-wt/ssot.md","x")'`,
+      `sh -c 'echo bad > .workbench/specs/20261123-wt/ssot.md'`,
+      `bash -lc 'cp /tmp/x .workbench/specs/20261123-wt/ssot.md'`,
+    ];
+    for (const c of mustDenySpec) {
+      expect(
+        evaluatePreToolUse(wb, {
+          hook_event_name: "PreToolUse",
+          cwd: wb,
+          tool_name: "exec_command",
+          tool_input: { command: c },
+        }),
+      ).toContain("冻结 Spec 保护");
+    }
+
+    // 2. Recursive glob `tests/**/*.hurl` inside bound worktree catches 0, 1, and 2+ nested dirs
+    for (const rel of ["tests/smoke.hurl", "tests/sub/a.hurl", "tests/a/b/a.hurl"]) {
+      expect(
+        evaluatePreToolUse(wb, {
+          hook_event_name: "PreToolUse",
+          cwd: wtFeat,
+          tool_name: "apply_patch",
+          tool_input: {
+            patch: `*** Begin Patch\n*** Update File: ${rel}\n@@\n-HTTP 200\n+HTTP 500\n*** End Patch`,
+          },
+        }),
+      ).toContain("冻结测试防篡改");
+    }
+    // `git checkout --` on locked hurl inside bound worktree caught by lock layer
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: "git checkout -- tests/sub/a.hurl" },
+      }),
+    ).toContain("冻结测试防篡改");
+
+    // 3. Sibling worktree (belonging to another branch/task) MUST NOT be blocked by wtFeat's lock!
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtOther,
+        tool_name: "apply_patch",
+        tool_input: {
+          patch: "*** Begin Patch\n*** Update File: tests/smoke.hurl\n@@\n-HTTP 200\n+HTTP 201\n*** End Patch",
+        },
+      }),
+    ).toBeNull();
+
+    // 4. Read-only operations MUST NOT false-positive!
+    const mustAllowReadOnly = [
+      `sed -n '1,5p' .workbench/specs/20261123-wt/ssot.md`,
+      `cp .workbench/specs/20261123-wt/ssot.md /tmp/backup-ssot.md`,
+      `dd if=.workbench/specs/20261123-wt/ssot.md of=/tmp/backup-ssot.md`,
+      `node -e 'console.log("example.hurl")'`,
+      `sh -c 'cat .workbench/specs/20261123-wt/ssot.md'`,
+    ];
+    for (const c of mustAllowReadOnly) {
+      expect(
+        evaluatePreToolUse(wb, {
+          hook_event_name: "PreToolUse",
+          cwd: wb,
+          tool_name: "exec_command",
+          tool_input: { command: c },
+        }),
+      ).toBeNull();
+    }
   });
 });

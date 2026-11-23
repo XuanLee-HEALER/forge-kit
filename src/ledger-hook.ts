@@ -95,10 +95,45 @@ function parseLangCheckInvocation(cmdToks: string[]): {
 
 function extractTscArgs(cmdToks: string[]): string[] | null {
   const [c0 = "", c1 = "", c2 = ""] = cmdToks;
-  if (c0 === "npx" && c1 === "tsc") return cmdToks.slice(2);
-  if (c0 === "bunx" && c1 === "tsc") return cmdToks.slice(2);
-  if (c0 === "bunx" && c1 === "--bun" && c2 === "tsc") return cmdToks.slice(3);
-  if (c0 === "tsc" || c0.endsWith("/tsc")) return cmdToks.slice(1);
+  const bin0 = c0.split("/").pop() ?? "";
+  if (bin0 === "npx" && c1 === "tsc") return cmdToks.slice(2);
+  if (bin0 === "bunx" && c1 === "tsc") return cmdToks.slice(2);
+  if (bin0 === "bunx" && c1 === "--bun" && c2 === "tsc") return cmdToks.slice(3);
+  if (bin0 === "tsc") return cmdToks.slice(1);
+  return null;
+}
+
+function parseGoInvocation(cmdToks: string[]): {
+  subcmd: "test" | "build" | "vet";
+  argsStart: number;
+  preDirs: string[];
+} | null {
+  const bin0 = (cmdToks[0] ?? "").split("/").pop() ?? "";
+  if (bin0 !== "go") return null;
+  const preDirs: string[] = [];
+  let idx = 1;
+  while (idx < cmdToks.length) {
+    const t = cmdToks[idx];
+    if (t === "-C" || t === "--C") {
+      const val = cmdToks[++idx];
+      if (!val) return null;
+      preDirs.push(val);
+      idx++;
+      continue;
+    }
+    if (t.startsWith("-C=") || t.startsWith("--C=")) {
+      const val = t.slice(t.indexOf("=") + 1);
+      if (!val) return null;
+      preDirs.push(val);
+      idx++;
+      continue;
+    }
+    break;
+  }
+  const sub = cmdToks[idx];
+  if (sub === "test" || sub === "build" || sub === "vet") {
+    return { subcmd: sub, argsStart: idx + 1, preDirs };
+  }
   return null;
 }
 
@@ -132,9 +167,16 @@ function classifyVerifyCommand(metaToks: ShellToken[]): {
     return { kind: "lang-check", cmdToks, envToks };
   }
 
+  // go test / vet / build (supports both `go -C <dir> vet` and `go vet -C <dir>`, and absolute paths)
+  const goInv = parseGoInvocation(cmdToks);
+  if (goInv) {
+    const kind =
+      goInv.subcmd === "test" ? "test" : goInv.subcmd === "vet" ? "lint" : "build";
+    return { kind, cmdToks, envToks };
+  }
+
   // test
   if (
-    (bin0 === "go" && c1 === "test") ||
     (bin0 === "bun" && c1 === "test") ||
     (bin0 === "bun" && c1 === "run" && (c2 === "test" || c2.startsWith("test:"))) ||
     (bin0 === "npm" && c1 === "run" && (c2 === "test" || c2.startsWith("test:"))) ||
@@ -147,7 +189,6 @@ function classifyVerifyCommand(metaToks: ShellToken[]): {
 
   // lint / static checks
   if (
-    (bin0 === "go" && c1 === "vet") ||
     (bin0 === "make" && (makeTarget === "lint" || makeTarget === "harness-guard")) ||
     (bin0 === "just" && (c1 === "check" || c1 === "lint" || c1 === "typecheck" || c1 === "typecheck-server")) ||
     (bin0 === "bun" && c1 === "run" && (c2 === "check" || c2.startsWith("check:") || c2 === "lint" || c2.startsWith("lint:"))) ||
@@ -166,7 +207,6 @@ function classifyVerifyCommand(metaToks: ShellToken[]): {
 
   // build
   if (
-    (bin0 === "go" && c1 === "build") ||
     (bin0 === "make" && (makeTarget === "build" || makeTarget === "compile")) ||
     (bin0 === "just" && c1 === "build") ||
     (bin0 === "bun" && c1 === "run" && (c2 === "build" || c2.startsWith("build:"))) ||
@@ -552,9 +592,10 @@ const TSC_NORMAL_LIST_OPTS = new Set([
 ]);
 
 function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): boolean {
-  const [c0, c1 = ""] = cmdToks;
+  const [c0 = "", c1 = ""] = cmdToks;
+  const bin0 = c0.split("/").pop() ?? "";
 
-  if (c0 === "make") {
+  if (bin0 === "make") {
     // 1. Startup environment: process.env overlaid ONLY by shell env prefix (`envToks`).
     const startupMakeEnv = new Map<string, string>();
     if (process.env.MAKEFLAGS !== undefined) startupMakeEnv.set("MAKEFLAGS", process.env.MAKEFLAGS);
@@ -581,7 +622,7 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
     return hasMakeNonExecArgs(cmdToks.slice(1), false);
   }
 
-  if (c0 === "just") {
+  if (bin0 === "just") {
     const effectiveJustEnv = new Map<string, string>();
     if (process.env.JUST_DRY_RUN !== undefined) effectiveJustEnv.set("JUST_DRY_RUN", process.env.JUST_DRY_RUN);
     if (process.env.JUST_ALLOW_MISSING !== undefined) {
@@ -642,20 +683,21 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
     return false;
   }
 
-  if (c0 === "go" && (c1 === "test" || c1 === "build" || c1 === "vet")) {
+  const goInv = parseGoInvocation(cmdToks);
+  if (goInv) {
     const isGoBoolOn = (norm: string, name: string): boolean => {
       if (norm === name) return true;
       if (!norm.startsWith(`${name}=`)) return false;
       const val = norm.slice(name.length + 1).toLowerCase();
       return val !== "false" && val !== "0" && val !== "f";
     };
-    for (let i = 2; i < cmdToks.length; i++) {
+    for (let i = goInv.argsStart; i < cmdToks.length; i++) {
       const tok = cmdToks[i];
       if (tok === "--") break;
       const norm = tok.startsWith("--") ? tok.slice(1) : tok;
       if (isGoBoolOn(norm, "-n") || norm === "-help" || norm === "-h") return true;
       if (
-        c1 === "test" &&
+        goInv.subcmd === "test" &&
         (isGoBoolOn(norm, "-c") || norm === "-list" || norm.startsWith("-list="))
       ) {
         return true;
@@ -741,7 +783,7 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
     return Array.from(tscFlags.values()).some(Boolean);
   }
 
-  if (c0 === "npx" && c1 === "eslint") {
+  if (bin0 === "npx" && c1 === "eslint") {
     for (let i = 2; i < cmdToks.length; i++) {
       const tok = cmdToks[i];
       if (tok === "--") break;
@@ -750,7 +792,7 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
     return false;
   }
 
-  if (c0 === "ruff" && c1 === "check") {
+  if (bin0 === "ruff" && c1 === "check") {
     for (let i = 2; i < cmdToks.length; i++) {
       const tok = cmdToks[i];
       if (tok === "--") break;
@@ -759,13 +801,13 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
     return false;
   }
 
-  if (c0 === "npm" || c0 === "bun") {
+  if (bin0 === "npm" || bin0 === "bun") {
     const flags = new Map<string, boolean>();
     const parseBoolVal = (v: string): boolean => {
       const low = v.toLowerCase();
       return low !== "false" && low !== "0" && low !== "";
     };
-    if (c0 === "npm") {
+    if (bin0 === "npm") {
       for (const [rawKey, rawVal] of Object.entries(process.env)) {
         if (rawVal === undefined) continue;
         const k = rawKey.toLowerCase();
@@ -782,7 +824,7 @@ function hasNonExecutingVerifyFlag(cmdToks: string[], envToks: string[] = []): b
       }
     }
     const checkKeys =
-      c0 === "bun" && c1 === "test"
+      bin0 === "bun" && c1 === "test"
         ? ["dry-run", "pass-with-no-tests"]
         : ["dry-run", "if-present", "no-exit-on-error"];
     for (let i = 1; i < cmdToks.length; i++) {
@@ -851,19 +893,123 @@ function extractMakeDirs(args: string[], startDir: string): string | null {
   return dir;
 }
 
+function commonDirAncestor(dirs: string[]): string {
+  if (dirs.length === 1) return dirs[0];
+  const partsList = dirs.map((d) => resolve(d).split("/"));
+  const common: string[] = [];
+  const minLen = Math.min(...partsList.map((p) => p.length));
+  for (let i = 0; i < minLen; i++) {
+    const seg = partsList[0][i];
+    if (partsList.every((p) => p[i] === seg)) common.push(seg);
+    else break;
+  }
+  return common.join("/") || "/";
+}
+
+function resolvePathArgToDir(
+  rawArg: string,
+  curDir: string,
+  stripPytestNodeId = false,
+): string {
+  let cleaned = stripPytestNodeId ? rawArg.split("::")[0] : rawArg;
+  if (cleaned.endsWith("/...")) cleaned = cleaned.slice(0, -4) || ".";
+  if (cleaned === "...") cleaned = ".";
+  const abs = resolve(curDir, cleaned);
+  if (existsSync(abs)) {
+    try {
+      return statSync(abs).isFile() ? dirname(abs) : abs;
+    } catch {
+      return abs;
+    }
+  }
+  const base = cleaned.split("/").pop() ?? "";
+  if (/\.[a-zA-Z0-9]{1,8}$/.test(base) && !base.startsWith(".")) {
+    return dirname(abs);
+  }
+  return abs;
+}
+
+function resolvePositionalTargetDir(
+  args: string[],
+  curDir: string,
+  opts: {
+    valueFlags: Set<string>;
+    stripPytestNodeId?: boolean;
+    onlyPathLike?: boolean;
+    projectFlags?: Set<string>;
+    rootDirFlags?: Set<string>;
+  },
+): string | null {
+  const positionals: string[] = [];
+  let explicitProject: string | null = null;
+  let explicitRoot: string | null = null;
+  let endFlags = false;
+  for (let i = 0; i < args.length; i++) {
+    const tok = args[i];
+    if (!endFlags && tok === "--") {
+      endFlags = true;
+      continue;
+    }
+    if (!endFlags && tok.startsWith("-") && tok.length > 1) {
+      const eqIdx = tok.indexOf("=");
+      const flagName = eqIdx >= 0 ? tok.slice(0, eqIdx) : tok;
+      if (opts.projectFlags?.has(flagName)) {
+        const val = eqIdx >= 0 ? tok.slice(eqIdx + 1) : args[++i];
+        if (!val) return null;
+        explicitProject = val;
+        continue;
+      }
+      if (opts.rootDirFlags?.has(flagName)) {
+        const val = eqIdx >= 0 ? tok.slice(eqIdx + 1) : args[++i];
+        if (!val) return null;
+        explicitRoot = val;
+        continue;
+      }
+      if (eqIdx < 0 && opts.valueFlags.has(flagName)) {
+        i++;
+      }
+      continue;
+    }
+    if (opts.onlyPathLike) {
+      const isPathLike =
+        tok.startsWith("./") ||
+        tok.startsWith("../") ||
+        tok.startsWith("/") ||
+        tok.includes("/") ||
+        existsSync(resolve(curDir, tok));
+      if (!isPathLike) continue;
+    }
+    positionals.push(tok);
+  }
+  if (positionals.length > 0) {
+    const dirs = positionals.map((p) =>
+      resolvePathArgToDir(p, curDir, Boolean(opts.stripPytestNodeId)),
+    );
+    return commonDirAncestor(dirs);
+  }
+  if (explicitProject) {
+    return resolvePathArgToDir(explicitProject, curDir);
+  }
+  if (explicitRoot) {
+    return resolve(curDir, explicitRoot);
+  }
+  return curDir;
+}
+
 function resolveVerifyTargetDir(
   cmdToks: string[],
   envToks: string[],
   curDir: string,
 ): string | null {
-  const [c0, c1 = ""] = cmdToks;
+  const [c0 = "", c1 = "", c2 = ""] = cmdToks;
+  const bin0 = c0.split("/").pop() ?? "";
 
-  if (c0 === "make") {
+  if (bin0 === "make") {
     // Per GNU Make docs, `-C` / `--directory` is ONLY honored on the command line (NEVER via MAKEFLAGS).
     return extractMakeDirs(cmdToks.slice(1), curDir);
   }
 
-  if (c0 === "just") {
+  if (bin0 === "just") {
     let explicitDir: string | null = process.env.JUST_WORKING_DIRECTORY || null;
     let justfile: string | null = process.env.JUST_JUSTFILE || null;
     for (const raw of envToks) {
@@ -919,9 +1065,14 @@ function resolveVerifyTargetDir(
       : curDir;
   }
 
-  if (c0 === "go" && (c1 === "test" || c1 === "build" || c1 === "vet")) {
+  const goInv = parseGoInvocation(cmdToks);
+  if (goInv) {
     let dir = curDir;
-    for (let i = 2; i < cmdToks.length; i++) {
+    for (const d of goInv.preDirs) {
+      dir = resolve(dir, d);
+    }
+    const pkgPaths: string[] = [];
+    for (let i = goInv.argsStart; i < cmdToks.length; i++) {
       const tok = cmdToks[i];
       if (tok === "--") break;
       if (tok === "-C" || tok === "--C") {
@@ -932,12 +1083,20 @@ function resolveVerifyTargetDir(
         const val = tok.slice(tok.indexOf("=") + 1);
         if (!val) return null;
         dir = resolve(dir, val);
+      } else if (
+        !tok.startsWith("-") &&
+        (tok.startsWith("./") || tok.startsWith("../") || tok.startsWith("/"))
+      ) {
+        pkgPaths.push(tok);
       }
+    }
+    if (pkgPaths.length > 0) {
+      return commonDirAncestor(pkgPaths.map((p) => resolvePathArgToDir(p, dir)));
     }
     return dir;
   }
 
-  if (c0 === "bun") {
+  if (bin0 === "bun") {
     let dir = curDir;
     for (let i = 1; i < cmdToks.length; i++) {
       const tok = cmdToks[i];
@@ -952,10 +1111,16 @@ function resolveVerifyTargetDir(
         dir = resolve(dir, val);
       }
     }
+    if (c1 === "test") {
+      return resolvePositionalTargetDir(cmdToks.slice(2), dir, {
+        valueFlags: new Set(["--cwd", "-t", "--test-name-pattern", "--timeout", "--preload", "-r"]),
+        onlyPathLike: true,
+      });
+    }
     return dir;
   }
 
-  if (c0 === "npm") {
+  if (bin0 === "npm") {
     let dir = curDir;
     for (let i = 1; i < cmdToks.length; i++) {
       const tok = cmdToks[i];
@@ -1026,6 +1191,163 @@ function resolveVerifyTargetDir(
       return Array.from(dirs)[0];
     }
     return curDir;
+  }
+
+  const pytestInv = isPytestInvocation(cmdToks);
+  if (pytestInv) {
+    return resolvePositionalTargetDir(cmdToks.slice(pytestInv.argsStart), curDir, {
+      valueFlags: new Set([
+        "-k",
+        "-m",
+        "-c",
+        "-o",
+        "-W",
+        "-p",
+        "-n",
+        "--maxfail",
+        "--tb",
+        "--capture",
+        "--junitxml",
+        "--basetemp",
+        "--confcutdir",
+        "--ignore",
+        "--ignore-glob",
+        "--deselect",
+        "--durations",
+      ]),
+      rootDirFlags: new Set(["--rootdir"]),
+      stripPytestNodeId: true,
+    });
+  }
+
+  if (bin0 === "mypy") {
+    return resolvePositionalTargetDir(cmdToks.slice(1), curDir, {
+      valueFlags: new Set([
+        "-m",
+        "--module",
+        "-p",
+        "--package",
+        "-c",
+        "--command",
+        "--config-file",
+        "--python-version",
+        "--python-executable",
+        "--platform",
+        "--cache-dir",
+        "--exclude",
+        "--follow-imports",
+        "--output",
+      ]),
+    });
+  }
+
+  if (bin0 === "pyright") {
+    return resolvePositionalTargetDir(cmdToks.slice(1), curDir, {
+      valueFlags: new Set([
+        "--pythonpath",
+        "--pythonplatform",
+        "--pythonversion",
+        "--typeshedpath",
+        "--venvpath",
+        "--level",
+        "--threads",
+      ]),
+      projectFlags: new Set(["-p", "--project"]),
+    });
+  }
+
+  if (bin0 === "ruff" && c1 === "check") {
+    return resolvePositionalTargetDir(cmdToks.slice(2), curDir, {
+      valueFlags: new Set([
+        "--config",
+        "--select",
+        "--extend-select",
+        "--ignore",
+        "--exclude",
+        "--output-format",
+        "--target-version",
+        "--cache-dir",
+      ]),
+    });
+  }
+
+  if (
+    (bin0 === "biome" && c1 === "check") ||
+    ((bin0 === "npx" || bin0 === "bunx") && c1 === "biome" && c2 === "check") ||
+    (bin0 === "bunx" && c1 === "--bun" && c2 === "biome" && cmdToks[3] === "check")
+  ) {
+    const startIdx = bin0 === "biome" ? 2 : c1 === "--bun" ? 4 : 3;
+    return resolvePositionalTargetDir(cmdToks.slice(startIdx), curDir, {
+      valueFlags: new Set([
+        "--config-path",
+        "--diagnostic-level",
+        "--max-diagnostics",
+        "--reporter",
+        "--since",
+      ]),
+    });
+  }
+
+  if ((bin0 === "npx" || bin0 === "bunx") && c1 === "eslint") {
+    return resolvePositionalTargetDir(cmdToks.slice(2), curDir, {
+      valueFlags: new Set([
+        "-c",
+        "--config",
+        "--ext",
+        "--format",
+        "-f",
+        "--ignore-path",
+        "--ignore-pattern",
+        "--max-warnings",
+        "--rule",
+        "--parser",
+        "--cache-location",
+      ]),
+    });
+  }
+
+  if (bin0 === "golangci-lint" && c1 === "run") {
+    return resolvePositionalTargetDir(cmdToks.slice(2), curDir, {
+      valueFlags: new Set([
+        "-c",
+        "--config",
+        "--timeout",
+        "--out-format",
+        "--build-tags",
+        "--enable",
+        "--disable",
+        "--new-from-rev",
+      ]),
+    });
+  }
+
+  if (bin0 === "hurl") {
+    return resolvePositionalTargetDir(cmdToks.slice(1), curDir, {
+      valueFlags: new Set([
+        "--variable",
+        "--variables-file",
+        "--file-root",
+        "--connect-timeout",
+        "--max-time",
+        "--retry",
+        "--retry-interval",
+        "--report-html",
+        "--report-json",
+        "--report-junit",
+        "--report-tap",
+        "--output",
+        "-o",
+        "--cookie",
+        "-b",
+        "--cookie-jar",
+        "-c",
+        "--proxy",
+        "-x",
+        "--user",
+        "-u",
+        "--jobs",
+      ]),
+    });
   }
 
   return curDir;
@@ -1843,27 +2165,39 @@ export function classifyPostToolEvidence(
         } else if (parsedLc.mode === "dynamic") {
           phases = [{ kind: "test", status: passed ? "pass" : "fail" }];
         } else {
-          // mode === "all": parse JSON report if available so static-only repos don't fabricate test/pass
+          // mode === "all": requires standalone invocation (`nonCdSegments.length === 1`) so combined
+          // output from chained `lang-check repoA && lang-check repoB` can never cross-credit phases!
+          if (nonCdSegments.length > 1) continue;
           const trimmedOut = outputText.trim();
           let parsedReport: {
+            executed?: number;
             checks?: Array<{ phase?: string; status?: string }>;
           } | null = null;
           if (trimmedOut.startsWith("{")) {
             try {
               parsedReport = JSON.parse(trimmedOut) as {
+                executed?: number;
                 checks?: Array<{ phase?: string; status?: string }>;
               };
             } catch {
               parsedReport = null;
             }
           }
-          if (parsedReport?.checks) {
+          if (
+            parsedReport?.checks &&
+            (typeof parsedReport.executed !== "number" || parsedReport.executed > 0)
+          ) {
             const staticRan = parsedReport.checks.filter(
               (c) => c.phase === "static" && c.status !== "skipped",
             );
             const dynamicRan = parsedReport.checks.filter(
               (c) => c.phase === "dynamic" && c.status !== "skipped",
             );
+            const allJsonPass =
+              staticRan.every((c) => c.status === "pass") &&
+              dynamicRan.every((c) => c.status === "pass");
+            // Fail closed if non-zero exit contradicts all-passing JSON payload
+            if (!passed && allJsonPass) continue;
             if (staticRan.length > 0) {
               phases.push({
                 kind: "lint",
@@ -1877,9 +2211,14 @@ export function classifyPostToolEvidence(
               });
             }
           } else {
-            // Non-JSON summary output: inspect `[PASS]`/`[FAIL]` `(lang/phase)` lines so static-only runs don't fabricate dynamic test/pass!
+            // Non-JSON summary output: require explicit `[PASS]`/`[FAIL]` `(lang/phase)` lines.
+            // Fail closed (emit nothing) when output is empty/truncated so no phase is fabricated!
             const staticMatches = [...outputText.matchAll(/\[(PASS|FAIL)\]\s+\([^/]+\/static\)/g)];
             const dynamicMatches = [...outputText.matchAll(/\[(PASS|FAIL)\]\s+\([^/]+\/dynamic\)/g)];
+            const allTextPass =
+              staticMatches.every((m) => m[1] === "PASS") &&
+              dynamicMatches.every((m) => m[1] === "PASS");
+            if (!passed && allTextPass) continue;
             if (staticMatches.length > 0) {
               phases.push({
                 kind: "lint",
@@ -1891,10 +2230,6 @@ export function classifyPostToolEvidence(
                 kind: "test",
                 status: dynamicMatches.every((m) => m[1] === "PASS") ? "pass" : "fail",
               });
-            }
-            if (phases.length === 0) {
-              // Fallback when output was truncated: record lint (never fabricate both without proof)
-              phases = [{ kind: "lint", status: passed ? "pass" : "fail" }];
             }
           }
         }
