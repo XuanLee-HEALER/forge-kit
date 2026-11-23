@@ -840,5 +840,46 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         tool_input: { command: `git apply --directory app-api ${benignPatch}` },
       }),
     ).toBeNull();
+
+    // Round 5 regressions:
+    // 7. Ambiguous section #1 is NOT cleared by explicit `---`/`+++` headers in section #2!
+    const multiSectionAmbigPatch = join(wb, "multi-ambig.patch");
+    writeFileSync(
+      multiSectionAmbigPatch,
+      [
+        "diff --git old/tests/smoke case.hurl newer/tests/smoke case.hurl",
+        "old mode 100644",
+        "new mode 100755",
+        "diff --git a/readme.md b/readme.md",
+        "--- a/readme.md",
+        "+++ b/readme.md",
+        "@@ -1 +1 @@",
+        "-a",
+        "+b",
+      ].join("\n") + "\n",
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${multiSectionAmbigPatch}` },
+      }),
+    ).toContain("冻结测试防篡改");
+
+    // 8. C-quoted octal UTF-8 filename in mode-only `diff --git` decodes to `café.hurl` and hits lock!
+    const utf8ModePatch = join(wb, "utf8-mode.patch");
+    writeFileSync(
+      utf8ModePatch,
+      'diff --git "a/tests/caf\\303\\251.hurl" "b/tests/caf\\303\\251.hurl"\nold mode 100644\nnew mode 100755\n',
+    );
+    expect(
+      evaluatePreToolUse(wb, {
+        hook_event_name: "PreToolUse",
+        cwd: wtFeat,
+        tool_name: "exec_command",
+        tool_input: { command: `git apply ${utf8ModePatch}` },
+      }),
+    ).toContain("冻结测试防篡改");
   });
 });

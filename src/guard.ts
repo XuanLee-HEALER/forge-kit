@@ -1909,6 +1909,70 @@ function parseShellRedirections(
   return { writeTargets, readInputs, strippedSeg: strippedParts.join("") };
 }
 
+function decodeGitCQuotedPath(quoted: string): string | null {
+  if (!quoted.startsWith('"') || !quoted.endsWith('"') || quoted.length < 2) return null;
+  const inner = quoted.slice(1, -1);
+  const bytes: number[] = [];
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch !== "\\") {
+      const cp = inner.codePointAt(i)!;
+      const full = String.fromCodePoint(cp);
+      pushUtf8Bytes(bytes, full);
+      if (full.length > 1) i += full.length - 1;
+      continue;
+    }
+    if (i + 1 >= inner.length) return null;
+    const esc = inner[++i];
+    if (esc === "a") bytes.push(0x07);
+    else if (esc === "b") bytes.push(0x08);
+    else if (esc === "t") bytes.push(0x09);
+    else if (esc === "n") bytes.push(0x0a);
+    else if (esc === "v") bytes.push(0x0b);
+    else if (esc === "f") bytes.push(0x0c);
+    else if (esc === "r") bytes.push(0x0d);
+    else if (esc === '"') bytes.push(0x22);
+    else if (esc === "\\") bytes.push(0x5c);
+    else if (esc >= "0" && esc <= "3") {
+      const oct = inner.slice(i, i + 3);
+      if (!/^[0-3][0-7][0-7]$/.test(oct)) return null;
+      const val = Number.parseInt(oct, 8);
+      if (val === 0) return null;
+      bytes.push(val);
+      i += 2;
+    } else {
+      return null;
+    }
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+function readGitDiffHeaderToken(
+  s: string,
+  start: number,
+): { value: string; nextIdx: number } | null {
+  if (start >= s.length) return null;
+  if (s[start] === '"') {
+    let i = start + 1;
+    while (i < s.length) {
+      if (s[i] === "\\") {
+        i += 2;
+        continue;
+      }
+      if (s[i] === '"') {
+        const decoded = decodeGitCQuotedPath(s.slice(start, i + 1));
+        if (decoded === null) return null;
+        return { value: decoded, nextIdx: i + 1 };
+      }
+      i++;
+    }
+    return null;
+  }
+  let end = s.indexOf(" ", start);
+  if (end < 0) end = s.length;
+  return { value: s.slice(start, end), nextIdx: end };
+}
+
 function extractPatchFileTargets(
   patchAbsPath: string,
   baseDir: string,
@@ -1922,11 +1986,22 @@ function extractPatchFileTargets(
     }
     const content = readFileSync(patchAbsPath, "utf8");
     const out: string[] = [];
-    const pushPath = (rawPath: string, defaultStripIfPrefixed: boolean): void => {
+    let anyUnresolvedAmbiguousSection = false;
+    let currentSectionAmbiguous = false;
+
+    const pushPath = (
+      rawPath: string,
+      defaultStripIfPrefixed: boolean,
+      alreadyDecoded = false,
+    ): "pushed" | "devnull" | "invalid" => {
       let raw = rawPath.trim();
-      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1);
-      if (!raw || raw === "/dev/null") return;
-      const parts = raw.replace(/\\/g, "/").split("/").filter(Boolean);
+      if (!alreadyDecoded && raw.startsWith('"')) {
+        const decoded = decodeGitCQuotedPath(raw);
+        if (decoded === null) return "invalid";
+        raw = decoded;
+      }
+      if (!raw || raw === "/dev/null") return "devnull";
+      const parts = raw.split("/").filter(Boolean);
       const effectiveStrip =
         stripLevel !== null
           ? defaultStripIfPrefixed
@@ -1936,23 +2011,27 @@ function extractPatchFileTargets(
             ? 1
             : 0;
       const rel = parts.slice(effectiveStrip).join("/");
-      if (rel) {
-        out.push(canonicalizeMaybePath(resolve(baseDir, rel)));
-      }
+      if (!rel) return "devnull";
+      out.push(canonicalizeMaybePath(resolve(baseDir, rel)));
+      return "pushed";
     };
 
-    let ambiguousDiffGit = false;
-    let sawExplicitTargetLine = false;
     const parseDiffGitLine = (line: string): [string, string] | null => {
       const rest = line.slice("diff --git ".length);
       if (!rest) return null;
-      // 1. Quoted path(s): parse two shell-like tokens supporting C-quoted `"..."`
+      // 1. C-quoted path(s) (handles spaces, escaped quotes, and octal UTF-8 bytes like `\303\251`)
       if (rest.includes('"')) {
-        const toks = splitShellTokens(rest);
-        if (toks && toks.length === 2 && toks[0] && toks[1]) {
-          return [toks[0], toks[1]];
+        const first = readGitDiffHeaderToken(rest, 0);
+        if (!first || rest[first.nextIdx] !== " ") return null;
+        const secondStart = first.nextIdx + 1;
+        if (rest[secondStart] === '"') {
+          const second = readGitDiffHeaderToken(rest, secondStart);
+          if (!second || second.nextIdx !== rest.length) return null;
+          return [first.value, second.value];
         }
-        return null;
+        const tail = rest.slice(secondStart);
+        if (!tail || tail.includes('"')) return null;
+        return [first.value, tail];
       }
       // 2. Unquoted identical path with optional spaces (e.g. `a/plan notes.md b/plan notes.md`)
       if (rest.length % 2 === 1) {
@@ -1984,31 +2063,37 @@ function extractPatchFileTargets(
     };
 
     for (const line of content.split(/\r?\n/)) {
-      const std = line.match(/^(?:---|\+\+\+|\*\*\*)\s+([^\t\r\n]+)/);
-      if (std) {
-        sawExplicitTargetLine = true;
-        pushPath(std[1], true);
-        continue;
-      }
       if (line.startsWith("diff --git ")) {
+        if (currentSectionAmbiguous) anyUnresolvedAmbiguousSection = true;
+        currentSectionAmbiguous = false;
         const pair = parseDiffGitLine(line);
         if (pair) {
-          pushPath(pair[0], true);
-          pushPath(pair[1], true);
+          const r1 = pushPath(pair[0], true, true);
+          const r2 = pushPath(pair[1], true, true);
+          if (r1 === "invalid" || r2 === "invalid") currentSectionAmbiguous = true;
         } else {
-          ambiguousDiffGit = true;
+          currentSectionAmbiguous = true;
         }
+        continue;
+      }
+      const std = line.match(/^(?:---|\+\+\+|\*\*\*)\s+([^\t\r\n]+)/);
+      if (std) {
+        const res = pushPath(std[1], true);
+        if (res === "invalid") anyUnresolvedAmbiguousSection = true;
+        else if (res === "pushed") currentSectionAmbiguous = false;
         continue;
       }
       const metaPath = line.match(/^(?:rename from|rename to|copy from|copy to|Index:)\s+([^\r\n]+)/);
       if (metaPath) {
-        sawExplicitTargetLine = true;
-        pushPath(metaPath[1], false);
+        const res = pushPath(metaPath[1], false);
+        if (res === "invalid") anyUnresolvedAmbiguousSection = true;
+        else if (res === "pushed") currentSectionAmbiguous = false;
         continue;
       }
     }
-    // Fail closed if a readable patch yielded zero recognized target paths or an unparseable diff --git header
-    if (out.length === 0 || (ambiguousDiffGit && !sawExplicitTargetLine)) {
+    if (currentSectionAmbiguous) anyUnresolvedAmbiguousSection = true;
+    // Fail closed if a readable patch yielded zero recognized target paths or any section stayed ambiguous
+    if (out.length === 0 || anyUnresolvedAmbiguousSection) {
       return { targets: [], uninspectable: true };
     }
     return { targets: [...new Set(out)], uninspectable: false };
