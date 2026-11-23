@@ -56,7 +56,13 @@ description: >
 ## 3. 生产发布
 
 1. 核对目标 SHA 位于 `origin/main` 历史且无夹带未授权提交；发布期间新增冲突修复按实际风险补查。
-2. 生产迁移、集群写操作、推送发布 tag 等不可逆动作严格遵守物理保险丝与人工确认边界；执行前做只读演练、执行后做只读核验与错误日志观察。
+2. **Runbook 签发自动推进**：先整理完整可读的发版 Runbook（精确列出仓库、目标 SHA、待合 PR 号、annotated tag 名、如需的 prod 迁移 SQL 文件路径 / `kubectl` 命令与回滚方案），执行：
+   ```bash
+   .workbench/bin/ledger runbook create --title "<发版标题>" \
+     [--pr <repo>:<pr号>] [--tag <repo>:<tag>:<sha>] \
+     [--sql <prod-host>:<sql路径>] [--kubectl "<精确kubectl命令>"]
+   ```
+   将 Runbook 与生成的 `rb-...` 编号发给用户确认；用户在本会话回复 **`批准 <runbook_id>`** 后，`UserPromptSubmit` Hook 自动为本会话签发 30 分钟精确白名单通行证，随后 Agent 自动推进合 PR、打 tag 并显式 `git push origin <tag>`、执行已登记迁移/`kubectl`、跟踪部署、只读核验与错误日志观察；全部完成后执行 `.workbench/bin/ledger runbook complete <runbook_id>`（未批准前绝不强行绕过；`git push --tags`、读 k8s `secret`、未登记的 prod 写操作永久禁止）。
 3. 涉及共享队列任务格式/语义变化时，核对滚动部署与回滚期间新旧版本共存兼容性。
 
 ## 4. 清理与收尾

@@ -172,7 +172,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
       writeFileSync(cfgPath, 'model = "gpt-6.2-sol"\n', "utf8");
       const untrusted = checkCodexHooksTrust(res.root, fakeCodexHome);
       expect(untrusted.checked).toBe(true);
-      expect(untrusted.totalCount).toBe(4);
+      expect(untrusted.totalCount).toBe(5);
       expect(untrusted.trustedCount).toBe(0);
 
       const hooksPath = untrusted.hooksPath;
@@ -191,7 +191,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
       );
       const partial = checkCodexHooksTrust(res.root, fakeCodexHome);
       expect(partial.checked).toBe(true);
-      expect(partial.totalCount).toBe(4);
+      expect(partial.totalCount).toBe(5);
       expect(partial.trustedCount).toBe(2);
     } finally {
       rmSync(fakeCodexHome, { recursive: true, force: true });

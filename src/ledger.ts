@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -61,6 +61,92 @@ const VALID_SPEC_AMEND_SCOPES = new Set<string>([
   "tech_spec",
   "test_spec",
 ]);
+
+function sha256String(input: string): string {
+  return createHash("sha256").update(input, "utf8").digest("hex");
+}
+
+export function tokenizeSimpleShellCommand(raw: string): string[] | null {
+  if (/[\n\r\0]/.test(raw)) return null;
+  const tokens: string[] = [];
+  let cur = "";
+  let has = false;
+  let quote: "'" | '"' | null = null;
+  let escape = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (escape) {
+      cur += ch;
+      has = true;
+      escape = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\") {
+        const next = raw[i + 1];
+        if (next === '"' || next === "\\" || next === "$" || next === "`") {
+          cur += next;
+          i++;
+        } else {
+          cur += "\\";
+        }
+      } else if (ch === '"') {
+        quote = null;
+      } else if (ch === "`" || (ch === "$" && raw[i + 1] === "(")) {
+        return null;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      has = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      has = true;
+      continue;
+    }
+    if (ch === ";" || ch === "&" || ch === "|" || ch === "`" || ch === "<" || ch === ">" || ch === "(" || ch === ")") {
+      return null;
+    }
+    if (ch === "$" && raw[i + 1] === "(") return null;
+    if (ch === " " || ch === "\t") {
+      if (has) {
+        tokens.push(cur);
+        cur = "";
+        has = false;
+      }
+      continue;
+    }
+    cur += ch;
+    has = true;
+  }
+  if (escape || quote !== null) return null;
+  if (has) tokens.push(cur);
+  return tokens;
+}
+
+export function normalizeKubectlTokens(tokens: string[]): string[] | null {
+  if (tokens.length < 2) return null;
+  const first = tokens[0];
+  if (first !== "kubectl" && !first.endsWith("/kubectl")) return null;
+  for (const tok of tokens.slice(1)) {
+    for (const part of tok.split(",")) {
+      if (/^secrets?(\/|$|\.)/i.test(part.trim())) {
+        return null;
+      }
+    }
+  }
+  return ["kubectl", ...tokens.slice(1)];
+}
 
 function sha256File(absPath: string): string | null {
   if (!existsSync(absPath)) return null;
@@ -134,7 +220,48 @@ export interface ExemptionRecord {
   expires_at: string | null;
 }
 
-const SCHEMA_VERSION = 2;
+export type RunbookStatus = "PENDING" | "APPROVED" | "COMPLETED" | "REVOKED";
+
+export interface RunbookTagAction {
+  repo: string;
+  tag: string;
+  sha: string;
+}
+
+export interface RunbookPrAction {
+  repo: string;
+  number: number;
+}
+
+export interface RunbookSqlFileAction {
+  host: string;
+  path: string;
+  sha256: string;
+}
+
+export interface RunbookActions {
+  tags: RunbookTagAction[];
+  prs: RunbookPrAction[];
+  sql_files: RunbookSqlFileAction[];
+  kubectl_commands: string[];
+}
+
+export interface RunbookRecord {
+  runbook_id: string;
+  task_id: string | null;
+  title: string;
+  status: RunbookStatus;
+  actions_json: string;
+  actions_hash: string;
+  created_at: string;
+  approved_at: string | null;
+  approved_session_id: string | null;
+  expires_at: string | null;
+  completed_at: string | null;
+  revoked_at: string | null;
+}
+
+const SCHEMA_VERSION = 3;
 const VALID_ENDPOINTS = new Set<string>([
   "investigation",
   "local",
@@ -315,6 +442,23 @@ export class Ledger {
         expires_at TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_exemptions_lookup ON exemptions(repo, branch);
+
+      CREATE TABLE IF NOT EXISTS runbooks (
+        runbook_id          TEXT PRIMARY KEY,
+        task_id             TEXT,
+        title               TEXT NOT NULL,
+        status              TEXT NOT NULL CHECK (status IN ('PENDING','APPROVED','COMPLETED','REVOKED')),
+        actions_json        TEXT NOT NULL,
+        actions_hash        TEXT NOT NULL,
+        created_at          TEXT NOT NULL,
+        approved_at         TEXT,
+        approved_session_id TEXT,
+        expires_at          TEXT,
+        completed_at        TEXT,
+        revoked_at          TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_runbooks_status_session
+        ON runbooks(status, approved_session_id);
 
       CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
         task_id,
@@ -1907,6 +2051,246 @@ export class Ledger {
     }
     return lines.join("\n");
   }
+
+  createRunbook(params: {
+    runbook_id?: string;
+    task_id?: string | null;
+    title: string;
+    actions: Partial<RunbookActions>;
+  }): RunbookRecord {
+    const title = params.title.trim();
+    if (!title) throw new Error("Runbook title is required");
+
+    const now = new Date();
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
+    const dd = String(now.getDate()).padStart(2, "0");
+    const runbook_id =
+      params.runbook_id?.trim().toLowerCase() ||
+      `rb-${mm}${dd}-${randomBytes(2).toString("hex")}`;
+    if (!/^rb-[a-z0-9-]{4,32}$/.test(runbook_id)) {
+      throw new Error(
+        `Invalid runbook_id "${runbook_id}" (must match /^rb-[a-z0-9-]{4,32}$/)`,
+      );
+    }
+
+    const tags: RunbookTagAction[] = [];
+    for (const raw of params.actions.tags ?? []) {
+      const repo = raw.repo.trim();
+      const tag = raw.tag.trim().replace(/^refs\/tags\//, "");
+      let sha = raw.sha.trim().toLowerCase();
+      if (!repo || !tag || !/^[0-9a-f]{7,40}$/.test(sha)) {
+        throw new Error(
+          `Invalid tag action (${raw.repo}:${raw.tag}:${raw.sha}); expected <repo>:<tag>:<hex-sha>`,
+        );
+      }
+      const repoDir = join(this.workbenchRoot, repo);
+      if (existsSync(repoDir)) {
+        const rev = runGit(repoDir, ["rev-parse", "--verify", `${sha}^{commit}`], 3000);
+        if (rev.code === 0 && /^[0-9a-f]{40}$/i.test(rev.stdout.trim())) {
+          sha = rev.stdout.trim().toLowerCase();
+        }
+      }
+      tags.push({ repo, tag, sha });
+    }
+
+    const prs: RunbookPrAction[] = [];
+    for (const raw of params.actions.prs ?? []) {
+      const repo = raw.repo.trim();
+      const num = Number(raw.number);
+      if (!repo || !Number.isInteger(num) || num <= 0) {
+        throw new Error(`Invalid PR action (${raw.repo}:${raw.number}); expected <repo>:<positive-int>`);
+      }
+      prs.push({ repo, number: num });
+    }
+
+    const sql_files: RunbookSqlFileAction[] = [];
+    for (const raw of params.actions.sql_files ?? []) {
+      const host = raw.host.trim();
+      const absPath = resolve(this.workbenchRoot, raw.path.trim());
+      if (!host) throw new Error("SQL file action requires non-empty host");
+      if (!existsSync(absPath)) {
+        throw new Error(`Runbook SQL file does not exist: ${absPath}`);
+      }
+      const real = realpathSync(absPath);
+      const hash = sha256File(real);
+      if (!hash) {
+        throw new Error(`Runbook SQL file is unreadable or not a regular file: ${real}`);
+      }
+      sql_files.push({ host, path: real, sha256: hash });
+    }
+
+    const kubectl_commands: string[] = [];
+    for (const rawCmd of params.actions.kubectl_commands ?? []) {
+      const toks = tokenizeSimpleShellCommand(rawCmd.trim());
+      if (!toks) {
+        throw new Error(
+          `Invalid kubectl command in runbook (shell chaining/metacharacters forbidden): ${rawCmd}`,
+        );
+      }
+      const norm = normalizeKubectlTokens(toks);
+      if (!norm) {
+        throw new Error(
+          `Rejected kubectl command in runbook (must start with kubectl and never access secrets): ${rawCmd}`,
+        );
+      }
+      kubectl_commands.push(rawCmd.trim());
+    }
+
+    if (
+      tags.length === 0 &&
+      prs.length === 0 &&
+      sql_files.length === 0 &&
+      kubectl_commands.length === 0
+    ) {
+      throw new Error(
+        "Runbook must include at least one action (--tag, --pr, --sql, or --kubectl)",
+      );
+    }
+
+    const normalized: RunbookActions = { tags, prs, sql_files, kubectl_commands };
+    const actions_json = canonicalJson(normalized);
+    const actions_hash = sha256String(actions_json);
+    const ts = nowIso();
+
+    return this.withImmediateTx(() => {
+      const existing = this.db
+        .query("SELECT runbook_id FROM runbooks WHERE runbook_id = ?")
+        .get(runbook_id);
+      if (existing) {
+        throw new Error(`Runbook already exists: ${runbook_id}`);
+      }
+      this.db
+        .query(
+          `INSERT INTO runbooks (
+            runbook_id, task_id, title, status, actions_json, actions_hash,
+            created_at, approved_at, approved_session_id, expires_at, completed_at, revoked_at
+          ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, NULL, NULL, NULL, NULL, NULL)`,
+        )
+        .run(runbook_id, params.task_id ?? null, title, actions_json, actions_hash, ts);
+      return this.getRunbook(runbook_id)!;
+    });
+  }
+
+  getRunbook(runbook_id: string): RunbookRecord | null {
+    return this.db
+      .query("SELECT * FROM runbooks WHERE runbook_id = ?")
+      .get(runbook_id.trim().toLowerCase()) as RunbookRecord | null;
+  }
+
+  listRunbooks(status?: RunbookStatus): RunbookRecord[] {
+    if (status) {
+      return this.db
+        .query("SELECT * FROM runbooks WHERE status = ? ORDER BY created_at DESC LIMIT 50")
+        .all(status) as RunbookRecord[];
+    }
+    return this.db
+      .query("SELECT * FROM runbooks ORDER BY created_at DESC LIMIT 50")
+      .all() as RunbookRecord[];
+  }
+
+  /**
+   * Exclusively invoked by `ledger-hook` upon receiving a genuine root-session `UserPromptSubmit`.
+   * NEVER exposed via `ledger` CLI so an agent cannot self-approve a runbook.
+   */
+  approveRunbookFromUserPrompt(params: {
+    runbook_id: string;
+    session_id: string;
+    ttl_minutes?: number;
+  }): { record: RunbookRecord; actions: RunbookActions } {
+    const id = params.runbook_id.trim().toLowerCase();
+    const sessionId = params.session_id.trim();
+    if (!sessionId) throw new Error("Cannot approve runbook without valid session_id");
+
+    const ttlMin = Math.min(120, Math.max(5, params.ttl_minutes ?? 30));
+
+    return this.withImmediateTx(() => {
+      const rb = this.getRunbook(id);
+      if (!rb) throw new Error(`Runbook not found: ${id}`);
+      if (rb.status === "COMPLETED" || rb.status === "REVOKED") {
+        throw new Error(`Runbook ${id} is ${rb.status} and cannot be approved`);
+      }
+      if (sha256String(rb.actions_json) !== rb.actions_hash) {
+        throw new Error(`Runbook ${id} integrity check failed (actions_hash mismatch)`);
+      }
+      const actions = JSON.parse(rb.actions_json) as RunbookActions;
+      for (const sf of actions.sql_files ?? []) {
+        const diskHash = sha256File(sf.path);
+        if (!diskHash || diskHash !== sf.sha256) {
+          throw new Error(
+            `Runbook ${id} SQL file changed on disk since creation (${sf.path}); recreate runbook before approving`,
+          );
+        }
+      }
+
+      const nowMs = Date.now();
+      const approvedAt = new Date(nowMs).toISOString();
+      const expiresAt = new Date(nowMs + ttlMin * 60_000).toISOString();
+      this.db
+        .query(
+          `UPDATE runbooks
+           SET status = 'APPROVED', approved_at = ?, approved_session_id = ?, expires_at = ?
+           WHERE runbook_id = ?`,
+        )
+        .run(approvedAt, sessionId, expiresAt, id);
+
+      return { record: this.getRunbook(id)!, actions };
+    });
+  }
+
+  listActiveApprovedRunbooks(
+    session_id: string,
+  ): Array<{ record: RunbookRecord; actions: RunbookActions }> {
+    const sid = session_id.trim();
+    if (!sid) return [];
+    const now = nowIso();
+    const rows = this.db
+      .query(
+        `SELECT * FROM runbooks
+         WHERE status = 'APPROVED' AND approved_session_id = ? AND expires_at > ?
+         ORDER BY approved_at DESC`,
+      )
+      .all(sid, now) as RunbookRecord[];
+    const out: Array<{ record: RunbookRecord; actions: RunbookActions }> = [];
+    for (const r of rows) {
+      if (sha256String(r.actions_json) !== r.actions_hash) continue;
+      try {
+        const actions = JSON.parse(r.actions_json) as RunbookActions;
+        out.push({ record: r, actions });
+      } catch {
+        // Ignore malformed
+      }
+    }
+    return out;
+  }
+
+  completeRunbook(runbook_id: string): RunbookRecord {
+    const id = runbook_id.trim().toLowerCase();
+    return this.withImmediateTx(() => {
+      const rb = this.getRunbook(id);
+      if (!rb) throw new Error(`Runbook not found: ${id}`);
+      if (rb.status === "REVOKED") {
+        throw new Error(`Cannot complete REVOKED runbook: ${id}`);
+      }
+      const ts = nowIso();
+      this.db
+        .query("UPDATE runbooks SET status = 'COMPLETED', completed_at = ? WHERE runbook_id = ?")
+        .run(ts, id);
+      return this.getRunbook(id)!;
+    });
+  }
+
+  revokeRunbook(runbook_id: string): RunbookRecord {
+    const id = runbook_id.trim().toLowerCase();
+    return this.withImmediateTx(() => {
+      const rb = this.getRunbook(id);
+      if (!rb) throw new Error(`Runbook not found: ${id}`);
+      const ts = nowIso();
+      this.db
+        .query("UPDATE runbooks SET status = 'REVOKED', revoked_at = ? WHERE runbook_id = ?")
+        .run(ts, id);
+      return this.getRunbook(id)!;
+    });
+  }
 }
 
 export async function runLedgerCli(): Promise<void> {
@@ -1928,7 +2312,8 @@ Commands:
   close     <task_id> [--summary <text>] [--no-archive] [--force-incomplete --reason <text>]
   archive   <task_id>
   cancel    <task_id> --reason <text>
-  prune     --before <days> [--apply]`;
+  prune     --before <days> [--apply]
+  runbook   <create|show|list|complete|revoke> [options]`;
 
   if (!cmd || cmd === "--help" || cmd === "-h" || rest.includes("--help") || rest.includes("-h")) {
     console.log(USAGE);
@@ -2303,6 +2688,105 @@ Commands:
       }
       const res = ledger.prune({ beforeDays: days, apply: Boolean(values.apply) });
       console.log(JSON.stringify(res, null, 2));
+    } else if (cmd === "runbook") {
+      const sub = rest[0];
+      if (!sub || sub === "--help" || sub === "-h") {
+        console.log(`Usage: ledger runbook <create|show|list|complete|revoke>
+  create   --title <text> [--id rb-xxxx] [--task <task_id>] [--tag <repo>:<tag>:<sha>]... [--pr <repo>:<num>]... [--sql <host>:<path>]... [--kubectl "<cmd>"]...
+  show     <runbook_id>
+  list     [--status <PENDING|APPROVED|COMPLETED|REVOKED>]
+  complete <runbook_id>
+  revoke   <runbook_id>
+Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <runbook_id>" (handled by UserPromptSubmit hook).`);
+        return;
+      }
+      if (sub === "create") {
+        const { values } = parseArgs({
+          args: rest.slice(1),
+          options: {
+            id: { type: "string" },
+            task: { type: "string" },
+            title: { type: "string" },
+            tag: { type: "string", multiple: true },
+            pr: { type: "string", multiple: true },
+            sql: { type: "string", multiple: true },
+            kubectl: { type: "string", multiple: true },
+          },
+        });
+        if (!values.title) throw new Error("Usage: ledger runbook create --title <text> ...");
+        const tags: RunbookTagAction[] = (values.tag ?? []).map((spec) => {
+          const parts = spec.split(":");
+          if (parts.length !== 3) {
+            throw new Error(`Invalid --tag "${spec}" (expected <repo>:<tag>:<sha>)`);
+          }
+          return { repo: parts[0], tag: parts[1], sha: parts[2] };
+        });
+        const prs: RunbookPrAction[] = (values.pr ?? []).map((spec) => {
+          const idx = spec.lastIndexOf(":");
+          if (idx <= 0) {
+            throw new Error(`Invalid --pr "${spec}" (expected <repo>:<number>)`);
+          }
+          return { repo: spec.slice(0, idx), number: Number(spec.slice(idx + 1).replace(/^#/, "")) };
+        });
+        const sql_files: RunbookSqlFileAction[] = (values.sql ?? []).map((spec) => {
+          const idx = spec.indexOf(":");
+          if (idx <= 0) {
+            throw new Error(`Invalid --sql "${spec}" (expected <host>:<path>)`);
+          }
+          return { host: spec.slice(0, idx), path: spec.slice(idx + 1), sha256: "" };
+        });
+        const rec = ledger.createRunbook({
+          runbook_id: values.id,
+          task_id: values.task,
+          title: values.title,
+          actions: {
+            tags,
+            prs,
+            sql_files,
+            kubectl_commands: values.kubectl ?? [],
+          },
+        });
+        console.log(
+          JSON.stringify(
+            {
+              ...rec,
+              actions: JSON.parse(rec.actions_json),
+              approval_prompt_hint: `请用户确认后回复：批准 ${rec.runbook_id}`,
+            },
+            null,
+            2,
+          ),
+        );
+      } else if (sub === "show") {
+        const id = rest[1];
+        if (!id) throw new Error("Usage: ledger runbook show <runbook_id>");
+        const rec = ledger.getRunbook(id);
+        if (!rec) throw new Error(`Runbook not found: ${id}`);
+        console.log(JSON.stringify({ ...rec, actions: JSON.parse(rec.actions_json) }, null, 2));
+      } else if (sub === "list") {
+        const { values } = parseArgs({
+          args: rest.slice(1),
+          options: { status: { type: "string" } },
+        });
+        const list = ledger.listRunbooks(values.status as RunbookStatus | undefined);
+        console.log(
+          JSON.stringify(
+            list.map((r) => ({ ...r, actions: JSON.parse(r.actions_json) })),
+            null,
+            2,
+          ),
+        );
+      } else if (sub === "complete") {
+        const id = rest[1];
+        if (!id) throw new Error("Usage: ledger runbook complete <runbook_id>");
+        console.log(JSON.stringify(ledger.completeRunbook(id), null, 2));
+      } else if (sub === "revoke") {
+        const id = rest[1];
+        if (!id) throw new Error("Usage: ledger runbook revoke <runbook_id>");
+        console.log(JSON.stringify(ledger.revokeRunbook(id), null, 2));
+      } else {
+        throw new Error(`Unknown ledger runbook subcommand: ${sub}`);
+      }
     } else {
       throw new Error(`Unknown ledger command: ${cmd}`);
     }

@@ -13,6 +13,7 @@ export interface CodexHookInput {
   tool_use_id?: string;
   agent_id?: string;
   agent_type?: string;
+  prompt?: string;
 }
 
 export type HookReadResult =
@@ -218,6 +219,18 @@ export function emitPostToolUseContext(additionalContext: string): void {
     JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PostToolUse",
+        additionalContext,
+      },
+    }),
+  );
+}
+
+export function emitUserPromptSubmitContext(additionalContext: string): void {
+  if (!additionalContext.trim()) return;
+  console.log(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "UserPromptSubmit",
         additionalContext,
       },
     }),

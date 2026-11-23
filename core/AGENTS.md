@@ -51,7 +51,7 @@
 
 - **问题出在哪个环境，就只查哪个环境**；线上问题看 prod 事实，不拿测试环境数据推断；测试环境问题不主动访问 prod（只读亦同）。
 - **凭据不回显**：读取配置或接口返回时只输出键名或脱敏摘要，不打印密钥、token 或完整敏感字段。
-- **物理保险丝由 `.codex/hooks.json` 强制执行**：prod 库写操作、非只读 `kubectl`、读取 k8s `secret`、`gh pr merge`、推送生产发布 tag、破坏共享工作树命令及直接编辑 `.workbench/ledger/` 原始文件均由底层护栏拦截。
+- **物理保险丝由 `.codex/hooks.json` 强制执行**：prod 库写操作、非只读 `kubectl`、读 k8s `secret`、`gh pr merge`、推生产 tag、破坏共享工作树及直接改 `.workbench/ledger/` 均由底层护栏拦截。**发版 Runbook 签发**：需自动推进发版时，先用 `.workbench/bin/ledger runbook create` 登记精确项（单 tag+SHA / PR / 迁移 SQL / 非只读 `kubectl`）并给用户确认；用户于本会话回复 `批准 <id>` 后由 `UserPromptSubmit` Hook 签发短期白名单通行证自动放行（`--tags`/强推 `main`/读 `secret` 永久禁止）。
 
 ## 开发任务账本（Ledger）、Spec 冻结与被动机制
 

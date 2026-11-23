@@ -724,7 +724,7 @@ export function doctorWorkbench(targetDir?: string): {
   } else {
     try {
       const h = JSON.parse(readFileSync(hooksPath, "utf8")) as { hooks?: Record<string, unknown> };
-      for (const reqEv of ["PreToolUse", "PostToolUse", "SessionStart", "PostCompact"]) {
+      for (const reqEv of ["PreToolUse", "PostToolUse", "SessionStart", "PostCompact", "UserPromptSubmit"]) {
         if (!h.hooks?.[reqEv]) {
           issues.push({
             level: "warn",

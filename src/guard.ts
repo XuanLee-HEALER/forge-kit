@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import {
@@ -21,7 +22,13 @@ import {
   extractTouchedFilePaths,
   readHookStdinStrict,
 } from "./hook-io";
-import { Ledger } from "./ledger";
+import {
+  Ledger,
+  normalizeKubectlTokens,
+  type RunbookActions,
+  type RunbookRecord,
+  tokenizeSimpleShellCommand,
+} from "./ledger";
 import { redactSecrets } from "./cmdfmt";
 
 const SQL_WRITE_RE =
@@ -478,15 +485,23 @@ export function checkLedgerTamper(
     }
   }
 
-  // 2. Shell commands directly mutating .workbench/ledger/
+  // 2. Shell commands directly mutating .workbench/ledger/ or invoking ledger-hook directly (anti-forgery)
   const cmd = extractShellCommand(input);
   if (!cmd) return null;
 
   for (const seg of splitShellSegments(cmd)) {
+    const toks = splitShellTokens(seg);
+    if (toks) {
+      for (const tok of toks) {
+        const base = tok.split("/").pop() ?? "";
+        if (base === "ledger-hook" || base === "ledger-hook.js" || base === "ledger-hook.ts") {
+          return "物理保险丝：禁止通过 Shell 直接调用 ledger-hook（仅允许由 Codex 底层 Hook 运行时调用）。";
+        }
+      }
+    }
     if (!seg.includes(".workbench/ledger") && !seg.includes("ledger.sqlite")) {
       continue;
     }
-    const toks = splitShellTokens(seg);
     const first = toks?.[0]?.split("/").pop() ?? "";
     const isLedgerCli =
       first === "ledger" ||
@@ -969,7 +984,99 @@ export function isHttpWriteCommand(cmd: string, depth = 0): boolean {
   return false;
 }
 
-export function checkProdDb(cmd: string, prodHosts: string[]): string | null {
+export type ApprovedRunbookEntry = { record: RunbookRecord; actions: RunbookActions };
+
+function loadApprovedRunbooksForSession(
+  workbenchRoot: string,
+  sessionId?: string | null,
+): ApprovedRunbookEntry[] {
+  const sid = (sessionId ?? "").trim();
+  if (!sid) return [];
+  const ledger = new Ledger(workbenchRoot);
+  try {
+    return ledger.listActiveApprovedRunbooks(sid);
+  } catch {
+    return [];
+  } finally {
+    ledger.closeDb();
+  }
+}
+
+function sha256FileForGuard(absPath: string): string | null {
+  try {
+    if (!existsSync(absPath) || !statSync(absPath).isFile()) return null;
+    return createHash("sha256").update(readFileSync(absPath)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+function extractSingleApprovedSqlFile(cmd: string, workdir: string): string | null {
+  // Require strictly a single non-piped, non-chained shell command without subshells/substitutions.
+  if (/[|;&`\n\r]|\$\(/.test(cmd)) return null;
+  const toks = splitShellTokens(cmd);
+  if (!toks || toks.length < 2) return null;
+
+  // Strip leading ENV=VAL assignments
+  let idx = 0;
+  while (idx < toks.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[idx])) idx++;
+  const bin = (toks[idx] ?? "").split("/").pop() ?? "";
+  if (bin !== "psql" && bin !== "usql" && bin !== "mysql") return null;
+
+  const files: string[] = [];
+  for (let i = idx + 1; i < toks.length; i++) {
+    const t = toks[i];
+    if (
+      t === "-c" ||
+      t.startsWith("-c") ||
+      t === "--command" ||
+      t.startsWith("--command=") ||
+      t === "-e" ||
+      t === "--execute" ||
+      t.startsWith("--execute=")
+    ) {
+      return null; // Reject inline SQL mixed with file execution
+    }
+    if (t === "-f" || t === "--file") {
+      if (i + 1 >= toks.length) return null;
+      files.push(toks[++i]);
+      continue;
+    }
+    if (t.startsWith("--file=")) {
+      files.push(t.slice("--file=".length));
+      continue;
+    }
+    if (t.startsWith("-f") && t.length > 2) {
+      files.push(t.slice(2));
+      continue;
+    }
+    if (t === "<") {
+      if (i + 1 >= toks.length) return null;
+      files.push(toks[++i]);
+      continue;
+    }
+    if (t.startsWith("<") && t.length > 1 && !t.startsWith("<<")) {
+      files.push(t.slice(1));
+      continue;
+    }
+    if (t.startsWith("<<")) return null; // Reject heredoc/herestring
+  }
+  if (files.length !== 1 || !files[0]) return null;
+  const resolved = resolve(workdir, files[0]);
+  if (!existsSync(resolved)) return null;
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return null;
+  }
+}
+
+export function checkProdDb(
+  cmd: string,
+  prodHosts: string[],
+  toolWorkdir = process.cwd(),
+  approvedRunbooks: ApprovedRunbookEntry[] = [],
+): string | null {
   if (prodHosts.length === 0) return null;
   const matchedHost = prodHosts.find((h) => cmd.includes(h));
   if (!matchedHost) return null;
@@ -982,7 +1089,23 @@ export function checkProdDb(cmd: string, prodHosts: string[]): string | null {
   }
 
   if (SQL_FILE_FLAG_RE.test(cmd) || hasUnquotedRedirect(cmd, "<")) {
-    return `物理保险丝：检测到连接 prod 数据库 (${matchedHost}) 且 SQL 来自文件或标准输入，禁止自动执行。`;
+    if (approvedRunbooks.length > 0) {
+      const sqlRealPath = extractSingleApprovedSqlFile(cmd, toolWorkdir);
+      if (sqlRealPath) {
+        const liveSha = sha256FileForGuard(sqlRealPath);
+        if (
+          liveSha &&
+          approvedRunbooks.some((rb) =>
+            rb.actions.sql_files.some(
+              (sf) => sf.host === matchedHost && sf.path === sqlRealPath && sf.sha256 === liveSha,
+            ),
+          )
+        ) {
+          return null;
+        }
+      }
+    }
+    return `物理保险丝：检测到连接 prod 数据库 (${matchedHost}) 且 SQL 来自文件或标准输入，禁止自动执行（如需发版迁移，请先创建 Runbook 登记 SQL 文件并由用户在对话中回复「批准 <runbook_id>」）。`;
   }
   const m = cmd.match(SQL_WRITE_RE);
   if (m) {
@@ -991,9 +1114,13 @@ export function checkProdDb(cmd: string, prodHosts: string[]): string | null {
   return null;
 }
 
-export function checkKubectl(cmd: string): string | null {
+export function checkKubectl(
+  cmd: string,
+  approvedRunbooks: ApprovedRunbookEntry[] = [],
+): string | null {
   if (!cmd.includes("kubectl")) return null;
-  for (const seg of splitShellSegments(cmd)) {
+  const segments = splitShellSegments(cmd);
+  for (const seg of segments) {
     if (!seg.includes("kubectl")) continue;
     const toks = splitShellTokens(seg);
     if (!toks) {
@@ -1020,23 +1147,38 @@ export function checkKubectl(cmd: string): string | null {
       }
       if (words.length === 0) continue;
 
-      const verb = words[0];
-      const sub = words[1] ?? "";
-      if (verb in KUBECTL_READ_SUB) {
-        if (!KUBECTL_READ_SUB[verb].has(sub)) {
-          return `物理保险丝：kubectl ${verb} ${sub} 属于非只读集群操作，禁止自动执行。`;
-        }
-      } else if (!KUBECTL_READ_VERBS.has(verb)) {
-        return `物理保险丝：kubectl ${verb} 属于非只读集群操作，禁止自动执行。`;
-      }
-
-      // Check secrets including comma-separated resource lists like `cm,secret`
+      // Permanent redline: NEVER allow secret access even via Runbook!
       for (const w of words.slice(1)) {
         for (const p of w.split(",")) {
           if (/^secrets?(\/|$|\.)/i.test(p.trim())) {
             return "物理保险丝：kubectl 读取 secret 资源，禁止自动执行。";
           }
         }
+      }
+
+      const verb = words[0];
+      const sub = words[1] ?? "";
+      const isReadonly =
+        verb in KUBECTL_READ_SUB ? KUBECTL_READ_SUB[verb].has(sub) : KUBECTL_READ_VERBS.has(verb);
+      if (!isReadonly) {
+        if (approvedRunbooks.length > 0 && segments.length === 1 && !/[|;&`\n\r<>]|\$\(/.test(cmd)) {
+          const normCur = normalizeKubectlTokens(toks.slice(i));
+          if (
+            normCur &&
+            i === 0 &&
+            approvedRunbooks.some((rb) =>
+              rb.actions.kubectl_commands.some((allowed) => {
+                const allowedToks = tokenizeSimpleShellCommand(allowed);
+                const normAllowed = allowedToks ? normalizeKubectlTokens(allowedToks) : null;
+                return normAllowed !== null && JSON.stringify(normAllowed) === JSON.stringify(normCur);
+              }),
+            )
+          ) {
+            continue;
+          }
+        }
+        const label = verb in KUBECTL_READ_SUB ? `kubectl ${verb} ${sub}` : `kubectl ${verb}`;
+        return `物理保险丝：${label} 属于非只读集群操作，禁止自动执行（如需发版变更，请先创建 Runbook 登记精确命令并由用户在对话中回复「批准 <runbook_id>」）。`;
       }
     }
   }
@@ -1155,11 +1297,134 @@ function parseGitPushArgs(args: string[]): {
   return { positional, hasRepoFlag, hasAllOrMirror };
 }
 
+function parseGhPrMergeTarget(
+  args: string[],
+  checkoutDir: string | null,
+  localRepoName: string | null,
+): { repo: string; number: number } | null {
+  const VALUE_FLAGS = new Set([
+    "-R",
+    "--repo",
+    "-t",
+    "--subject",
+    "-b",
+    "--body",
+    "-F",
+    "--body-file",
+    "--match-head-commit",
+    "--author-email",
+  ]);
+  let repoFlag: string | null = null;
+  const positionals: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") {
+      positionals.push(...args.slice(i + 1));
+      break;
+    }
+    if (a === "-R" || a === "--repo") {
+      repoFlag = args[++i] ?? null;
+      continue;
+    }
+    if (a.startsWith("--repo=")) {
+      repoFlag = a.slice("--repo=".length);
+      continue;
+    }
+    if (a.startsWith("-R") && a.length > 2) {
+      repoFlag = a.slice(2);
+      continue;
+    }
+    if (VALUE_FLAGS.has(a)) {
+      i++;
+      continue;
+    }
+    if (a.startsWith("-")) continue;
+    positionals.push(a);
+  }
+  if (positionals.length !== 1) return null;
+  const pos = positionals[0];
+  let prNum: number | null = null;
+  let urlRepoName: string | null = null;
+  const numMatch = pos.match(/^#?(\d+)$/);
+  if (numMatch) {
+    prNum = Number(numMatch[1]);
+  } else {
+    const urlMatch = pos.match(/^https?:\/\/[^/\s]+\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)(?:\/.*)?$/i);
+    if (urlMatch) {
+      urlRepoName = urlMatch[2];
+      prNum = Number(urlMatch[3]);
+    }
+  }
+  if (!prNum || !Number.isInteger(prNum) || prNum <= 0) return null;
+
+  let effectiveRepo = localRepoName;
+  if (repoFlag) {
+    const parsedFlag = parseGhRepoSpec(repoFlag);
+    if (!parsedFlag) return null;
+    if (checkoutDir) {
+      const originUrl = runGit(checkoutDir, ["remote", "get-url", "origin"], 3000).stdout.trim();
+      const originId = parseGitRemoteRepo(originUrl);
+      if (originId && (originId.owner !== parsedFlag.owner || originId.repo !== parsedFlag.repo)) {
+        return null;
+      }
+    }
+    effectiveRepo = parsedFlag.repo;
+  }
+  if (urlRepoName) {
+    if (effectiveRepo && effectiveRepo.toLowerCase() !== urlRepoName.toLowerCase()) return null;
+    effectiveRepo = urlRepoName;
+  }
+  if (!effectiveRepo) return null;
+  return { repo: effectiveRepo, number: prNum };
+}
+
+function isApprovedTagPushRefspec(params: {
+  workbenchRoot: string;
+  targetDir: string;
+  refspec: string;
+  isForce: boolean;
+  isDelete: boolean;
+  approvedRunbooks: ApprovedRunbookEntry[];
+}): boolean {
+  const { workbenchRoot, targetDir, refspec, isForce, isDelete, approvedRunbooks } = params;
+  if (isForce || isDelete || approvedRunbooks.length === 0) return false;
+  if (refspec.startsWith("+") || refspec.startsWith(":")) return false;
+  const parts = refspec.split(":");
+  if (parts.length > 2) return false;
+  const srcRef = parts[0];
+  const dstRef = parts.length === 2 ? parts[1] : parts[0];
+  if (!srcRef || !dstRef) return false;
+  const cleanSrc = srcRef.replace(/^refs\/tags\//, "");
+  const cleanDst = dstRef.replace(/^refs\/tags\//, "");
+  if (cleanSrc !== cleanDst) return false;
+
+  const loc = locateRepo(workbenchRoot, targetDir);
+  if (!loc) return false;
+  const tagRev = runGit(loc.checkoutDir, ["rev-parse", "--verify", `refs/tags/${cleanDst}^{commit}`], 3000);
+  if (tagRev.code !== 0 || !tagRev.stdout.trim()) return false;
+  const liveTagCommit = tagRev.stdout.trim().toLowerCase();
+
+  for (const rb of approvedRunbooks) {
+    for (const entry of rb.actions.tags) {
+      if (entry.repo.toLowerCase() !== loc.repo.toLowerCase()) continue;
+      if (entry.tag !== cleanDst) continue;
+      const expectedSha = entry.sha.toLowerCase();
+      if (liveTagCommit === expectedSha) return true;
+      const expectedRev = runGit(loc.checkoutDir, ["rev-parse", "--verify", `${expectedSha}^{commit}`], 3000);
+      if (expectedRev.code === 0 && expectedRev.stdout.trim().toLowerCase() === liveTagCommit) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 export function checkGitPhysicalFuse(
   workbenchRoot: string,
   cmd: string,
   toolWorkdir: string,
   cfg: WorkbenchConfig,
+  approvedRunbooks: ApprovedRunbookEntry[] = [],
 ): string | null {
   const segments = splitShellSegments(cmd);
   const tagRegexes = cfg.guard.prod_tag_patterns.map((p) => new RegExp(p));
@@ -1169,10 +1434,31 @@ export function checkGitPhysicalFuse(
     const toks = splitShellTokens(segments[i]);
     if (!toks || toks.length === 0) continue;
 
-    // gh pr merge fuse
+    // gh pr merge fuse (allowed ONLY when exact repo + PR number is in an active approved Runbook)
     const ghIdx = toks.findIndex((t) => t === "gh" || t.endsWith("/gh"));
     if (ghIdx !== -1 && toks[ghIdx + 1] === "pr" && toks[ghIdx + 2] === "merge") {
-      return "物理保险丝：禁止 Agent 直接执行 `gh pr merge`，PR 合并到主分支由用户确认并执行。";
+      if (approvedRunbooks.length > 0 && !hasPrecedingDynamicCd(segments, i)) {
+        const segCwd = resolveSegmentCwd(segments, i, toolWorkdir);
+        const loc = locateRepo(workbenchRoot, segCwd);
+        const target = parseGhPrMergeTarget(
+          toks.slice(ghIdx + 3),
+          loc?.checkoutDir ?? null,
+          loc?.repo ?? null,
+        );
+        if (
+          target &&
+          approvedRunbooks.some((rb) =>
+            rb.actions.prs.some(
+              (p) =>
+                p.repo.toLowerCase() === target.repo.toLowerCase() &&
+                p.number === target.number,
+            ),
+          )
+        ) {
+          continue;
+        }
+      }
+      return "物理保险丝：禁止 Agent 直接执行 `gh pr merge`，请由用户合并 PR 或先创建 Runbook 经用户回复「批准 <runbook_id>」后执行。";
     }
 
     const git = extractGitSubcommand(toks);
@@ -1216,11 +1502,12 @@ export function checkGitPhysicalFuse(
     if (git.subcmd === "push") {
       const args = git.subArgs;
       if (args.includes("--tags")) {
-        return "物理保险丝：禁止自动推送 tag（`git push --tags` 可能直接触发生产部署），须由用户明确授权或亲自推送。";
+        return "物理保险丝：禁止批量推送全部 tag（`git push --tags`），请显式推送经 Runbook 批准的单个发版 tag。";
       }
       const isForce = args.some(
         (a) => a === "-f" || a === "--force" || a.startsWith("--force-with-lease"),
       );
+      const isDelete = args.some((a) => a === "--delete" || a === "-d");
       const parsedPush = parseGitPushArgs(args);
       if (parsedPush.hasAllOrMirror) {
         return "物理保险丝：禁止 `git push --all` / `--mirror`，请显式指定要推送的单一分支。";
@@ -1228,11 +1515,29 @@ export function checkGitPhysicalFuse(
       const refspecs = parsedPush.hasRepoFlag
         ? parsedPush.positional
         : parsedPush.positional.slice(1);
+      const segCwd = resolveSegmentCwd(segments, i, toolWorkdir);
+      const targetDir = git.gitDirFlag ? resolve(segCwd, git.gitDirFlag) : segCwd;
+      const dynamicTarget =
+        hasPrecedingDynamicCd(segments, i) || Boolean(git.gitDirFlag && hasShellExpansion(git.gitDirFlag));
       for (const refspec of refspecs) {
         const rhs = refspec.includes(":") ? refspec.split(":").pop() ?? "" : refspec;
         const cleanRef = rhs.replace(/^refs\/(heads|tags)\//, "");
         if (refspec.startsWith("refs/tags/") || tagRegexes.some((re) => re.test(cleanRef))) {
-          return `物理保险丝：禁止自动推送生产发布 tag (${refspec})，推送 tag 会立即触发生产部署。`;
+          if (
+            !dynamicTarget &&
+            !hasShellExpansion(refspec) &&
+            isApprovedTagPushRefspec({
+              workbenchRoot,
+              targetDir,
+              refspec,
+              isForce,
+              isDelete,
+              approvedRunbooks,
+            })
+          ) {
+            continue;
+          }
+          return `物理保险丝：禁止未批准推送生产发布 tag (${refspec})，请先用 \`ledger runbook create\` 生成发版单并经用户在对话中回复「批准 <runbook_id>」后再推送。`;
         }
         if (protectedBranches.has(cleanRef)) {
           return `物理保险丝：禁止直接推送到受保护主分支 (${cleanRef})，请提 PR 由用户合并。`;
@@ -1240,8 +1545,6 @@ export function checkGitPhysicalFuse(
       }
       // Implicit push (`git push` or `git push origin`) -> inspect current checkout branch
       if (refspecs.length === 0) {
-        const segCwd = resolveSegmentCwd(segments, i, toolWorkdir);
-        const targetDir = git.gitDirFlag ? resolve(segCwd, git.gitDirFlag) : segCwd;
         const loc = locateRepo(workbenchRoot, targetDir);
         if (loc && protectedBranches.has(loc.branch)) {
           return `物理保险丝：当前位于受保护主分支 (${loc.branch})，禁止隐式直接推送，请提 PR 由用户合并。`;
@@ -1334,6 +1637,7 @@ export function checkLedgerGate(
   cmd: string,
   toolWorkdir: string,
   cfg: WorkbenchConfig,
+  approvedRunbooks: ApprovedRunbookEntry[] = [],
 ): string | null {
   if (!cfg.ledger.enabled) return null;
   const registeredRepos = new Set(cfg.repos);
@@ -1416,6 +1720,22 @@ export function checkLedgerGate(
             const srcRef = rawSrc.replace(/^\+/, "");
             if (!srcRef) {
               // Empty source refspec (`:branch`) is remote branch deletion
+              continue;
+            }
+            const isForcePush = git.subArgs.some(
+              (a) => a === "-f" || a === "--force" || a.startsWith("--force-with-lease"),
+            );
+            if (
+              isApprovedTagPushRefspec({
+                workbenchRoot,
+                targetDir,
+                refspec: spec,
+                isForce: isForcePush,
+                isDelete: false,
+                approvedRunbooks,
+              })
+            ) {
+              // Approved release tag push targets an already-merged main commit, not an unmerged feature branch.
               continue;
             }
             if (srcRef === "HEAD") {
@@ -2999,15 +3319,16 @@ export function evaluatePreToolUse(
   ) {
     return "物理保险丝（fail-closed）：工作台已启用 require_prod_db_hosts，但未配置任何 prod_db_hosts，拒绝执行数据库/HTTP 写命令直至补齐配置。";
   }
+  const approvedRunbooks = loadApprovedRunbooksForSession(workbenchRoot, input.session_id);
   const fuseReason =
-    checkProdDb(cmd, prodHosts) ??
-    checkKubectl(cmd) ??
+    checkProdDb(cmd, prodHosts, toolWorkdir, approvedRunbooks) ??
+    checkKubectl(cmd, approvedRunbooks) ??
     checkCloudAndRedisOps(cmd) ??
-    checkGitPhysicalFuse(workbenchRoot, cmd, toolWorkdir, cfg);
+    checkGitPhysicalFuse(workbenchRoot, cmd, toolWorkdir, cfg, approvedRunbooks);
   if (fuseReason) return fuseReason;
 
   // Tier 2: Passive dev ledger gate
-  return checkLedgerGate(workbenchRoot, cmd, toolWorkdir, cfg);
+  return checkLedgerGate(workbenchRoot, cmd, toolWorkdir, cfg, approvedRunbooks);
 }
 
 function logGuardError(root: string, err: unknown): void {
