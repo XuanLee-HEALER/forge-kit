@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   collectProdDbHosts,
   findWorkbenchRoot,
   loadWorkbenchConfig,
+  parseYamlFile,
   type WorkbenchConfig,
 } from "./config";
 import {
@@ -23,6 +24,7 @@ import {
   readHookStdinStrict,
 } from "./hook-io";
 import {
+  canonicalizeOsPath,
   Ledger,
   normalizeKubectlTokens,
   type RunbookActions,
@@ -398,7 +400,7 @@ export function splitShellSegments(cmd: string): string[] {
 }
 
 /** Detect unquoted shell redirection (`<` or `>`) so SQL comparisons inside quotes don't false-positive. */
-function hasUnquotedRedirect(cmd: string, char: "<" | ">"): boolean {
+export function hasUnquotedRedirect(cmd: string, char: "<" | ">"): boolean {
   let quote: "'" | '"' | null = null;
   let escape = false;
   for (let i = 0; i < cmd.length; i++) {
@@ -468,6 +470,136 @@ function matchesGlob(filePath: string, glob: string): boolean {
   return new RegExp(re).test(target);
 }
 
+const LEDGER_HOOK_READONLY_INSPECTORS = new Set([
+  "ls",
+  "stat",
+  "file",
+  "readlink",
+  "realpath",
+  "shasum",
+  "sha256sum",
+  "md5",
+  "wc",
+  "rg",
+  "grep",
+  "which",
+  "type",
+  "cat",
+  "head",
+  "tail",
+]);
+
+const ALLOWED_INSPECTOR_DIRS = new Set([
+  "/bin",
+  "/usr/bin",
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+]);
+
+function hasUnquotedPipe(cmd: string): boolean {
+  let quote: "'" | '"' | "$'" | null = null;
+  let escape = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    const next = cmd[i + 1];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === "$'") {
+      if (ch === "\\") escape = true;
+      else if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\") escape = true;
+      else if (ch === '"') quote = null;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === "$" && next === "'") {
+      quote = "$'";
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "|") {
+      if (next === "|") {
+        i++;
+        continue;
+      }
+      if (cmd[i - 1] === ">") continue; // clobber >|
+      return true;
+    }
+  }
+  return false;
+}
+
+function isReadonlyLedgerHookInspection(
+  cmd: string,
+  seg: string,
+  toks: string[],
+): boolean {
+  if (hasUnquotedPipe(cmd)) return false;
+  if (hasUnquotedRedirect(seg, ">")) return false;
+  if (seg.includes("$(") || seg.includes("`")) return false;
+  let idx = 0;
+  while (idx < toks.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[idx])) idx++;
+  if (idx >= toks.length) return false;
+  const rawBin = toks[idx];
+  const bin = rawBin.split("/").pop() ?? "";
+  if (bin === "ledger-hook" || bin === "ledger-hook.js" || bin === "ledger-hook.ts") {
+    return false;
+  }
+  if (!LEDGER_HOOK_READONLY_INSPECTORS.has(bin)) return false;
+  // Require bare binary name OR standard system binary directory (never `./ls` or `/tmp/evil/ls`)
+  if (rawBin.includes("/")) {
+    const dir = dirname(rawBin);
+    if (!ALLOWED_INSPECTOR_DIRS.has(dir)) return false;
+  }
+  // Reject write/helper-executing options per inspector (`file -C`/`-m` compiles magic DB; `rg --pre` executes external commands)
+  if (bin === "file") {
+    for (const arg of toks.slice(idx + 1)) {
+      if (arg === "--") break;
+      if (
+        arg === "--compile" ||
+        arg === "--magic-file" ||
+        arg.startsWith("--magic-file=") ||
+        (arg.startsWith("-") && !arg.startsWith("--") && /[Cm]/.test(arg.slice(1)))
+      ) {
+        return false;
+      }
+    }
+  } else if (bin === "rg") {
+    for (const arg of toks.slice(idx + 1)) {
+      if (arg === "--") break;
+      if (
+        arg === "--pre" ||
+        arg.startsWith("--pre=") ||
+        arg === "--pre-glob" ||
+        arg.startsWith("--pre-glob=") ||
+        arg === "--hostname-bin" ||
+        arg.startsWith("--hostname-bin=") ||
+        arg === "--search-zip" ||
+        (arg.startsWith("-") && !arg.startsWith("--") && arg.includes("z"))
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 export function checkLedgerTamper(
   workbenchRoot: string,
   input: CodexHookInput,
@@ -492,11 +624,12 @@ export function checkLedgerTamper(
   for (const seg of splitShellSegments(cmd)) {
     const toks = splitShellTokens(seg);
     if (toks) {
-      for (const tok of toks) {
+      const mentionsLedgerHook = toks.some((tok) => {
         const base = tok.split("/").pop() ?? "";
-        if (base === "ledger-hook" || base === "ledger-hook.js" || base === "ledger-hook.ts") {
-          return "物理保险丝：禁止通过 Shell 直接调用 ledger-hook（仅允许由 Codex 底层 Hook 运行时调用）。";
-        }
+        return base === "ledger-hook" || base === "ledger-hook.js" || base === "ledger-hook.ts";
+      });
+      if (mentionsLedgerHook && !isReadonlyLedgerHookInspection(cmd, seg, toks)) {
+        return "物理保险丝：禁止通过 Shell 直接调用 ledger-hook（仅允许由 Codex 底层 Hook 运行时调用）。";
       }
     }
     if (!seg.includes(".workbench/ledger") && !seg.includes("ledger.sqlite")) {
@@ -546,12 +679,12 @@ export function parseGitRemoteRepo(
     };
   }
   // URL style: https://github.com/owner/repo or ssh://git@ghe.local/owner/repo
-  const url = cleaned.match(/^https?:\/\/(?:[^@/\s]+@)?([^:/\s]+)(?::\d+)?\/([^/\s]+)\/([^/\s]+)$|^ssh:\/\/(?:[^@/\s]+@)?([^:/\s]+)(?::\d+)?\/([^/\s]+)\/([^/\s]+)$/i);
+  const url = cleaned.match(/^(https?|ssh):\/\/(?:[^@/\s]+@)?([^:/\s]+)(?::(\d+))?\/([^/\s]+)\/([^/\s]+)$/i);
   if (url) {
-    const host = (url[1] ?? url[4]).toLowerCase();
-    const owner = (url[2] ?? url[5]).toLowerCase();
-    const repo = (url[3] ?? url[6]).toLowerCase();
-    return { host, owner, repo };
+    const [, scheme, hostname, port, owner, repo] = url;
+    const defaultPort = scheme.toLowerCase() === "ssh" ? 22 : scheme.toLowerCase() === "https" ? 443 : 80;
+    const host = hostname.toLowerCase() + (port && Number(port) !== defaultPort ? `:${Number(port)}` : "");
+    return { host, owner: owner.toLowerCase(), repo: repo.toLowerCase() };
   }
   return null;
 }
@@ -578,7 +711,7 @@ export function parseGhRepoSpec(
       repo: parts[1].toLowerCase(),
     };
   }
-  if (parts.length === 3 && parts[0].includes(".")) {
+  if (parts.length === 3 && /^[A-Za-z0-9][A-Za-z0-9._-]*(?::\d+)?$/.test(parts[0])) {
     return {
       host: parts[0].toLowerCase(),
       owner: parts[1].toLowerCase(),
@@ -1011,64 +1144,957 @@ function sha256FileForGuard(absPath: string): string | null {
   }
 }
 
-function extractSingleApprovedSqlFile(cmd: string, workdir: string): string | null {
-  // Require strictly a single non-piped, non-chained shell command without subshells/substitutions.
-  if (/[|;&`\n\r]|\$\(/.test(cmd)) return null;
-  const toks = splitShellTokens(cmd);
-  if (!toks || toks.length < 2) return null;
+function isAllowedDbcredSubstitution(
+  inner: string,
+  workbenchRoot: string,
+  workdir: string,
+): boolean {
+  const trimmed = inner.trim();
+  if (!trimmed || /[;|&`<>()\n\r\0'"]/.test(trimmed)) return false;
+  const parts = trimmed.split(/[ \t]+/).filter(Boolean);
+  if (parts.length !== 2) return false;
+  const [bin, envArg] = parts;
+  if (!/^[A-Za-z0-9._-]+$/.test(envArg)) return false;
+  // Never permit bare `dbcred` resolved via PATH; must be an explicit relative/absolute path
+  if (!bin.includes("/")) return false;
+  const expectedReal = canonicalizeOsPath(workbenchRoot, ".workbench/bin/dbcred");
+  const candidateReal = canonicalizeOsPath(workdir, bin);
+  if (!expectedReal || !candidateReal) return false;
+  return candidateReal === expectedReal;
+}
 
-  // Strip leading ENV=VAL assignments
+/**
+ * Quote-aware single-command safety check for Runbook-approved SQL migration files:
+ * - Permits literal `&` / `?` inside single/double quotes (e.g. PostgreSQL DSN query params).
+ * - Permits ONLY exact double-quoted `$(<path-to-.workbench/bin/dbcred> <env>)` credential substitution.
+ * - Permits ONLY exact `2>&1` / `1>&2` fd duplication; rejects ALL other output redirections (`>`).
+ * - Rejects shell chaining (`;`, `&&`, `||`, `|`, `&`, `\n`), subshells, backticks, heredocs, and arbitrary `$(...)`.
+ */
+function isSafeSingleSqlShellCommand(
+  cmd: string,
+  workbenchRoot: string,
+  workdir: string,
+): boolean {
+  let quote: "'" | '"' | null = null;
+  let escape = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    const next = cmd[i + 1];
+    if (ch === "\0" || ch === "\n" || ch === "\r") return false;
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\") {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        quote = null;
+        continue;
+      }
+      if (ch === "`") return false;
+      if (ch === "$" && next === "(") {
+        const closeIdx = cmd.indexOf(")", i + 2);
+        if (closeIdx === -1) return false;
+        const inner = cmd.slice(i + 2, closeIdx);
+        if (!isAllowedDbcredSubstitution(inner, workbenchRoot, workdir)) return false;
+        i = closeIdx;
+        continue;
+      }
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === "$" && next === "'") {
+      // Reject Bash ANSI-C `$'...'` quoting for approved SQL migrations to guarantee zero escape-decoding ambiguity
+      return false;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    // Reject ALL unquoted `$(...)` (dbcred substitution is only allowed inside double quotes)
+    if (ch === "$" && next === "(") return false;
+    if (ch === "<") {
+      if (next === "<" || next === ">" || next === "&") return false;
+      // Reject numbered input redirections on non-stdin fds (e.g. `3< migration.sql`), allow only plain `<` or `0<`
+      let dStart = i - 1;
+      while (dStart >= 0 && cmd[dStart] >= "0" && cmd[dStart] <= "9") dStart--;
+      const numStr = cmd.slice(dStart + 1, i);
+      const beforeNum = dStart >= 0 ? cmd[dStart] : undefined;
+      if (
+        numStr.length > 0 &&
+        (beforeNum === undefined || beforeNum === " " || beforeNum === "\t") &&
+        numStr !== "0"
+      ) {
+        return false;
+      }
+      continue;
+    }
+    if (ch === ">") {
+      // Allow ONLY standalone `2>&1` or `1>&2` fd duplication; reject all file output redirections (`> file`, `>> file`, etc.)
+      const prev = cmd[i - 1];
+      const beforePrev = cmd[i - 2];
+      const targetFd = cmd[i + 2];
+      const afterTarget = cmd[i + 3];
+      const validSrcFd =
+        (prev === "2" || prev === "1") &&
+        (beforePrev === undefined || beforePrev === " " || beforePrev === "\t");
+      const validDup =
+        validSrcFd &&
+        next === "&" &&
+        (targetFd === "1" || targetFd === "2") &&
+        targetFd !== prev &&
+        (afterTarget === undefined || afterTarget === " " || afterTarget === "\t");
+      if (!validDup) return false;
+      i += 2; // consume `>&1` / `>&2`
+      continue;
+    }
+    if (ch === ";" || ch === "|" || ch === "&" || ch === "`" || ch === "(" || ch === ")") {
+      return false;
+    }
+  }
+  return !escape && quote === null;
+}
+
+/**
+ * Quote-aware tokenization for a validated single SQL command that separates `< file` / `<file`
+ * stdin redirections and drops benign `2>&1` / `1>&2` fd duplications.
+ */
+function extractSqlTokensAndStdinRedirects(
+  cmd: string,
+): { args: string[]; stdinFiles: string[] } | null {
+  const rawTokens: Array<{ kind: "word" | "stdin" | "fddup"; value: string }> = [];
+  let cur = "";
+  let hasWord = false;
+  let quote: "'" | '"' | null = null;
+  let escape = false;
+
+  const flush = () => {
+    if (!hasWord) return;
+    if (cur === "2>&1" || cur === "1>&2") {
+      rawTokens.push({ kind: "fddup", value: cur });
+    } else {
+      rawTokens.push({ kind: "word", value: cur });
+    }
+    cur = "";
+    hasWord = false;
+  };
+
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    const next = cmd[i + 1];
+    if (escape) {
+      cur += ch;
+      hasWord = true;
+      escape = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else cur += ch;
+      hasWord = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\") {
+        if (next === '"' || next === "\\" || next === "$" || next === "`") {
+          escape = true;
+        } else {
+          cur += ch;
+        }
+      } else if (ch === '"') {
+        quote = null;
+      } else {
+        cur += ch;
+      }
+      hasWord = true;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === "$" && next === "'") {
+      return null;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      hasWord = true;
+      continue;
+    }
+    if (ch === " " || ch === "\t") {
+      flush();
+      continue;
+    }
+    if (ch === "<") {
+      if (hasWord && /^\d+$/.test(cur)) {
+        if (cur !== "0") return null; // Only fd 0 (`0<` or `<`) feeds client stdin!
+        cur = "";
+        hasWord = false;
+      } else {
+        flush();
+      }
+      rawTokens.push({ kind: "stdin", value: "<" });
+      continue;
+    }
+    cur += ch;
+    hasWord = true;
+  }
+  if (quote !== null || escape) return null;
+  flush();
+
+  const args: string[] = [];
+  const stdinFiles: string[] = [];
+  for (let i = 0; i < rawTokens.length; i++) {
+    const tok = rawTokens[i];
+    if (tok.kind === "fddup") continue;
+    if (tok.kind === "stdin") {
+      const nextTok = rawTokens[++i];
+      if (!nextTok || nextTok.kind !== "word" || !nextTok.value) return null;
+      stdinFiles.push(nextTok.value);
+      continue;
+    }
+    args.push(tok.value);
+  }
+  return { args, stdinFiles };
+}
+
+function extractHostsFromConnStr(connStr: string): { hosts: string[]; invalid: boolean } {
+  const hosts: string[] = [];
+  const trimmed = connStr.trim();
+  const uriMatch = trimmed.match(/^(?:postgres(?:ql)?|mysql):\/\/(.*)$/i);
+  if (uriMatch) {
+    // Replace validated `$(.../dbcred <env>)` placeholders before URI authority/path splitting
+    // so slashes inside the helper path (e.g. `.workbench/bin/dbcred`) never truncate the authority!
+    const rest = uriMatch[1].replace(/\$\([^)]*\)/g, "CRED");
+    const qIdx = rest.indexOf("?");
+    const beforeQuery = qIdx >= 0 ? rest.slice(0, qIdx) : rest;
+    const queryStr = qIdx >= 0 ? rest.slice(qIdx + 1) : "";
+    const slashIdx = beforeQuery.indexOf("/");
+    const authority = slashIdx >= 0 ? beforeQuery.slice(0, slashIdx) : beforeQuery;
+    const atIdx = authority.lastIndexOf("@");
+    const hostPortList = atIdx >= 0 ? authority.slice(atIdx + 1) : authority;
+    let invalid = false;
+    const addEncodedHost = (encoded: string) => {
+      try {
+        for (const entry of decodeURIComponent(encoded).split(",")) {
+          if (entry.trim()) hosts.push(entry.trim());
+          else invalid = true;
+        }
+      } catch {
+        invalid = true;
+      }
+    };
+    if (hostPortList.length > 0) {
+      for (const part of hostPortList.split(",")) {
+        const p = part.trim();
+        let host = p;
+        if (p.startsWith("[")) {
+          const endBracket = p.indexOf("]");
+          if (endBracket < 0) { invalid = true; continue; }
+          host = p.slice(1, endBracket);
+        } else {
+          const colonIdx = p.lastIndexOf(":");
+          if (colonIdx >= 0) host = p.slice(0, colonIdx);
+        }
+        addEncodedHost(host);
+      }
+    }
+    if (queryStr) {
+      for (const pair of queryStr.split("&")) {
+        if (!pair) continue;
+        const eqIdx = pair.indexOf("=");
+        const rawKey = eqIdx >= 0 ? pair.slice(0, eqIdx) : pair;
+        const rawVal = eqIdx >= 0 ? pair.slice(eqIdx + 1) : "";
+        try {
+          const key = decodeURIComponent(rawKey).toLowerCase();
+          if (key === "host") {
+            for (const entry of rawVal.split(",")) addEncodedHost(entry);
+          } else {
+            decodeURIComponent(rawVal);
+            if (key === "service" || key === "hostaddr") invalid = true;
+          }
+        } catch {
+          invalid = true;
+        }
+      }
+    }
+    return { hosts, invalid };
+  }
+
+  // libpq keyword=value connection string (e.g. `host = prod-db.internal dbname=app`)
+  if (trimmed.includes("=")) {
+    let i = 0;
+    while (i < trimmed.length) {
+      while (i < trimmed.length && (trimmed[i] === " " || trimmed[i] === "\t")) i++;
+      if (i >= trimmed.length) break;
+      const eqIdx = trimmed.indexOf("=", i);
+      if (eqIdx < 0) return { hosts, invalid: true };
+      const key = trimmed.slice(i, eqIdx).trim().toLowerCase();
+      if (!/^[a-z_][a-z0-9_]*$/.test(key)) return { hosts, invalid: true };
+      i = eqIdx + 1;
+      while (i < trimmed.length && (trimmed[i] === " " || trimmed[i] === "\t")) i++;
+      if (i >= trimmed.length) return { hosts, invalid: true };
+      let val = "";
+      if (trimmed[i] === "'") {
+        i++;
+        let closed = false;
+        while (i < trimmed.length) {
+          if (trimmed[i] === "\\" && i + 1 < trimmed.length) {
+            val += trimmed[i + 1];
+            i += 2;
+          } else if (trimmed[i] === "'") {
+            i++;
+            closed = true;
+            break;
+          } else {
+            val += trimmed[i++];
+          }
+        }
+        if (!closed) return { hosts, invalid: true };
+      } else {
+        while (i < trimmed.length && trimmed[i] !== " " && trimmed[i] !== "\t") {
+          if (trimmed[i] === "\\" && i + 1 < trimmed.length) {
+            val += trimmed[i + 1];
+            i += 2;
+          } else {
+            val += trimmed[i++];
+          }
+        }
+      }
+      if (key === "service" || key === "hostaddr") return { hosts, invalid: true };
+      if (key === "host") {
+        if (!val.trim()) return { hosts, invalid: true };
+        for (const h of val.split(",")) {
+          if (!h.trim()) return { hosts, invalid: true };
+          hosts.push(h.trim());
+        }
+      }
+    }
+  }
+  return { hosts, invalid: false };
+}
+
+const DISALLOWED_PSQL_ENV_VARS = new Set([
+  "PSQLRC",
+  "PGSERVICE",
+  "PGSERVICEFILE",
+  "PGHOSTADDR",
+]);
+const DISALLOWED_MYSQL_ENV_VARS = new Set([
+  "MYSQL_HOME",
+  "MYSQL_GROUP_SUFFIX",
+  "MYSQL_TEST_LOGIN_FILE",
+]);
+const DISALLOWED_USQL_ENV_VARS = new Set([
+  "USQLRC",
+  "PSQLRC",
+  "PGSERVICE",
+  "PGSERVICEFILE",
+  "PGHOSTADDR",
+  "MYSQL_HOME",
+]);
+
+const PSQL_LONG_VALUE_FLAGS = new Set([
+  "--host",
+  "--port",
+  "--username",
+  "--dbname",
+  "--file",
+  "--set",
+  "--variable",
+  "--pset",
+]);
+const PSQL_LONG_BOOL_FLAGS = new Set([
+  "--no-psqlrc",
+  "--quiet",
+  "--echo-all",
+  "--echo-errors",
+  "--echo-queries",
+  "--single-transaction",
+  "--tuples-only",
+  "--no-align",
+  "--csv",
+  "--expanded",
+  "--no-password",
+  "--password",
+]);
+const PSQL_SHORT_VALUE_FLAGS = new Set(["h", "p", "U", "d", "f", "v", "P"]);
+const PSQL_SHORT_BOOL_FLAGS = new Set(["X", "q", "a", "b", "e", "1", "t", "A", "x", "w", "W"]);
+
+const USQL_LONG_VALUE_FLAGS = new Set(["--file", "--set", "--variable", "--pset"]);
+const USQL_LONG_BOOL_FLAGS = new Set([
+  "--no-rc",
+  "--quiet",
+  "--single-transaction",
+  "--no-align",
+  "--tuples-only",
+  "--json",
+  "--csv",
+]);
+const USQL_SHORT_VALUE_FLAGS = new Set(["f", "v", "P"]);
+const USQL_SHORT_BOOL_FLAGS = new Set(["X", "q", "1", "A", "t", "J", "C"]);
+
+const MYSQL_LONG_VALUE_FLAGS = new Set([
+  "--host",
+  "--port",
+  "--user",
+  "--password",
+  "--database",
+  "--default-character-set",
+  "--ssl-mode",
+  "--protocol",
+]);
+const MYSQL_LONG_BOOL_FLAGS = new Set([
+  "--verbose",
+  "--batch",
+  "--skip-column-names",
+  "--silent",
+  "--ssl",
+  "--skip-ssl",
+  "--no-auto-rehash",
+]);
+const MYSQL_SHORT_VALUE_FLAGS = new Set(["h", "P", "u", "p", "D"]);
+const MYSQL_SHORT_BOOL_FLAGS = new Set(["v", "B", "N", "s", "A"]);
+
+function normalizeSqlHosts(bin: string, values: string[]): string[] {
+  return values.flatMap((value) => bin === "psql" ? value.split(",") : [value])
+    .map((host) => host.trim().toLowerCase());
+}
+
+function parseSqlClientArgs(bin: "psql" | "mysql" | "usql", toks: string[], inspectWrites: boolean) {
+  const hostCandidates: string[] = [];
+  const longValueFlags =
+    bin === "psql"
+      ? PSQL_LONG_VALUE_FLAGS
+      : bin === "usql"
+        ? USQL_LONG_VALUE_FLAGS
+        : MYSQL_LONG_VALUE_FLAGS;
+  const longBoolFlags =
+    bin === "psql"
+      ? PSQL_LONG_BOOL_FLAGS
+      : bin === "usql"
+        ? USQL_LONG_BOOL_FLAGS
+        : MYSQL_LONG_BOOL_FLAGS;
+  const shortValueFlags =
+    bin === "psql"
+      ? PSQL_SHORT_VALUE_FLAGS
+      : bin === "usql"
+        ? USQL_SHORT_VALUE_FLAGS
+        : MYSQL_SHORT_VALUE_FLAGS;
+  const shortBoolFlags =
+    bin === "psql"
+      ? PSQL_SHORT_BOOL_FLAGS
+      : bin === "usql"
+        ? USQL_SHORT_BOOL_FLAGS
+        : MYSQL_SHORT_BOOL_FLAGS;
+
+  const flagFiles: string[] = [];
+  const positionals: string[] = [];
+  let dbname: string | undefined;
+  let stopFlags = false;
+
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (!stopFlags && t === "--") {
+      stopFlags = true;
+      continue;
+    }
+    if (!stopFlags && t.startsWith("--")) {
+      const eq = t.indexOf("=");
+      const name = eq >= 0 ? t.slice(0, eq) : t;
+      const eqVal = eq >= 0 ? t.slice(eq + 1) : null;
+      if (longBoolFlags.has(name)) {
+        if (eqVal !== null) return null;
+        continue;
+      }
+      if (longValueFlags.has(name) || (inspectWrites && name === (bin === "psql" ? "--command" : "--execute"))) {
+        const val = eqVal !== null ? eqVal : toks[++i];
+        if (val === undefined || val === "") return null;
+        if (name === "--file") flagFiles.push(val);
+        else if (name === "--host") hostCandidates.push(val);
+        else if (name === "--dbname" && bin === "psql") {
+          if (dbname !== undefined) return null;
+          dbname = val;
+        }
+        continue;
+      }
+      return null; // Reject unknown or dangerous long flag (`--command`, `--execute`, `--output`, `--defaults-file`, etc.)
+    }
+    if (!stopFlags && t.startsWith("-") && t.length > 1) {
+      for (let j = 1; j < t.length; j++) {
+        const ch = t[j];
+        if (shortBoolFlags.has(ch)) continue;
+        if (shortValueFlags.has(ch) || (inspectWrites && ch === (bin === "psql" ? "c" : "e"))) {
+          const val = j < t.length - 1 ? t.slice(j + 1) : toks[++i];
+          if (val === undefined || val === "") return null;
+          if (ch === "f") flagFiles.push(val);
+          else if (ch === "h") hostCandidates.push(val);
+          else if (ch === "d" && bin === "psql") {
+            if (dbname !== undefined) return null;
+            dbname = val;
+          }
+          break;
+        }
+        return null; // Reject unknown or dangerous short flag (`-c`, `-Xc`, `-e`, `-Be`, `-o`, etc.)
+      }
+      continue;
+    }
+    positionals.push(t);
+  }
+
+  // Parse positional connection targets per client grammar
+  if (bin === "psql") {
+    if (positionals.length > 2 || (dbname !== undefined && positionals.length > 0)) return null;
+    const connection = dbname ?? positionals[0];
+    if (connection) {
+      const parsedConn = extractHostsFromConnStr(connection);
+      if (parsedConn.invalid) return null;
+      hostCandidates.push(...parsedConn.hosts);
+    }
+  } else if (bin === "usql") {
+    // usql requires a single explicit URI DSN positional
+    if (positionals.length !== 1 || !/^(?:postgres(?:ql)?|mysql):\/\//i.test(positionals[0])) {
+      return null;
+    }
+    const parsedConn = extractHostsFromConnStr(positionals[0]);
+    if (parsedConn.invalid) return null;
+    hostCandidates.push(...parsedConn.hosts);
+  } else {
+    if (positionals.length > 1) return null;
+  }
+
+  return { hostCandidates, flagFiles };
+}
+
+function parseApprovedSqlMigrationCommand(
+  workbenchRoot: string,
+  cmd: string,
+  workdir: string,
+): { host: string; sqlRealPath: string } | null {
+  if (!isSafeSingleSqlShellCommand(cmd, workbenchRoot, workdir)) return null;
+  if (splitShellSegments(cmd).length !== 1) return null;
+  const extracted = extractSqlTokensAndStdinRedirects(cmd);
+  if (!extracted || extracted.args.length < 2) return null;
+  const { args: toks, stdinFiles } = extracted;
+
+  // Identify client binary FIRST, then apply case-sensitive client-specific env & option rules!
+  const rawEnvPairs: Array<[string, string]> = [];
   let idx = 0;
-  while (idx < toks.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[idx])) idx++;
+  while (idx < toks.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[idx])) {
+    const eq = toks[idx].indexOf("=");
+    rawEnvPairs.push([toks[idx].slice(0, eq), toks[idx].slice(eq + 1)]);
+    idx++;
+  }
   const bin = (toks[idx] ?? "").split("/").pop() ?? "";
   if (bin !== "psql" && bin !== "usql" && bin !== "mysql") return null;
 
-  const files: string[] = [];
-  for (let i = idx + 1; i < toks.length; i++) {
-    const t = toks[i];
+  const disallowedEnv =
+    bin === "psql"
+      ? DISALLOWED_PSQL_ENV_VARS
+      : bin === "usql"
+        ? DISALLOWED_USQL_ENV_VARS
+        : DISALLOWED_MYSQL_ENV_VARS;
+  const inlineEnv = new Map(rawEnvPairs);
+  for (const key of disallowedEnv) {
+    if (inlineEnv.get(key) ?? process.env[key]) return null;
+  }
+  const hostEnvKey = bin === "psql" ? "PGHOST" : bin === "mysql" ? "MYSQL_HOST" : null;
+  const parsed = parseSqlClientArgs(bin, toks.slice(idx + 1), false);
+  if (!parsed) return null;
+  const { hostCandidates, flagFiles } = parsed;
+  const allFiles = [...flagFiles, ...stdinFiles];
+  if (allFiles.length !== 1 || !allFiles[0]) return null;
+
+  if (hostCandidates.length === 0 && hostEnvKey) {
+    const host = inlineEnv.get(hostEnvKey) ?? process.env[hostEnvKey];
+    if (host) hostCandidates.push(host);
+  }
+  const normalizedHosts = new Set(normalizeSqlHosts(bin, hostCandidates));
+  if (normalizedHosts.has("") || normalizedHosts.size !== 1) return null;
+  const effectiveHost = [...normalizedHosts][0];
+
+  const sqlRealPath = canonicalizeOsPath(workdir, allFiles[0]);
+  if (!sqlRealPath) return null;
+  return { host: effectiveHost, sqlRealPath };
+}
+
+/**
+ * Strip unquoted shell redirections (`> /dev/null`, `2>&1`, `>> log`, `< input`) from a command segment
+ * while preserving quoted literal filenames (e.g. `"foo>bar.test.js"`).
+ */
+export function stripUnquotedShellRedirections(seg: string): string {
+  let out = "";
+  let quote: "'" | '"' | "$'" | null = null;
+  let escape = false;
+  let i = 0;
+  const skipTargetWord = () => {
+    while (i < seg.length && (seg[i] === " " || seg[i] === "\t")) i++;
+    let wQuote: "'" | '"' | "$'" | null = null;
+    let wEscape = false;
+    while (i < seg.length) {
+      const c = seg[i];
+      const nx = seg[i + 1];
+      if (wEscape) {
+        wEscape = false;
+        i++;
+        continue;
+      }
+      if (wQuote === "'") {
+        if (c === "'") wQuote = null;
+        i++;
+        continue;
+      }
+      if (wQuote === "$'") {
+        if (c === "\\") wEscape = true;
+        else if (c === "'") wQuote = null;
+        i++;
+        continue;
+      }
+      if (wQuote === '"') {
+        if (c === "\\") wEscape = true;
+        else if (c === '"') wQuote = null;
+        i++;
+        continue;
+      }
+      if (c === "\\") {
+        wEscape = true;
+        i++;
+        continue;
+      }
+      if (c === "$" && nx === "'") {
+        wQuote = "$'";
+        i += 2;
+        continue;
+      }
+      if (c === "'" || c === '"') {
+        wQuote = c;
+        i++;
+        continue;
+      }
+      if (c === " " || c === "\t" || c === "\n" || c === ">" || c === "<") break;
+      i++;
+    }
+  };
+
+  while (i < seg.length) {
+    const ch = seg[i];
+    const next = seg[i + 1];
+    if (escape) {
+      out += ch;
+      escape = false;
+      i++;
+      continue;
+    }
+    if (quote === "'") {
+      out += ch;
+      if (ch === "'") quote = null;
+      i++;
+      continue;
+    }
+    if (quote === "$'") {
+      out += ch;
+      if (ch === "\\") escape = true;
+      else if (ch === "'") quote = null;
+      i++;
+      continue;
+    }
+    if (quote === '"') {
+      out += ch;
+      if (ch === "\\") escape = true;
+      else if (ch === '"') quote = null;
+      i++;
+      continue;
+    }
+    if (ch === "\\") {
+      out += ch;
+      escape = true;
+      i++;
+      continue;
+    }
+    if (ch === "$" && next === "'") {
+      quote = "$'";
+      out += "$'";
+      i += 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      out += ch;
+      i++;
+      continue;
+    }
+    if ((ch === "&" && next === ">") || ch === ">" || ch === "<") {
+      // Drop any immediately preceding unquoted fd digits at word start (e.g. `2>` or `1>`)
+      if (ch === ">" || ch === "<") {
+        let dEnd = out.length;
+        while (dEnd > 0 && out[dEnd - 1] >= "0" && out[dEnd - 1] <= "9") dEnd--;
+        if (dEnd < out.length && (dEnd === 0 || out[dEnd - 1] === " " || out[dEnd - 1] === "\t")) {
+          out = out.slice(0, dEnd);
+        }
+      }
+      if (ch === "&" && next === ">") {
+        i += seg[i + 2] === ">" ? 3 : 2;
+      } else if (ch === ">" && (next === ">" || next === "|" || next === "&")) {
+        i += 2;
+      } else if (ch === "<" && (next === "&" || next === ">")) {
+        i += 2;
+      } else {
+        i += 1;
+      }
+      skipTargetWord();
+      out += " ";
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+export function unwrapShellPrefix(toks: string[]) {
+  let i = 0;
+  let clearedEnv = false;
+  let ambiguous = false;
+  const env = new Map<string, string>();
+  const unsetKeys = new Set<string>();
+  const dirs: string[] = [];
+  while (i < toks.length) {
+    const tok = toks[i];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) {
+      const eq = tok.indexOf("=");
+      env.set(tok.slice(0, eq), tok.slice(eq + 1));
+      unsetKeys.delete(tok.slice(0, eq));
+      i++;
+      continue;
+    }
+    const name = tok.split("/").pop();
+    if (name === "command") {
+      i++;
+      while (toks[i] === "-p" || toks[i] === "--") i++;
+      continue;
+    }
+    if (name !== "env") break;
+    i++;
+    while (toks[i]?.startsWith("-")) {
+      const opt = toks[i++];
+      if (opt === "--") break;
+      if (["-i", "--ignore-environment", "-"].includes(opt)) {
+        clearedEnv = true;
+        env.clear();
+        unsetKeys.clear();
+      } else if (opt.startsWith("-u") || opt === "--unset" || opt.startsWith("--unset=")) {
+        const key = opt === "-u" || opt === "--unset" ? toks[i++] :
+          opt.startsWith("--unset=") ? opt.slice(8) : opt.slice(2);
+        if (!key) { ambiguous = true; break; }
+        unsetKeys.add(key);
+        env.delete(key);
+      } else if (opt.startsWith("-P")) {
+        if (opt === "-P") i++;
+      } else if (opt.startsWith("-C") || opt === "--chdir" || opt.startsWith("--chdir=")) {
+        const dir = opt.startsWith("--chdir=") ? opt.slice(8) : opt.startsWith("-C") && opt.length > 2 ? opt.slice(2) : toks[i++];
+        if (!dir) { ambiguous = true; break; }
+        dirs.push(dir);
+      } else {
+        ambiguous = true;
+        break;
+      }
+    }
+    if (ambiguous) break;
+  }
+  const effective = (key: string) => env.get(key) ??
+    (clearedEnv || unsetKeys.has(key) ? "" : process.env[key] ?? "");
+  return { bin: toks[i]?.split("/").pop(), args: toks.slice(i + 1), effective, ambiguous, dirs };
+}
+
+// Inspect split-string arguments only to identify commands that must be gated.
+function expandEnvSplitStrings(toks: string[]): string[] {
+  return toks.flatMap((tok, i) => {
+    if (toks[i - 1] === "-S" || toks[i - 1] === "--split-string") return splitShellTokens(tok) ?? [tok];
+    if (tok.startsWith("--split-string=")) return splitShellTokens(tok.slice("--split-string=".length)) ?? [tok];
+    if (tok.startsWith("-S") && tok.length > 2) return splitShellTokens(tok.slice(2)) ?? [tok];
+    return [tok];
+  });
+}
+
+function findSqlClient(toks: string[]) {
+  const idx = toks.findIndex((tok) => /(?:^|\/)(psql|mysql|usql)$/.test(tok));
+  return { bin: toks[idx]?.split("/").pop(), args: toks.slice(idx + 1) };
+}
+
+function extractCheckProdDbHosts(bin: "psql" | "usql" | "mysql", args: string[]) {
+  const parsedArgs = parseSqlClientArgs(bin, args, true);
+  if (parsedArgs) {
+    const hosts = parsedArgs.hostCandidates;
+    return { hosts, unsafeOverride: normalizeSqlHosts(bin, hosts).some((h) => !h || hasShellExpansion(h)) };
+  }
+  // Even with unsupported options, inspect known host selectors. Ambiguous operands
+  // must not suppress the inherited host when deciding whether production is in scope.
+  const hosts: string[] = [];
+  let unsafeOverride = false;
+  let stopFlags = false;
+  let positionals = 0;
+  for (let i = 0; i < args.length; i++) {
+    const tok = args[i];
+    if (!stopFlags && tok === "--") { stopFlags = true; continue; }
+    let conn = tok;
+    if (!stopFlags && tok.startsWith("-")) {
+      const eq = tok.indexOf("=");
+      const opt = eq < 0 ? tok : tok.slice(0, eq);
+      if (["--defaults-file", "--defaults-extra-file", "--defaults-group-suffix", "--login-path"].includes(opt)) {
+        unsafeOverride = true;
+      }
+      if (opt === "--host" || opt === "--dbname" || /^-[hd]/.test(tok)) {
+        const value = tok.startsWith("--") ? (eq < 0 ? args[++i] : tok.slice(eq + 1))
+          : tok.slice(2) || args[++i];
+        if (!value) { unsafeOverride = true; continue; }
+        if (opt === "--host" || tok.startsWith("-h")) { hosts.push(value); continue; }
+        conn = value;
+      } else {
+        const values = bin === "mysql" ? MYSQL_LONG_VALUE_FLAGS : PSQL_LONG_VALUE_FLAGS;
+        if (eq < 0 && (values.has(opt) || ["-c", "-e", "-f", "-U", "-u", "-P", "-v", "--execute", "--command", "--connect-timeout"].includes(opt))) i++;
+        else if (eq < 0 && !opt.startsWith("--")) unsafeOverride = true;
+        else if (eq < 0 && opt.startsWith("--") &&
+          !(bin === "mysql" ? MYSQL_LONG_BOOL_FLAGS : PSQL_LONG_BOOL_FLAGS).has(opt)) unsafeOverride = true;
+        continue;
+      }
+    }
+    if (stopFlags || !tok.startsWith("-")) positionals++;
+    if (bin !== "mysql" && (/^(postgres(?:ql)?|mysql):\/\//i.test(conn) || conn.includes("="))) {
+      if (positionals > 1) unsafeOverride = true;
+      const parsed = extractHostsFromConnStr(conn);
+      hosts.push(...parsed.hosts);
+      if (parsed.invalid) unsafeOverride = true;
+    }
+  }
+  if (normalizeSqlHosts(bin, hosts).some((h) => !h || hasShellExpansion(h))) unsafeOverride = true;
+  return { hosts, unsafeOverride };
+}
+
+function hasSqlClientFileOption(cmd: string): boolean {
+  for (const seg of splitShellSegments(cmd)) {
+    const toks = splitShellTokens(seg);
+    if (!toks || toks.length === 0) continue;
+    const prefix = unwrapShellPrefix(toks);
+    const { bin, args } = prefix.ambiguous ? findSqlClient(expandEnvSplitStrings(toks)) : prefix;
+    if (bin !== "psql" && bin !== "usql" && bin !== "mysql") continue;
+    for (const t of args) {
+      if (t === "--") break;
+      if (t === "--file" || t.startsWith("--file=")) return true;
+      if (t.startsWith("-") && !t.startsWith("--") && t.length > 1) {
+        if (bin === "psql" || bin === "usql") {
+          for (let j = 1; j < t.length; j++) {
+            const ch = t[j];
+            if (ch === "f") return true;
+            if (PSQL_SHORT_VALUE_FLAGS.has(ch) || ch === "c" || ch === "o" || ch === "L") break;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+const SAFE_LEDGER_CLI_SUBCMDS = new Set([
+  "runbook",
+  "open",
+  "close",
+  "record",
+  "decide",
+  "blocker",
+  "status",
+  "query",
+  "attach",
+  "detach",
+  "reopen",
+  "set-endpoint",
+  "cancel",
+  "verify",
+]);
+
+/**
+ * Verify that `cmd` is a standalone, metacharacter-free invocation of this workbench's own
+ * canonical `.workbench/bin/ledger` CLI (which only operates on local `.workbench/ledger/ledger.sqlite`
+ * and never connects to remote databases). Prevents `checkProdDb` from falsely blocking commands like
+ * `.workbench/bin/ledger runbook create --sql <prod-host>:<file>` or `ledger record --summary "... <prod-host> ..."`.
+ */
+function isSafeWorkbenchLedgerCliCommand(
+  cmd: string,
+  workbenchRoot: string,
+  workdir: string,
+): boolean {
+  let quote: "'" | '"' | null = null;
+  let escape = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    const next = cmd[i + 1];
+    if (ch === "\0" || ch === "\n" || ch === "\r") return false;
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\") {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        quote = null;
+        continue;
+      }
+      if (ch === "`" || (ch === "$" && next === "(")) return false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === "$" && next === "'") {
+      return false;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "$" && next === "(") return false;
     if (
-      t === "-c" ||
-      t.startsWith("-c") ||
-      t === "--command" ||
-      t.startsWith("--command=") ||
-      t === "-e" ||
-      t === "--execute" ||
-      t.startsWith("--execute=")
+      ch === ";" ||
+      ch === "|" ||
+      ch === "&" ||
+      ch === ">" ||
+      ch === "<" ||
+      ch === "`" ||
+      ch === "(" ||
+      ch === ")"
     ) {
-      return null; // Reject inline SQL mixed with file execution
+      return false;
     }
-    if (t === "-f" || t === "--file") {
-      if (i + 1 >= toks.length) return null;
-      files.push(toks[++i]);
-      continue;
-    }
-    if (t.startsWith("--file=")) {
-      files.push(t.slice("--file=".length));
-      continue;
-    }
-    if (t.startsWith("-f") && t.length > 2) {
-      files.push(t.slice(2));
-      continue;
-    }
-    if (t === "<") {
-      if (i + 1 >= toks.length) return null;
-      files.push(toks[++i]);
-      continue;
-    }
-    if (t.startsWith("<") && t.length > 1 && !t.startsWith("<<")) {
-      files.push(t.slice(1));
-      continue;
-    }
-    if (t.startsWith("<<")) return null; // Reject heredoc/herestring
   }
-  if (files.length !== 1 || !files[0]) return null;
-  const resolved = resolve(workdir, files[0]);
-  if (!existsSync(resolved)) return null;
-  try {
-    return realpathSync(resolved);
-  } catch {
-    return null;
+  if (escape || quote !== null) return false;
+  if (splitShellSegments(cmd).length !== 1) return false;
+  const toks = splitShellTokens(cmd);
+  if (!toks || toks.length < 2) return false;
+  const bin = toks[0];
+  if (!bin.includes("/")) return false;
+  const expectedLedger = canonicalizeOsPath(workbenchRoot, ".workbench/bin/ledger");
+  const candidateLedger = canonicalizeOsPath(workdir, bin);
+  if (!expectedLedger || !candidateLedger || candidateLedger !== expectedLedger) {
+    return false;
   }
+  return SAFE_LEDGER_CLI_SUBCMDS.has(toks[1]);
 }
 
 export function checkProdDb(
@@ -1076,10 +2102,36 @@ export function checkProdDb(
   prodHosts: string[],
   toolWorkdir = process.cwd(),
   approvedRunbooks: ApprovedRunbookEntry[] = [],
+  workbenchRoot = toolWorkdir,
 ): string | null {
   if (prodHosts.length === 0) return null;
-  const matchedHost = prodHosts.find((h) => cmd.includes(h));
-  if (!matchedHost) return null;
+  if (isSafeWorkbenchLedgerCliCommand(cmd, workbenchRoot, toolWorkdir)) return null;
+  const matchedHosts: string[] = [];
+  for (const seg of splitShellSegments(cmd)) {
+    const toks = splitShellTokens(stripUnquotedShellRedirections(seg)) ?? [];
+    const { bin, effective, args, ambiguous } = unwrapShellPrefix(toks);
+    let literal = seg;
+    const hosts: string[] = [];
+    if (ambiguous) {
+      const client = findSqlClient(expandEnvSplitStrings(toks));
+      if (client.bin === "psql" || client.bin === "mysql" || client.bin === "usql") {
+        hosts.push(...normalizeSqlHosts(client.bin, extractCheckProdDbHosts(client.bin, client.args).hosts));
+      }
+      for (const key of ["PGHOST", "PGHOSTADDR", "MYSQL_HOST"]) {
+        hosts.push(...normalizeSqlHosts("psql", [effective(key), process.env[key] ?? ""]));
+      }
+    } else if (bin === "psql" || bin === "mysql" || bin === "usql") {
+      const parsed = extractCheckProdDbHosts(bin, args);
+      hosts.push(...parsed.hosts);
+      if (hosts.length && !parsed.unsafeOverride) literal = args.join(" ");
+      else if (bin !== "usql") hosts.push(effective(bin === "psql" ? "PGHOST" : "MYSQL_HOST"));
+      if (bin === "psql") hosts.push(effective("PGHOSTADDR"));
+    }
+    const normalized = normalizeSqlHosts(bin ?? "", hosts);
+    matchedHosts.push(...prodHosts.filter((h) => literal.toLowerCase().includes(h.toLowerCase()) || normalized.includes(h.toLowerCase())));
+  }
+  if (matchedHosts.length === 0) return null;
+  const matchedHost = matchedHosts[0];
 
   // ClickHouse HTTP write or POST/PUT/DELETE via curl/wget/http
   if (isHttpWriteCommand(cmd)) {
@@ -1088,16 +2140,19 @@ export function checkProdDb(
     }
   }
 
-  if (SQL_FILE_FLAG_RE.test(cmd) || hasUnquotedRedirect(cmd, "<")) {
+  if (SQL_FILE_FLAG_RE.test(cmd) || hasUnquotedRedirect(cmd, "<") || hasSqlClientFileOption(cmd)) {
     if (approvedRunbooks.length > 0) {
-      const sqlRealPath = extractSingleApprovedSqlFile(cmd, toolWorkdir);
-      if (sqlRealPath) {
-        const liveSha = sha256FileForGuard(sqlRealPath);
+      const parsed = parseApprovedSqlMigrationCommand(workbenchRoot, cmd, toolWorkdir);
+      if (parsed && prodHosts.some((h) => h.toLowerCase() === parsed.host)) {
+        const liveSha = sha256FileForGuard(parsed.sqlRealPath);
         if (
           liveSha &&
           approvedRunbooks.some((rb) =>
             rb.actions.sql_files.some(
-              (sf) => sf.host === matchedHost && sf.path === sqlRealPath && sf.sha256 === liveSha,
+              (sf) =>
+                sf.host.toLowerCase() === parsed.host &&
+                sf.path === parsed.sqlRealPath &&
+                sf.sha256 === liveSha,
             ),
           )
         ) {
@@ -1195,23 +2250,89 @@ export function checkCloudAndRedisOps(cmd: string): string | null {
   return null;
 }
 
+/**
+ * Resolve git `-C <dir>` flags sequentially matching Git's `chdir()` semantics:
+ * each non-empty operand is resolved physically via `realpathSync.native` against the preceding physical directory
+ * (preserving `..` across symlinks). When `strict` is true, returns `null` if any `-C` directory cannot be resolved.
+ */
+export function resolveGitDirFlags(
+  baseCwd: string,
+  flags: string[],
+  strict = false,
+): string | null {
+  let dir = canonicalizeOsPath(baseCwd, ".") ?? baseCwd;
+  for (const f of flags) {
+    if (!f) continue; // Git treats empty `-C ""` as a no-op
+    const phys = canonicalizeOsPath(dir, f);
+    if (phys) {
+      dir = phys;
+    } else if (strict) {
+      return null;
+    } else {
+      dir = resolve(dir, f);
+    }
+  }
+  return dir;
+}
+
 export function extractGitSubcommand(
   tokens: string[],
-): { gitIdx: number; gitDirFlag: string | null; subcmd: string; subArgs: string[] } | null {
+): {
+  gitIdx: number;
+  gitDirFlags: string[];
+  configs: string[];
+  hasUnsafeGlobalOverride: boolean;
+  subcmd: string;
+  subArgs: string[];
+} | null {
+  const UNSAFE_GLOBAL_VALUE_FLAGS = new Set([
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+  ]);
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
     if (t !== "git" && !t.endsWith("/git")) continue;
-    let gitDirFlag: string | null = null;
+    const gitDirFlags: string[] = [];
+    const configs: string[] = [];
+    let hasUnsafeGlobalOverride = false;
     let j = i + 1;
     while (j < tokens.length) {
       const a = tokens[j];
       if (a === "-C" && j + 1 < tokens.length) {
-        gitDirFlag = tokens[j + 1];
+        gitDirFlags.push(tokens[j + 1]);
         j += 2;
         continue;
       }
+      if (a.startsWith("-C") && a.length > 2) {
+        gitDirFlags.push(a.slice(2));
+        j++;
+        continue;
+      }
       if (a === "-c" && j + 1 < tokens.length) {
+        configs.push(tokens[j + 1]);
         j += 2;
+        continue;
+      }
+      if (a.startsWith("-c") && a.length > 2) {
+        configs.push(a.slice(2));
+        j++;
+        continue;
+      }
+      if (UNSAFE_GLOBAL_VALUE_FLAGS.has(a)) {
+        hasUnsafeGlobalOverride = true;
+        j += 2;
+        continue;
+      }
+      if (
+        a.startsWith("--git-dir=") ||
+        a.startsWith("--work-tree=") ||
+        a.startsWith("--namespace=") ||
+        a.startsWith("--config-env=")
+      ) {
+        hasUnsafeGlobalOverride = true;
+        j++;
         continue;
       }
       if (a.startsWith("-")) {
@@ -1220,7 +2341,9 @@ export function extractGitSubcommand(
       }
       return {
         gitIdx: i,
-        gitDirFlag,
+        gitDirFlags,
+        configs,
+        hasUnsafeGlobalOverride,
         subcmd: a,
         subArgs: tokens.slice(j + 1),
       };
@@ -1258,10 +2381,35 @@ function hasPrecedingDynamicCd(segments: string[], targetIndex: number): boolean
   return false;
 }
 
+// Shortest accepted spellings for the push options that affect guard decisions.
+const PUSH_OPTIONS = [
+  ["--mi", "--mirror"], ["--al", "--all"], ["--br", "--branches"], ["--ta", "--tags"],
+  ["--fo", "--force"], ["--force-w", "--force-with-lease"], ["--force-i", "--force-if-includes"],
+  ["--de", "--delete"], ["--no-de", "--no-delete"], ["--pr", "--prune"], ["--rep", "--repo"],
+  ["--fol", "--follow-tags"], ["--no-fol", "--no-follow-tags"],
+  ["--pu", "--push-option"], ["--rec", "--receive-pack"], ["--ex", "--exec"],
+];
+
+function canonicalPushOption(token: string): string {
+  const name = token.split("=", 1)[0];
+  const match = PUSH_OPTIONS.find(([min, full]) => name.startsWith(min) && full.startsWith(name));
+  if (match) return match[1];
+  // Git also accepts shorter unambiguous prefixes (for example --m for --mirror).
+  const candidates = PUSH_OPTIONS.filter(([, full]) => full.startsWith(name));
+  if (!name.startsWith("--no-") && candidates.length === 1) return candidates[0][1];
+  if (name.startsWith("--force-") && candidates.length) return "--force";
+  return name;
+}
+
 function parseGitPushArgs(args: string[]): {
-  positional: string[];
-  hasRepoFlag: boolean;
+  refspecs: string[];
+  remote: string | undefined;
   hasAllOrMirror: boolean;
+  hasTags: boolean;
+  isForce: boolean;
+  isDelete: boolean;
+  hasPrune: boolean;
+  cliFollowTags: boolean | null;
 } {
   const VALUE_FLAGS = new Set([
     "-o",
@@ -1271,8 +2419,13 @@ function parseGitPushArgs(args: string[]): {
     "--exec",
   ]);
   const positional: string[] = [];
-  let hasRepoFlag = false;
+  let repoValue: string | undefined;
   let hasAllOrMirror = false;
+  let hasTags = false;
+  let isForce = false;
+  let isDelete = false;
+  let hasPrune = false;
+  let cliFollowTags: boolean | null = null;
   let stopFlags = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -1280,28 +2433,210 @@ function parseGitPushArgs(args: string[]): {
       stopFlags = true;
       continue;
     }
-    if (!stopFlags && a.startsWith("-")) {
-      if (a === "--repo" || a.startsWith("--repo=")) {
-        hasRepoFlag = true;
-      }
-      if (a === "--all" || a === "--mirror") {
+    if (!stopFlags && a.startsWith("--")) {
+      const option = canonicalPushOption(a);
+      if (option === "--repo") {
+        repoValue = a.includes("=") ? a.slice(a.indexOf("=") + 1) : args[i + 1];
+      } else if (option === "--all" || option === "--branches" || option === "--mirror") {
         hasAllOrMirror = true;
+      } else if (option === "--tags") {
+        hasTags = true;
+      } else if (
+        option === "--force" ||
+        option === "--force-with-lease" ||
+        option === "--force-if-includes"
+      ) {
+        isForce = true;
+      } else if (option === "--delete") {
+        isDelete = true;
+      } else if (option === "--no-delete") {
+        isDelete = false;
+      } else if (option === "--prune") {
+        hasPrune = true;
+      } else if (option === "--follow-tags") {
+        cliFollowTags = true;
+      } else if (option === "--no-follow-tags") {
+        cliFollowTags = false;
       }
-      if (VALUE_FLAGS.has(a)) {
+      if (VALUE_FLAGS.has(option) && !a.includes("=")) {
         i++;
+      }
+      continue;
+    }
+    if (!stopFlags && a.startsWith("-") && a.length > 1) {
+      for (let j = 1; j < a.length; j++) {
+        const ch = a[j];
+        if (ch === "f") isForce = true;
+        else if (ch === "d") isDelete = true;
+        else if (ch === "o") {
+          if (j === a.length - 1) i++;
+          break;
+        }
       }
       continue;
     }
     positional.push(a);
   }
-  return { positional, hasRepoFlag, hasAllOrMirror };
+  const refspecs = positional.slice(1);
+  if (refspecs.some((ref) => ref === ":" || ref === "+:" || ref.includes("*"))) hasAllOrMirror = true;
+  return {
+    refspecs,
+    remote: positional[0] ?? repoValue,
+    hasAllOrMirror,
+    hasTags,
+    isForce,
+    isDelete,
+    hasPrune,
+    cliFollowTags,
+  };
 }
 
-function parseGhPrMergeTarget(
-  args: string[],
-  checkoutDir: string | null,
-  localRepoName: string | null,
-): { repo: string; number: number } | null {
+function resolveEffectivePushRemote(dir: string, explicit: string | undefined, branch: string, overrides: string[]) {
+  if (explicit) return explicit;
+  const get = (key: string) => runGit(dir, [...overrides, "config", "--get", key], 3000).stdout.trim();
+  const configured = (branch && get(`branch.${branch}.pushRemote`)) || get("remote.pushDefault")
+    || (branch && get(`branch.${branch}.remote`));
+  if (configured) return configured;
+  const remotes = runGit(dir, [...overrides, "remote"], 3000).stdout.trim().split("\n").filter(Boolean);
+  return remotes.length === 1 ? remotes[0] : "origin";
+}
+
+function isImplicitPushAmbiguous(
+  parsedPush: ReturnType<typeof parseGitPushArgs>,
+  gitConfigs: string[],
+  targetDir: string,
+  protectedBranches: Set<string>,
+): string | null {
+  if (parsedPush.refspecs.length && parsedPush.refspecs.every((ref) => ref.includes(":"))) return null;
+  const overrides = gitConfigs.flatMap((value) => ["-c", value]);
+  const config = (key: string) =>
+    runGit(targetDir, [...overrides, "config", "--get", key], 3000).stdout.trim();
+  const branch = runGit(targetDir, ["symbolic-ref", "--quiet", "--short", "HEAD"], 3000).stdout.trimEnd();
+  const remote = resolveEffectivePushRemote(targetDir, parsedPush.remote, branch, overrides);
+  const key = `remote.${remote}.push`;
+  if (runGit(targetDir, [...overrides, "config", "--get-all", key], 3000).code === 0) {
+    return `检测到 ${key} 推送配置，请显式指定 src:dst refspec。`;
+  }
+  if (parsedPush.refspecs.length) return null;
+  const pushDefault = config("push.default").toLowerCase();
+  if (pushDefault === "matching") {
+    return "push.default=matching 可能推送多个分支，请显式指定 refspec。";
+  }
+  if (!["", "simple", "current", "nothing", "upstream", "tracking"].includes(pushDefault)) {
+    return "未知 push.default，请显式指定 refspec。";
+  }
+
+  if (branch && (pushDefault === "upstream" || pushDefault === "tracking")) {
+    const merge = config(`branch.${branch}.merge`);
+    if (merge && (!merge.startsWith("refs/heads/") || protectedBranches.has(merge.slice("refs/heads/".length)))) {
+      return "隐式推送的上游目标受保护，请显式指定 refspec。";
+    }
+  }
+  if (!parsedPush.remote) {
+    const pushRef = runGit(targetDir, [...overrides, "rev-parse", "--symbolic-full-name", "@{push}"], 3000);
+    const prefix = `refs/remotes/${remote}/`;
+    const ref = pushRef.stdout.trimEnd();
+    if (pushRef.code === 0 && ref.startsWith(prefix) && protectedBranches.has(ref.slice(prefix.length))) {
+      return "隐式推送的目标分支受保护，请显式指定 refspec。";
+    }
+  }
+  if (runGit(targetDir, [...overrides, "config", "--bool", "--get", `remote.${remote}.mirror`], 3000).stdout.trim() === "true") {
+    return "mirror 远端禁止隐式推送，请显式指定 refspec。";
+  }
+  return null;
+}
+
+function repoOrigin(dir: string) {
+  const result = runGit(dir, ["remote", "get-url", "origin"], 3000);
+  return result.code === 0 ? parseGitRemoteRepo(result.stdout) : null;
+}
+
+export function resolveGhDefaultHost(effective: (key: string) => string, cwd = process.cwd()): string {
+  const host = effective("GH_HOST");
+  if (host) return host.toLowerCase();
+  const home = effective("HOME");
+  const configHome = effective("XDG_CONFIG_HOME") || (home && join(home, ".config"));
+  const configDir = effective("GH_CONFIG_DIR") || (configHome && join(configHome, "gh"));
+  if (configDir) {
+    const config = parseYamlFile<Record<string, unknown>>(resolve(cwd, configDir, "hosts.yml"));
+    const hosts = Object.keys(config ?? {}).map((key) => key.toLowerCase());
+    if (hosts.length === 1) return hosts[0];
+  }
+  return "github.com";
+}
+
+const HOSTLESS_GH_REPO = /^[^/@:]+\/[^/]+$/;
+
+export function qualifyGhRepoSpec(spec: string, effective: (key: string) => string, cwd: string): string {
+  return HOSTLESS_GH_REPO.test(spec) ? `${resolveGhDefaultHost(effective, cwd)}/${spec}` : spec;
+}
+
+function resolveGhDefaultRepo(dir: string) {
+  const getRemote = (name: string) => {
+    const url = runGit(dir, ["remote", "get-url", "--", name], 3000);
+    return url.code === 0 ? parseGitRemoteRepo(url.stdout) : null;
+  };
+  const config = runGit(dir, ["config", "--null", "--get-regexp", "^remote\\..*\\.gh-resolved$"], 3000);
+  if (config.code === 1) {
+    const remotes = runGit(dir, ["remote"], 3000);
+    const rank = (name: string) => {
+      const index = ["upstream", "github", "origin"].indexOf(name.toLowerCase());
+      return index < 0 ? 3 : index;
+    };
+    const names = remotes.stdout.trimEnd().split("\n").filter(Boolean).sort((a, b) => rank(a) - rank(b));
+    const [best, second] = names;
+    if (remotes.code !== 0 || !best || (second && rank(best) === rank(second))) return null;
+    return getRemote(best);
+  }
+  if (config.code !== 0) return null;
+  let resolved: ReturnType<typeof parseGitRemoteRepo> = null;
+  for (const line of config.stdout.split("\0").filter(Boolean)) {
+    const match = line.match(/^remote\.(.+)\.gh-resolved\n([^\n]+)$/);
+    if (!match) return null;
+    const remoteRepo = getRemote(match[1]);
+    if (!remoteRepo) return null;
+    const spec = match[2] === "base" ? remoteRepo : parseGhRepoSpec(match[2]);
+    if (!spec) return null;
+    const repo = { ...spec, host: remoteRepo.host };
+    if (resolved && (repo.host !== resolved.host || repo.owner !== resolved.owner ||
+        repo.repo !== resolved.repo)) return null;
+    resolved = repo;
+  }
+  return resolved;
+}
+
+function ghDefaultMatchesOrigin(dir: string, origin: ReturnType<typeof parseGitRemoteRepo>): boolean {
+  const repo = resolveGhDefaultRepo(dir);
+  return !!repo && !!origin && repo.host === origin.host && repo.owner === origin.owner && repo.repo === origin.repo;
+}
+
+export function extractGhPrSubcommand(toks: string[], prefix = unwrapShellPrefix(toks)) {
+  const index = toks.findIndex((tok) => tok === "gh" || tok.endsWith("/gh"));
+  if (index < 0) return null;
+  const args = prefix.bin === "gh" ? prefix.args : toks.slice(index + 1);
+  const flags: string[] = [];
+  let sawPr = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg.startsWith("-")) {
+      flags.push(arg);
+      if (arg === "-R" || arg === "--repo") flags.push(args[++i] ?? "");
+      continue;
+    }
+    if (sawPr) return { subcmd: arg, subArgs: [...flags, ...args.slice(i + 1)], prefix };
+    if (arg !== "pr") return null;
+    sawPr = true;
+  }
+  return null;
+}
+
+function parseDeliverySegment(toks: string[]) {
+  const prefix = unwrapShellPrefix(toks);
+  const words = prefix.ambiguous ? expandEnvSplitStrings(toks) : toks;
+  return { prefix, git: extractGitSubcommand(words), gh: extractGhPrSubcommand(words, prefix) };
+}
+
+function parseGhPrMergeTarget(args: string[], checkoutDir: string | null, effective: (key: string) => string, cwd: string) {
   const VALUE_FLAGS = new Set([
     "-R",
     "--repo",
@@ -1343,39 +2678,285 @@ function parseGhPrMergeTarget(
   }
   if (positionals.length !== 1) return null;
   const pos = positionals[0];
-  let prNum: number | null = null;
-  let urlRepoName: string | null = null;
-  const numMatch = pos.match(/^#?(\d+)$/);
-  if (numMatch) {
-    prNum = Number(numMatch[1]);
-  } else {
-    const urlMatch = pos.match(/^https?:\/\/[^/\s]+\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)(?:\/.*)?$/i);
-    if (urlMatch) {
-      urlRepoName = urlMatch[2];
-      prNum = Number(urlMatch[3]);
+  const url = pos.match(/^https?:\/\/([^/\s]+)\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)(?:\/.*)?$/i);
+  const number = Number(url ? url[4] : pos.match(/^#?(\d+)$/)?.[1]);
+  if (!Number.isSafeInteger(number) || number <= 0) return null;
+  if (!url && repoFlag === null) repoFlag = effective("GH_REPO") || null;
+  const flag = repoFlag !== null ? parseGhRepoSpec(qualifyGhRepoSpec(repoFlag, effective, cwd)) : null;
+  if (repoFlag !== null && !flag) return null;
+  const urlHost = url ? parseGitRemoteRepo(pos.replace(/\/pull\/\d+(?:\/.*)?$/i, ""))?.host : null;
+  if (url && !urlHost) return null;
+  const host = urlHost ?? flag?.host ?? (effective("GH_HOST").toLowerCase() || null);
+  const owner = url?.[2].toLowerCase() ?? flag?.owner ?? null;
+  const repo = url?.[3].toLowerCase() ?? flag?.repo;
+  if (flag && (flag.repo !== repo || flag.owner !== owner || flag.host !== host)) return null;
+  const origin = checkoutDir ? repoOrigin(checkoutDir) : null;
+  if (checkoutDir && (!origin || (repo && repo !== origin.repo) ||
+      (host && host !== origin.host) || (owner && owner !== origin.owner))) return null;
+  if (checkoutDir && !url && repoFlag === null && !ghDefaultMatchesOrigin(checkoutDir, origin)) return null;
+  const targetRepo = repo ?? origin?.repo;
+  return targetRepo ? { host, owner, repo: targetRepo, number } : null;
+}
+
+function hasOnlyAndSeparators(cmd: string): boolean {
+  let quote: "'" | '"' | "$'" | null = null;
+  let escape = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    const next = cmd[i + 1];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === "$'") {
+      if (ch === "\\") escape = true;
+      else if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\") escape = true;
+      else if (ch === '"') quote = null;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === "$" && next === "'") {
+      quote = "$'";
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === ";" || ch === "\n" || ch === "\r" || ch === "|") return false;
+    if (ch === "&") {
+      if (next === "&") {
+        i++;
+        continue;
+      }
+      const prev = cmd[i - 1];
+      if (prev === ">" || prev === "<" || next === ">") continue;
+      return false;
     }
   }
-  if (!prNum || !Number.isInteger(prNum) || prNum <= 0) return null;
+  return !escape && quote === null;
+}
 
-  let effectiveRepo = localRepoName;
-  if (repoFlag) {
-    const parsedFlag = parseGhRepoSpec(repoFlag);
-    if (!parsedFlag) return null;
-    if (checkoutDir) {
-      const originUrl = runGit(checkoutDir, ["remote", "get-url", "origin"], 3000).stdout.trim();
-      const originId = parseGitRemoteRepo(originUrl);
-      if (originId && (originId.owner !== parsedFlag.owner || originId.repo !== parsedFlag.repo)) {
+/**
+ * Strict command-position git parser (used for Runbook approval exceptions so
+ * non-git commands or git info queries like `git --exec-path tag ...` NEVER count as tag creation).
+ * Allowlists ONLY `-C <dir>` (accumulated sequentially) and `-c <key[=val]>`.
+ */
+function extractCommandPositionGit(
+  tokens: string[],
+): { gitDirFlags: string[]; subcmd: string; subArgs: string[]; configs: string[] } | null {
+  let idx = 0;
+  while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[idx])) {
+    // Reject `GIT_*=` repository/config override environment variables (e.g. `GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG_PARAMETERS`)
+    const key = tokens[idx].slice(0, tokens[idx].indexOf("="));
+    if (key.startsWith("GIT_")) return null;
+    idx++;
+  }
+  const bin = tokens[idx] ?? "";
+  if (bin !== "git" && !bin.endsWith("/git")) return null;
+  const gitDirFlags: string[] = [];
+  const configs: string[] = [];
+  let j = idx + 1;
+  while (j < tokens.length) {
+    const a = tokens[j];
+    if (a === "-C") {
+      if (j + 1 >= tokens.length) return null;
+      gitDirFlags.push(tokens[j + 1]);
+      j += 2;
+      continue;
+    }
+    if (a.startsWith("-C") && a.length > 2) {
+      gitDirFlags.push(a.slice(2));
+      j++;
+      continue;
+    }
+    if (a === "-c") {
+      if (j + 1 >= tokens.length) return null;
+      configs.push(tokens[j + 1]);
+      j += 2;
+      continue;
+    }
+    if (a.startsWith("-c") && a.length > 2) {
+      configs.push(a.slice(2));
+      j++;
+      continue;
+    }
+    if (a.startsWith("-")) {
+      // Reject ALL other global options (`--exec-path`, `--version`, `--git-dir`, `--work-tree`, etc.)
+      return null;
+    }
+    return { gitDirFlags, subcmd: a, subArgs: tokens.slice(j + 1), configs };
+  }
+  return null;
+}
+
+function getCanonicalGitCommonDir(dir: string): string | null {
+  const res = runGit(dir, ["rev-parse", "--git-common-dir"], 3000);
+  if (res.code !== 0 || !res.stdout.trim()) return null;
+  try {
+    return realpathSync(resolve(dir, res.stdout.trim()));
+  } catch {
+    return resolve(dir, res.stdout.trim());
+  }
+}
+
+function isSimpleLiteralCdSegment(seg: string): boolean {
+  if (hasUnquotedRedirect(seg, ">") || hasUnquotedRedirect(seg, "<")) return false;
+  if (seg.includes("$(") || seg.includes("`")) return false;
+  const toks = splitShellTokens(seg);
+  if (!toks || toks.length !== 2) return false;
+  return toks[0] === "cd" && !toks[1].startsWith("-") && !hasShellExpansion(toks[1]);
+}
+
+function parseGitTagCreation(subArgs: string[]): { tagName: string; targetRef: string } | null {
+  const ALLOWED_VALUE_FLAGS = new Set([
+    "-m",
+    "--message",
+    "-F",
+    "--file",
+    "-u",
+    "--local-user",
+    "--cleanup",
+  ]);
+  const ALLOWED_BOOL_FLAGS = new Set([
+    "-a",
+    "--annotate",
+    "-s",
+    "--sign",
+    "--no-sign",
+    "-f",
+    "--force",
+    "-e",
+    "--edit",
+    "--create-reflog",
+  ]);
+  const SHORT_BOOL = new Set(["a", "s", "f", "e"]);
+  const SHORT_VALUE = new Set(["m", "F", "u"]);
+  const positionals: string[] = [];
+  let stopFlags = false;
+  for (let i = 0; i < subArgs.length; i++) {
+    const a = subArgs[i];
+    if (!stopFlags && a === "--") {
+      stopFlags = true;
+      continue;
+    }
+    if (!stopFlags && a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const name = eq >= 0 ? a.slice(0, eq) : a;
+      if (ALLOWED_BOOL_FLAGS.has(name) && eq < 0) continue;
+      if (ALLOWED_VALUE_FLAGS.has(name)) {
+        if (eq < 0 && ++i >= subArgs.length) return null;
+        continue;
+      }
+      return null;
+    }
+    if (!stopFlags && a.startsWith("-") && a.length > 1) {
+      for (let j = 1; j < a.length; j++) {
+        const ch = a[j];
+        if (SHORT_BOOL.has(ch)) continue;
+        if (SHORT_VALUE.has(ch)) {
+          if (j === a.length - 1 && ++i >= subArgs.length) return null;
+          break;
+        }
         return null;
       }
+      continue;
     }
-    effectiveRepo = parsedFlag.repo;
+    positionals.push(a);
   }
-  if (urlRepoName) {
-    if (effectiveRepo && effectiveRepo.toLowerCase() !== urlRepoName.toLowerCase()) return null;
-    effectiveRepo = urlRepoName;
+  if (positionals.length < 1 || positionals.length > 2) return null;
+  return { tagName: positionals[0], targetRef: positionals[1] ?? "HEAD" };
+}
+
+/**
+ * Evaluate follow-tags behavior:
+ * - `"explicit_true"` / `"explicit_false"`: explicitly decided by CLI flags (`--follow-tags` / `--no-follow-tags`)
+ *   or inline `-c push.followTags[=...]` (independent of checkout resolution!).
+ * - `"repo_true"` / `"repo_false"`: read from repo config when `checkoutDir` is known.
+ * - `"unknown"`: no explicit setting and `checkoutDir` could not be resolved (dynamic/nonexistent path).
+ */
+function evaluateFollowTagsSetting(
+  pushSubArgs: string[],
+  gitConfigs: string[],
+  checkoutDir: string | null,
+): "cli_true" | "cli_false" | "inline_true" | "inline_false" | "repo_true" | "repo_false" | "unknown" {
+  // 1. Unified push option parser respects grouped flags (`-vo <val>`) and option arity (`-o --no-follow-tags`)
+  const parsed = parseGitPushArgs(pushSubArgs);
+  if (parsed.cliFollowTags !== null) return parsed.cliFollowTags ? "cli_true" : "cli_false";
+
+  // 2. Check inline `-c push.followTags[=...]` (valueless `-c push.followTags` is `true` in Git!)
+  let inlineFollowTags: boolean | null = null;
+  for (const cfg of gitConfigs) {
+    const eq = cfg.indexOf("=");
+    if (eq < 0) {
+      if (cfg.trim().toLowerCase() === "push.followtags") {
+        inlineFollowTags = true;
+      }
+      continue;
+    }
+    const key = cfg.slice(0, eq).trim().toLowerCase();
+    if (key !== "push.followtags") continue;
+    const val = cfg.slice(eq + 1).trim().toLowerCase();
+    inlineFollowTags = !["false", "0", "no", "off", ""].includes(val);
   }
-  if (!effectiveRepo) return null;
-  return { repo: effectiveRepo, number: prNum };
+  if (inlineFollowTags !== null) return inlineFollowTags ? "inline_true" : "inline_false";
+
+  // 3. Check repo effective git config (`push.followTags`)
+  if (!checkoutDir) return "unknown";
+  const cfgRes = runGit(checkoutDir, ["config", "--get", "--bool", "push.followTags"], 3000);
+  if (cfgRes.code === 0 && cfgRes.stdout.trim().toLowerCase() === "true") {
+    return "repo_true";
+  }
+  return "repo_false";
+}
+
+function isFollowTagsEffective(
+  pushSubArgs: string[],
+  gitConfigs: string[],
+  checkoutDir: string | null,
+): boolean {
+  const state = evaluateFollowTagsSetting(pushSubArgs, gitConfigs, checkoutDir);
+  return state === "cli_true" || state === "inline_true" || state === "repo_true" || state === "unknown";
+}
+
+function effectivePushRepo(dir: string, remote: string, configs: string[]) {
+  const overrides = configs.flatMap((value) => ["-c", value]);
+  const urls = runGit(dir, [...overrides, "remote", "get-url", "--push", "--all", "--", remote], 3000);
+  if (urls.code === 0) {
+    const lines = urls.stdout.trimEnd().split("\n");
+    return lines.length === 1 ? parseGitRemoteRepo(lines[0]) : null;
+  }
+  if (!parseGitRemoteRepo(remote)) return null;
+  const rules = runGit(dir, [...overrides, "config", "--null", "--get-regexp", "^url\\..*\\.(push)?insteadof$"], 3000);
+  if (rules.code !== 0 && rules.code !== 1) return null;
+  for (const suffix of [".pushinsteadof", ".insteadof"]) {
+    let longest = -1;
+    const receivers = new Set<string>();
+    for (const record of rules.stdout.split("\0")) {
+      const delim = record.indexOf("\n");
+      if (delim < 0) continue;
+      const key = record.slice(0, delim);
+      const prefix = record.slice(delim + 1);
+      if (!key.endsWith(suffix) || !remote.startsWith(prefix) || prefix.length < longest) continue;
+      if (prefix.length > longest) receivers.clear();
+      longest = prefix.length;
+      receivers.add(key.slice(4, -suffix.length) + remote.slice(longest));
+    }
+    if (receivers.size) return receivers.size === 1 ? parseGitRemoteRepo([...receivers][0]) : null;
+  }
+  return parseGitRemoteRepo(remote);
 }
 
 function isApprovedTagPushRefspec(params: {
@@ -1385,8 +2966,25 @@ function isApprovedTagPushRefspec(params: {
   isForce: boolean;
   isDelete: boolean;
   approvedRunbooks: ApprovedRunbookEntry[];
+  cmd?: string;
+  segments?: string[];
+  segmentIndex?: number;
+  toolWorkdir?: string;
+  pushSegmentTokens: string[];
 }): boolean {
-  const { workbenchRoot, targetDir, refspec, isForce, isDelete, approvedRunbooks } = params;
+  const {
+    workbenchRoot,
+    targetDir,
+    refspec,
+    isForce,
+    isDelete,
+    approvedRunbooks,
+    cmd,
+    segments,
+    segmentIndex,
+    toolWorkdir,
+    pushSegmentTokens,
+  } = params;
   if (isForce || isDelete || approvedRunbooks.length === 0) return false;
   if (refspec.startsWith("+") || refspec.startsWith(":")) return false;
   const parts = refspec.split(":");
@@ -1400,9 +2998,77 @@ function isApprovedTagPushRefspec(params: {
 
   const loc = locateRepo(workbenchRoot, targetDir);
   if (!loc) return false;
-  const tagRev = runGit(loc.checkoutDir, ["rev-parse", "--verify", `refs/tags/${cleanDst}^{commit}`], 3000);
-  if (tagRev.code !== 0 || !tagRev.stdout.trim()) return false;
-  const liveTagCommit = tagRev.stdout.trim().toLowerCase();
+
+  const push = extractCommandPositionGit(pushSegmentTokens);
+  if (!push || push.subcmd !== "push" || parseGitPushArgs(push.subArgs).hasPrune) return false;
+  if (isFollowTagsEffective(push.subArgs, push.configs, loc.checkoutDir)) return false;
+
+  const { remote } = parseGitPushArgs(push.subArgs);
+  if (!remote) return false;
+  const pushId = effectivePushRepo(loc.checkoutDir, remote, push.configs);
+  const originId = repoOrigin(loc.checkoutDir);
+  if (!originId || !pushId || pushId.host !== originId.host ||
+      pushId.owner !== originId.owner || pushId.repo !== originId.repo) return false;
+
+  const pushCommonDir = getCanonicalGitCommonDir(loc.checkoutDir);
+  if (!pushCommonDir) return false;
+
+  // Multi-segment command handling: ONLY permit strictly `&&`-chained optional literal `cd`
+  // segments and at most ONE command-position `git tag` creating `cleanDst` in the same repo
+  // (resolved in the creating worktree!). Any other preceding command fails closed so neither
+  // `echo git tag ...` nor `git branch -f ...` can forge or drift the target commit!
+  let pendingTagTargetRef: string | null = null;
+  let pendingTagCheckoutDir: string | null = null;
+  let sawPrecedingTagTouch = false;
+  if (segments && segmentIndex !== undefined && segmentIndex > 0 && toolWorkdir) {
+    if (!cmd || !hasOnlyAndSeparators(cmd)) return false;
+    for (let k = 0; k < segmentIndex; k++) {
+      const seg = segments[k];
+      if (isSimpleLiteralCdSegment(seg)) continue;
+      if (hasUnquotedRedirect(seg, ">") || hasUnquotedRedirect(seg, "<")) return false;
+      if (seg.includes("$(") || seg.includes("`")) return false;
+      const prevToks = splitShellTokens(seg);
+      if (!prevToks) return false;
+      const prevGit = extractCommandPositionGit(prevToks);
+      if (!prevGit || prevGit.subcmd !== "tag") return false;
+      if (sawPrecedingTagTouch) return false; // At most ONE preceding `git tag`
+      if (prevGit.gitDirFlags.some((f) => hasShellExpansion(f))) return false;
+      const prevCwd = resolveSegmentCwd(segments, k, toolWorkdir);
+      const prevTargetDir = resolveGitDirFlags(prevCwd, prevGit.gitDirFlags, true);
+      if (!prevTargetDir) return false;
+      const prevLoc = locateRepo(workbenchRoot, prevTargetDir);
+      if (!prevLoc) return false;
+      const prevCommonDir = getCanonicalGitCommonDir(prevLoc.checkoutDir);
+      if (!prevCommonDir || prevCommonDir !== pushCommonDir) return false;
+      const parsedTag = parseGitTagCreation(prevGit.subArgs);
+      if (!parsedTag || parsedTag.tagName !== cleanDst) return false;
+      if (hasShellExpansion(parsedTag.targetRef)) return false;
+      sawPrecedingTagTouch = true;
+      pendingTagTargetRef = parsedTag.targetRef;
+      pendingTagCheckoutDir = prevLoc.checkoutDir;
+    }
+  }
+
+  let liveTagCommit: string;
+  if (sawPrecedingTagTouch) {
+    if (!pendingTagTargetRef || !pendingTagCheckoutDir) return false;
+    // Resolve the target ref strictly inside the creating checkout (NOT the push worktree!)
+    const targetRev = runGit(
+      pendingTagCheckoutDir,
+      ["rev-parse", "--verify", `${pendingTagTargetRef}^{commit}`],
+      3000,
+    );
+    if (targetRev.code !== 0 || !targetRev.stdout.trim()) return false;
+    liveTagCommit = targetRev.stdout.trim().toLowerCase();
+  } else {
+    const tagRev = runGit(
+      loc.checkoutDir,
+      ["rev-parse", "--verify", `refs/tags/${cleanDst}^{commit}`],
+      3000,
+    );
+    if (tagRev.code !== 0 || !tagRev.stdout.trim()) return false;
+    liveTagCommit = tagRev.stdout.trim().toLowerCase();
+  }
 
   for (const rb of approvedRunbooks) {
     for (const entry of rb.actions.tags) {
@@ -1435,24 +3101,29 @@ export function checkGitPhysicalFuse(
     if (!toks || toks.length === 0) continue;
 
     // gh pr merge fuse (allowed ONLY when exact repo + PR number is in an active approved Runbook)
-    const ghIdx = toks.findIndex((t) => t === "gh" || t.endsWith("/gh"));
-    if (ghIdx !== -1 && toks[ghIdx + 1] === "pr" && toks[ghIdx + 2] === "merge") {
-      if (approvedRunbooks.length > 0 && !hasPrecedingDynamicCd(segments, i)) {
-        const segCwd = resolveSegmentCwd(segments, i, toolWorkdir);
-        const loc = locateRepo(workbenchRoot, segCwd);
-        const target = parseGhPrMergeTarget(
-          toks.slice(ghIdx + 3),
-          loc?.checkoutDir ?? null,
-          loc?.repo ?? null,
-        );
+    const { prefix, gh, git } = parseDeliverySegment(toks);
+    if (git?.subcmd === "push" || git?.subcmd === "commit" || gh?.subcmd === "merge" || gh?.subcmd === "create" || gh?.subcmd === "new") {
+      if (prefix.ambiguous) return "物理保险丝：无法解析 env 交付命令。";
+      if (prefix.dirs.some(hasShellExpansion)) return "物理保险丝：检测到未展开的 shell 变量路径。";
+    }
+    if (gh?.subcmd === "merge") {
+      if (approvedRunbooks.length && prefix.bin === "gh" && !hasPrecedingDynamicCd(segments, i)) {
+        const cwd = resolveSegmentCwd(segments, i, toolWorkdir);
+        const dir = resolveGitDirFlags(cwd, prefix.dirs, true);
+        if (!dir) return "物理保险丝：无法解析 env 工作目录。";
+        const loc = locateRepo(workbenchRoot, dir);
+        const target = parseGhPrMergeTarget(gh.subArgs, loc?.checkoutDir ?? null, gh.prefix.effective, dir);
         if (
           target &&
           approvedRunbooks.some((rb) =>
-            rb.actions.prs.some(
-              (p) =>
-                p.repo.toLowerCase() === target.repo.toLowerCase() &&
-                p.number === target.number,
-            ),
+            rb.actions.prs.some((p) => {
+              if (p.number !== target.number) return false;
+              const local = loc?.repo.toLowerCase() === p.repo.toLowerCase();
+              if (!target.owner) return local;
+              const origin = repoOrigin(local && loc ? loc.checkoutDir : resolve(workbenchRoot, p.repo));
+              return origin?.repo === target.repo && origin.owner === target.owner &&
+                (!target.host || origin.host === target.host);
+            }),
           )
         ) {
           continue;
@@ -1461,7 +3132,6 @@ export function checkGitPhysicalFuse(
       return "物理保险丝：禁止 Agent 直接执行 `gh pr merge`，请由用户合并 PR 或先创建 Runbook 经用户回复「批准 <runbook_id>」后执行。";
     }
 
-    const git = extractGitSubcommand(toks);
     if (!git) continue;
 
     // Shared worktree destructive operations
@@ -1501,30 +3171,53 @@ export function checkGitPhysicalFuse(
     // git push fuse: tags / force / direct push to main (explicit OR implicit current branch)
     if (git.subcmd === "push") {
       const args = git.subArgs;
-      if (args.includes("--tags")) {
+      const parsedPush = parseGitPushArgs(args);
+      if (parsedPush.hasTags) {
         return "物理保险丝：禁止批量推送全部 tag（`git push --tags`），请显式推送经 Runbook 批准的单个发版 tag。";
       }
-      const isForce = args.some(
-        (a) => a === "-f" || a === "--force" || a.startsWith("--force-with-lease"),
-      );
-      const isDelete = args.some((a) => a === "--delete" || a === "-d");
-      const parsedPush = parseGitPushArgs(args);
+      const isForce = parsedPush.isForce;
+      const isDelete = parsedPush.isDelete;
       if (parsedPush.hasAllOrMirror) {
-        return "物理保险丝：禁止 `git push --all` / `--mirror`，请显式指定要推送的单一分支。";
+        return "物理保险丝：禁止 `git push --all` / `--branches` / `--mirror` 或批量 refspec，请显式指定要推送的单一分支。";
       }
-      const refspecs = parsedPush.hasRepoFlag
-        ? parsedPush.positional
-        : parsedPush.positional.slice(1);
+      const { refspecs } = parsedPush;
       const segCwd = resolveSegmentCwd(segments, i, toolWorkdir);
-      const targetDir = git.gitDirFlag ? resolve(segCwd, git.gitDirFlag) : segCwd;
       const dynamicTarget =
-        hasPrecedingDynamicCd(segments, i) || Boolean(git.gitDirFlag && hasShellExpansion(git.gitDirFlag));
+        hasPrecedingDynamicCd(segments, i) || git.gitDirFlags.some((f) => hasShellExpansion(f));
+      const effectiveCwd = resolveGitDirFlags(segCwd, prefix.dirs, true);
+      if (!effectiveCwd) return "物理保险丝：无法解析 env 工作目录。";
+      const targetDir = dynamicTarget ? null : resolveGitDirFlags(effectiveCwd, git.gitDirFlags, true);
+      // Unconditionally reject unresolved repository/config overrides (`GIT_*=` env vars or `--git-dir`/`--work-tree`/`--config-env`)
+      // on git push so neither checkout identity nor effective push.followTags can diverge from what guard inspected!
+      const hasLeadingGitEnvOverride = toks
+        .slice(0, git.gitIdx)
+        .some((t) => /^GIT_[A-Za-z0-9_]*=/.test(t));
+      if (hasLeadingGitEnvOverride || git.hasUnsafeGlobalOverride) {
+        return "物理保险丝：检测到命令行 GIT_* 环境变量或 --git-dir/--work-tree/--config-env 覆盖，禁止用于 git push，请直接用字面路径与 `-C` 执行。";
+      }
+      const followTagsState = evaluateFollowTagsSetting(args, git.configs, targetDir);
+      if (
+        followTagsState === "cli_true" ||
+        followTagsState === "inline_true" ||
+        followTagsState === "repo_true"
+      ) {
+        return "物理保险丝：检测到 --follow-tags 或 push.followTags=true，禁止隐式附带推送 tag，请显式传入 --no-follow-tags 或单独推送经 Runbook 批准的 tag。";
+      }
+      if (followTagsState === "unknown" && (!cfg.ledger.enabled || cfg.repos.length === 0)) {
+        return "物理保险丝：无法解析目标仓库路径以核验 push.followTags 配置，请改用明确字面路径或显式传入 --no-follow-tags。";
+      }
       for (const refspec of refspecs) {
-        const rhs = refspec.includes(":") ? refspec.split(":").pop() ?? "" : refspec;
+        const rhs = (refspec.includes(":") ? refspec.split(":").pop() ?? "" : refspec).replace(/^\+/, "");
+        if (rhs === "HEAD" || rhs === "@") {
+          const branch = targetDir && !refspec.includes(":")
+            ? runGit(targetDir, ["symbolic-ref", "--quiet", "--short", "HEAD"], 3000).stdout.trimEnd() : "";
+          if (!branch || protectedBranches.has(branch)) return "物理保险丝：禁止通过 HEAD 直接推送到受保护主分支或未确定的目标。";
+        }
         const cleanRef = rhs.replace(/^refs\/(heads|tags)\//, "");
         if (refspec.startsWith("refs/tags/") || tagRegexes.some((re) => re.test(cleanRef))) {
           if (
             !dynamicTarget &&
+            targetDir !== null &&
             !hasShellExpansion(refspec) &&
             isApprovedTagPushRefspec({
               workbenchRoot,
@@ -1533,6 +3226,11 @@ export function checkGitPhysicalFuse(
               isForce,
               isDelete,
               approvedRunbooks,
+              cmd,
+              segments,
+              segmentIndex: i,
+              toolWorkdir,
+              pushSegmentTokens: toks,
             })
           ) {
             continue;
@@ -1544,7 +3242,11 @@ export function checkGitPhysicalFuse(
         }
       }
       // Implicit push (`git push` or `git push origin`) -> inspect current checkout branch
-      if (refspecs.length === 0) {
+      if (targetDir) {
+        const reason = isImplicitPushAmbiguous(parsedPush, git.configs, targetDir, protectedBranches);
+        if (reason) return `物理保险丝：${reason}`;
+      }
+      if (!refspecs.length && targetDir) {
         const loc = locateRepo(workbenchRoot, targetDir);
         if (loc && protectedBranches.has(loc.branch)) {
           return `物理保险丝：当前位于受保护主分支 (${loc.branch})，禁止隐式直接推送，请提 PR 由用户合并。`;
@@ -1652,28 +3354,27 @@ export function checkLedgerGate(
       if (!toks || toks.length === 0) continue;
 
       const segCwd = resolveSegmentCwd(segments, i, toolWorkdir);
-      const git = extractGitSubcommand(toks);
-      const ghIdx = toks.findIndex((t) => t === "gh" || t.endsWith("/gh"));
-      const isGhPrCreate =
-        ghIdx !== -1 &&
-        toks[ghIdx + 1] === "pr" &&
-        (toks[ghIdx + 2] === "create" || toks[ghIdx + 2] === "new");
+      const { prefix, gh, git } = parseDeliverySegment(toks);
+      const isGhPrCreate = gh?.subcmd === "create" || gh?.subcmd === "new";
 
       const isGitCommit = git?.subcmd === "commit";
       const isGitPush = git?.subcmd === "push";
 
       if (!isGitCommit && !isGitPush && !isGhPrCreate) continue;
+      if (prefix.ambiguous) return "账本门禁：无法解析 env 交付命令。";
 
       if (
-        (git?.gitDirFlag && hasShellExpansion(git.gitDirFlag)) ||
+        prefix.dirs.some(hasShellExpansion) ||
+        (git && git.gitDirFlags.some((f) => hasShellExpansion(f))) ||
         hasPrecedingDynamicCd(segments, i)
       ) {
         return "账本门禁（fail-closed）：检测到未展开的 shell 变量路径用于 git/gh 交付命令，请改用明确字面路径。";
       }
 
-      const targetDir = git?.gitDirFlag
-        ? resolve(segCwd, git.gitDirFlag)
-        : segCwd;
+      const targetDir = resolveGitDirFlags(segCwd, [...prefix.dirs, ...(git?.gitDirFlags ?? [])], true);
+      if (!targetDir) {
+        return "账本门禁（fail-closed）：无法解析 git -C 目标目录，拒绝放行交付操作。";
+      }
       const loc = locateRepo(workbenchRoot, targetDir);
       if (!loc) {
         const regName = pathBelongsToRegisteredRepo(workbenchRoot, targetDir, registeredRepos);
@@ -1696,18 +3397,17 @@ export function checkLedgerGate(
 
       const targets: DeliveryTarget[] = [];
       if (isGitPush && git) {
-        const isDeleteFlag = git.subArgs.some((a) => a === "--delete" || a === "-d");
-        if (isDeleteFlag) {
+        const parsedPush = parseGitPushArgs(git.subArgs);
+        const reason = isImplicitPushAmbiguous(parsedPush, git.configs, targetDir, new Set(cfg.guard.protected_branches));
+        if (reason) return `账本门禁：${reason}`;
+        if (parsedPush.isDelete) {
           // Deleting a remote feature branch (protected branches already blocked by Tier 1)
           continue;
         }
-        const parsedPush = parseGitPushArgs(git.subArgs);
         if (parsedPush.hasAllOrMirror) {
-          return "账本门禁（fail-closed）：禁止 `git push --all` / `--mirror`，请显式指定目标分支。";
+          return "账本门禁（fail-closed）：禁止 `git push --all` / `--branches` / `--mirror` 或批量 refspec，请显式指定目标分支。";
         }
-        const refspecs = parsedPush.hasRepoFlag
-          ? parsedPush.positional
-          : parsedPush.positional.slice(1);
+        const { refspecs } = parsedPush;
         if (refspecs.length === 0) {
           targets.push({
             branch: loc.branch,
@@ -1722,23 +3422,25 @@ export function checkLedgerGate(
               // Empty source refspec (`:branch`) is remote branch deletion
               continue;
             }
-            const isForcePush = git.subArgs.some(
-              (a) => a === "-f" || a === "--force" || a.startsWith("--force-with-lease"),
-            );
             if (
               isApprovedTagPushRefspec({
                 workbenchRoot,
                 targetDir,
                 refspec: spec,
-                isForce: isForcePush,
+                isForce: parsedPush.isForce,
                 isDelete: false,
                 approvedRunbooks,
+                cmd,
+                segments,
+                segmentIndex: i,
+                toolWorkdir,
+                pushSegmentTokens: toks,
               })
             ) {
               // Approved release tag push targets an already-merged main commit, not an unmerged feature branch.
               continue;
             }
-            if (srcRef === "HEAD") {
+            if (srcRef === "HEAD" || srcRef === "@") {
               targets.push({
                 branch: loc.branch,
                 sha: loc.headSha,
@@ -1759,14 +3461,15 @@ export function checkLedgerGate(
           if (targets.length === 0) continue;
         }
       } else if (isGhPrCreate) {
-        const parsedGh = parseGhPrCreateArgs(toks.slice(ghIdx + 3));
+        const parsedGh = parseGhPrCreateArgs(gh.subArgs);
         // Fail closed if `-R` / `--repo` (including attached `-Rowner/repo`) points to a different repository than origin
-        const explicitGhRepo = parsedGh.repo;
+        const explicitGhRepo = parsedGh.repo ?? (prefix.effective("GH_REPO") || null);
+        const envHost = prefix.effective("GH_HOST").toLowerCase();
         const originUrl = runGit(loc.checkoutDir, ["remote", "get-url", "origin"], 3000).stdout.trim();
         const originIdentity = parseGitRemoteRepo(originUrl);
 
         if (explicitGhRepo) {
-          const targetIdentity = parseGhRepoSpec(explicitGhRepo);
+          const targetIdentity = parseGhRepoSpec(qualifyGhRepoSpec(explicitGhRepo, prefix.effective, targetDir));
           if (!targetIdentity || !originIdentity) {
             return `账本门禁（fail-closed）：无法完整核验 \`gh pr create -R ${explicitGhRepo}\` 与当前仓 origin (${originUrl || "未配置"}) 的 owner/repo 身份，拒绝放行。`;
           }
@@ -1777,6 +3480,14 @@ export function checkLedgerGate(
           ) {
             return `账本门禁（fail-closed）：\`gh pr create\` 指定目标仓 ${explicitGhRepo} 与当前仓 origin (${originIdentity.host}/${originIdentity.owner}/${originIdentity.repo}) 不一致，请在目标仓内执行。`;
           }
+        }
+
+        if (!explicitGhRepo && envHost && envHost !== originIdentity?.host) {
+          return "账本门禁：GH_HOST 与当前仓 origin 不一致。";
+        }
+
+        if (!explicitGhRepo && !ghDefaultMatchesOrigin(loc.checkoutDir, originIdentity)) {
+          return "账本门禁：无法确认 gh 默认目标仓与当前仓 origin 一致，请显式指定 -R。";
         }
 
         const prHead = parsedGh.head;
@@ -3085,7 +4796,7 @@ export function checkSpecAndTestLocks(
         } else if (bin === "git") {
           const git = extractGitSubcommand(cmdToks);
           if (git) {
-            const gitDir = git.gitDirFlag ? resolve(effectiveCwd, git.gitDirFlag) : effectiveCwd;
+            const gitDir = resolveGitDirFlags(effectiveCwd, git.gitDirFlags, false) ?? effectiveCwd;
             const subArgs = git.subArgs;
             if (git.subcmd === "checkout" || git.subcmd === "restore") {
               const ddIdx = subArgs.indexOf("--");
@@ -3321,7 +5032,7 @@ export function evaluatePreToolUse(
   }
   const approvedRunbooks = loadApprovedRunbooksForSession(workbenchRoot, input.session_id);
   const fuseReason =
-    checkProdDb(cmd, prodHosts, toolWorkdir, approvedRunbooks) ??
+    checkProdDb(cmd, prodHosts, toolWorkdir, approvedRunbooks, workbenchRoot) ??
     checkKubectl(cmd, approvedRunbooks) ??
     checkCloudAndRedisOps(cmd) ??
     checkGitPhysicalFuse(workbenchRoot, cmd, toolWorkdir, cfg, approvedRunbooks);

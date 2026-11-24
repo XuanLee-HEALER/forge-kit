@@ -19,7 +19,7 @@ description: >
 ## 1. 上测试环境（FAT）
 
 1. 确认当前 `HEAD SHA` 已通过 `wrapup` 且账本无未关闭 blocker。
-2. 使用 `<仓>.worktrees/<临时名>` 下的 detached worktree 合并至测试分支（不在共享工作树切分支，**禁止调用 Codex Desktop 内置 `create_worktree`** 切离工作台根目录；若仓库配置指定了 cherry-pick 规则，按仓库配置执行）：
+2. 使用 `<仓>.worktrees/<临时名>` 下的 detached worktree 合并至测试分支（不在共享工作树切分支，**禁止调用 Codex Desktop 内置 `create_worktree`** 切离工作台根目录；若仓库配置指定了 cherry-pick 规则，按仓库配置执行；功能分支 `<featSha>` 始终作为账本主提交承载 `lint`/`test`/`review`/`fat` 证据，若 cherry-pick 到远端 `origin/fat` 产生了新提交 `<fatSha>`，在临时 worktree 建临时集成分支并通过 `ledger attach <task_id> --repo <r> --branch <临时分支> --head <fatSha>` 挂载，待该 `<fatSha>` 具备推送前置验证证据后推送至 `origin/fat`，并**仅在步骤 4 跟踪部署与验收通过后**以 `--sha <featSha>` 记录 `--kind fat --status pass`（摘要写明对应 `<fatSha>`），清理临时分支并执行 `ledger detach <task_id> --repo <r> --branch <临时分支> --reason "已推 origin/fat 并清理"` 后再关账）：
    ```bash
    git -C <仓> fetch origin
    git -C <仓> worktree add --detach <临时目录> origin/fat
@@ -63,10 +63,12 @@ description: >
      [--sql <prod-host>:<sql路径>] [--kubectl "<精确kubectl命令>"]
    ```
    将 Runbook 与生成的 `rb-...` 编号发给用户确认；用户在本会话回复 **`批准 <runbook_id>`** 后，`UserPromptSubmit` Hook 自动为本会话签发 30 分钟精确白名单通行证，随后 Agent 自动推进合 PR、打 tag 并显式 `git push origin <tag>`、执行已登记迁移/`kubectl`、跟踪部署、只读核验与错误日志观察；全部完成后执行 `.workbench/bin/ledger runbook complete <runbook_id>`（未批准前绝不强行绕过；`git push --tags`、读 k8s `secret`、未登记的 prod 写操作永久禁止）。
+   - **纯运维/补跑已上线 SQL（无业务仓代码改动）**：无需开设 `--endpoint prod` 开发任务账本（避免无分支挂载而被迫 `--force-incomplete` 关账），直接执行 `.workbench/bin/ledger runbook create --title "<说明>" --sql <prod-host>:<sql路径>` 签发发版单，经用户回复 `批准 <runbook_id>` 后执行并回查；如需留存排查与核验上下文，可开设 `--endpoint investigation` 排查账本或写入运维日志。
 3. 涉及共享队列任务格式/语义变化时，核对滚动部署与回滚期间新旧版本共存兼容性。
 
 ## 4. 清理与收尾
 
-1. PR 已合并且部署确认成功后，立刻清理本次创建的 `<仓>.worktrees/<name>`、`git -C <仓> worktree prune` 及已合入远端的本地临时分支（或运行 `.workbench/bin/wb-git sweep`），核验 `git -C <仓> worktree list` 无本次残留；若 PR 尚未合并则明确标注留待合并后清理。
-2. 执行 `.workbench/bin/ledger close <task_id>` 归档本次账本。
-3. 仅汇报实际发生的 PR、tag、部署、验收与清理结果。
+1. PR 已合并且部署确认成功后，立刻清理本次创建的 `<仓>.worktrees/<name>`、`git -C <仓> worktree prune` 及已合入远端的本地临时分支（或运行 `.workbench/bin/wb-git sweep`），核验 `git -C <仓> worktree list` 无本次残留；若 PR 尚未合并则明确标注留待合并后清理。若账本曾挂有已改名或废弃的临时分支，先执行 `.workbench/bin/ledger detach <task_id> --repo <r> --branch <b>` 再关账。
+2. 若同一任务从 `fat` 继续推进到 `pr` 或 `prod`，优先使用 `.workbench/bin/ledger reopen <task_id> --endpoint <pr|prod>`（或尚在 `OPEN` 时用 `ledger set-endpoint`）延续原账本并直接复用同 SHA 已有验证证据，不要另开重复账本手抄证据。
+3. 执行 `.workbench/bin/ledger close <task_id>` 归档本次账本。
+4. 仅汇报实际发生的 PR、tag、部署、验收与清理结果。

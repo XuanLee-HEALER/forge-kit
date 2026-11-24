@@ -66,11 +66,11 @@
 
 | 逻辑档位 | 适用任务 | 对应代理 |
 |---|---|---|
-| `mechanical` | 边界清晰的检索、机械整理 | `.codex/agents/scanner.toml` |
-| `standard` | 常规开发、修复、测试、常规评审与文档整理 | `.codex/agents/dev.toml` |
-| `deep` | 复杂架构权衡、高不确定性根因、高风险深度审查、Paperwork 独立评审（需写明具体理由） | `.codex/agents/analyst.toml` / `spec-reviewer.toml` |
+| `mechanical` | 边界清晰的只读检索、核查与机械整理 | `.codex/agents/scanner.toml` |
+| `standard` | 常规开发、修复、测试与文档修改（仅写操作） | `.codex/agents/dev.toml` |
+| `deep` | 复杂架构权衡、高不确定性根因、高风险/Paperwork 只读评审（需写明理由） | `.codex/agents/analyst.toml` / `spec-reviewer.toml` |
 
-优先编排独立代理完成实现与评审，自己负责范围、核验与验收；直接完成成本明显更低的小任务可直接处理。独立 review CLI 必须实际调用并保留隔离上下文，不可用自审替代。
+按职责选代理（只读检索用 `scanner`，只读评审用 `codex review` / `analyst` / `spec-reviewer`，勿将只读任务派给可写 `dev`）；小任务可直接处理。独立 review CLI 必须实际调用并保持隔离，不可自审替代。
 
 ## 流程 Skills 与仓库配置
 

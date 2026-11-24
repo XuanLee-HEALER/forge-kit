@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { locateRepo, runGit } from "../src/git";
 import { Ledger } from "../src/ledger";
-import { handleLedgerHook } from "../src/ledger-hook";
+import { classifyPostToolEvidence, handleLedgerHook } from "../src/ledger-hook";
 
 let wb: string;
 let repoDir: string;
@@ -18,6 +18,7 @@ beforeEach(() => {
   );
   repoDir = join(wb, "svc");
   mkdirSync(repoDir, { recursive: true });
+  mkdirSync(join(repoDir, "tests"));
   runGit(repoDir, ["init", "-b", "main"]);
   runGit(repoDir, ["config", "user.email", "dev@example.com"]);
   runGit(repoDir, ["config", "user.name", "Dev"]);
@@ -46,6 +47,345 @@ afterEach(() => {
 });
 
 describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () => {
+  test("validates manifest verification scripts without forwarded flags", () => {
+    const evidence = (cmd: string) => classifyPostToolEvidence(cmd, repoDir, 0, "");
+    const manifest = join(repoDir, "package.json");
+    writeFileSync(manifest, JSON.stringify({ scripts: { test: "pytest --version", check: "tsc --version" } }));
+    expect(evidence("npm test")).toEqual([]);
+    expect(evidence("npm run check")).toEqual([]);
+    writeFileSync(manifest, JSON.stringify({ scripts: { test: "pytest tests/" } }));
+    expect(evidence("npm test")).toMatchObject([{ kind: "test", status: "pass" }]);
+  });
+
+  test("preserves the requested evidence kind through manifest delegation", () => {
+    const evidence = (command: string, scripts: Record<string, string>) => {
+      writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts }));
+      return classifyPostToolEvidence(command, repoDir, 0, "");
+    };
+    expect(evidence("npm test", { test: "tsc --noEmit" })).toEqual([]);
+    expect(evidence("npm test", { test: "npm run lint", lint: "tsc --noEmit" })).toEqual([]);
+    expect(evidence("npm run check", { check: "tsc --noEmit" })).toMatchObject([{ kind: "lint", status: "pass" }]);
+    expect(evidence("npm run build", { build: "bun test" })).toEqual([]);
+  });
+
+  test("validates forwarded arguments at the underlying runner and checkout", () => {
+    const sibling = join(wb, "svc-b");
+    mkdirSync(join(sibling, "tests"), { recursive: true });
+    runGit(sibling, ["init"]);
+    mkdirSync(join(repoDir, "tests", "unit"), { recursive: true });
+    const evidence = (args: string) => classifyPostToolEvidence("npm test -- " + args, repoDir, 0, "");
+    for (const test of ["pytest", "npm run inner", "npm run inner --"]) {
+      writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test, inner: "pytest" } }));
+      expect(classifyPostToolEvidence("npm test ../svc-b/tests", repoDir, 0, "")).toEqual([]);
+      expect(classifyPostToolEvidence("npm test --cache ../svc-b/tests tests/unit", repoDir, 0, ""))
+        .toMatchObject([{ kind: "test", status: "pass" }]);
+      expect(classifyPostToolEvidence("npm test tests/unit", repoDir, 0, "")).toMatchObject([{ kind: "test", status: "pass" }]);
+      if (test === "npm run inner") {
+        // npm consumes --co before its separator and executes the bare inner script.
+        expect(evidence("--co")).toMatchObject([{ kind: "test", status: "pass" }]);
+        expect(evidence("-v")).toEqual([]);
+      } else {
+        expect(evidence("--co")).toEqual([]);
+        expect(evidence("-v")).toMatchObject([{ kind: "test", status: "pass" }]);
+      }
+      expect(evidence("../svc-b/tests")).toEqual([]);
+      expect(evidence("tests/unit")).toMatchObject([{ kind: "test", status: "pass" }]);
+    }
+    writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: "pytest" } }));
+    expect(classifyPostToolEvidence("npm test -v", repoDir, 0, "")).toEqual([]);
+    expect(classifyPostToolEvidence("npm test --logs-dir ../svc-b", repoDir, 0, ""))
+      .toMatchObject([{ kind: "test", status: "pass", targetDir: repoDir }]);
+    writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: "npm run inner --", inner: "go -C . test" } }));
+    expect(evidence("-v")).toMatchObject([{ kind: "test", status: "pass" }]);
+    writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: "npm run inner --", inner: "vitest" } }));
+    expect(classifyPostToolEvidence("npm test -- -v", repoDir, 0, "")).toEqual([]);
+  });
+
+  test("rejects manifest state changes and suppresses verification before file writes", () => {
+    const manifest = join(repoDir, "package.json");
+    writeFileSync(manifest, JSON.stringify({ scripts: { test: "MAKEFLAGS=-n && make test" } }));
+    expect(classifyPostToolEvidence("npm test", repoDir, 0, "")).toEqual([]);
+    for (const later of ["eslint --fix .", "ruff check --fix", "biome check --write", "gofmt -w a.go", "tsc", "tsc --noEmit null", "bun build app.ts"]) {
+      const script = "pytest && " + later;
+      writeFileSync(manifest, JSON.stringify({ scripts: { test: script } }));
+      expect(classifyPostToolEvidence("npm test", repoDir, 0, "")).toEqual([]);
+      expect(classifyPostToolEvidence(script, repoDir, 0, "").some(e => e.kind === "test")).toBe(false);
+    }
+  });
+
+  test("resolves trailing package scripts and their lifecycle hooks before crediting earlier tests", () => {
+    const evidence = (command: string, scripts: Record<string, string>) => {
+      writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts }));
+      return classifyPostToolEvidence(command, repoDir, 0, "").map(e => [e.kind, e.status]);
+    };
+    expect(evidence("pytest && npm run lint", { lint: "eslint . --format json --output-file report.json" })).toEqual([["lint", "pass"]]);
+    expect(evidence("pytest && eslint . -o report.json", {})).toEqual([["lint", "pass"]]);
+    expect(evidence("pytest && npm run lint", { lint: "eslint --fix ." })).toEqual([["lint", "pass"]]);
+    expect(evidence("pytest && npm run check", { check: "tsc --noEmit" })).toEqual([["test", "pass"], ["lint", "pass"]]);
+    expect(evidence("pytest && npm run check", { check: "tsc --noEmit", postcheck: "npm run change", change: "eslint --fix ." })).toEqual([]);
+    expect(evidence("pytest && npm run check -- --fix", { check: "eslint ." })).toEqual([["lint", "pass"]]);
+    expect(evidence("pytest && npm run check", { check: "npm run check" })).toEqual([]);
+  });
+
+  test("validates post-script lifecycle commands unless the manager skips them", () => {
+    const evidence = (posttest: string, command = "npm test") => {
+      writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: "pytest", posttest } }));
+      return classifyPostToolEvidence(command, repoDir, 0, "");
+    };
+    for (const command of ["npm test", "pnpm test", "yarn test", "bun run test"]) {
+      for (const post of ["node update-fixtures.js", "echo x > app.ts", "exit 0", "A=1", "eslint --fix ."]) {
+        expect(evidence(post, command)).toEqual([]);
+      }
+      expect(evidence("echo done", command)).toMatchObject([{ kind: "test", status: "pass" }]);
+    }
+    expect(evidence("node update-fixtures.js", "npm test --ignore-scripts")).toMatchObject([{ kind: "test", status: "pass" }]);
+    for (const cmd of ["npm test --ignore-scripts false tests", "npm test --ignore-scripts=false tests",
+      "npm --ignore-scripts false test", "npm_config_ignore_scripts=true npm test --no-ignore-scripts"]) {
+      expect(evidence("node update-fixtures.js", cmd)).toEqual([]);
+    }
+    for (const cmd of ["npm test --ignore-scripts tests", "npm --ignore-scripts true test", "npm_config_ignore_scripts=true npm test"]) {
+      expect(evidence("node update-fixtures.js", cmd)).toMatchObject([{ kind: "test", status: "pass" }]);
+    }
+    expect(evidence("node update-fixtures.js", "npm test -- --ignore-scripts")).toEqual([]);
+  });
+
+  test("requires executed lang-check phases and Hurl inputs through manifest scripts", () => {
+    const evidence = (inner: string, output: string) => {
+      writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: "npm run inner", inner } }));
+      return classifyPostToolEvidence("npm test", repoDir, 0, output);
+    };
+    const command = "lang-check --mode all --lang python --json";
+    const report = (phase: string) => JSON.stringify({ ok: true, executed: 1, failed: 0, checks: [{ phase, status: "pass" }] });
+    const banner = "> pkg@1.0.0 test\n> lang-check --mode all --json\n\n";
+    expect(evidence(command, banner + report("dynamic"))).toMatchObject([{ kind: "test", status: "pass" }]);
+    expect(evidence(command, banner + report("static"))).toEqual([]);
+    expect(evidence(command, report("static"))).toEqual([]);
+    expect(evidence(command, "")).toEqual([]);
+    expect(evidence(command, report("dynamic"))).toMatchObject([{ kind: "test", status: "pass" }]);
+    expect(evidence("hurl --test tests", "Executed files: 0\n")).toEqual([]);
+    expect(evidence("hurl --test tests", "Executed files: 1\nSucceeded: 1 (100.0%)\n")).toMatchObject([{ kind: "test", status: "pass" }]);
+  });
+
+  test("classifies Bun builds directly and through a package script", () => {
+    mkdirSync(join(repoDir, "src"));
+    writeFileSync(join(repoDir, "src/index.ts"), "export default 1;");
+    const build = "bun build --target=bun --outdir=dist src/index.ts";
+    writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { build } }));
+    for (const command of [build, "npm run build", "bun run build"]) {
+      expect(classifyPostToolEvidence(command, repoDir, 0, "")).toMatchObject([{ kind: "build", status: "pass" }]);
+    }
+    const sibling = join(wb, "svc-b");
+    mkdirSync(sibling);
+    runGit(sibling, ["init"]);
+    writeFileSync(join(sibling, "package.json"), "{}");
+    const evidence = (cmd: string) => classifyPostToolEvidence(cmd, repoDir, 0, "");
+    for (const cmd of ["bun build ../svc-b/package.json", "bun build --sourcemap ../svc-b/package.json",
+      "bun build --outdir ./dist ../svc-b/package.json"]) {
+      expect(evidence(cmd)).toMatchObject([{ kind: "build", status: "pass", targetDir: sibling }]);
+    }
+    expect(evidence("bun --cwd . build ../svc-b/package.json")).toEqual([]);
+    expect(evidence("bun build --external --cwd=../svc-b package.json"))
+      .toMatchObject([{ kind: "build", status: "pass", targetDir: repoDir }]);
+    expect(evidence("bun build --external --help package.json"))
+      .toMatchObject([{ kind: "build", status: "pass", targetDir: repoDir }]);
+    const direct = "bun build --cwd ../svc-b ./package.json";
+    const delegatedCross = "bun --cwd . build --cwd=../svc-b ./package.json";
+    const delegatedLocal = "bun --cwd . build";
+    expect(classifyPostToolEvidence(direct, repoDir, 0, "")).toMatchObject([{ kind: "build", status: "pass", targetDir: sibling }]);
+    expect(classifyPostToolEvidence(delegatedCross, repoDir, 0, "")).toEqual([]);
+    expect(classifyPostToolEvidence(delegatedLocal, repoDir, 0, "")).toMatchObject([{ kind: "build", status: "pass", targetDir: repoDir }]);
+    writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { build: "echo skipped" } }));
+    expect(classifyPostToolEvidence(delegatedLocal, repoDir, 0, "")).toEqual([]);
+    writeFileSync(join(repoDir, "package.json"), "{}");
+    expect(evidence("bun --cwd=. build ./src/index.ts")).toMatchObject([{ kind: "build", status: "pass" }]);
+    expect(evidence("bun --cwd . build ./src/index.ts")).toEqual([]);
+    expect(classifyPostToolEvidence("bun build --help", repoDir, 0, "")).toEqual([]);
+    expect(classifyPostToolEvidence("bun build --version", repoDir, 0, "")).toEqual([]);
+  });
+
+  test("distinguishes Bun test scripts selected by a leading --cwd from the built-in runner", () => {
+    const manifest = join(repoDir, "package.json");
+    const evidence = (cmd: string, exitCode = 0) => classifyPostToolEvidence(cmd, repoDir, exitCode, "");
+    const sibling = join(wb, "svc-b");
+    mkdirSync(join(sibling, "tests"), { recursive: true });
+    runGit(sibling, ["init"]);
+
+    writeFileSync(manifest, JSON.stringify({ scripts: { test: "echo skipped" } }));
+    expect(evidence("bun --cwd . test")).toEqual([]);
+    expect(evidence("bun test --cwd .")).toMatchObject([{ kind: "test", status: "pass", targetDir: repoDir }]);
+
+    writeFileSync(manifest, JSON.stringify({ scripts: { test: "pytest" } }));
+    expect(evidence("bun --cwd . test")).toMatchObject([{ kind: "test", status: "pass", targetDir: repoDir }]);
+    expect(evidence("bun --cwd . test ../svc-b/tests")).toEqual([]);
+
+    writeFileSync(manifest, JSON.stringify({ scripts: {} }));
+    expect(evidence("bun --cwd . test", 1)).toEqual([]);
+    expect(evidence("bun --cwd=. test")).toMatchObject([{ kind: "test", status: "pass", targetDir: repoDir }]);
+    expect(evidence("bun test")).toMatchObject([{ kind: "test", status: "pass", targetDir: repoDir }]);
+  });
+
+  test("resolves npm information flags in order and consumes config option values", () => {
+    const sibling = join(wb, "svc-b");
+    mkdirSync(sibling);
+    runGit(sibling, ["init"]);
+    writeFileSync(join(sibling, "init.js"), "");
+    writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: "pytest" } }));
+    const evidence = (cmd: string) => classifyPostToolEvidence(cmd, repoDir, 0, "");
+    for (const flag of ["--version", "--help", "--versions", "--usage"]) {
+      expect(evidence("npm test " + flag + "=true")).toEqual([]);
+      expect(evidence("npm test " + flag + " true")).toEqual([]);
+      expect(evidence("npm " + flag + " false test")).toMatchObject([{ kind: "test", status: "pass" }]);
+      const disable = flag === "--help" ? "--no-usage" : "--no-" + flag.slice(2);
+      expect(evidence("npm test " + flag + " " + disable)).toMatchObject([{ kind: "test", status: "pass" }]);
+    }
+    for (const args of ["--help=0", "--help=FALSE", "--help=", "--no-usage=false", "--hel", "-H", "-sH", "--help --no-u", "--help --u=false"]) {
+      expect(evidence("npm test " + args)).toEqual([]);
+    }
+    for (const args of ["--help=false", "-H false", "--help --no-usage=true"]) {
+      expect(evidence("npm test " + args)).toMatchObject([{ kind: "test", status: "pass" }]);
+    }
+    for (const alias of ["--help", "-h", "-?"]) {
+      expect(evidence("npm test " + alias + " --no-usage")).toMatchObject([{ kind: "test", status: "pass" }]);
+      expect(evidence("npm test --no-usage " + alias)).toEqual([]);
+    }
+    expect(evidence("npm test --usage --help=false")).toMatchObject([{ kind: "test", status: "pass" }]);
+    for (const args of ["--usage --no-help", "--no-help --usage", "--help --no-help"]) {
+      expect(evidence("npm test " + args)).toEqual([]);
+    }
+    expect(evidence("npm test --init-module ../svc-b/init.js")).toMatchObject([{ kind: "test", status: "pass", targetDir: repoDir }]);
+  });
+
+  test("reconciles wrapped lang-check exit status and extracts reports between lifecycle banners", () => {
+    writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: "lang-check --mode all --json", posttest: "echo done" } }));
+    const run = (phase: string, ok: boolean, code: number) => {
+      const json = JSON.stringify({ ok, executed: 1, failed: ok ? 0 : 1,
+        checks: [{ phase, status: ok ? "pass" : "fail", detail: 'braces }{"' }] }, null, 2);
+      const output = "> pkg@1.0.0 test\n> lang-check --mode all --json\n\n{}\n" + json +
+        "\n\n> pkg@1.0.0 posttest\n> echo done\n\ndone\n";
+      return classifyPostToolEvidence("npm test", repoDir, code, output);
+    };
+    expect(run("dynamic", true, 0)).toMatchObject([{ kind: "test", status: "pass" }]);
+    expect(run("dynamic", false, 1)).toMatchObject([{ kind: "test", status: "fail" }]);
+    expect(run("dynamic", false, 0)).toEqual([]);
+    expect(run("static", false, 1)).toEqual([]);
+  });
+
+  test("inherits nested lifecycle configuration and validates verbosity on the final runner", () => {
+    const run = (scripts: Record<string, string>, cmd: string) => {
+      writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts }));
+      return classifyPostToolEvidence(cmd, repoDir, 0, "");
+    };
+    const scripts = { test: "npm run inner", inner: "pytest", postinner: "eslint --fix ." };
+    expect(run(scripts, "npm_config_ignore_scripts=true npm test")).toMatchObject([{ kind: "test", status: "pass" }]);
+    expect(run(scripts, "npm test")).toEqual([]);
+    expect(run({ ...scripts, test: "npm_config_ignore_scripts=false npm run inner" }, "npm_config_ignore_scripts=true npm test")).toEqual([]);
+    const verbose = (inner: string) => run({ test: "npm run inner --", inner }, "npm test -- -v");
+    expect(verbose("echo starting && go -C . test")).toMatchObject([{ kind: "test", status: "pass" }]);
+    expect(verbose("echo starting && vitest")).toEqual([]);
+    expect(verbose("echo starting && pytest > result")).toEqual([]);
+  });
+
+  test("resolves nested verification scripts and rejects no-ops, cycles and excessive depth", () => {
+    const evidence = (scripts: Record<string, string>) => {
+      writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts }));
+      return classifyPostToolEvidence("npm test", repoDir, 0, "");
+    };
+    for (const script of ["true", ":", "/bin/echo ok", "/usr/bin/printf ok", "pwd", "date", "exit 0"]) {
+      expect(evidence({ test: script })).toEqual([]);
+    }
+    const chain = { test: "npm run test:unit", "test:unit": "npm run test:ci" };
+    expect(evidence({ ...chain, "test:ci": "pytest --version" })).toEqual([]);
+    expect(evidence({ ...chain, "test:ci": "pytest tests/" })).toMatchObject([{ kind: "test", status: "pass" }]);
+    mkdirSync(join(repoDir, "sub"));
+    writeFileSync(join(repoDir, "sub", "package.json"), JSON.stringify({ scripts: { unit: "true" } }));
+    expect(evidence({ test: "npm --prefix sub run unit", unit: "pytest tests/" })).toEqual([]);
+    expect(evidence({ test: "npm run a", a: "npm run b", b: "npm run a" })).toEqual([]);
+    expect(evidence({ test: "npm run a", a: "npm run b", b: "npm run c", c: "npm run d",
+      d: "npm run e", e: "npm run f", f: "npm run g", g: "pytest tests/" })).toEqual([]);
+  });
+
+  test("checks each manifest segment and resolves package scripts within the credited checkout", () => {
+    const rootManifest = (test: string) => writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test } }));
+    const evidence = (cwd = repoDir) => classifyPostToolEvidence("npm test", cwd, 0, "");
+    for (const script of ["echo start && echo done", "echo start && pytest --version", "echo start && ls", "exec true && pytest", "return 0 && pytest", "! pytest",
+      "pytest && exit 0", "pytest && git switch main", "pytest || true", "pytest; true"]) {
+      rootManifest(script);
+      expect(evidence()).toEqual([]);
+    }
+    rootManifest("echo start && pytest tests/");
+    expect(evidence()).toMatchObject([{ kind: "test", status: "pass" }]);
+    const src = join(repoDir, "src");
+    mkdirSync(src);
+    rootManifest("true");
+    expect(evidence(src)).toEqual([]);
+
+    const sibling = join(wb, "svc-b");
+    mkdirSync(sibling);
+    runGit(sibling, ["init"]);
+    const localPackage = join(repoDir, "packages", "app");
+    mkdirSync(localPackage, { recursive: true });
+    for (const dir of [sibling, localPackage]) {
+      mkdirSync(join(dir, "tests"));
+      writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { test: "pytest tests/" } }));
+    }
+    for (const script of ["npm --prefix ../svc-b test", "cd ../svc-b && bun test", "make -C ../svc-b test"]) {
+      rootManifest(script);
+      expect(evidence(src)).toEqual([]);
+    }
+    for (const script of ["npm --prefix packages/app test", "cd packages/app && npm test", "make -C packages/app test"]) {
+      rootManifest(script);
+      expect(evidence(src)).toMatchObject([{ kind: "test", status: "pass" }]);
+    }
+  });
+
+  test("rejects npm verification inherited from a parent of a nested checkout", () => {
+    writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: "pytest tests/" } }));
+    const nested = join(repoDir, "nested");
+    mkdirSync(nested);
+    runGit(nested, ["init"]);
+    expect(classifyPostToolEvidence("npm test", nested, 0, "")).toEqual([]);
+  });
+
+  test("matches enterprise PR evidence against the effective GH_HOST and GH_REPO", () => {
+    runGit(repoDir, ["remote", "add", "origin", "https://ghe.example/acme/svc.git"]);
+    const record = (args: string, host = "ghe.example") => handleLedgerHook(wb, {
+      hook_event_name: "PostToolUse", cwd: repoDir, tool_name: "exec_command", tool_use_id: args,
+      tool_input: { command: args + " -t demo -b b", workdir: repoDir },
+      tool_response: { exit_code: 0, output: `https://${host}/acme/svc/pull/77` },
+    }).recorded;
+    expect(record("GH_HOST=ghe.example gh -R acme/svc pr create")).toBe(1);
+    expect(record("GH_HOST=ghe.example GH_REPO=acme/svc gh pr create")).toBe(1);
+    expect(record("GH_HOST=github.com gh pr create")).toBe(0);
+    expect(record("GH_REPO=ghe.example/other/svc gh pr create")).toBe(0);
+    const config = join(wb, "gh-config");
+    mkdirSync(config);
+    writeFileSync(join(config, "hosts.yml"), "'GHE.EXAMPLE':\n  user: demo\n");
+    expect(record(`GH_HOST= GH_CONFIG_DIR='${config}' gh -R acme/svc pr create`)).toBe(1);
+    expect(record(`GH_HOST= GH_CONFIG_DIR='${config}' GH_REPO=acme/svc gh pr create`)).toBe(1);
+    writeFileSync(join(config, "hosts.yml"), "ghe.example: {}\nghe-b.example: {}\n");
+    const multiHost = `GH_HOST= GH_CONFIG_DIR='${config}' gh -R acme/svc pr create --draft`;
+    expect(record(multiHost)).toBe(0);
+    runGit(repoDir, ["remote", "set-url", "origin", "https://github.com/acme/svc.git"]);
+    expect(record(multiHost, "github.com")).toBe(1);
+    runGit(repoDir, ["remote", "set-url", "origin", "https://ghe/acme/svc.git"]);
+    expect(record("GH_HOST=ghe gh -R acme/svc pr create", "ghe")).toBe(1);
+  });
+
+  test("records PR creation with persistent repo flags and verifies the URL port", () => {
+    runGit(repoDir, ["remote", "add", "origin", "https://github.com:443/acme/svc.git"]);
+    const record = (command: string, port: number, workdir = repoDir) => handleLedgerHook(wb, {
+      hook_event_name: "PostToolUse", cwd: workdir, tool_name: "exec_command",
+      tool_use_id: command + port, tool_input: { command, workdir },
+      tool_response: { exit_code: 0, output: `https://github.com:${port}/acme/svc/pull/42` },
+    }).recorded;
+    expect(record("gh -R acme/svc pr create -t demo -b b", 443)).toBe(1);
+    expect(record("gh pr -R acme/svc create -t demo -b b", 443)).toBe(1);
+    expect(record("env -Csvc gh pr create -t demo -b b", 443, wb)).toBe(1);
+    expect(record("gh pr create -t demo -b b", 443)).toBe(1);
+    runGit(repoDir, ["remote", "set-url", "origin", "https://github.com/acme/svc.git"]);
+    expect(record("gh pr create -t demo -b b", 8443)).toBe(0);
+  });
+
   test("ignores ambiguous `|| true` and echo text; records pinned review head SHA and deduplicates by tool_use_id", () => {
     // Ambiguous `bun test || true` must NOT fabricate pass!
     const amb = handleLedgerHook(wb, {
@@ -857,9 +1197,132 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
     expect(
       classifyPostToolEvidence("go test -C ../other-repo ./...", repoDir, 0, "")[0]?.targetDir,
     ).toBe(otherRepoDir);
+    // Multi `-C` git commit resolves sequentially (`packages/api`, NOT `/work/api`)!
+    expect(
+      classifyPostToolEvidence("git -C packages -C api commit -m fix", "/work", 0, "")[0]?.targetDir,
+    ).toBe("/work/packages/api");
+    // `bun test --cwd` resolves positional test paths relative to `--cwd` (distinct from `bun run <script> --cwd`)!
+    expect(
+      classifyPostToolEvidence("bun test --cwd ../other-repo ./tests/a.test.ts", repoDir, 0, "")[0]?.targetDir,
+    ).toBe(join(otherRepoDir, "tests"));
+    // Shared external Vitest `--config` suppresses misattribution to the shared config directory!
+    expect(
+      classifyPostToolEvidence("vitest run --config ../other-repo/vitest.config.ts", repoDir, 0, ""),
+    ).toEqual([]);
+    // `npm run lint --workspaces=true`, `-ws`, `--usage`, `--usag`, `--versions`, and Bun `--filter`/`-Fname`/`--workspaces` suppress attribution!
+    expect(classifyPostToolEvidence("npm run lint --workspaces=true", repoDir, 0, "")).toEqual([]);
+    expect(classifyPostToolEvidence("npm run lint -ws", repoDir, 0, "")).toEqual([]);
+    expect(classifyPostToolEvidence("npm --usage run check", repoDir, 0, "")).toEqual([]);
+    expect(classifyPostToolEvidence("npm --usag run check", repoDir, 0, "")).toEqual([]);
+    expect(classifyPostToolEvidence("npm --versions run check", repoDir, 0, "")).toEqual([]);
+    expect(classifyPostToolEvidence("bun --filter=pkg-b test", repoDir, 0, "")).toEqual([]);
+    expect(classifyPostToolEvidence("bun -Fpkg-b test", repoDir, 0, "")).toEqual([]);
+    expect(classifyPostToolEvidence("bun --workspaces run test", repoDir, 0, "")).toEqual([]);
+    // Output redirections (`> /dev/null`) are stripped before Node test file resolution!
+    expect(classifyPostToolEvidence("node --test > /dev/null", repoDir, 0, "")[0]?.targetDir).toBe(
+      repoDir,
+    );
+    // Multi-line `set -e` followed by `git switch` suppresses earlier test attribution so wrong branch SHA is never credited!
+    expect(
+      classifyPostToolEvidence("set -e\nnpm test\ngit switch main", repoDir, 0, ""),
+    ).toEqual([]);
+    expect(
+      classifyPostToolEvidence("set -e\nnpm test\nnpm run build", repoDir, 0, "")
+        .map(({ kind, status }) => [kind, status]),
+    ).toEqual([["build", "pass"]]);
+    for (const [command, kinds] of [
+      ["npm run check && bun test", ["lint", "test"]],
+      ["npm run check && ./tools/ls", []],
+      ["npm run check && /bin/ls", ["lint"]],
+      ["npm run check && make test clean", []],
+      ["make test clean", []],
+      ["just test deploy", []],
+      ["npm run check && npm test && npm run build", ["build"]],
+      ["npm run check && git commit -m x", []],
+      ["npm run check && echo x > app.ts", []],
+    ] as const) {
+      expect(classifyPostToolEvidence(command, repoDir, 0, "").map((e) => [e.kind, e.status]))
+        .toEqual(kinds.map((kind) => [kind, "pass"]));
+    }
+    for (const command of [
+      "npm run test:integration -- --help",
+      "pnpm test -- --version",
+      "bun run test -- --pass-with-no-tests",
+      "yarn lint -- --watch",
+      "npm run check -- --showConfig",
+      "npm run check -- --noCheck",
+      "npm run lint -- --print-config",
+      "npm -v test",
+      "npm run check -- -v",
+      "bun run check -v",
+      "pnpm lint -v",
+      "yarn build -v",
+      "bun run check --showConfig",
+      "pnpm check --showConfig",
+      "yarn lint --print-config",
+      "bun run check -- --SHOWCONFIG=true",
+    ]) {
+      expect(classifyPostToolEvidence(command, repoDir, 0, "")).toEqual([]);
+    }
+    for (const runner of ["vitest", "jest", "node --test", "bun test", "pytest --version", "pytest --collect-only", "go test -list=."]) {
+      writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: runner } }));
+      expect(classifyPostToolEvidence("npm test -- -v", repoDir, 0, "")).toEqual([]);
+    }
+    for (const runner of ["go test", "pytest", "pytest tests/"]) {
+      writeFileSync(join(repoDir, "package.json"), JSON.stringify({ scripts: { test: runner } }));
+      expect(classifyPostToolEvidence("npm test -- -v", repoDir, 0, "")[0]?.kind).toBe("test");
+    }
+    for (const [command, exitCode, status] of [
+      ["npm test -- -v", 0, "pass"],
+      ["npm test -- -v", 1, "fail"],
+      ["bun run test -v", 0, "pass"],
+      ["pnpm test -- -n 2", 0, "pass"],
+    ] as const) {
+      expect(classifyPostToolEvidence(command, repoDir, exitCode, "")).toMatchObject([{ kind: "test", status }]);
+    }
+    for (const value of ["false", "0", "null"]) {
+      expect(classifyPostToolEvidence(`npm run check -- --showConfig=${value}`, repoDir, 0, "")[0]?.status).toBe("pass");
+    }
+    expect(
+      classifyPostToolEvidence("bun --cwd core --cwd ../other-repo run check", repoDir, 0, "")[0]?.targetDir,
+    ).toBe(otherRepoDir);
+    // Repeated npm `--prefix` resolves LAST prefix against invocation dir (NOT nested!)
+    expect(
+      classifyPostToolEvidence("npm --prefix ./src --prefix ../other-repo run lint", repoDir, 0, "")[0]?.targetDir,
+    ).toBe(otherRepoDir);
+    // `svelte-check -v` (version query) records nothing; relative `--tsconfig` resolves against `--workspace`!
+    expect(classifyPostToolEvidence("svelte-check -v", repoDir, 0, "3.8.0")).toEqual([]);
+    expect(classifyPostToolEvidence("npx svelte-check -v", repoDir, 0, "3.8.0")).toEqual([]);
+    expect(
+      classifyPostToolEvidence(
+        "svelte-check --workspace ../other-repo --tsconfig tsconfig.json",
+        repoDir,
+        0,
+        "",
+      )[0]?.targetDir,
+    ).toBe(otherRepoDir);
+    // `pnpm -w exec vitest run` from a member beneath `pnpm-workspace.yaml` resolves to workspace root!
+    const wsRoot = join(wb, "ws-root");
+    const wsMember = join(wsRoot, "packages", "member");
+    mkdirSync(wsMember, { recursive: true });
+    writeFileSync(join(wsRoot, "pnpm-workspace.yaml"), "packages:\n  - packages/*\n");
+    expect(
+      classifyPostToolEvidence("pnpm -w exec vitest run", wsMember, 0, "")[0]?.targetDir,
+    ).toBe(wsRoot);
+
+    expect(
+      classifyPostToolEvidence("bun --cwd ../other-repo run check", repoDir, 0, "")[0]?.targetDir,
+    ).toBe(otherRepoDir);
+    expect(
+      classifyPostToolEvidence("bun run --cwd ../other-repo check", repoDir, 0, "")[0]?.targetDir,
+    ).toBe(otherRepoDir);
+    // For `bun run <script> --cwd ...`, trailing flags belong to `<script>`, NOT Bun -> targetDir stays repoDir!
     expect(
       classifyPostToolEvidence("bun run check --cwd ../other-repo", repoDir, 0, "")[0]?.targetDir,
-    ).toBe(otherRepoDir);
+    ).toBe(repoDir);
+    expect(
+      classifyPostToolEvidence("bun run check --cwd ../other-repo", repoDir, 1, "")[0]?.targetDir,
+    ).toBe(repoDir);
     expect(
       classifyPostToolEvidence("npm run lint --prefix ../other-repo", repoDir, 0, "")[0]?.targetDir,
     ).toBe(otherRepoDir);
@@ -1214,5 +1677,208 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
       trigger: "auto",
     });
     expect(compact.compactMessage).toContain("20261121-work");
+  });
+
+  test("captures multi-line cd/set -euo pipefail verification scripts and expanded JS/TS runners while rejecting failure masking", () => {
+    // 1. Multi-line pure `cd` + `npm test` (both pass and fail)
+    const r1 = handleLedgerHook(wb, {
+      hook_event_name: "PostToolUse",
+      cwd: wb,
+      tool_name: "Bash",
+      tool_use_id: "tu-ml-npm-test-pass",
+      tool_input: { command: "cd svc\nnpm test" },
+      tool_response: { exit_code: 0, stdout: "ok" },
+    });
+    expect(r1.recorded).toBe(1);
+
+    const r1Fail = handleLedgerHook(wb, {
+      hook_event_name: "PostToolUse",
+      cwd: wb,
+      tool_name: "Bash",
+      tool_use_id: "tu-ml-npm-test-fail",
+      tool_input: { command: "cd svc\nnpm test" },
+      tool_response: { exit_code: 1, stdout: "failed" },
+    });
+    expect(r1Fail.recorded).toBe(1);
+
+    // 2. Multi-line `set -euo pipefail` + `cd` + `npm run typecheck > /tmp/tc.log 2>&1`
+    const r2 = handleLedgerHook(wb, {
+      hook_event_name: "PostToolUse",
+      cwd: wb,
+      tool_name: "Bash",
+      tool_use_id: "tu-ml-set-e-typecheck",
+      tool_input: {
+        command: "set -euo pipefail\ncd svc\nnpm run typecheck > /tmp/tc.log 2>&1",
+      },
+      tool_response: { exit_code: 0, stdout: "" },
+    });
+    expect(r2.recorded).toBe(1);
+
+    // 3. Expanded runners: vitest run, svelte-check, pnpm test, pnpm -C, yarn lint, yarn run lint, node --test, bun run typecheck, keyword-in-filename under set -e
+    mkdirSync(join(repoDir, "src"), { recursive: true });
+    writeFileSync(join(repoDir, "src", "foo.test.mjs"), "console.log('ok');\n");
+    const runners = [
+      { id: "tu-vitest", cmd: "npx vitest run", expectedKind: "test", cwd: repoDir },
+      { id: "tu-svelte", cmd: "npx svelte-check --tsconfig ./tsconfig.json", expectedKind: "lint", cwd: repoDir },
+      { id: "tu-pnpm-test", cmd: "pnpm test", expectedKind: "test", cwd: repoDir },
+      { id: "tu-pnpm-ws-root", cmd: "pnpm --workspace-root test", expectedKind: "test", cwd: repoDir },
+      { id: "tu-pnpm-c-test", cmd: "pnpm -C svc test", expectedKind: "test", cwd: wb },
+      { id: "tu-yarn-lint", cmd: "yarn lint", expectedKind: "lint", cwd: repoDir },
+      { id: "tu-yarn-run-lint", cmd: "yarn run lint", expectedKind: "lint", cwd: repoDir },
+      { id: "tu-node-test", cmd: "node --test src/foo.test.mjs", expectedKind: "test", cwd: repoDir },
+      { id: "tu-bun-tc", cmd: "bun run typecheck", expectedKind: "lint", cwd: repoDir },
+      { id: "tu-edge-case", cmd: "set -e\nnpm test tests/edge-case.test.ts", expectedKind: "test", cwd: repoDir },
+    ] as const;
+    for (const item of runners) {
+      const r = handleLedgerHook(wb, {
+        hook_event_name: "PostToolUse",
+        cwd: item.cwd,
+        tool_name: "Bash",
+        tool_use_id: item.id,
+        tool_input: { command: item.cmd },
+        tool_response: { exit_code: 0, stdout: "ok" },
+      });
+      expect(r.recorded).toBe(1);
+    }
+
+    // 4. Adversarial rejections: MUST record 0!
+    const badCmds = [
+      // Unguarded multi-line where echo masks failing test
+      "cd svc\nbun test\necho ok",
+      // Disabling errexit mid-script
+      "set -e\nset +e\ncd svc\nbun test\necho ok",
+      // Errexit-exempt AND-list under `set -e` (single-line AND continued across newline!)
+      "set -e\ncd svc\nfalse && npm test\ntrue",
+      "set -e\ncd svc\nfalse &&\nnpm test\ntrue",
+      // Heredoc data lines masquerading as verification command
+      "set -e\ncd svc\ncat <<EOF\nnpm test\nEOF",
+      // Errexit-exempt `if !` masking failure under `set -e`
+      "set -euo pipefail\ncd svc\nif ! bun test; then echo ok; fi",
+      // `trap` under `set -e`
+      "set -e\ntrap 'exit 0' ERR\ncd svc\nbun test",
+      // Node application arguments & non-test/info modes (`--test` after script, `-v`, `--v8-options`)
+      "cd svc\nnode app.js --test",
+      "cd svc\nnode -v --test",
+      "cd svc\nnode --v8-options --test",
+      "cd svc\nnode -e 'process.exit(0)' --test",
+      // Watch-mode / discovery / report-merge / zero-test Vitest
+      "cd svc\nnpx vitest --watch",
+      "cd svc\nnpx vitest",
+      "cd svc\nCI=1 vitest list",
+      "cd svc\nCI=1 vitest --merge-reports",
+      "cd svc\nnpx vitest run --passWithNoTests unmatched",
+      // Dry-run & ambiguous filter pnpm
+      "cd svc\npnpm test --dry-run",
+      "cd svc\npnpm --filter forge-kit-no-such-project test",
+    ];
+    for (let idx = 0; idx < badCmds.length; idx++) {
+      const bad = handleLedgerHook(wb, {
+        hook_event_name: "PostToolUse",
+        cwd: wb,
+        tool_name: "Bash",
+        tool_use_id: `tu-bad-ml-${idx}`,
+        tool_input: { command: badCmds[idx] },
+        tool_response: { exit_code: 0, stdout: "ok" },
+      });
+      expect(bad.recorded).toBe(0);
+    }
+
+    // Verify ledger recorded expected kinds & statuses cleanly
+    const ledger = new Ledger(wb);
+    try {
+      const events = ledger.getTaskEvents("20261121-work");
+      const payloadByToolUse = (id: string) => {
+        const ev = events.find((e) => e.tool_use_id === id);
+        return ev ? (JSON.parse(ev.payload_json) as { kind?: string; status?: string }) : null;
+      };
+
+      const testPass = payloadByToolUse("tu-ml-npm-test-pass:0");
+      expect(testPass?.kind).toBe("test");
+      expect(testPass?.status).toBe("pass");
+
+      const testFail = payloadByToolUse("tu-ml-npm-test-fail:0");
+      expect(testFail?.kind).toBe("test");
+      expect(testFail?.status).toBe("fail");
+
+      const tcPass = payloadByToolUse("tu-ml-set-e-typecheck:0");
+      expect(tcPass?.kind).toBe("lint");
+      expect(tcPass?.status).toBe("pass");
+
+      expect(payloadByToolUse("tu-vitest:0")?.kind).toBe("test");
+      expect(payloadByToolUse("tu-svelte:0")?.kind).toBe("lint");
+      expect(payloadByToolUse("tu-pnpm-test:0")?.kind).toBe("test");
+      expect(payloadByToolUse("tu-pnpm-c-test:0")?.kind).toBe("test");
+      expect(payloadByToolUse("tu-yarn-lint:0")?.kind).toBe("lint");
+      expect(payloadByToolUse("tu-yarn-run-lint:0")?.kind).toBe("lint");
+      expect(payloadByToolUse("tu-node-test:0")?.kind).toBe("test");
+      expect(payloadByToolUse("tu-bun-tc:0")?.kind).toBe("lint");
+      expect(payloadByToolUse("tu-edge-case:0")?.kind).toBe("test");
+    } finally {
+      ledger.closeDb();
+    }
+
+    // 5. Cross-repository attribution: commands executed from repo A (`svc`) targeting repo B (`svc-b`)
+    // MUST credit ONLY `svc-b` (with svc-b's distinct SHA) and NEVER `svc`!
+    const repoBDir = join(wb, "svc-b");
+    mkdirSync(repoBDir, { recursive: true });
+    runGit(repoBDir, ["init", "-b", "main"]);
+    runGit(repoBDir, ["config", "user.email", "t@t.local"]);
+    runGit(repoBDir, ["config", "user.name", "T"]);
+    writeFileSync(join(repoBDir, "x.test.js"), "console.log('ok');\n");
+    writeFileSync(join(repoBDir, "tsconfig.json"), "{}\n");
+    runGit(repoBDir, ["add", "."]);
+    runGit(repoBDir, ["commit", "-m", "init repo B"]);
+    runGit(repoBDir, ["checkout", "-b", "feat/work"]);
+    const repoBSha = runGit(repoBDir, ["rev-parse", "HEAD"]).stdout.trim();
+    writeFileSync(
+      join(wb, ".workbench", "workbench.yaml"),
+      `name: "demo"\nrepos:\n  - svc\n  - svc-b\nledger:\n  enabled: true\n`,
+    );
+    const ledgerB = new Ledger(wb);
+    ledgerB.attachRepo({
+      task_id: "20261121-work",
+      repo: "svc-b",
+      branch: "feat/work",
+      head_sha: repoBSha,
+    });
+    ledgerB.closeDb();
+
+    const commitCommand = "env -C ../svc-b git commit -m demo";
+    expect(classifyPostToolEvidence(commitCommand, repoDir, 0, "")).toMatchObject([
+      { kind: "commit", status: "pass", targetDir: realpathSync(repoBDir) },
+    ]);
+    const crossRepoCmds = [
+      { id: "tu-x-commit", cmd: commitCommand, kind: "commit" },
+      { id: "tu-x-node", cmd: "node --test ../svc-b/x.test.js", kind: "test" },
+      { id: "tu-x-pnpm-vitest", cmd: "pnpm vitest run --root ../svc-b", kind: "test" },
+      { id: "tu-x-vitest-dir", cmd: "npx vitest run --dir ../svc-b", kind: "test" },
+      { id: "tu-x-pnpm-svelte", cmd: "pnpm svelte-check --workspace ../svc-b", kind: "lint" },
+      { id: "tu-x-npx-svelte", cmd: "npx svelte-check --tsconfig ../svc-b/tsconfig.json", kind: "lint" },
+      { id: "tu-x-pnpm-c", cmd: "pnpm -C ../svc-b test", kind: "test" },
+    ] as const;
+    for (const c of crossRepoCmds) {
+      const r = handleLedgerHook(wb, {
+        hook_event_name: "PostToolUse",
+        cwd: repoDir, // Running from repo A (`svc`)!
+        tool_name: "Bash",
+        tool_use_id: c.id,
+        tool_input: { command: c.cmd, workdir: repoDir },
+        tool_response: { exit_code: 0, stdout: "ok" },
+      });
+      expect(r.recorded).toBe(1);
+    }
+
+    const verifyB = new Ledger(wb);
+    try {
+      const events = verifyB.getTaskEvents("20261121-work");
+      for (const c of crossRepoCmds) {
+        const ev = events.find((e) => e.tool_use_id === `${c.id}:0`);
+        expect(ev?.repo).toBe("svc-b");
+        expect(ev?.sha).toBe(repoBSha);
+        expect((JSON.parse(ev!.payload_json) as { kind: string }).kind).toBe(c.kind);
+      }
+    } finally {
+      verifyB.closeDb();
+    }
   });
 });

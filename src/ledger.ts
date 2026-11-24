@@ -148,6 +148,19 @@ export function normalizeKubectlTokens(tokens: string[]): string[] | null {
   return ["kubectl", ...tokens.slice(1)];
 }
 
+/**
+ * Resolve `rawPath` relative to `cwd` preserving `..` segments across symlinks
+ * (using POSIX `realpath(3)` via `realpathSync.native` without lexical `path.resolve` collapse).
+ */
+export function canonicalizeOsPath(cwd: string, rawPath: string): string | null {
+  const joined = isAbsolute(rawPath) ? rawPath : `${cwd.replace(/\/+$/, "")}/${rawPath}`;
+  try {
+    return realpathSync.native(joined);
+  } catch {
+    return null;
+  }
+}
+
 function sha256File(absPath: string): string | null {
   if (!existsSync(absPath)) return null;
   try {
@@ -159,6 +172,14 @@ function sha256File(absPath: string): string | null {
     return null;
   }
 }
+
+const ENDPOINT_RANK: Record<DeliveryEndpoint, number> = {
+  investigation: 0,
+  local: 1,
+  fat: 2,
+  pr: 3,
+  prod: 4,
+};
 
 export interface TaskRecord {
   task_id: string;
@@ -757,6 +778,168 @@ export class Ledger {
     session_id?: string | null;
   }): EventRecord {
     return this.withImmediateTx(() => this.attachRepoInTx(params));
+  }
+
+  detachRepo(params: {
+    task_id: string;
+    repo: string;
+    branch: string;
+    reason?: string;
+    actor?: string;
+    session_id?: string | null;
+  }): EventRecord {
+    return this.withImmediateTx(() => {
+      const task = this.getTask(params.task_id);
+      if (!task) throw new Error(`Task not found: ${params.task_id}`);
+      if (task.status !== "OPEN") {
+        throw new Error(`Cannot detach repo on ${task.status} task: ${params.task_id}`);
+      }
+      const existing = this.db
+        .query(
+          "SELECT * FROM task_repos WHERE task_id = ? AND repo = ? AND branch = ?",
+        )
+        .get(params.task_id, params.repo, params.branch) as TaskRepoRecord | null;
+      if (!existing) {
+        throw new Error(
+          `Branch ${params.repo}:${params.branch} is not attached to task ${params.task_id}`,
+        );
+      }
+      this.db
+        .query("DELETE FROM task_repos WHERE task_id = ? AND repo = ? AND branch = ?")
+        .run(params.task_id, params.repo, params.branch);
+      return this.appendEventInTx({
+        task_id: params.task_id,
+        event_type: "REPO_DETACHED",
+        actor: params.actor ?? "agent",
+        session_id: params.session_id,
+        repo: params.repo,
+        branch: params.branch,
+        sha: existing.head_sha ?? existing.base_sha ?? null,
+        payload: {
+          reason: params.reason ?? "",
+          prev_head_sha: existing.head_sha ?? null,
+          worktree: existing.worktree ?? null,
+        },
+      });
+    });
+  }
+
+  reopenTask(params: {
+    task_id: string;
+    endpoint?: DeliveryEndpoint;
+    depth?: VerificationDepth;
+    reason?: string;
+    actor?: string;
+    session_id?: string | null;
+  }): { task: TaskRecord; event: EventRecord } {
+    if (params.endpoint !== undefined && !VALID_ENDPOINTS.has(params.endpoint)) {
+      throw new Error(`Invalid endpoint: ${params.endpoint}`);
+    }
+    if (params.depth !== undefined && !VALID_DEPTHS.has(params.depth)) {
+      throw new Error(`Invalid verification depth: ${params.depth}`);
+    }
+    return this.withImmediateTx(() => {
+      const task = this.getTask(params.task_id);
+      if (!task) throw new Error(`Task not found: ${params.task_id}`);
+      if (task.status !== "CLOSED") {
+        throw new Error(
+          `Only CLOSED tasks can be reopened (task ${params.task_id} is ${task.status})`,
+        );
+      }
+      const nextEndpoint = params.endpoint !== undefined ? params.endpoint : task.endpoint;
+      const nextDepth = params.depth !== undefined ? params.depth : task.verification_depth;
+      const isDowngrade = ENDPOINT_RANK[nextEndpoint] < ENDPOINT_RANK[task.endpoint];
+      if (isDowngrade) {
+        if (nextEndpoint === "investigation") {
+          throw new Error(
+            `Cannot downgrade development task ${params.task_id} (${task.endpoint}) to investigation`,
+          );
+        }
+        if (!params.reason?.trim()) {
+          throw new Error(
+            `Downgrading endpoint (${task.endpoint} -> ${nextEndpoint}) requires a non-empty --reason`,
+          );
+        }
+      }
+      const repos = this.getTaskRepos(params.task_id);
+      for (const r of repos) {
+        this.assertRepoBranchFreeForOpenTask(r.repo, r.branch, params.task_id);
+      }
+      const ts = nowIso();
+      this.db
+        .query(
+          `UPDATE tasks
+           SET status = 'OPEN', closed_at = NULL, endpoint = ?, verification_depth = ?, updated_at = ?
+           WHERE task_id = ?`,
+        )
+        .run(nextEndpoint, nextDepth, ts, params.task_id);
+      const event = this.appendEventInTx({
+        task_id: params.task_id,
+        event_type: "TASK_REOPENED",
+        actor: params.actor ?? "agent",
+        session_id: params.session_id,
+        ts,
+        payload: {
+          prev_endpoint: task.endpoint,
+          endpoint: nextEndpoint,
+          prev_depth: task.verification_depth,
+          verification_depth: nextDepth,
+          reason: params.reason ?? "",
+          ...(isDowngrade ? { downgrade: true } : {}),
+        },
+      });
+      return { task: this.getTask(params.task_id)!, event };
+    });
+  }
+
+  updateEndpoint(params: {
+    task_id: string;
+    endpoint: DeliveryEndpoint;
+    reason?: string;
+    actor?: string;
+    session_id?: string | null;
+  }): { task: TaskRecord; event: EventRecord } {
+    if (!VALID_ENDPOINTS.has(params.endpoint)) {
+      throw new Error(`Invalid endpoint: ${params.endpoint}`);
+    }
+    return this.withImmediateTx(() => {
+      const task = this.getTask(params.task_id);
+      if (!task) throw new Error(`Task not found: ${params.task_id}`);
+      if (task.status !== "OPEN") {
+        throw new Error(`Cannot update endpoint on ${task.status} task: ${params.task_id}`);
+      }
+      const isDowngrade = ENDPOINT_RANK[params.endpoint] < ENDPOINT_RANK[task.endpoint];
+      if (isDowngrade) {
+        if (params.endpoint === "investigation") {
+          throw new Error(
+            `Cannot downgrade development task ${params.task_id} (${task.endpoint}) to investigation; use 'ledger cancel --reason ...' or 'ledger close --force-incomplete --reason ...'`,
+          );
+        }
+        if (!params.reason?.trim()) {
+          throw new Error(
+            `Downgrading endpoint (${task.endpoint} -> ${params.endpoint}) requires a non-empty --reason`,
+          );
+        }
+      }
+      const ts = nowIso();
+      this.db
+        .query("UPDATE tasks SET endpoint = ?, updated_at = ? WHERE task_id = ?")
+        .run(params.endpoint, ts, params.task_id);
+      const event = this.appendEventInTx({
+        task_id: params.task_id,
+        event_type: "ENDPOINT_UPDATED",
+        actor: params.actor ?? "agent",
+        session_id: params.session_id,
+        ts,
+        payload: {
+          prev_endpoint: task.endpoint,
+          endpoint: params.endpoint,
+          reason: params.reason ?? "",
+          ...(isDowngrade ? { downgrade: true } : {}),
+        },
+      });
+      return { task: this.getTask(params.task_id)!, event };
+    });
   }
 
   recordDecision(params: {
@@ -1676,10 +1859,62 @@ export class Ledger {
             if (liveRes.code === 0 && liveRes.stdout.trim()) {
               effectiveSha = liveRes.stdout.trim();
             } else {
+              // Allow closing a post-delivery cleaned-up branch ONLY when:
+              // 1) endpoint is a delivered remote target (fat/pr/prod),
+              // 2) recorded head_sha resolves to a real commit reachable from `origin`'s exact
+              //    delivery destination ref (NEVER a local-only tag, another remote, or an unmerged feature ref for fat), AND
+              // 3) that exact SHA already has complete verification + endpoint delivery evidence.
+              const allowedRemoteRefs = new Set(
+                task.endpoint === "fat"
+                  ? ["refs/remotes/origin/fat"]
+                  : task.endpoint === "pr"
+                    ? [`refs/remotes/origin/${r.branch}`, "refs/remotes/origin/main", "refs/remotes/origin/master"]
+                    : task.endpoint === "prod"
+                      ? ["refs/remotes/origin/main", "refs/remotes/origin/master"]
+                      : [],
+              );
+              const remoteRefs =
+                allowedRemoteRefs.size > 0 && r.head_sha
+                  ? runGit(
+                      candidateDir,
+                      [
+                        "for-each-ref",
+                        "--format=%(refname)",
+                        "--contains",
+                        `${r.head_sha}^{commit}`,
+                        ...allowedRemoteRefs,
+                      ],
+                      3000,
+                    )
+                  : null;
+              const matchedExactRemoteRef = Boolean(
+                remoteRefs &&
+                  remoteRefs.code === 0 &&
+                  remoteRefs.stdout
+                    .split(/\r?\n/)
+                    .map((line) => line.trim())
+                    .some((ref) => allowedRemoteRefs.has(ref)),
+              );
+              if (matchedExactRemoteRef && r.head_sha) {
+                const deliveredCheck = this.checkPushReadiness({
+                  task_id: params.task_id,
+                  repo: r.repo,
+                  head_sha: r.head_sha,
+                  checkEndpoint: true,
+                });
+                if (deliveredCheck.ready) {
+                  continue;
+                }
+                allMissing.push(
+                  `${r.repo}:${r.branch} live branch refs/heads/${r.branch} could not be resolved on disk (and recorded ${r.head_sha.slice(0, 8)} lacks full evidence; detach obsolete branch with 'ledger detach' if abandoned)`,
+                  ...deliveredCheck.missing,
+                );
+                continue;
+              }
               // Fail closed: repo exists on disk, so an unresolvable/missing branch MUST NOT
-              // silently close using stale stored head_sha!
+              // silently close using unverified/stale stored head_sha!
               allMissing.push(
-                `${r.repo}:${r.branch} live branch refs/heads/${r.branch} could not be resolved on disk`,
+                `${r.repo}:${r.branch} live branch refs/heads/${r.branch} could not be resolved on disk (if renamed/abandoned, run 'ledger detach ${params.task_id} --repo ${r.repo} --branch ${r.branch}')`,
               );
               continue;
             }
@@ -1957,29 +2192,22 @@ export class Ledger {
     const cutoff = new Date(
       Date.now() - params.beforeDays * 86400_000,
     ).toISOString();
-    const rows = this.db
-      .query(
-        `SELECT task_id FROM tasks
-         WHERE status IN ('CLOSED', 'CANCELLED')
-           AND COALESCE(closed_at, updated_at) < ?
-         ORDER BY created_at ASC`,
-      )
-      .all(cutoff) as Array<{ task_id: string }>;
-    const candidates = rows.map((r) => r.task_id);
-    if (!params.apply || candidates.length === 0) {
-      return { cutoff, candidates, deleted: [] };
-    }
-
-    this.withImmediateTx(() => {
-      for (const id of candidates) {
-        this.db.query("DELETE FROM tasks WHERE task_id = ?").run(id);
-      }
-      this.db
-        .query("DELETE FROM exemptions WHERE expires_at IS NOT NULL AND expires_at < ?")
-        .run(nowIso());
+    const eligible = "status IN ('CLOSED', 'CANCELLED') AND COALESCE(closed_at, updated_at) < ?";
+    const selectCandidates = () => {
+      const rows = this.db.query(`SELECT task_id FROM tasks WHERE ${eligible} ORDER BY created_at ASC`)
+        .all(cutoff) as Array<{ task_id: string }>;
+      return rows.map((row) => row.task_id);
+    };
+    if (!params.apply) return { cutoff, candidates: selectCandidates(), deleted: [] };
+    const result = this.withImmediateTx(() => {
+      const candidates = selectCandidates();
+      const remove = this.db.query(`DELETE FROM tasks WHERE task_id = ? AND ${eligible}`);
+      const deleted = candidates.filter((id) => remove.run(id, cutoff).changes > 0);
+      this.db.query("DELETE FROM exemptions WHERE expires_at IS NOT NULL AND expires_at < ?").run(nowIso());
+      return { cutoff, candidates, deleted };
     });
-    this.db.exec("VACUUM;");
-    return { cutoff, candidates, deleted: candidates };
+    if (result.deleted.length) this.db.exec("VACUUM;");
+    return result;
   }
 
   formatCompactContext(maxTasks = 8): string {
@@ -2106,12 +2334,12 @@ export class Ledger {
     const sql_files: RunbookSqlFileAction[] = [];
     for (const raw of params.actions.sql_files ?? []) {
       const host = raw.host.trim();
-      const absPath = resolve(this.workbenchRoot, raw.path.trim());
+      const rawSqlPath = raw.path.trim();
       if (!host) throw new Error("SQL file action requires non-empty host");
-      if (!existsSync(absPath)) {
-        throw new Error(`Runbook SQL file does not exist: ${absPath}`);
+      const real = canonicalizeOsPath(this.workbenchRoot, rawSqlPath);
+      if (!real) {
+        throw new Error(`Runbook SQL file does not exist: ${rawSqlPath}`);
       }
-      const real = realpathSync(absPath);
       const hash = sha256File(real);
       if (!hash) {
         throw new Error(`Runbook SQL file is unreadable or not a regular file: ${real}`);
@@ -2297,8 +2525,11 @@ export async function runLedgerCli(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   const USAGE = `Usage: ledger <command> [options]
 Commands:
-  open        --id <id> --title <title> --endpoint <investigation|local|fat|pr|prod> --depth <targeted|full> [--repo <r> --branch <b> --base <sha> --head <sha> --worktree <p>]
-  attach      <task_id> --repo <r> --branch <b> [--base <sha> --head <sha> --worktree <p>]
+  open         --id <id> --title <title> --endpoint <investigation|local|fat|pr|prod> --depth <targeted|full> [--repo <r> --branch <b> --base <sha> --head <sha> --worktree <p>]
+  attach       <task_id> --repo <r> --branch <b> [--base <sha> --head <sha> --worktree <p>]
+  detach       <task_id> --repo <r> --branch <b> [--reason <text>]
+  reopen       <task_id> [--endpoint <ep>] [--depth <d>] [--reason <text>]
+  set-endpoint <task_id> --endpoint <ep> [--reason <text>]
   freeze      <task_id> [--spec-dir <dir>] [--lock-tests <glob>]...
   amend       <task_id> --scope <requirement|invariant|tech_spec|test_spec> --reason <text>
   spec-status <task_id>
@@ -2381,6 +2612,72 @@ Commands:
         actor: values.actor,
       });
       console.log(JSON.stringify(ev, null, 2));
+    } else if (cmd === "detach") {
+      const task_id = rest[0];
+      const { values } = parseArgs({
+        args: rest.slice(1),
+        options: {
+          repo: { type: "string" },
+          branch: { type: "string" },
+          reason: { type: "string" },
+          actor: { type: "string", default: "agent" },
+        },
+      });
+      if (!task_id || !values.repo || !values.branch) {
+        throw new Error("Usage: ledger detach <task_id> --repo <r> --branch <b> [--reason <text>]");
+      }
+      const ev = ledger.detachRepo({
+        task_id,
+        repo: values.repo,
+        branch: values.branch,
+        reason: values.reason,
+        actor: values.actor,
+      });
+      console.log(JSON.stringify(ev, null, 2));
+    } else if (cmd === "reopen") {
+      const task_id = rest[0];
+      const { values } = parseArgs({
+        args: rest.slice(1),
+        options: {
+          endpoint: { type: "string" },
+          depth: { type: "string" },
+          reason: { type: "string" },
+          actor: { type: "string", default: "agent" },
+        },
+      });
+      if (!task_id) {
+        throw new Error(
+          "Usage: ledger reopen <task_id> [--endpoint <ep>] [--depth <d>] [--reason <text>]",
+        );
+      }
+      const res = ledger.reopenTask({
+        task_id,
+        endpoint: values.endpoint as DeliveryEndpoint | undefined,
+        depth: values.depth as VerificationDepth | undefined,
+        reason: values.reason,
+        actor: values.actor,
+      });
+      console.log(JSON.stringify(res, null, 2));
+    } else if (cmd === "set-endpoint") {
+      const task_id = rest[0];
+      const { values } = parseArgs({
+        args: rest.slice(1),
+        options: {
+          endpoint: { type: "string" },
+          reason: { type: "string" },
+          actor: { type: "string", default: "agent" },
+        },
+      });
+      if (!task_id || values.endpoint === undefined) {
+        throw new Error("Usage: ledger set-endpoint <task_id> --endpoint <ep> [--reason <text>]");
+      }
+      const res = ledger.updateEndpoint({
+        task_id,
+        endpoint: values.endpoint as DeliveryEndpoint,
+        reason: values.reason,
+        actor: values.actor,
+      });
+      console.log(JSON.stringify(res, null, 2));
     } else if (cmd === "freeze") {
       const task_id = rest[0];
       const { values } = parseArgs({

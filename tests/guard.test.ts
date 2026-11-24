@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runGit } from "../src/git";
-import { evaluatePreToolUse } from "../src/guard";
+import { evaluatePreToolUse, resolveGhDefaultHost } from "../src/guard";
 import { Ledger } from "../src/ledger";
 
 let wb: string;
@@ -145,6 +145,16 @@ describe("Tier 1 Physical Fuses & Fail-Closed", () => {
     }
   });
 
+  for (const enabled of [false, true]) {
+    test(`blocks wildcard refspecs at the physical fuse with ledger enabled=${enabled}`, () => {
+      appendFileSync(join(wb, ".workbench", "workbench.yaml"), `ledger:\n  enabled: ${enabled}\n`);
+      for (const namespace of ["heads", "tags"]) {
+        const ref = `refs/${namespace}/*`;
+        expect(evaluatePreToolUse(wb, shellInput(`git -C app-api push origin '${ref}:${ref}'`))).toContain("物理保险丝");
+      }
+    });
+  }
+
   test("blocks prod tag push, explicit & implicit main push, and gh pr merge", () => {
     expect(evaluatePreToolUse(wb, shellInput("git -C app-api push --tags"))).toContain("tag");
     expect(evaluatePreToolUse(wb, shellInput("git -C app-api push origin api-v1.2.3"))).toContain(
@@ -158,6 +168,9 @@ describe("Tier 1 Physical Fuses & Fail-Closed", () => {
     // Implicit `git push` while checked out on main MUST be blocked!
     runGit(repoDir, ["checkout", "main"]);
     expect(evaluatePreToolUse(wb, shellInput("git -C app-api push"))).toContain("主分支");
+    for (const ref of ["HEAD", "+HEAD", "@", "feat/demo:HEAD"]) {
+      expect(evaluatePreToolUse(wb, shellInput(`git -C app-api push origin ${ref}`))).toContain("主分支");
+    }
   });
 
   test("blocks prod DB writes while allowing SELECT with < comparison operator", () => {
@@ -325,6 +338,52 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         evaluatePreToolUse(wb, shellInput(`git -C ${tmpWt} push origin HEAD:fat`)),
       ).toBeNull();
 
+      for (const ref of ["HEAD", "@"]) {
+        expect(evaluatePreToolUse(wb, shellInput(`git -C app-api push origin ${ref}`))).toBeNull();
+      }
+      runGit(repoDir, ["remote", "add", "origin", "https://github.com/acme/app-api.git"]);
+      const create = (opts: string) => evaluatePreToolUse(wb, shellInput(`gh pr create ${opts} -t t -b b`, repoDir));
+      expect(create("")).toBeNull();
+      runGit(repoDir, ["remote", "add", "Upstream", "https://github.com/other-org/app-api.git"]);
+      expect(create("")).toContain("gh 默认目标仓");
+      runGit(repoDir, ["remote", "set-url", "Upstream", "https://github.com/acme/app-api.git"]);
+      runGit(repoDir, ["remote", "add", "UPSTREAM", "https://github.com/acme/app-api.git"]);
+      expect(create("")).toContain("gh 默认目标仓");
+      runGit(repoDir, ["remote", "remove", "UPSTREAM"]);
+      runGit(repoDir, ["remote", "remove", "Upstream"]);
+      runGit(repoDir, ["remote", "add", "upstream", "https://github.com/other-org/app-api.git"]);
+      runGit(repoDir, ["config", "remote.upstream.gh-resolved", "base"]);
+      expect(create("")).toContain("gh 默认目标仓");
+      expect(create("-R acme/app-api")).toBeNull();
+
+      runGit(repoDir, ["remote", "set-url", "origin", "https://ghe.example/acme/app-api.git"]);
+      runGit(repoDir, ["config", "--unset", "remote.upstream.gh-resolved"]);
+      runGit(repoDir, ["config", "remote.origin.gh-resolved", "acme/app-api"]);
+      expect(create("")).toBeNull();
+      runGit(repoDir, ["remote", "set-url", "upstream", "https://github.com/acme/app-api.git"]);
+      runGit(repoDir, ["config", "remote.upstream.gh-resolved", "acme/app-api"]);
+      expect(create("")).toContain("gh 默认目标仓");
+
+      const ghConfig = join(wb, "gh-config");
+      mkdirSync(ghConfig);
+      writeFileSync(join(ghConfig, "hosts.yml"), "ghe.example:\n  user: demo\n");
+      const configuredCreate = () => evaluatePreToolUse(wb, shellInput(
+        `GH_HOST= GH_CONFIG_DIR='${ghConfig}' gh -R acme/app-api pr create -t t -b b`, repoDir));
+      expect(configuredCreate()).toBeNull();
+      runGit(repoDir, ["remote", "set-url", "origin", "https://github.com/acme/app-api.git"]);
+      expect(configuredCreate()).toContain("不一致");
+      writeFileSync(join(ghConfig, "hosts.yml"), "ghe-a.example: {}\nghe-b.example: {}\n");
+      expect(resolveGhDefaultHost((key) => key === "GH_CONFIG_DIR" ? ghConfig : "")).toBe("github.com");
+      expect(configuredCreate()).toBeNull();
+      runGit(repoDir, ["remote", "set-url", "upstream", "https://ghe-a.example/acme/app-api.git"]);
+      runGit(repoDir, ["config", "--unset", "remote.origin.gh-resolved"]);
+      runGit(repoDir, ["config", "remote.upstream.gh-resolved", "github.com/acme/app-api"]);
+      expect(create("")).toContain("gh 默认目标仓");
+      runGit(repoDir, ["remote", "set-url", "origin", "https://ghe-a.example/acme/app-api.git"]);
+      expect(configuredCreate()).toContain("不一致");
+      runGit(repoDir, ["remote", "set-url", "origin", "https://ghe/acme/app-api.git"]);
+      expect(evaluatePreToolUse(wb, shellInput("GH_HOST=ghe gh -R acme/app-api pr create -t t -b b", repoDir))).toBeNull();
+
       // Regression: if merged HEAD itself has a FAILED test recorded, NEVER fall back to parent feature SHA!
       const mergedHead = runGit(tmpWt, ["rev-parse", "HEAD"]).stdout.trim();
       const ledger3 = new Ledger(wb);
@@ -345,16 +404,88 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     }
   });
 
+  test("checks delivery readiness after --no-delete and in env-selected checkouts", () => {
+    for (const cmd of [
+      "git -C app-api push --delete --no-delete origin HEAD:refs/heads/feat/demo",
+      "git -C app-api push --delete --no-de origin HEAD:refs/heads/feat/demo",
+      "env -C app-api gh pr create -t t -b b", "env -Capp-api gh pr create -t t -b b",
+      "env -C app-api git push origin feat/demo",
+    ]) expect(evaluatePreToolUse(wb, shellInput(cmd))).toContain("账本门禁");
+    expect(evaluatePreToolUse(wb, shellInput('env -S "git -C app-api push origin HEAD"'))).toContain("无法解析 env");
+    expect(evaluatePreToolUse(wb, shellInput('env -C "$REPO" gh pr create -t t -b b'))).toContain("未展开");
+  });
+
+  test("checks effective GH_REPO and GH_HOST for PR creation", () => {
+    runGit(repoDir, ["remote", "add", "origin", "https://github.com/acme/app-api.git"]);
+    const create = "gh pr create --head feat/demo -t t -b b";
+    const check = (cmd: string) => evaluatePreToolUse(wb, shellInput(cmd, repoDir));
+    expect(check(`GH_REPO=other-org/app-api ${create}`)).toContain("不一致");
+    expect(check("GH_HOST=ghe.internal gh pr create -R acme/app-api -t t -b b")).toContain("不一致");
+    expect(check(`GH_HOST=ghe.internal ${create}`)).toContain("不一致");
+    const original = process.env.GH_REPO;
+    try {
+      process.env.GH_REPO = "other-org/app-api";
+      expect(check(create)).toContain("不一致");
+    } finally {
+      if (original === undefined) delete process.env.GH_REPO;
+      else process.env.GH_REPO = original;
+    }
+  });
+
+  test("requires explicit refspecs for matching and configured remote pushes", () => {
+    const push = (args: string) => evaluatePreToolUse(wb, shellInput(`git -C app-api ${args}`));
+    const explicit = push("push origin feat/demo");
+    runGit(repoDir, ["config", "push.default", "matching"]);
+    expect(push("push origin")).toContain("push.default=matching");
+    expect(push("push origin feat/demo")).toBe(explicit);
+    runGit(repoDir, ["config", "--unset", "push.default"]);
+    runGit(repoDir, ["config", "remote.origin.push", "refs/heads/feat/demo:refs/heads/main"]);
+    expect(push("push origin")).toContain("remote.origin.push");
+    expect(push("push --repo=other origin")).toContain("remote.origin.push");
+    expect(push("push --repo origin")).toContain("remote.origin.push");
+    expect(push("push origin feat/demo")).toContain("src:dst");
+    expect(push("push origin feat/demo:feat/demo")).toBe(explicit);
+  });
+
+  test("inspects the sole push remote and recognizes abbreviated push options", () => {
+    const push = (opts: string) => evaluatePreToolUse(wb, shellInput(`git -C app-api push ${opts}`));
+    for (const [opt, reason] of [
+      ["--mir", "--mirror"], ["--al", "--all"], ["--bran", "--branches"],
+      ["--ta", "--tags"], ["--fo", "强推"], ["--fol", "--follow-tags"],
+    ]) expect(push(opt)).toContain(reason);
+    runGit(repoDir, ["remote", "add", "backup", "https://example.com/team/app.git"]);
+    runGit(repoDir, ["config", "remote.backup.mirror", "true"]);
+    expect(push("")).toContain("mirror");
+  });
+
+  test("blocks implicit mirror pushes and protected upstream destinations", () => {
+    const push = (args: string) => evaluatePreToolUse(wb, shellInput(`git -C app-api ${args}`));
+    runGit(repoDir, ["config", "remote.origin.mirror", "true"]);
+    expect(push("push origin")).toContain("mirror");
+    runGit(repoDir, ["config", "--unset", "remote.origin.mirror"]);
+    runGit(repoDir, ["config", "branch.feat/demo.remote", "origin"]);
+    runGit(repoDir, ["config", "branch.feat/demo.merge", "refs/heads/main"]);
+    expect(push("-c push.default=upstream push origin")).toContain("上游");
+    runGit(repoDir, ["config", "push.default", "upstream"]);
+    expect(push("push")).toContain("上游");
+  });
+
   test("blocks --repo= push to main, --all push, dynamic shell var path, cross-fork PR head, and ClickHouse HTTP under require_prod_db_hosts", () => {
-    // 1. `--repo=origin` must NOT swallow first positional refspec `feat/demo:main`!
+    // The positional receiver overrides --repo.
     expect(
-      evaluatePreToolUse(wb, shellInput("git -C app-api push --repo=origin feat/demo:main")),
+      evaluatePreToolUse(wb, shellInput("git -C app-api push --repo=origin origin feat/demo:main")),
     ).toContain("受保护主分支");
 
     // 2. `git push --all` blocked
     expect(
       evaluatePreToolUse(wb, shellInput("git -C app-api push --all")),
     ).toContain("--all");
+    expect(
+      evaluatePreToolUse(wb, shellInput("git -C app-api push --branches")),
+    ).toContain("--branches");
+    for (const refspec of [":", "+:"]) {
+      expect(evaluatePreToolUse(wb, shellInput(`git -C app-api push origin ${refspec}`))).toContain("物理保险丝");
+    }
 
     // 3. Unexpanded shell variable path fails closed
     expect(
@@ -378,6 +509,11 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     expect(
       evaluatePreToolUse(wb, shellInput("cd app-api && gh pr create -Rother-org/app-api --title t --body b")),
     ).toContain("与当前仓 origin (github.com/acme/app-api) 不一致");
+
+    for (const command of ["gh -R other-org/app-api pr create", "gh pr -Rother-org/app-api new"]) {
+      expect(evaluatePreToolUse(wb, shellInput(`cd app-api && ${command} --title t --body b`)))
+        .toContain("与当前仓 origin (github.com/acme/app-api) 不一致");
+    }
 
     // 4b. Diverged remote tracking ref `origin/feat/demo` fails closed on `gh pr create`
     const headSha = runGit(repoDir, ["rev-parse", "HEAD"]).stdout.trim();

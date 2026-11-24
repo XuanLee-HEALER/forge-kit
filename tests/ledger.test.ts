@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { evaluatePreToolUse } from "../src/guard";
 import { Ledger } from "../src/ledger";
 
 let dir: string;
@@ -321,6 +322,30 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       expect(ledger.verify().ok).toBe(true);
       expect(ledger.verify().checked_tasks).toBe(1);
     } finally {
+      ledger.closeDb();
+    }
+  });
+
+  test("prune selects candidates after a concurrent reopen commits before the write lock", () => {
+    const ledger = new Ledger(dir);
+    const other = new Ledger(dir);
+    try {
+      for (const id of ["old-closed", "old-reopened"]) {
+        ledger.openTask({ task_id: id, title: id, endpoint: "investigation", depth: "targeted" });
+        ledger.closeTask({ task_id: id, archive: false });
+      }
+      ledger.db.exec("UPDATE tasks SET closed_at = '2000-01-01'");
+      const exec = ledger.db.exec.bind(ledger.db);
+      ledger.db.exec = (sql, ...bindings) => {
+        if (sql === "BEGIN IMMEDIATE;") other.reopenTask({ task_id: "old-reopened" });
+        return exec(sql, ...bindings);
+      };
+      const result = ledger.prune({ apply: true, beforeDays: 90 });
+      expect(result.candidates).toEqual(["old-closed"]);
+      expect(result.deleted).toEqual(["old-closed"]);
+      expect(other.getTask("old-reopened")?.status).toBe("OPEN");
+    } finally {
+      other.closeDb();
       ledger.closeDb();
     }
   });
@@ -828,6 +853,393 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       } finally {
         rmSync(outsideDir, { recursive: true, force: true });
       }
+      expect(ledger.verify().ok).toBe(true);
+    } finally {
+      ledger.closeDb();
+    }
+  });
+
+  test("detachRepo, deleted delivered branch closeTask tolerance, reopenTask, and updateEndpoint", () => {
+    const repoDir = join(dir, "web");
+    mkdirSync(repoDir, { recursive: true });
+    const run = (args: string[]) => {
+      const r = Bun.spawnSync(["git", ...args], { cwd: repoDir });
+      if (r.exitCode !== 0) throw new Error(r.stderr.toString());
+      return r.stdout.toString().trim();
+    };
+    run(["init", "-b", "main"]);
+    run(["config", "user.email", "t@t.local"]);
+    run(["config", "user.name", "T"]);
+    writeFileSync(join(repoDir, "a.ts"), "export const a = 1;\n");
+    run(["add", "a.ts"]);
+    run(["commit", "-m", "init"]);
+    const baseSha = run(["rev-parse", "HEAD"]);
+
+    run(["checkout", "-b", "feat/retry"]);
+    writeFileSync(join(repoDir, "a.ts"), "export const a = 2;\n");
+    run(["add", "a.ts"]);
+    run(["commit", "-m", "fix: retry"]);
+    const featSha = run(["rev-parse", "HEAD"]);
+
+    run(["checkout", "-b", "integrate/retry-fat"]);
+    const fatSha = run(["rev-parse", "HEAD"]);
+    run(["checkout", "main"]);
+
+    const ledger = new Ledger(dir);
+    try {
+      ledger.openTask({
+        task_id: "20261124-retry",
+        title: "Retry fix",
+        endpoint: "local",
+        depth: "targeted",
+        repo: "web",
+        branch: "old/renamed-branch",
+        base_sha: baseSha,
+        head_sha: baseSha,
+      });
+      ledger.attachRepo({
+        task_id: "20261124-retry",
+        repo: "web",
+        branch: "feat/retry",
+        base_sha: baseSha,
+        head_sha: featSha,
+      });
+      ledger.attachRepo({
+        task_id: "20261124-retry",
+        repo: "web",
+        branch: "integrate/retry-fat",
+        base_sha: baseSha,
+        head_sha: fatSha,
+      });
+
+      // Detach abandoned/renamed branch cleanly
+      const detEv = ledger.detachRepo({
+        task_id: "20261124-retry",
+        repo: "web",
+        branch: "old/renamed-branch",
+        reason: "renamed to feat/retry",
+      });
+      expect(detEv.event_type).toBe("REPO_DETACHED");
+
+      // Promote endpoint local -> fat
+      const upd = ledger.updateEndpoint({
+        task_id: "20261124-retry",
+        endpoint: "fat",
+        reason: "user approved FAT",
+      });
+      expect(upd.task.endpoint).toBe("fat");
+
+      // Record complete FAT evidence on featSha (= fatSha)
+      for (const [kind, role] of [
+        ["lint", undefined],
+        ["test", undefined],
+        ["review", "business"],
+        ["fat", undefined],
+      ] as const) {
+        ledger.recordEvidence({
+          task_id: "20261124-retry",
+          kind,
+          status: "pass",
+          summary: `${kind} pass`,
+          repo: "web",
+          sha: featSha,
+          meta: role ? { role } : undefined,
+        });
+      }
+
+      // Push delivered commit to origin/fat before deleting temporary FAT integration branch on disk
+      const bareOrigin = join(dir, "web-origin.git");
+      Bun.spawnSync(["git", "init", "--bare", bareOrigin], { stdout: "pipe", stderr: "pipe" });
+      run(["remote", "add", "origin", bareOrigin]);
+      run(["push", "origin", "integrate/retry-fat:refs/heads/fat"]);
+      run(["fetch", "origin"]);
+      run(["branch", "-D", "integrate/retry-fat"]);
+      const closed = ledger.closeTask({
+        task_id: "20261124-retry",
+        summary: "FAT verified",
+        archive: false,
+      });
+      expect(closed.task.status).toBe("CLOSED");
+
+      // Reopen CLOSED task to advance endpoint fat -> pr, reusing existing SHA evidence!
+      // Reject empty enum values on reopen (both API and CLI leave task CLOSED with zero new events!)
+      const eventsBeforeBadReopen = ledger.getTaskEvents("20261124-retry").length;
+      expect(() =>
+        ledger.reopenTask({ task_id: "20261124-retry", depth: "" as never }),
+      ).toThrow("Invalid verification depth");
+      expect(() =>
+        ledger.reopenTask({ task_id: "20261124-retry", endpoint: "" as never }),
+      ).toThrow("Invalid endpoint");
+      const ledgerCli = join(import.meta.dir, "..", "src", "bin", "ledger.ts");
+      for (const badFlag of ["--depth=", "--endpoint="]) {
+        const proc = Bun.spawnSync([process.execPath, ledgerCli, "reopen", "20261124-retry", badFlag], {
+          env: { ...process.env, FORGE_WORKBENCH_ROOT: dir },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        expect(proc.exitCode).not.toBe(0);
+      }
+      expect(ledger.getTask("20261124-retry")?.status).toBe("CLOSED");
+      expect(ledger.getTaskEvents("20261124-retry").length).toBe(eventsBeforeBadReopen);
+
+      const reopened = ledger.reopenTask({
+        task_id: "20261124-retry",
+        endpoint: "pr",
+        reason: "create PR after FAT",
+      });
+      expect(reopened.task.status).toBe("OPEN");
+      expect(reopened.task.endpoint).toBe("pr");
+      // Detach temporary FAT integration branch before PR close (its commit lives on origin/fat, not origin/main)
+      ledger.detachRepo({
+        task_id: "20261124-retry",
+        repo: "web",
+        branch: "integrate/retry-fat",
+        reason: "temporary FAT branch cleaned up before PR",
+      });
+      expect(
+        ledger.checkPushReadiness({
+          task_id: "20261124-retry",
+          repo: "web",
+          head_sha: featSha,
+        }).ready,
+      ).toBe(true);
+
+      // Record PR evidence and close again cleanly (without duplicating lint/test/review!)
+      ledger.recordEvidence({
+        task_id: "20261124-retry",
+        kind: "pr",
+        status: "pass",
+        summary: "PR #979 opened",
+        repo: "web",
+        sha: featSha,
+      });
+      expect(
+        ledger.closeTask({ task_id: "20261124-retry", archive: false }).task.status,
+      ).toBe("CLOSED");
+
+      // Divergent cherry-pick FAT workflow (`fatSha !== featSha`):
+      // Attach integration branch -> guard blocks push before evidence -> verify cherryFatSha -> guard allows push
+      // -> push to origin/fat -> after deployment/acceptance record fat/pass on featSha -> detach temp branch -> close!
+      mkdirSync(join(dir, ".workbench"), { recursive: true });
+      writeFileSync(
+        join(dir, ".workbench", "workbench.yaml"),
+        `name: "demo"\nrepos:\n  - web\nledger:\n  enabled: true\nguard:\n  protected_branches:\n    - main\n`,
+      );
+      run(["checkout", "-b", "fat-diverged", baseSha]);
+      writeFileSync(join(repoDir, "fat-only.txt"), "fat history\n");
+      run(["add", "fat-only.txt"]);
+      run(["commit", "-m", "chore: fat base commit"]);
+      run(["cherry-pick", featSha]);
+      const cherryFatSha = run(["rev-parse", "HEAD"]);
+      expect(cherryFatSha).not.toBe(featSha);
+
+      ledger.openTask({
+        task_id: "20261124-cherry",
+        title: "Divergent cherry-pick FAT delivery",
+        endpoint: "fat",
+        depth: "targeted",
+        repo: "web",
+        branch: "feat/retry",
+        base_sha: baseSha,
+        head_sha: featSha,
+      });
+      ledger.attachRepo({
+        task_id: "20261124-cherry",
+        repo: "web",
+        branch: "fat-diverged",
+        base_sha: baseSha,
+        head_sha: cherryFatSha,
+      });
+      // Guarded push of `fat-diverged` MUST be blocked before `cherryFatSha` has test + review evidence!
+      expect(
+        evaluatePreToolUse(dir, {
+          hook_event_name: "PreToolUse",
+          cwd: repoDir,
+          tool_name: "Bash",
+          tool_input: { command: "git push origin fat-diverged:fat", workdir: repoDir },
+        }),
+      ).toContain("账本门禁");
+      // Record test + review on `cherryFatSha` -> guarded push is now ALLOWED!
+      ledger.recordEvidence({
+        task_id: "20261124-cherry",
+        kind: "test",
+        status: "pass",
+        summary: "fat integration test pass",
+        repo: "web",
+        sha: cherryFatSha,
+      });
+      ledger.recordEvidence({
+        task_id: "20261124-cherry",
+        kind: "review",
+        status: "pass",
+        summary: "fat integration review pass",
+        repo: "web",
+        sha: cherryFatSha,
+        meta: { role: "business" },
+      });
+      expect(
+        evaluatePreToolUse(dir, {
+          hook_event_name: "PreToolUse",
+          cwd: repoDir,
+          tool_name: "Bash",
+          tool_input: { command: "git push origin fat-diverged:fat", workdir: repoDir },
+        }),
+      ).toBeNull();
+      // Execute push to origin/fat, then AFTER deployment & acceptance record evidence on canonical `featSha`!
+      run(["push", "-f", "origin", "fat-diverged:refs/heads/fat"]);
+      run(["fetch", "origin"]);
+      run(["checkout", "main"]);
+      for (const [kind, role] of [
+        ["test", undefined],
+        ["review", "business"],
+        ["fat", undefined],
+      ] as const) {
+        ledger.recordEvidence({
+          task_id: "20261124-cherry",
+          kind,
+          status: "pass",
+          summary: `${kind} pass (cherry-pick ${cherryFatSha.slice(0, 8)})`,
+          repo: "web",
+          sha: featSha,
+          meta: role ? { role } : undefined,
+        });
+      }
+      // Without detaching divergent cherry-pick branch (which lacks fat acceptance on cherryFatSha), close fails closed;
+      // after detaching temp branch per ship/SKILL.md, close succeeds cleanly!
+      expect(() => ledger.closeTask({ task_id: "20261124-cherry", archive: false })).toThrow();
+      run(["branch", "-D", "fat-diverged"]);
+      ledger.detachRepo({
+        task_id: "20261124-cherry",
+        repo: "web",
+        branch: "fat-diverged",
+        reason: "pushed cherry-pick to origin/fat and cleaned up",
+      });
+      expect(
+        ledger.closeTask({ task_id: "20261124-cherry", archive: false }).task.status,
+      ).toBe("CLOSED");
+
+      // Local-only tag, `origin/feat/*` (not `origin/fat`!), OR personal `fork/fat` MUST NOT satisfy FAT cleaned-branch delivery tolerance!
+      const forkBare = join(dir, "web-fork.git");
+      Bun.spawnSync(["git", "init", "--bare", forkBare], { stdout: "pipe", stderr: "pipe" });
+      run(["remote", "add", "fork", forkBare]);
+      run(["checkout", "-b", "feat/local-tag-only", baseSha]);
+      writeFileSync(join(repoDir, "b.ts"), "export const b = 1;\n");
+      run(["add", "b.ts"]);
+      run(["commit", "-m", "feat: not on origin/fat"]);
+      const tagOnlySha = run(["rev-parse", "HEAD"]);
+      run(["tag", "v-local-only", tagOnlySha]);
+      // Remove `origin/fat` so `origin/fat/candidate` can be created (testing exact ref match vs prefix match!)
+      run(["push", "origin", "--delete", "fat"]);
+      run(["fetch", "--prune", "origin"]);
+      run(["push", "origin", "feat/local-tag-only:refs/heads/feat/local-tag-only"]);
+      run(["push", "origin", "feat/local-tag-only:refs/heads/fat/candidate"]);
+      run(["push", "fork", "feat/local-tag-only:refs/heads/fat"]);
+      run(["fetch", "origin"]);
+      run(["fetch", "fork"]);
+      run(["checkout", "main"]);
+      ledger.openTask({
+        task_id: "20261124-tag-only",
+        title: "Local tag, origin feature branch, & fork/fat must fail closed for FAT",
+        endpoint: "fat",
+        depth: "targeted",
+        repo: "web",
+        branch: "feat/local-tag-only",
+        head_sha: tagOnlySha,
+      });
+      for (const [kind, role] of [
+        ["test", undefined],
+        ["review", "business"],
+        ["fat", undefined],
+      ] as const) {
+        ledger.recordEvidence({
+          task_id: "20261124-tag-only",
+          kind,
+          status: "pass",
+          summary: `${kind} pass`,
+          repo: "web",
+          sha: tagOnlySha,
+          meta: role ? { role } : undefined,
+        });
+      }
+      run(["branch", "-D", "feat/local-tag-only"]);
+      expect(() => ledger.closeTask({ task_id: "20261124-tag-only", archive: false })).toThrow(
+        "could not be resolved on disk",
+      );
+      ledger.cancelTask({ task_id: "20261124-tag-only", reason: "cleanup" });
+
+      // Endpoint downgrade guards: dev -> investigation forbidden; dev -> lower dev requires --reason!
+      run(["checkout", "-b", "feat/downgrade-guard", baseSha]);
+      const dgSha = run(["rev-parse", "HEAD"]);
+      run(["checkout", "main"]);
+      ledger.openTask({
+        task_id: "20261124-dg",
+        title: "Downgrade guard test",
+        endpoint: "prod",
+        depth: "full",
+        repo: "web",
+        branch: "feat/downgrade-guard",
+        head_sha: dgSha,
+      });
+      ledger.recordBlocker({
+        task_id: "20261124-dg",
+        action: "open",
+        blocker_id: "b1",
+        summary: "unfinished blocker",
+      });
+      expect(() =>
+        ledger.updateEndpoint({ task_id: "20261124-dg", endpoint: "investigation" }),
+      ).toThrow("Cannot downgrade development task");
+      expect(() =>
+        ledger.updateEndpoint({ task_id: "20261124-dg", endpoint: "fat" }),
+      ).toThrow("requires a non-empty --reason");
+      const dgRes = ledger.updateEndpoint({
+        task_id: "20261124-dg",
+        endpoint: "fat",
+        reason: "re-scoped to FAT only by user",
+      });
+      expect(dgRes.task.endpoint).toBe("fat");
+      expect(JSON.parse(dgRes.event.payload_json).downgrade).toBe(true);
+      ledger.cancelTask({ task_id: "20261124-dg", reason: "cleanup" });
+
+      // Local-endpoint task with deleted branch MUST STILL fail closed!
+      run(["checkout", "-b", "feat/local-del"]);
+      const localSha = run(["rev-parse", "HEAD"]);
+      run(["checkout", "main"]);
+      ledger.openTask({
+        task_id: "20261124-local-del",
+        title: "Local deleted branch",
+        endpoint: "local",
+        depth: "targeted",
+        repo: "web",
+        branch: "feat/local-del",
+        head_sha: localSha,
+      });
+      ledger.recordEvidence({
+        task_id: "20261124-local-del",
+        kind: "test",
+        status: "pass",
+        summary: "ok",
+        repo: "web",
+        sha: localSha,
+      });
+      ledger.recordEvidence({
+        task_id: "20261124-local-del",
+        kind: "review",
+        status: "pass",
+        summary: "ok",
+        repo: "web",
+        sha: localSha,
+        meta: { role: "business" },
+      });
+      run(["branch", "-D", "feat/local-del"]);
+      expect(() => ledger.closeTask({ task_id: "20261124-local-del", archive: false })).toThrow(
+        "could not be resolved on disk",
+      );
+      ledger.cancelTask({ task_id: "20261124-local-del", reason: "cleanup" });
+      expect(() => ledger.reopenTask({ task_id: "20261124-local-del" })).toThrow(
+        "Only CLOSED tasks can be reopened",
+      );
+
       expect(ledger.verify().ok).toBe(true);
     } finally {
       ledger.closeDb();
