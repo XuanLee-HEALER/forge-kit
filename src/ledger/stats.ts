@@ -18,7 +18,7 @@ export function ledgerStats(ledger: Ledger, days?: number) {
           .map((row) => (row as { name: string }).name),
       );
       const tasks = {
-        by_status: { OPEN: 0, CLOSED: 0, CANCELLED: 0 },
+        by_status: { OPEN: 0, HANDED_OFF: 0, CLOSED: 0, CANCELLED: 0 },
         by_endpoint: Object.create(null) as Record<string, number>,
       };
       const durations: number[] = [];

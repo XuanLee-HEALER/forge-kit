@@ -1,5 +1,6 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, readdirSync, realpathSync } from "node:fs";
-import { basename, join, relative, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 export interface GitRunResult {
   code: number;
@@ -17,6 +18,11 @@ export interface RepoLocation {
   isDetached: boolean;
 }
 
+const verificationDeadline = new AsyncLocalStorage<number>();
+export function withinProcessDeadline<T>(deadline:number, operation:()=>T):T {
+  return verificationDeadline.run(deadline,operation);
+}
+
 export function runProcess(
   argv: string[],
   opts?: {
@@ -27,12 +33,15 @@ export function runProcess(
   },
 ): GitRunResult {
   try {
+    const remaining = (verificationDeadline.getStore() ?? Infinity) - Date.now();
+    if (remaining <= 0) throw Error("Verification timed out");
+    const timeout = opts?.timeoutMs ?? 10000;
     const proc = Bun.spawnSync(argv, {
       cwd: opts?.cwd,
       env: opts?.env ?? process.env,
       stdout: "pipe",
       stderr: "pipe",
-      timeout: opts?.timeoutMs ?? 10_000,
+      timeout: Number.isFinite(remaining) ? Math.min(timeout || remaining, remaining) : timeout,
     });
     opts?.onOutput?.(proc.stdout, proc.stderr);
     return {
@@ -115,13 +124,12 @@ export function locateRepo(
     return null;
   }
 
-  const repoName = basename(mainCheckout);
   const branch = lines[2];
   const headRes = runGit(top, ["rev-parse", "HEAD"], 3000);
   const headSha = headRes.code === 0 ? headRes.stdout.trim() : null;
 
   return {
-    repo: repoName,
+    repo: relMain,
     repoRoot: mainCheckout,
     checkoutDir: top,
     worktree: top !== mainCheckout ? top : null,

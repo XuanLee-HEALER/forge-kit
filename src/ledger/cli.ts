@@ -1,8 +1,12 @@
+import { existsSync } from "node:fs";
+import { ledgerDbPath } from "./types";
+import { releaseCommand } from "./release";
+import { handoff, resume } from "./handoff";
 import { telemetryCli } from "./stats";
 import { reviewNative, syncPr } from "./delivery-tools";
 import { findWorkbenchRoot } from "../config";
 import { runReviewFallback } from "./review-fallback";
-import { Ledger } from "./store";
+import { handedOffOwner, Ledger } from "./store";
 import {
   evidenceSource,
   type DeliveryEndpoint,
@@ -35,7 +39,14 @@ Commands:
   review-fallback <task_id> --repo <repo> --role <role> --sha <full-sha>
   exempt    --repo <r> --branch <b> --reason <text> [--sha <sha> --ttl-hours <n>]
   status    [--task <id>] [--repo <r> --branch <b>] [--json]
-  query     [--q <fts>] [--repo <r>] [--status <OPEN|CLOSED|CANCELLED>] [--since <iso>] [--json]
+  query     [--q <fts>] [--repo <r>] [--status <OPEN|HANDED_OFF|CLOSED|CANCELLED>] [--since <iso>] [--json]
+  handoff   <task_id> [--sql host:path ...] [--rollback note]
+  resume    <task_id> [--reason note]
+  release   create --title text [--from-handoffs | --tasks ids | --prs repo#num,...] [--order repos]\n            PR selectors include every attachment of the selected handoff.
+  release   verify|runbook|complete|cancel <release_id> | status [release_id]
+            For each executed SQL/tag/kubectl action, record its result on a release item:
+            record <task> --kind prod --repo <repo> --branch <branch> --sha <handoff-sha> --status pass --summary <result> --meta '{"runbook_id":"<rb-id>","action_id":"<execution_actions ID>"}'
+            For each prod item, record delivery at its handoff SHA with the same command, omitting --meta.
   stats     [--days N] [--json]
   tip       <task_id>
   verify-tip <task_id>@<hash> | --task <id> --tip <hash>
@@ -53,9 +64,33 @@ Commands:
 
   const root = findWorkbenchRoot();
   const telemetry = ["stats","tip","verify-tip"].includes(cmd);
-  const ledger = new Ledger(root, {readonly:telemetry});
+  const releaseStatus = cmd === "release" && rest[0] === "status";
+  if (releaseStatus && !existsSync(ledgerDbPath(root))) {
+    if (rest.length !== 1) throw Error("Unknown release or invalid status arguments");
+    console.log("[]");
+    return;
+  }
+  const ledger = new Ledger(root, {readonly:telemetry || releaseStatus});
   try {
     if (telemetry) return telemetryCli(ledger,cmd,rest);
+    if (cmd === "release") {
+      const result = releaseCommand(ledger,rest);
+      console.log(JSON.stringify(result,null,2));
+      if ("ok" in result && !result.ok) process.exitCode = 1;
+      return;
+    }
+    if (cmd === "resume" || cmd === "handoff") {
+      const [id,...args] = rest;
+      if (!id) throw Error("Expected task ID");
+      const result = cmd === "resume"
+        ? resume(ledger,id,parseArgs({args,options:{reason:{type:"string"}}}).values.reason)
+        : (() => {
+            const {values} = parseArgs({args,options:{sql:{type:"string",multiple:true},rollback:{type:"string"}}});
+            return handoff(ledger,id,values.sql ?? [],values.rollback);
+          })();
+      console.log(JSON.stringify(result,null,2));
+      return;
+    }
     if (cmd === "open") {
       const { values } = parseArgs({
         args: rest,
@@ -377,6 +412,8 @@ Commands:
         console.log(JSON.stringify(data, null, 2));
       } else if (values.repo && values.branch) {
         const tasks = ledger.findOpenTasksByRepoBranch(values.repo, values.branch);
+        const owner = handedOffOwner(ledger,values.repo,values.branch);
+        if (owner) tasks.push(owner);
         const exemption = ledger.findActiveExemption(values.repo, values.branch);
         console.log(JSON.stringify({ tasks, exemption }, null, 2));
       } else {

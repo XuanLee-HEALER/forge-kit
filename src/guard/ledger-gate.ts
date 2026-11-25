@@ -3,7 +3,7 @@ import { getBranchDiffStats, getHeadAndParents, getStagedDiffStats, locateRepo, 
 import { isApprovedTagPushRefspec, parseDeliverySegment } from "./git-gh";
 import { type ApprovedRunbookEntry } from "./runbook-state";
 import { getSpecState } from "../ledger/spec";
-import { Ledger } from "../ledger/store";
+import { handedOffBranches, handedOffOwner, Ledger } from "../ledger/store";
 import { resolve } from "node:path";
 import {
   ghDefaultMatchesOrigin,
@@ -21,7 +21,6 @@ import {
   splitShellSegments,
   splitShellTokens,
 } from "../shared/shell";
-
 function evaluateDiffExemptEligibility(
   stats: { files: string[]; changedLines: number },
   cfg: WorkbenchConfig,
@@ -38,7 +37,6 @@ function evaluateDiffExemptEligibility(
   }
   return { ...stats, eligible: !reason, reason };
 }
-
 function pathBelongsToRegisteredRepo(
   workbenchRoot: string,
   targetDir: string,
@@ -59,7 +57,6 @@ function pathBelongsToRegisteredRepo(
   }
   return null;
 }
-
 export function checkLedgerGate(
   workbenchRoot: string,
   cmd: string,
@@ -70,25 +67,19 @@ export function checkLedgerGate(
   if (!cfg.ledger.enabled) return null;
   const registeredRepos = new Set(cfg.repos);
   if (registeredRepos.size === 0) return null;
-
   const segments = splitShellSegments(cmd);
   let ledger: Ledger | null = null;
-
   try {
     for (let i = 0; i < segments.length; i++) {
       const toks = splitShellTokens(segments[i]);
       if (!toks || toks.length === 0) continue;
-
       const segCwd = resolveSegmentCwd(segments, i, toolWorkdir);
       const { prefix, gh, git } = parseDeliverySegment(toks);
       const isGhPrCreate = gh?.subcmd === "create" || gh?.subcmd === "new";
-
       const isGitCommit = git?.subcmd === "commit";
       const isGitPush = git?.subcmd === "push";
-
       if (!isGitCommit && !isGitPush && !isGhPrCreate) continue;
       if (prefix.ambiguous) return "账本门禁：无法解析 env 交付命令。";
-
       if (
         prefix.dirs.some(hasShellExpansion) ||
         (git && git.gitDirFlags.some((f) => hasShellExpansion(f))) ||
@@ -96,7 +87,6 @@ export function checkLedgerGate(
       ) {
         return "账本门禁（fail-closed）：检测到未展开的 shell 变量路径用于 git/gh 交付命令，请改用明确字面路径。";
       }
-
       const targetDir = resolveGitDirFlags(segCwd, [...prefix.dirs, ...(git?.gitDirFlags ?? [])], true);
       if (!targetDir) {
         return "账本门禁（fail-closed）：无法解析 git -C 目标目录，拒绝放行交付操作。";
@@ -109,25 +99,23 @@ export function checkLedgerGate(
         }
         continue;
       }
-      if (!registeredRepos.has(loc.repo)) {
-        continue;
-      }
-
+      if (!registeredRepos.has(loc.repo)) continue;
       if (!ledger) ledger = new Ledger(workbenchRoot);
-
       const current = { branch: loc.branch, sha: loc.headSha, isDetached: loc.isDetached };
       const targets: (typeof current)[] = [];
       if (isGitPush && git) {
         const parsedPush = parseGitPushArgs(git.subArgs);
-        const reason = isImplicitPushAmbiguous(parsedPush, git.configs, targetDir, new Set(cfg.guard.protected_branches));
+        const handedOff = new Set(handedOffBranches(ledger, loc.repo));
+        const reason = isImplicitPushAmbiguous(parsedPush, git.configs, targetDir, new Set([...cfg.guard.protected_branches, ...handedOff]));
+        const destinations = parsedPush.refspecs.map(ref =>
+          ref.replace(/^\+/, "").split(":").at(-1)!.replace(/^refs\/heads\//, ""));
+        if ((handedOff.size && parsedPush.hasPrune) || destinations.some(branch => handedOff.has(branch)))
+          return "分支已交接，修改远端目标前请先执行 ledger resume。";
         if (reason) return `账本门禁：${reason}`;
-        if (parsedPush.isDelete) {
-          // Deleting a remote feature branch (protected branches already blocked by Tier 1)
-          continue;
-        }
         if (parsedPush.hasAllOrMirror) {
           return "账本门禁（fail-closed）：禁止 `git push --all` / `--branches` / `--mirror` 或批量 refspec，请显式指定目标分支。";
         }
+        if (parsedPush.isDelete) continue;
         const { refspecs } = parsedPush;
         if (refspecs.length === 0) {
           targets.push(current);
@@ -180,7 +168,6 @@ export function checkLedgerGate(
         const envHost = prefix.effective("GH_HOST").toLowerCase();
         const originUrl = runGit(loc.checkoutDir, ["remote", "get-url", "origin"], 3000).stdout.trim();
         const originIdentity = parseGitRemoteRepo(originUrl);
-
         if (explicitGhRepo) {
           const targetIdentity = parseGhRepoSpec(qualifyGhRepoSpec(explicitGhRepo, prefix.effective, targetDir));
           if (!targetIdentity || !originIdentity) {
@@ -194,15 +181,12 @@ export function checkLedgerGate(
             return `账本门禁（fail-closed）：\`gh pr create\` 指定目标仓 ${explicitGhRepo} 与当前仓 origin (${originIdentity.host}/${originIdentity.owner}/${originIdentity.repo}) 不一致，请在目标仓内执行。`;
           }
         }
-
         if (!explicitGhRepo && envHost && envHost !== originIdentity?.host) {
           return "账本门禁：GH_HOST 与当前仓 origin 不一致。";
         }
-
         if (!explicitGhRepo && !ghDefaultMatchesOrigin(loc.checkoutDir, originIdentity)) {
           return "账本门禁：无法确认 gh 默认目标仓与当前仓 origin 一致，请显式指定 -R。";
         }
-
         let branch = loc.branch, sha = loc.headSha, isDetached = loc.isDetached;
         if (parsedGh.head) {
           const parts = parsedGh.head.split(":");
@@ -222,13 +206,13 @@ export function checkLedgerGate(
       } else {
         targets.push(current);
       }
-
       for (const target of targets) {
         const deliveryBranch = target.branch;
         const deliverySha = target.sha;
         const deliveryDetached = target.isDetached;
 
-        // Resolve owning OPEN task(s)
+        const owner = !deliveryDetached && handedOffOwner(ledger,loc.repo,deliveryBranch);
+        if (owner) return "分支已交接，继续开发请执行 ledger resume " + owner.task_id;
         const openTasks = deliveryDetached
           ? ledger.findOpenTasksByRepoCommits(loc.repo, getHeadAndParents(loc.checkoutDir))
           : ledger.findOpenTasksByRepoBranch(loc.repo, deliveryBranch);

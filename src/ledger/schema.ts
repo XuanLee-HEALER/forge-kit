@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { withImmediateTx } from "./transactions";
 import { computeEntryHash, type LedgerReader, type TaskRecord } from "./types";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 export function ensureInitialized(db: Database): void {
   const versionRow = db.query("PRAGMA user_version;").get() as {
@@ -13,22 +13,30 @@ export function ensureInitialized(db: Database): void {
   }
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA synchronous = NORMAL;");
-  withImmediateTx(db, () => {
-    const inner = db.query("PRAGMA user_version;").get() as {
-      user_version?: number;
-    } | null;
-    if (inner?.user_version === SCHEMA_VERSION) return;
-    initSchema(db);
-    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
-  });
+  db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    withImmediateTx(db, () => {
+      const { user_version } = db.query("PRAGMA user_version").get() as { user_version: number };
+      if (user_version === SCHEMA_VERSION) return;
+      if (user_version > SCHEMA_VERSION) throw Error("Unsupported newer ledger schema");
+      if (db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get()) {
+        createTasks(db, "tasks_v4");
+        const columns = "task_id,title,status,endpoint,verification_depth,open_blockers,last_verified_sha,tip_hash,created_at,updated_at,closed_at";
+        db.exec(`INSERT INTO tasks_v4(rowid,${columns}) SELECT rowid,${columns} FROM tasks;
+                 DROP TABLE tasks; ALTER TABLE tasks_v4 RENAME TO tasks`);
+      } else createTasks(db, "tasks");
+      initSchema(db);
+      if (db.query("PRAGMA foreign_key_check").get()) throw Error("Ledger migration failed foreign_key_check");
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    });
+  } finally { db.exec("PRAGMA foreign_keys = ON"); }
 }
 
-function initSchema(db: Database): void {
-  db.exec(`
-      CREATE TABLE IF NOT EXISTS tasks (
+function createTasks(db: Database, name: "tasks" | "tasks_v4") {
+  db.exec(`CREATE TABLE ${name} (
         task_id            TEXT PRIMARY KEY,
         title              TEXT NOT NULL,
-        status             TEXT NOT NULL CHECK (status IN ('OPEN','CLOSED','CANCELLED')),
+        status             TEXT NOT NULL CHECK (status IN ('OPEN','HANDED_OFF','CLOSED','CANCELLED')),
         endpoint           TEXT NOT NULL,
         verification_depth TEXT NOT NULL,
         open_blockers      INTEGER NOT NULL DEFAULT 0,
@@ -37,8 +45,30 @@ function initSchema(db: Database): void {
         created_at         TEXT NOT NULL,
         updated_at         TEXT NOT NULL,
         closed_at          TEXT
-      );
+      );`);
+}
 
+function initSchema(db: Database): void {
+  db.exec(`
+      CREATE TABLE IF NOT EXISTS task_handoffs (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
+        handed_off_at TEXT NOT NULL, ledger_tip TEXT NOT NULL, items_json TEXT NOT NULL,
+        sql_files_json TEXT NOT NULL, rollback_plan TEXT
+      );
+      CREATE TABLE IF NOT EXISTS releases (
+        release_id TEXT PRIMARY KEY, title TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('DRAFT','VERIFIED','APPROVED','COMPLETED','CANCELLED')),
+        runbook_id TEXT, sql_files_json TEXT NOT NULL, rollback_plan TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS release_items (
+        release_id TEXT NOT NULL REFERENCES releases(release_id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id), repo TEXT NOT NULL, branch TEXT NOT NULL, base_branch TEXT NOT NULL,
+        pr_number INTEGER NOT NULL, pr_url TEXT NOT NULL, expected_head_sha TEXT NOT NULL,
+        verified_head_sha TEXT, ledger_tip TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('PENDING','VERIFIED','STALE_PR','MERGED')),
+        merge_order INTEGER NOT NULL, PRIMARY KEY(release_id,task_id,repo,pr_number)
+      );
       CREATE TABLE IF NOT EXISTS task_repos (
         repo        TEXT NOT NULL,
         branch      TEXT NOT NULL,

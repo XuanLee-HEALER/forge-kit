@@ -7,7 +7,7 @@ import {
   extractTouchedFilePaths,
   type CodexHookInput,
 } from "../hook-io";
-import { listActiveSpecLocks } from "../ledger/spec";
+import { activeSpecTaskIds, listActiveSpecLocks } from "../ledger/spec";
 import { Ledger } from "../ledger/store";
 import { existsSync, statSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
@@ -44,7 +44,7 @@ export function checkSpecAndTestLocks(
     if (activeLocks.length === 0) return null;
 
     const allOpenBoundWorktrees = new Set<string>();
-    for (const openTask of ledger.listOpenTasks()) {
+    for (const openTask of activeSpecTaskIds(ledger)) {
       for (const r of ledger.getTaskRepos(openTask.task_id)) {
         if (r.worktree) allOpenBoundWorktrees.add(canonicalizeMaybePath(r.worktree));
       }

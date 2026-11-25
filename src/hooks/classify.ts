@@ -1,4 +1,4 @@
-import { verifiedPr } from "../ledger/delivery-tools";
+import { verifiedPr } from "../ledger/pr";
 import { redactSecrets } from "../cmdfmt";
 import { findWorkbenchRoot, loadWorkbenchConfig } from "../config";
 import { getHeadAndParents, locateRepo, runGit } from "../git";

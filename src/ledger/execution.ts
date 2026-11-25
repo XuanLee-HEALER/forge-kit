@@ -1,3 +1,4 @@
+import { canonicalRepoPath } from "../config";
 import { realpathSync } from "node:fs";
 import { basename, join } from "node:path";
 import { locateRepo, runGit } from "../git";
@@ -23,6 +24,7 @@ export function cleanCheckout(dir: string) {
 
 export function executionSnapshot(ledger: Ledger, target: Target) {
   const root = ledger.workbenchRoot;
+  if (target.repo) target = {...target, repo:canonicalRepoPath(root,target.repo)};
   let dir = target.cwd ?? process.cwd();
   if (!target.cwd && (target.task || target.repo)) {
     const tasks = target.task ? [target.task] : ledger.listOpenTasks().map((t) => t.task_id);

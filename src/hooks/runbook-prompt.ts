@@ -1,4 +1,5 @@
 import { type CodexHookInput } from "../hook-io";
+import { approveRunbookFromUserPrompt } from "../ledger/runbook";
 import { Ledger } from "../ledger/store";
 import { type RunbookActions } from "../ledger/types";
 
@@ -38,7 +39,8 @@ export function handleUserPromptRunbookDirectives(
   const mentioned = [...new Set(ids.map(id => id.toLowerCase()))];
   const revokeIds = revoke ? [...new Set(revoke[1].toLowerCase().split(/[ \t]+/))] : [];
   const approveIds = approve ? mentioned : [];
-  const ledger = new Ledger(workbenchRoot);
+  const deadline = Date.now() + 4500;
+  const ledger = new Ledger(workbenchRoot, {busyTimeoutMs: 500});
   const notes: string[] = [];
   try {
     if (!approve && (/批准|approve/i.test(prompt) || !revoke && mentioned.some(id => ledger.getRunbook(id)?.status === "PENDING"))) {
@@ -56,10 +58,10 @@ export function handleUserPromptRunbookDirectives(
     }
     for (const id of approveIds) {
       try {
-        const { record, actions } = ledger.approveRunbookFromUserPrompt({
+        const { record, actions } = approveRunbookFromUserPrompt(ledger,{
           runbook_id: id,
           session_id: sessionId,
-        });
+        },deadline);
         notes.push(
           `[Forge Runbook] 用户已在主会话批准发版单 ${record.runbook_id}（有效至 ${record.expires_at}，绑定当前 session）。` +
             `底层 guard 将自动放行已登记项：${formatRunbookScopeSummary(actions)}。` +

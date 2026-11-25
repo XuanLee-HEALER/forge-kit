@@ -1,16 +1,16 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadModelsConfig } from "../config";
+import { canonicalRepoPath, loadModelsConfig } from "../config";
 import { checkoutEnvironment, runGit, runProcess } from "../git";
-import { repoOrigin } from "../shared/gh-remote";
+import { inspectPr, verifiedPr } from "./pr";
 import { prRemoteRefs, reachableFromRefs, resolveTaskCheckout } from "./checkout";
 import { coversReviewBase } from "./review-range";
 import { getSpecState } from "./spec";
 import type { Ledger } from "./store";
 
 function attached(ledger: Ledger, task: string, repo: string, branch?: string) {
-  const rows = ledger.getTaskRepos(task).filter(r => r.repo === repo && (!branch || r.branch === branch));
+  const rows = ledger.getTaskRepos(task).filter(r => r.repo === canonicalRepoPath(ledger.workbenchRoot,repo) && (!branch || r.branch === branch));
   if (ledger.getTask(task)?.status !== "OPEN" || rows.length !== 1)
     throw new Error("Expected one open task attachment; specify --branch for multiple branches");
   return rows[0];
@@ -86,33 +86,6 @@ export function reviewNative(ledger: Ledger, task: string, repo: string, baseRef
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 }
 
-export function verifiedPr(dir: string, branch: string, head: string, pr?: string, env = process.env) {
-  const origin = repoOrigin(dir);
-  if (!origin) throw new Error("Expected a GitHub origin");
-  const slug = origin.owner + "/" + origin.repo;
-  const urlPrefix = "https://" + origin.host + "/" + slug + "/pull/";
-  function prNumber(url: unknown) {
-    if (typeof url !== "string") return null;
-    let canonical: string;
-    try { canonical = new URL(url).href; } catch { return null; }
-    if (!canonical.toLowerCase().startsWith(urlPrefix)) return null;
-    const num = canonical.slice(urlPrefix.length);
-    return /^[1-9]\d*$/.test(num) ? num : null;
-  }
-  const number = pr && (/^[1-9]\d*$/.test(pr) ? pr : prNumber(pr));
-  const selector = pr ? (number ? pr : null) : branch;
-  if (!selector || selector.startsWith("-")) throw new Error("Expected a PR number or URL in origin");
-  const result = runProcess(["gh", "pr", "view", selector, "--repo", origin.host + "/" + slug, "--json",
-    "url,state,headRefName,headRefOid,isCrossRepository,headRepository,headRepositoryOwner"], { cwd: dir, env: checkoutEnvironment(env) });
-  if (result.code) throw new Error("Unable to verify pull request: " + result.stderr);
-  const data = JSON.parse(result.stdout);
-  if (!prNumber(data.url) || (pr && prNumber(data.url) !== number) || data.isCrossRepository !== false ||
-      data.headRepository?.name?.toLowerCase() !== origin.repo || data.headRepositoryOwner?.login?.toLowerCase() !== origin.owner ||
-      !["OPEN", "MERGED"].includes(data.state) || data.headRefName !== branch || data.headRefOid !== head)
-    throw new Error("Pull request does not match origin, branch, state or HEAD");
-  return data;
-}
-
 export function syncPr(ledger: Ledger, task: string, repo: string, pr?: string, branch?: string) {
   const attachment = attached(ledger, task, repo, branch);
   const { dir } = resolveTaskCheckout(ledger.workbenchRoot, attachment);
@@ -129,9 +102,16 @@ export function syncPr(ledger: Ledger, task: string, repo: string, pr?: string, 
   return ledger.db.transaction(() => {
     const live = attached(ledger, task, repo, attachment.branch);
     if (resolveTaskCheckout(ledger.workbenchRoot, live).dir !== dir || currentHead(live) !== head) throw new Error("Branch advanced while verifying PR");
-    ledger.db.query("UPDATE task_repos SET head_sha = ? WHERE task_id = ? AND repo = ? AND branch = ?")
+    ledger.db.query("UPDATE task_repos SET head_sha = ? WHERE task_id = ? AND canonical_repo(repo) = canonical_repo(?) AND branch = ?")
       .run(head, task, repo, attachment.branch);
     return ledger.recordEvidence({ task_id: task, repo, branch: attachment.branch, sha: head, kind: "pr",
       source: "tool", actor: "tool", status: "pass", summary: data.url, meta: { state: data.state, pr_url: data.url, pr_head_oid: data.headRefOid } });
   }).immediate();
+}
+
+export function matchesReleasePr(dir: string, pin: { url:string; head:string; branch:string; base:string }) {
+  try {
+    const pr = inspectPr(dir, pin.branch, pin.url, process.env, 2500);
+    return pr.state === "OPEN" && pr.headRefOid === pin.head && pr.baseRefName === pin.base;
+  } catch { return false; }
 }

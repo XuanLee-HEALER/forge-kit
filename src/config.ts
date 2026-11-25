@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 
 export interface ProdDbTarget {
   name: string;
@@ -162,6 +162,11 @@ export function parseTomlFile<T>(filePath: string): T | null {
   return Bun.TOML.parse(raw) as T;
 }
 
+export function canonicalRepoPath(root: string, repo: string): string {
+  const path = resolve(root, repo);
+  return existsSync(path) ? relative(realpathSync(root),realpathSync(path)) || "." : relative(resolve(root),path) || ".";
+}
+
 export function loadWorkbenchConfig(root: string): WorkbenchConfig {
   const raw = parseYamlFile<Partial<WorkbenchConfig>>(
     join(root, ".workbench", "workbench.yaml"),
@@ -176,7 +181,7 @@ export function loadWorkbenchConfig(root: string): WorkbenchConfig {
   return {
     name: raw?.name || "workbench",
     git_org: raw?.git_org,
-    repos: Array.isArray(raw?.repos) ? raw.repos.map(String) : [],
+    repos: Array.isArray(raw?.repos) ? raw.repos.map(repo => canonicalRepoPath(root,String(repo))) : [],
     ledger: {
       enabled: ledgerRaw.enabled ?? DEFAULT_LEDGER.enabled,
       retention_days:

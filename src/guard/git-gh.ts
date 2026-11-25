@@ -1,8 +1,9 @@
+import { matchesReleasePr } from "../ledger/delivery-tools";
 import { type WorkbenchConfig } from "../config";
 import { locateRepo, runGit } from "../git";
 import { type ApprovedRunbookEntry } from "./runbook-state";
 import { resolve } from "node:path";
-import { parseGhApi, readOnlyGraphql, extractGhPrSubcommand, parseGhPrMergeTarget, repoOrigin } from "../shared/gh-remote";
+import { matchesPinnedMerge, parseGhApi, readOnlyGraphql, extractGhPrSubcommand, parseGhPrMergeTarget, repoOrigin } from "../shared/gh-remote";
 import {
   effectivePushRepo,
   evaluateFollowTagsSetting,
@@ -209,7 +210,7 @@ export function checkGitPhysicalFuse(
           target &&
           approvedRunbooks.some((rb) =>
             rb.actions.prs.some((p) => {
-              if (p.number !== target.number) return false;
+              if (p.number !== target.number || (p.pin && !(matchesPinnedMerge(gh.subArgs, p.pin) && matchesReleasePr(resolve(workbenchRoot, p.repo), p.pin)))) return false;
               const local = loc?.repo.toLowerCase() === p.repo.toLowerCase();
               if (!target.owner) return local;
               const origin = repoOrigin(local && loc ? loc.checkoutDir : resolve(workbenchRoot, p.repo));
@@ -223,7 +224,6 @@ export function checkGitPhysicalFuse(
       }
       return "物理保险丝：禁止 Agent 直接执行 `gh pr merge`，请由用户合并 PR 或先创建 Runbook 经用户回复「批准 <runbook_id>」后执行。";
     }
-
     if (!git) continue;
 
     // Shared worktree destructive operations

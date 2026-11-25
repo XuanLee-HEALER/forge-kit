@@ -436,6 +436,20 @@ export function extractGhPrSubcommand(toks: string[], prefix = unwrapShellPrefix
   return null;
 }
 
+// A release approval binds the exact URL and uses GitHub's atomic head precondition.
+export function matchesPinnedMerge(args: string[], pin: { url: string; head: string }): boolean {
+  let target = false, matched = false, merge = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === pin.url && !target) target = true;
+    else if (arg === "--merge" && !merge) merge = true;
+    else if (arg === "--match-head-commit" && !matched && args[++i] === pin.head) matched = true;
+    else if (arg === "--match-head-commit=" + pin.head && !matched) matched = true;
+    else return false;
+  }
+  return target && matched && merge;
+}
+
 export function parseGhPrMergeTarget(args: string[], checkoutDir: string | null, effective: (key: string) => string, cwd: string) {
   const VALUE_FLAGS = new Set([
     "-R",

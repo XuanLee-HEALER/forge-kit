@@ -18,7 +18,7 @@ export function evidenceSource(payload: { source?: unknown }, actor: string): Ev
 
 export const EXECUTABLE_EVIDENCE = new Set(["lint", "test", "build", "hurl", "review", "pr"]);
 
-export type TaskStatus = "OPEN" | "CLOSED" | "CANCELLED";
+export type TaskStatus = "OPEN" | "HANDED_OFF" | "CLOSED" | "CANCELLED";
 
 export type DeliveryEndpoint = "investigation" | "local" | "fat" | "pr" | "prod";
 
@@ -151,6 +151,7 @@ export interface RunbookTagAction {
 export interface RunbookPrAction {
   repo: string;
   number: number;
+  pin?: { url: string; head: string; branch: string; base: string };
 }
 
 export interface RunbookSqlFileAction {

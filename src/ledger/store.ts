@@ -1,3 +1,5 @@
+import { currentHandoff, productionActions, actionMatchesItem } from "./release-inspection";
+import { canonicalRepoPath } from "../config";
 import { prRemoteRefs, reachableFromRefs, resolveTaskCheckout } from "./checkout";
 import { coversReviewBase, reviewMeetsFloor } from "./review-range";
 import { Database } from "bun:sqlite";
@@ -40,6 +42,18 @@ import {
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+export function handedOffBranches(ledger: Ledger, repo: string) {
+  return ledger.db.query<{branch:string},[string]>(
+    "SELECT tr.branch FROM task_repos tr JOIN tasks t USING(task_id) WHERE canonical_repo(tr.repo) = canonical_repo(?) AND t.status='HANDED_OFF'"
+  ).all(repo).map(row => row.branch);
+}
+
+export function handedOffOwner(ledger: Ledger, repo: string, branch: string) {
+  return ledger.db.query<TaskRecord,[string,string]>(
+    "SELECT t.* FROM tasks t JOIN task_repos tr USING(task_id) WHERE canonical_repo(tr.repo) = canonical_repo(?) AND tr.branch=? AND t.status='HANDED_OFF'"
+  ).get(repo,branch);
+}
+
 export class Ledger {
   readonly db: Database;
   readonly dbPath: string;
@@ -50,6 +64,8 @@ export class Ledger {
     this.dbPath = opts?.dbPath ?? ledgerDbPath(workbenchRoot);
     if (!opts?.readonly) mkdirSync(dirname(this.dbPath), { recursive: true });
     this.db = new Database(this.dbPath, opts?.readonly ? { readonly:true } : { create:true });
+    this.db.function("canonical_repo", repo =>
+      typeof repo === "string" ? canonicalRepoPath(workbenchRoot,repo) : null);
     // Set busy_timeout FIRST (lower than outer hook timeout to prevent colliding timeouts).
     const busyMs = opts?.busyTimeoutMs ?? 2500;
     this.db.exec(`PRAGMA busy_timeout = ${busyMs};`);
@@ -68,14 +84,17 @@ export class Ledger {
   ): void {
     const conflicts = this.db
       .query(
-        `SELECT t.task_id FROM tasks t
+        `SELECT t.task_id, t.status FROM tasks t
          INNER JOIN task_repos tr ON t.task_id = tr.task_id
-         WHERE tr.repo = ? AND tr.branch = ? AND t.status = 'OPEN' AND t.task_id != ?`,
+         WHERE canonical_repo(tr.repo) = canonical_repo(?) AND tr.branch = ? AND t.status IN ('OPEN','HANDED_OFF') AND t.task_id != ?`,
       )
-      .all(repo, branch, allowedTaskId) as Array<{ task_id: string }>;
+      .all(repo, branch, allowedTaskId) as Array<{ task_id: string; status: string }>;
+    if (conflicts[0]?.status === "HANDED_OFF") {
+      throw Error("Branch " + repo + ":" + branch + " is owned by a handed-off task; run ledger resume " + conflicts[0].task_id);
+    }
     if (conflicts.length > 0) {
       throw new Error(
-        `Branch ${repo}:${branch} is already owned by OPEN task ${conflicts[0].task_id}; close/cancel it or use a separate branch.`,
+        `Branch ${repo}:${branch} is already owned by ${conflicts[0].status} task ${conflicts[0].task_id}; close/cancel it or use a separate branch.`,
       );
     }
   }
@@ -111,6 +130,7 @@ export class Ledger {
     if (!VALID_DEPTHS.has(params.depth)) {
       throw new Error(`Invalid verification depth: ${params.depth}`);
     }
+    if (params.repo) params = {...params, repo:canonicalRepoPath(this.workbenchRoot,params.repo)};
     if (!/^[a-zA-Z0-9._-]{3,80}$/.test(params.task_id)) {
       throw new Error(
         `Invalid task_id "${params.task_id}" (use 3-80 chars of a-zA-Z0-9._-)`,
@@ -184,6 +204,7 @@ export class Ledger {
     actor?: string;
     session_id?: string | null;
   }): EventRecord {
+    params = {...params, repo:canonicalRepoPath(this.workbenchRoot,params.repo)};
     const task = this.getTask(params.task_id);
     if (!task) throw new Error(`Task not found: ${params.task_id}`);
     if (task.status !== "OPEN") {
@@ -191,11 +212,13 @@ export class Ledger {
     }
     this.assertRepoBranchFreeForOpenTask(params.repo, params.branch, params.task_id);
 
-    const previous = this.db.query("SELECT base_sha, worktree FROM task_repos WHERE task_id = ? AND repo = ? AND branch = ?")
-      .get(params.task_id, params.repo, params.branch) as { base_sha: string | null; worktree: string | null } | null;
+    const previous = this.getTaskRepos(params.task_id).find(r=>r.repo===params.repo && r.branch===params.branch);
+    // Keep historical hash-chain entries intact. Coalesce legacy attachment aliases on this write.
+    this.db.query("DELETE FROM task_repos WHERE task_id=? AND branch=? AND canonical_repo(repo)=? AND repo<>?")
+      .run(params.task_id,params.branch,params.repo,params.repo);
     const history = this.db.query(`SELECT json_extract(payload_json, '$.base_sha') AS base_sha,
       json_type(payload_json, '$.base_repair') AS repair FROM events
-      WHERE task_id = ? AND repo = ? AND branch = ? AND event_type = 'REPO_ATTACHED' ORDER BY seq`)
+      WHERE task_id = ? AND canonical_repo(repo) = canonical_repo(?) AND branch = ? AND event_type = 'REPO_ATTACHED' ORDER BY seq`)
       .all(params.task_id, params.repo, params.branch) as Array<{ base_sha: string | null; repair: string | null }>;
     if (params.worktree && !existsSync(join(params.worktree, ".git"))) throw new Error("Cannot verify supplied worktree: " + params.worktree);
     const checkout = resolveTaskCheckout(this.workbenchRoot, { ...params, worktree: params.worktree ?? previous?.worktree ?? null }, true);
@@ -227,11 +250,11 @@ export class Ledger {
       .run(
         params.repo,
         params.branch,
-        worktree,
+        worktree ?? previous?.worktree ?? null,
         params.task_id,
         base,
-        params.head_sha ?? null,
-        ts,
+        params.head_sha ?? previous?.head_sha ?? null,
+        previous?.attached_at ?? ts,
       );
 
     return appendEventInTx(this.db, {
@@ -283,7 +306,7 @@ export class Ledger {
       }
       const existing = this.db
         .query(
-          "SELECT * FROM task_repos WHERE task_id = ? AND repo = ? AND branch = ?",
+          "SELECT * FROM task_repos WHERE task_id = ? AND canonical_repo(repo) = canonical_repo(?) AND branch = ?",
         )
         .get(params.task_id, params.repo, params.branch) as TaskRepoRecord | null;
       if (!existing) {
@@ -292,7 +315,7 @@ export class Ledger {
         );
       }
       this.db
-        .query("DELETE FROM task_repos WHERE task_id = ? AND repo = ? AND branch = ?")
+        .query("DELETE FROM task_repos WHERE task_id = ? AND canonical_repo(repo) = canonical_repo(?) AND branch = ?")
         .run(params.task_id, params.repo, params.branch);
       return appendEventInTx(this.db, {
         task_id: params.task_id,
@@ -561,7 +584,26 @@ export class Ledger {
     return withImmediateTx(this.db, () => {
       const task = this.getTask(params.task_id);
       if (!task) throw new Error(`Task not found: ${params.task_id}`);
-      if (task.status !== "OPEN") {
+      // Deployment can happen after PR handoff. Only the pinned production receipt
+      // may extend this chain without resuming development.
+      let prodReceipt = false;
+      if (task.status === "HANDED_OFF" && params.kind === "prod" && params.repo && params.branch && params.sha) {
+        const repo = canonicalRepoPath(this.workbenchRoot,params.repo);
+        const snapshot = currentHandoff(this,task.task_id);
+        const item = snapshot.items.find(i =>
+          canonicalRepoPath(this.workbenchRoot,i.repo) === repo && i.branch === params.branch && i.verified_head === params.sha);
+        const bookId = params.meta?.runbook_id;
+        if (bookId !== undefined || params.meta?.action_id !== undefined) {
+          const book = typeof bookId === "string" ? this.getRunbook(bookId) : null;
+          const linked = book && this.db.query("SELECT 1 FROM releases r JOIN release_items i USING(release_id) WHERE r.runbook_id=? AND r.status='APPROVED' AND i.task_id=? AND i.ledger_tip=?")
+            .get(book.runbook_id,task.task_id,snapshot.ledger_tip);
+          const action = book && productionActions(JSON.parse(book.actions_json)).find(a=>a.action_id===params.meta?.action_id)?.action;
+          if (!item || !linked || book?.status !== "APPROVED" || !action || !actionMatchesItem(snapshot,item,action))
+            throw Error("Production receipt must match an approved release action and handoff SHA");
+          prodReceipt = true;
+        } else prodReceipt = !!item && task.endpoint === "prod";
+      }
+      if (task.status !== "OPEN" && !prodReceipt) {
         throw new Error(`Cannot record evidence on ${task.status} task`);
       }
       const event_type =
@@ -591,7 +633,7 @@ export class Ledger {
       if (params.repo && params.branch && params.sha && params.kind === "commit") {
         this.db
           .query(
-            `UPDATE task_repos SET head_sha = ? WHERE task_id = ? AND repo = ? AND branch = ?`,
+            `UPDATE task_repos SET head_sha = ? WHERE task_id = ? AND canonical_repo(repo) = canonical_repo(?) AND branch = ?`,
           )
           .run(params.sha, params.task_id, params.repo, params.branch);
       }
@@ -671,7 +713,7 @@ export class Ledger {
     const row = this.db
       .query(
         `SELECT * FROM exemptions
-         WHERE repo = ? AND branch = ?
+         WHERE canonical_repo(repo) = canonical_repo(?) AND branch = ?
            AND (expires_at IS NULL OR expires_at > ?)
          ORDER BY id DESC LIMIT 1`,
       )
@@ -682,9 +724,9 @@ export class Ledger {
   findOpenTasksByRepoBranch(repo: string, branch: string): TaskRecord[] {
     return this.db
       .query(
-        `SELECT t.* FROM tasks t
+        `SELECT DISTINCT t.* FROM tasks t
          INNER JOIN task_repos tr ON t.task_id = tr.task_id
-         WHERE tr.repo = ? AND tr.branch = ? AND t.status = 'OPEN'
+         WHERE canonical_repo(tr.repo) = canonical_repo(?) AND tr.branch = ? AND t.status = 'OPEN'
          ORDER BY t.updated_at DESC`,
       )
       .all(repo, branch) as TaskRecord[];
@@ -701,7 +743,7 @@ export class Ledger {
       .query(
         `SELECT DISTINCT t.* FROM tasks t
          INNER JOIN task_repos tr ON t.task_id = tr.task_id
-         WHERE tr.repo = ? AND tr.head_sha IN (${placeholders}) AND t.status = 'OPEN'
+         WHERE canonical_repo(tr.repo) = canonical_repo(?) AND tr.head_sha IN (${placeholders}) AND t.status = 'OPEN'
          ORDER BY t.updated_at DESC`,
       )
       .all(repo, ...shas) as TaskRecord[];
@@ -716,9 +758,21 @@ export class Ledger {
   }
 
   getTaskRepos(task_id: string): TaskRepoRecord[] {
-    return this.db
-      .query("SELECT * FROM task_repos WHERE task_id = ? ORDER BY attached_at ASC")
-      .all(task_id) as TaskRepoRecord[];
+    const rows = this.db.query<TaskRepoRecord,[string]>("SELECT * FROM task_repos WHERE task_id=? ORDER BY attached_at,rowid").all(task_id);
+    const unique = new Map<string,TaskRepoRecord>();
+    for (const row of rows) {
+      row.repo = canonicalRepoPath(this.workbenchRoot,row.repo);
+      const key = JSON.stringify([row.repo,row.branch]), prior=unique.get(key);
+      if (!prior) unique.set(key,row);
+      else {
+        if(prior.base_sha && row.base_sha && prior.base_sha!==row.base_sha)
+          throw Error("Conflicting legacy attachment baselines for "+row.repo+":"+row.branch);
+        prior.base_sha ??= row.base_sha;
+        prior.head_sha = row.head_sha ?? prior.head_sha;
+        prior.worktree = row.worktree ?? prior.worktree;
+      }
+    }
+    return [...unique.values()];
   }
 
   getTaskBlockers(task_id: string): TaskBlockerRecord[] {
@@ -829,6 +883,7 @@ export class Ledger {
       );
     }
 
+    params = {...params, repo:canonicalRepoPath(this.workbenchRoot,params.repo)};
     const specState = getSpecState(this, params.task_id, { delivery: params, closing });
     if (specState.drifted_locked_tests.length) {
       hasExplicitFailure = true;
@@ -849,7 +904,7 @@ export class Ledger {
       .query(
         `SELECT seq, actor, branch, payload_json FROM events
          WHERE task_id = ? AND event_type = 'EVIDENCE_CAPTURED'
-           AND repo = ? AND sha = ?
+           AND canonical_repo(repo) = canonical_repo(?) AND sha = ?
          ORDER BY seq ASC`,
       )
       .all(params.task_id, params.repo, params.head_sha) as Array<{
@@ -1224,7 +1279,7 @@ export class Ledger {
     }
     if (params.repo) {
       where.push(
-        "EXISTS (SELECT 1 FROM task_repos tr WHERE tr.task_id = t.task_id AND tr.repo = ?)",
+        "EXISTS (SELECT 1 FROM task_repos tr WHERE tr.task_id = t.task_id AND canonical_repo(tr.repo) = canonical_repo(?))",
       );
       args.push(params.repo);
     }
@@ -1246,7 +1301,7 @@ export class Ledger {
       }
       if (params.repo) {
         evWhere.push(
-          "(e.repo = ? OR EXISTS (SELECT 1 FROM task_repos tr WHERE tr.task_id = e.task_id AND tr.repo = ?))",
+          "(canonical_repo(e.repo) = canonical_repo(?) OR EXISTS (SELECT 1 FROM task_repos tr WHERE tr.task_id = e.task_id AND canonical_repo(tr.repo) = canonical_repo(?)))",
         );
         evArgs.push(params.repo, params.repo);
       }
@@ -1271,7 +1326,7 @@ export class Ledger {
     const cutoff = new Date(
       Date.now() - params.beforeDays * 86400_000,
     ).toISOString();
-    const eligible = "status IN ('CLOSED', 'CANCELLED') AND COALESCE(closed_at, updated_at) < ?";
+    const eligible = "status IN ('CLOSED', 'CANCELLED') AND COALESCE(closed_at, updated_at) < ? AND NOT EXISTS (SELECT 1 FROM release_items r WHERE r.task_id=tasks.task_id)";
     const selectCandidates = () => {
       const rows = this.db.query(`SELECT task_id FROM tasks WHERE ${eligible} ORDER BY created_at ASC`)
         .all(cutoff) as Array<{ task_id: string }>;
@@ -1291,7 +1346,9 @@ export class Ledger {
 
   formatCompactContext(maxTasks = 8): string {
     const open = this.listOpenTasks().slice(0, maxTasks);
-    if (open.length === 0) return "";
+    const { count } = this.db.query("SELECT COUNT(*) AS count FROM tasks WHERE status='HANDED_OFF'").get() as { count: number };
+    const quiet = count ? "Handoffs awaiting release: " + count + " (run ledger release create --from-handoffs)" : "";
+    if (!open.length) return quiet;
     const lines: string[] = ["[Workbench Active Task Ledgers]"];
     for (const t of open) {
       const repos = this.getTaskRepos(t.task_id);
@@ -1364,6 +1421,7 @@ export class Ledger {
         `- ${t.task_id} (${t.endpoint}/${t.verification_depth}): ${t.title} [${repoDesc}]${specBadge}${evidence ? " | " + evidence : ""}${blockerText}${activeDecs ? ` | decisions: ${activeDecs}` : ""}`,
       );
     }
+    if (quiet) lines.push(quiet);
     return lines.join("\n");
   }
 

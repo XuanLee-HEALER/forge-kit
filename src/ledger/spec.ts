@@ -1,3 +1,4 @@
+import { canonicalRepoPath } from "../config";
 import { scanLockedTests } from "./locked-tests";
 import { appendEventInTx, withImmediateTx } from "./transactions";
 import {
@@ -26,6 +27,33 @@ const VALID_SPEC_AMEND_SCOPES = new Set<string>([
   "tech_spec",
   "test_spec",
 ]);
+
+function readFrozenPayload(root:string, json:string) {
+  const payload = JSON.parse(json) as Partial<SpecFrozenPayload>;
+  const relativeKey = (path:string) => relative(resolve(root),resolve(root,path));
+  const repos=Object.keys(payload.locked_test_revisions ?? {}).map(relativeKey).sort((a,b)=>b.length-a.length);
+  for (const field of ["locked_test_files","locked_test_blobs","locked_test_modes","tracked_locked_tests","locked_test_revisions","locked_gitlinks"] as const) {
+    const map = payload[field];
+    if (!map) continue;
+    for (const key of Object.keys(map)) {
+      let normalized: string;
+      if (field === "locked_gitlinks") {
+        const [repo,path,oid] = JSON.parse(key);
+        normalized = JSON.stringify([canonicalRepoPath(root,repo),path,oid]);
+      } else if (field === "locked_test_revisions") normalized=canonicalRepoPath(root,key);
+      else {
+        normalized=relativeKey(key);
+        const repo=repos.find(r=>normalized.startsWith(r+"/"));
+        if(repo) normalized=canonicalRepoPath(root,repo)+normalized.slice(repo.length);
+      }
+      if (normalized !== key) {
+        map[normalized] = map[key];
+        delete map[key];
+      }
+    }
+  }
+  return payload;
+}
 
 export function freezeSpec(ledger: LedgerReader, params: {
   task_id: string;
@@ -171,7 +199,7 @@ export function freezeSpec(ledger: LedgerReader, params: {
     if (prevSpec.freeze_seq !== null) {
       const row = ledger.db.query("SELECT payload_json FROM events WHERE task_id = ? AND seq = ?")
         .get(params.task_id, prevSpec.freeze_seq) as { payload_json: string };
-      const prior = JSON.parse(row.payload_json) as Partial<SpecFrozenPayload>;
+      const prior = readFrozenPayload(ledger.workbenchRoot,row.payload_json);
       for (const [key, hash] of Object.entries(prior.locked_test_files ?? {})) {
         const slash = key.indexOf("/");
         if (activeRepos.has(key.slice(0, slash)) || !lockedGlobs.some(g => matchesGlob(key.slice(slash + 1), g))) continue;
@@ -304,7 +332,7 @@ export function getSpecState(ledger: LedgerReader, task_id: string, options: { m
   for (const row of rows) {
     try {
       if (row.event_type === "SPEC_FROZEN") {
-        const p = JSON.parse(row.payload_json) as Partial<SpecFrozenPayload>;
+        const p = readFrozenPayload(ledger.workbenchRoot,row.payload_json);
         freezeSeq = row.seq;
         specDir = p.spec_dir ?? specDir;
         if (p.files) files = p.files;
@@ -451,8 +479,12 @@ export function getSpecState(ledger: LedgerReader, task_id: string, options: { m
   };
 }
 
+export function activeSpecTaskIds(ledger: LedgerReader) {
+  return ledger.db.query<{task_id:string},[]>("SELECT task_id FROM tasks WHERE status IN ('OPEN','HANDED_OFF')").all();
+}
+
 export function listActiveSpecLocks(ledger: LedgerReader, metadataOnly = false): TaskSpecState[] {
-  const open = ledger.listOpenTasks();
+  const open = activeSpecTaskIds(ledger);
   const out: TaskSpecState[] = [];
   for (const t of open) {
     const st = getSpecState(ledger, t.task_id, { metadataOnly });

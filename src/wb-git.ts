@@ -252,7 +252,7 @@ function loadProtectedOpenTaskRefs(workbenchRoot: string): {
   if (!existsSync(ledgerPath)) return { branches, worktrees };
   const ledger = new Ledger(workbenchRoot);
   try {
-    for (const task of ledger.listOpenTasks()) {
+    for (const task of ledger.db.query<{ task_id: string }, []>("SELECT task_id FROM tasks WHERE status IN ('OPEN','HANDED_OFF')").all()) {
       for (const r of ledger.getTaskRepos(task.task_id)) {
         branches.add(`${r.repo}:${r.branch}`);
         if (r.worktree && existsSync(r.worktree)) {
@@ -334,7 +334,7 @@ export function sweepMergedBranches(
       const key = `${r.repo}:${wt.branch}`;
       if (openProtected.branches.has(key) || openProtected.worktrees.has(wt.path)) {
         skippedOpenTasks.push(key);
-        console.log(`${r.repo}: worktree ${wt.relPath} (${wt.branch}) protected by OPEN task ledger, skipped`);
+        console.log(`${r.repo}: worktree ${wt.relPath} (${wt.branch}) protected by active task ledger, skipped`);
         continue;
       }
       const dirty = runGit(wt.path, ["status", "--porcelain"]).stdout.trim();

@@ -1,4 +1,5 @@
-import { runGit } from "../git";
+import { checkedActions, requireActionReceipts, detail, inspect, observe, type ReleaseLedger } from "./release-inspection";
+import { runGit, withinProcessDeadline } from "../git";
 import { withImmediateTx } from "./transactions";
 import {
   canonicalJson,
@@ -80,7 +81,8 @@ export function createRunbook(ledger: LedgerReader, params: {
     if (!repo || !Number.isInteger(num) || num <= 0) {
       throw new Error(`Invalid PR action (${raw.repo}:${raw.number}); expected <repo>:<positive-int>`);
     }
-    prs.push({ repo, number: num });
+    if (raw.pin && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(raw.pin.head)) throw Error("Invalid pinned PR head");
+    prs.push({ repo, number: num, ...(raw.pin && { pin: raw.pin }) });
   }
 
   const sql_files: RunbookSqlFileAction[] = [];
@@ -168,48 +170,67 @@ export function listRunbooks(ledger: LedgerReader, status?: RunbookStatus): Runb
     .all() as RunbookRecord[];
 }
 
-export function approveRunbookFromUserPrompt(ledger: LedgerReader, params: {
+export function approveRunbookFromUserPrompt(ledger: ReleaseLedger, params: {
   runbook_id: string;
   session_id: string;
   ttl_minutes?: number;
-}): { record: RunbookRecord; actions: RunbookActions } {
-  const id = params.runbook_id.trim().toLowerCase();
-  const sessionId = params.session_id.trim();
-  if (!sessionId) throw new Error("Cannot approve runbook without valid session_id");
+}, deadline = Date.now() + 4500): { record: RunbookRecord; actions: RunbookActions } {
+  return withinProcessDeadline(deadline, () => {
+    const id = params.runbook_id.trim().toLowerCase();
+    const sessionId = params.session_id.trim();
+    if (!sessionId) throw new Error("Cannot approve runbook without valid session_id");
 
-  const ttlMin = Math.min(120, Math.max(5, params.ttl_minutes ?? 30));
+    const ttlMin = Math.min(120, Math.max(5, params.ttl_minutes ?? 30));
 
-  return withImmediateTx(ledger.db, () => {
-    const rb = ledger.getRunbook(id);
-    if (!rb) throw new Error(`Runbook not found: ${id}`);
-    if (rb.status !== "PENDING") {
-      throw new Error(`Runbook ${id} is ${rb.status} and cannot be approved`);
-    }
-    if (sha256String(rb.actions_json) !== rb.actions_hash) {
-      throw new Error(`Runbook ${id} integrity check failed (actions_hash mismatch)`);
-    }
-    const actions = JSON.parse(rb.actions_json) as RunbookActions;
-    for (const sf of actions.sql_files ?? []) {
-      const diskHash = sha256File(sf.path);
-      if (!diskHash || diskHash !== sf.sha256) {
-        throw new Error(
-          `Runbook ${id} SQL file changed on disk since creation (${sf.path}); recreate runbook before approving`,
-        );
+    const linked = () => ledger.db.query<{release_id:string},[string]>(
+      "SELECT release_id FROM releases WHERE runbook_id=?").get(id)?.release_id;
+    const releaseId = linked();
+    const pending = ledger.getRunbook(id);
+    if (pending?.status !== "PENDING") throw Error("Runbook is not PENDING: " + id);
+    const observations = releaseId ? observe(ledger, detail(ledger,releaseId), deadline) : null;
+
+    return withImmediateTx(ledger.db, () => {
+      const rb = ledger.getRunbook(id);
+      if (!rb) throw new Error(`Runbook not found: ${id}`);
+      if (rb.status !== "PENDING") {
+        throw new Error(`Runbook ${id} is ${rb.status} and cannot be approved`);
       }
-    }
+      if (sha256String(rb.actions_json) !== rb.actions_hash) {
+        throw new Error(`Runbook ${id} integrity check failed (actions_hash mismatch)`);
+      }
+      if (linked() !== releaseId || rb.actions_hash !== pending.actions_hash) throw Error("Runbook binding changed");
+      if (releaseId && observations) {
+        const release = detail(ledger,releaseId);
+        if (release.status !== "VERIFIED" || release.runbook_id !== id) throw Error("Release is not VERIFIED");
+        const checked = inspect(ledger,releaseId,observations,deadline);
+        if (!checked.ok) throw Error(checked.errors.join("\n"));
+        checkedActions(checked,rb);
+      }
+      const actions = JSON.parse(rb.actions_json) as RunbookActions;
+      for (const sf of actions.sql_files ?? []) {
+        const diskHash = sha256File(sf.path);
+        if (!diskHash || diskHash !== sf.sha256) {
+          throw new Error(
+            `Runbook ${id} SQL file changed on disk since creation (${sf.path}); recreate runbook before approving`,
+          );
+        }
+      }
 
-    const nowMs = Date.now();
-    const approvedAt = new Date(nowMs).toISOString();
-    const expiresAt = new Date(nowMs + ttlMin * 60_000).toISOString();
-    ledger.db
-      .query(
-        `UPDATE runbooks
-           SET status = 'APPROVED', approved_at = ?, approved_session_id = ?, expires_at = ?
-           WHERE runbook_id = ?`,
-      )
-      .run(approvedAt, sessionId, expiresAt, id);
+      const nowMs = Date.now();
+      if (nowMs >= deadline) throw Error("Runbook approval verification timed out");
+      const approvedAt = new Date(nowMs).toISOString();
+      const expiresAt = new Date(nowMs + ttlMin * 60_000).toISOString();
+      ledger.db
+        .query(
+          `UPDATE runbooks
+             SET status = 'APPROVED', approved_at = ?, approved_session_id = ?, expires_at = ?
+             WHERE runbook_id = ?`,
+        )
+        .run(approvedAt, sessionId, expiresAt, id);
 
-    return { record: ledger.getRunbook(id)!, actions };
+      ledger.db.query("UPDATE releases SET status='APPROVED', updated_at=? WHERE runbook_id=? AND status='VERIFIED'").run(approvedAt,id);
+      return { record: ledger.getRunbook(id)!, actions };
+    });
   });
 }
 
@@ -240,13 +261,19 @@ export function listActiveApprovedRunbooks(
   return out;
 }
 
-export function completeRunbook(ledger: LedgerReader, runbook_id: string): RunbookRecord {
+export function completeRunbook(ledger: ReleaseLedger, runbook_id: string): RunbookRecord {
   const id = runbook_id.trim().toLowerCase();
   return withImmediateTx(ledger.db, () => {
     const rb = ledger.getRunbook(id);
     if (!rb) throw new Error(`Runbook not found: ${id}`);
+    if (rb.status === "COMPLETED") return rb;
     if (rb.status === "REVOKED") {
       throw new Error(`Cannot complete REVOKED runbook: ${id}`);
+    }
+    const linked = ledger.db.query<{release_id:string},[string]>("SELECT release_id FROM releases WHERE runbook_id=?").get(id);
+    if (linked) {
+      if (!rb.approved_at) throw Error("Release runbook requires human approval");
+      requireActionReceipts(ledger,linked.release_id,rb);
     }
     const ts = nowIso();
     ledger.db
@@ -265,6 +292,7 @@ export function revokeRunbook(ledger: LedgerReader, runbook_id: string): Runbook
     ledger.db
       .query("UPDATE runbooks SET status = 'REVOKED', revoked_at = ? WHERE runbook_id = ?")
       .run(ts, id);
+    ledger.db.query("UPDATE releases SET status='VERIFIED', updated_at=? WHERE runbook_id=? AND status='APPROVED'").run(ts,id);
     return ledger.getRunbook(id)!;
   });
 }
