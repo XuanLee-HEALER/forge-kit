@@ -37,6 +37,7 @@ bin_bundles = [
   "lang-check.js",
   "wb-verify.js",
   "forge-review.js",
+  "forge-ship.js",
 ]
 
 bin_wrappers = [
@@ -49,6 +50,7 @@ bin_wrappers = [
   "lang-check",
   "wb-verify",
   "forge-review",
+  "forge-ship",
 ]
 
 [private]
@@ -57,6 +59,7 @@ init_only = [
   "AGENTS.local.md",
   ".workbench/workbench.yaml",
   ".workbench/models.toml",
+  ".workbench/ship-policy.yaml",
   ".workbench/env/environments.example.json",
   "one-off-scripts/README.md",
 ]

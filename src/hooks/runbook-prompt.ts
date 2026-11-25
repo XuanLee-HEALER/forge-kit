@@ -1,5 +1,6 @@
 import { type CodexHookInput } from "../hook-io";
 import { approveRunbookFromUserPrompt } from "../ledger/runbook";
+import { humanFastTrack } from "../ledger/fast-track";
 import { Ledger } from "../ledger/store";
 import { type RunbookActions } from "../ledger/types";
 
@@ -30,6 +31,25 @@ export function handleUserPromptRunbookDirectives(
   const sessionId = (input.session_id ?? "").trim();
   if (!prompt || !sessionId) return undefined;
 
+  const fast =
+    !/[\r\n]/.test(input.prompt ?? "") &&
+    /^(快轨批准|快轨撤销|fast-track approve|fast-track revoke)[ \t]+(ft-\d+-[a-f0-9]+)$/.exec(prompt);
+  if (fast) {
+    const ledger = new Ledger(workbenchRoot);
+    try {
+      const e = humanFastTrack(ledger, fast[2], sessionId, ["快轨批准", "fast-track approve"].includes(fast[1]));
+      return (
+        e.envelope_id +
+        " " +
+        e.status +
+        ("delivery" in e && "notice" in e && e.notice ? " " + e.notice + " " + JSON.stringify(e.delivery) : "")
+      );
+    } catch (error) {
+      return "Fast-track directive refused: " + error;
+    } finally {
+      ledger.closeDb();
+    }
+  }
   const ids = prompt.match(/rb-[a-z0-9-]+/gi);
   if (!ids) return undefined;
   const approve = !/[\r\n]/.test(input.prompt ?? "") && /^(?:批准|approve)[ \t]+(rb-[a-z0-9-]+(?:[ \t]+rb-[a-z0-9-]+)*)$/i.test(prompt);

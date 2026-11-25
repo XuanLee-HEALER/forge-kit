@@ -1,5 +1,6 @@
 import { checkedActions, requireActionReceipts, detail, inspect, observe, type ReleaseLedger } from "./release-inspection";
 import { runGit, withinProcessDeadline } from "../git";
+import { tagTargetIsCurrent } from "./pr";
 import { withImmediateTx } from "./transactions";
 import {
   canonicalJson,
@@ -71,7 +72,7 @@ export function createRunbook(ledger: LedgerReader, params: {
         sha = rev.stdout.trim().toLowerCase();
       }
     }
-    tags.push({ repo, tag, sha });
+    tags.push({ repo, tag, sha, ...(raw.remote && {remote:raw.remote}) });
   }
 
   const prs: RunbookPrAction[] = [];
@@ -253,6 +254,21 @@ export function listActiveApprovedRunbooks(
     if (sha256String(r.actions_json) !== r.actions_hash) continue;
     try {
       const actions = JSON.parse(r.actions_json) as RunbookActions;
+      // The push guard reads the authorized remote only after matching the local repository and tag.
+      // Use the hashed remote, even when the pushing worktree and the primary checkout have different origins.
+      if (actions.tags?.some(tag => tag.remote)) {
+        actions.tags = actions.tags.map(tag => {
+          const remote = tag.remote;
+          if (!remote) return tag;
+          const pin = actions.prs.find(pr => pr.repo === tag.repo && pr.pin?.head === tag.sha)?.pin;
+          let current: boolean | undefined;
+          return { ...tag, get remote() {
+            current ??= !!pin?.base_oid && tagTargetIsCurrent(ledger.workbenchRoot, remote, pin.base, pin.base_oid);
+            // A stale pin must match no host/owner/repo, including on a second read of this snapshot.
+            return current ? remote : "unavailable";
+          }};
+        });
+      }
       out.push({ record: r, actions });
     } catch {
       // Ignore malformed

@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { withImmediateTx } from "./transactions";
 import { computeEntryHash, type LedgerReader, type TaskRecord } from "./types";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 export function ensureInitialized(db: Database): void {
   const versionRow = db.query("PRAGMA user_version;").get() as {
@@ -19,12 +19,12 @@ export function ensureInitialized(db: Database): void {
       const { user_version } = db.query("PRAGMA user_version").get() as { user_version: number };
       if (user_version === SCHEMA_VERSION) return;
       if (user_version > SCHEMA_VERSION) throw Error("Unsupported newer ledger schema");
-      if (db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get()) {
+      if (user_version < 4 && db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").get()) {
         createTasks(db, "tasks_v4");
         const columns = "task_id,title,status,endpoint,verification_depth,open_blockers,last_verified_sha,tip_hash,created_at,updated_at,closed_at";
         db.exec(`INSERT INTO tasks_v4(rowid,${columns}) SELECT rowid,${columns} FROM tasks;
                  DROP TABLE tasks; ALTER TABLE tasks_v4 RENAME TO tasks`);
-      } else createTasks(db, "tasks");
+      } else if (user_version < 4) createTasks(db, "tasks");
       initSchema(db);
       if (db.query("PRAGMA foreign_key_check").get()) throw Error("Ledger migration failed foreign_key_check");
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
@@ -50,6 +50,15 @@ function createTasks(db: Database, name: "tasks" | "tasks_v4") {
 
 function initSchema(db: Database): void {
   db.exec(`
+      CREATE TABLE IF NOT EXISTS fast_track_envelopes (
+        envelope_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK(status IN ('PENDING','ACTIVE','REDEEMED','DEGRADED','REVOKED','EXPIRED')),
+        target_endpoint TEXT NOT NULL CHECK(target_endpoint IN ('fat','pr','prod')),
+        allowed_repos_json TEXT NOT NULL, allowed_path_globs_json TEXT NOT NULL, spec_hashes_json TEXT NOT NULL,
+        freeze_seq INTEGER NOT NULL, base_shas_json TEXT NOT NULL, policy_hash TEXT NOT NULL, scope_hash TEXT NOT NULL,
+        run_token TEXT, ttl_minutes INTEGER NOT NULL, approved_session_id TEXT, approved_at TEXT, expires_at TEXT, degraded_reason TEXT,
+        redeemed_at TEXT, redeemed_runbook_id TEXT REFERENCES runbooks(runbook_id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS task_handoffs (
         task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
         handed_off_at TEXT NOT NULL, ledger_tip TEXT NOT NULL, items_json TEXT NOT NULL,

@@ -19,7 +19,7 @@ shared    → core utilities and runtime
 | Guard | guard/evaluate, runbook-state, sql-http, infra, git-gh, tamper, spec-lock, ledger-gate | Apply a seven-second fail-closed budget, physical fuses, literal file locks and the ledger delivery gate |
 | Hooks | hooks/types, classify, runbook-prompt | Observe commits and remotely verified PR creation, restore session summaries and process whole-message human directives |
 
-The public facades are src/guard.ts, src/ledger.ts and src/ledger-hook.ts. The ten build entrypoints in src/bin are cli, ledger, ledger-hook, guard, wb-git, dbcred, cmdfmt, lang-check, wb-verify and forge-review. The last two own active verification and parallel role reviews. PostToolUse has no package-manager, runner, manifest or review-output parser.
+The public facades are src/guard.ts, src/ledger.ts and src/ledger-hook.ts. The eleven build entrypoints in src/bin are cli, ledger, ledger-hook, guard, wb-git, dbcred, cmdfmt, lang-check, wb-verify, forge-review and forge-ship. The ship runner evaluates and redeems human-approved scopes through the ledger. PostToolUse has no package-manager, runner, manifest or review-output parser.
 
 ## Verification checklist
 

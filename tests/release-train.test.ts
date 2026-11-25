@@ -51,7 +51,7 @@ test("v3 migration preserves data, FTS rowids, chains and foreign keys", () => {
   const migrated = new Ledger(root, { dbPath: path });
   try {
     expect(dump(migrated.db)).toEqual(before);
-    expect(migrated.db.query("PRAGMA user_version").get()).toEqual({ user_version: 4 });
+    expect(migrated.db.query("PRAGMA user_version").get()).toEqual({ user_version: 5 });
     expect(migrated.db.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(migrated.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
     expect(

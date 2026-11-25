@@ -7,7 +7,7 @@
     "forge": "./bin/forge"
   },
   "scripts": {
-    "build": "bun build --target=bun --outdir=dist --entry-naming=[name].[ext] src/bin/cli.ts src/bin/ledger.ts src/bin/guard.ts src/bin/ledger-hook.ts src/bin/wb-git.ts src/bin/dbcred.ts src/bin/cmdfmt.ts src/bin/lang-check.ts src/bin/wb-verify.ts src/bin/forge-review.ts",
+    "build": "bun build --target=bun --outdir=dist --entry-naming=[name].[ext] src/bin/cli.ts src/bin/ledger.ts src/bin/guard.ts src/bin/ledger-hook.ts src/bin/wb-git.ts src/bin/dbcred.ts src/bin/cmdfmt.ts src/bin/lang-check.ts src/bin/wb-verify.ts src/bin/forge-review.ts src/bin/forge-ship.ts",
     "check": "bunx --bun tsc --noEmit",
     "test": "bun test ./tests",
     "test:all": "bun test ./tests && (cd review-agents && bun test)",
@@ -16,5 +16,8 @@
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1"
   }
 }

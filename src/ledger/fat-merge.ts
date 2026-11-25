@@ -16,6 +16,8 @@ export function fatMerge(
   cherryPick = false,
   noPush = false,
   verifyCmd?: string,
+  beforePush?: (featureSha:string, targetSha:string, newSha:string) => void,
+  transportDir?: string,
 ) {
   if (!repo || /[/\\]/.test(repo) || repo === "." || repo === "..") throw Error("Expected a repository name");
   const root = join(ledger.workbenchRoot, repo);
@@ -59,7 +61,7 @@ export function fatMerge(
       runGit(root, ["merge-base", "--is-ancestor", base, feat_sha]).code)
   )
     throw Error("Cherry-pick requires the attached ancestor base");
-  git(root, ["fetch", "origin", "refs/heads/" + fat + ":refs/remotes/origin/" + fat]);
+  git(transportDir ?? root, ["fetch", "origin", "refs/heads/" + fat + ":refs/remotes/origin/" + fat]);
   const target = git(root, ["rev-parse", "--verify", "refs/remotes/origin/" + fat + "^{commit}"]);
   mkdirSync(root + ".worktrees", { recursive: true });
   const dir = join(root + ".worktrees", "fat-merge-" + Date.now() + "-" + crypto.randomUUID());
@@ -92,7 +94,8 @@ export function fatMerge(
       if (git(dir, ["rev-parse", "HEAD"]) !== fat_sha) throw Error("FAT integration HEAD changed during verification");
     }
     if (ready() !== base) throw Error("Feature base changed during integration");
-    if (!noPush) git(dir, ["push", "--no-follow-tags", "origin", fat_sha + ":refs/heads/" + fat]);
+    beforePush?.(feat_sha,target,fat_sha);
+    if (!noPush) git(transportDir ?? dir, ["push", "--no-follow-tags", ...(beforePush ? ["--force-with-lease=refs/heads/"+fat+":"+target] : []), "origin", fat_sha + ":refs/heads/" + fat]);
     return {
       ok: true,
       repo,

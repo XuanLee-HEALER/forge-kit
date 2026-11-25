@@ -76,7 +76,7 @@ export function reviewNative(ledger: Ledger, task: string, repo: string, baseRef
       }
     }
     return ledger.db.transaction(() => {
-      const live = attached(ledger, task, repo, attachment.branch);
+    const live = attached(ledger, task, repo, attachment.branch);
       if (resolveTaskCheckout(ledger.workbenchRoot, live).dir !== dir || current() !== head || floor() !== review_floor_seq || live.base_sha !== attachment.base_sha)
         throw new Error("HEAD, attachment or review floor changed during review");
       return ledger.recordEvidence({ task_id: task, repo, branch: attachment.branch, sha: head, kind: "review",
@@ -86,7 +86,7 @@ export function reviewNative(ledger: Ledger, task: string, repo: string, baseRef
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 }
 
-export function syncPr(ledger: Ledger, task: string, repo: string, pr?: string, branch?: string) {
+export function syncPr(ledger: Ledger, task: string, repo: string, pr?: string, branch?: string, beforeRecord?:()=>void) {
   const attachment = attached(ledger, task, repo, branch);
   const { dir } = resolveTaskCheckout(ledger.workbenchRoot, attachment);
   const branchRef = "refs/heads/" + attachment.branch;
@@ -100,6 +100,7 @@ export function syncPr(ledger: Ledger, task: string, repo: string, pr?: string, 
   const head = currentHead(attachment);
   const data = verifiedPr(dir, attachment.branch, head, pr);
   return ledger.db.transaction(() => {
+    beforeRecord?.();
     const live = attached(ledger, task, repo, attachment.branch);
     if (resolveTaskCheckout(ledger.workbenchRoot, live).dir !== dir || currentHead(live) !== head) throw new Error("Branch advanced while verifying PR");
     ledger.db.query("UPDATE task_repos SET head_sha = ? WHERE task_id = ? AND canonical_repo(repo) = canonical_repo(?) AND branch = ?")
@@ -109,9 +110,9 @@ export function syncPr(ledger: Ledger, task: string, repo: string, pr?: string, 
   }).immediate();
 }
 
-export function matchesReleasePr(dir: string, pin: { url:string; head:string; branch:string; base:string }) {
+export function matchesReleasePr(dir: string, pin: { url:string; head:string; branch:string; base:string; base_oid?:string;merged_oid?:string }) {
   try {
-    const pr = inspectPr(dir, pin.branch, pin.url, process.env, 2500);
-    return pr.state === "OPEN" && pr.headRefOid === pin.head && pr.baseRefName === pin.base;
+    const pr = inspectPr(dir, pin.branch, pin.url, process.env, 2500, {baseOid:!!pin.base_oid});
+    return !pin.merged_oid && pr.state === "OPEN" && pr.headRefOid === pin.head && pr.baseRefName === pin.base && (!pin.base_oid || pr.baseRefOid===pin.base_oid);
   } catch { return false; }
 }

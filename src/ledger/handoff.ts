@@ -6,12 +6,12 @@ import { runGit } from "../git";
 import { canonicalizeOsPath } from "../shared/path";
 import { resolveTaskCheckout } from "./checkout";
 import { verifiedPr } from "./pr";
-import type { Snapshot } from "./release-inspection";
+import type { HandoffItem, Snapshot } from "./release-inspection";
 import type { Ledger } from "./store";
 import { appendEventInTx, withImmediateTx } from "./transactions";
 import { evidenceSource, nowIso, type RunbookSqlFileAction } from "./types";
 
-export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback?: string) {
+export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback?: string, callbacks?:{verifyTarget:(repo:string,branch:string,oid:string,state:string)=>void; beforeRecord:(items:HandoffItem[])=>void; afterRecord:()=>void}) {
   function candidates() {
     const task = ledger.getTask(task_id);
     if (task?.status !== "OPEN" || !["pr", "prod"].includes(task.endpoint))
@@ -70,7 +70,8 @@ export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback
   const initial = candidates();
   const items = initial.map(({ repo, branch, base_sha, verified_head, dir, url, hint }) => {
     try {
-      const pr = verifiedPr(dir, branch, verified_head, url);
+      const pr = verifiedPr(dir, branch, verified_head, url, process.env, Boolean(callbacks));
+      callbacks?.verifyTarget(repo,branch,pr.baseRefOid,pr.state);
       if (typeof pr.baseRefName !== "string" || !pr.baseRefName) throw Error("PR has no base branch");
       return {
         repo,
@@ -88,6 +89,7 @@ export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback
   return withImmediateTx(ledger.db, () => {
     if (JSON.stringify(candidates()) !== JSON.stringify(initial))
       throw Error("Handoff changed; repeat ledger pr-sync");
+    callbacks?.beforeRecord(items);
     const sql_owners: NonNullable<Snapshot["sql_owners"]> = [];
     const sql_files = sql.map((spec) => {
       const match = /^(\[[^\]]+\](?::\d+)?|[^:,\s]+(?::\d+)?):(.+)$/.exec(spec);
@@ -141,6 +143,7 @@ export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback
         snapshot.rollback_plan,
       );
     ledger.db.query("UPDATE tasks SET status='HANDED_OFF' WHERE task_id=?").run(task_id);
+    callbacks?.afterRecord();
     return {
       task_id,
       status: "HANDED_OFF",

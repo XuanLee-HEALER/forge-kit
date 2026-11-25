@@ -1,3 +1,4 @@
+import { loadShipPolicy } from "./config";
 import { Database } from "bun:sqlite";
 import {
   chmodSync,
@@ -334,6 +335,7 @@ export function initWorkbench(opts: {
     ["AGENTS.local.md", "AGENTS.local.md"],
     ["workbench.yaml", ".workbench/workbench.yaml"],
     ["models.toml", ".workbench/models.toml"],
+    ["ship-policy.yaml", ".workbench/ship-policy.yaml"],
     ["environments.example.json", ".workbench/env/environments.example.json"],
     ["one-off-scripts-README.md", "one-off-scripts/README.md"],
   ];
@@ -456,6 +458,8 @@ export function syncWorkbench(opts?: {
     opts?.kitRoot ??
     (existsSync(prevLock.kit_root) ? prevLock.kit_root : findKitRoot());
   const manifest = loadKitManifest(kitRoot);
+  const policyPath = join(targetRoot,".workbench/ship-policy.yaml");
+  if (!existsSync(policyPath)) cpSync(join(kitRoot,"templates/ship-policy.yaml"),policyPath,{force:false});
   const cfg = loadWorkbenchConfig(targetRoot);
 
   syncManagedAssets({
@@ -850,8 +854,10 @@ export function doctorWorkbench(targetDir?: string): {
     }
   }
 
+  try { loadShipPolicy(root); } catch (err) { issues.push({level:"error",check:"ship-policy",message:String(err)}); }
+
   // 5. Binaries & review-agents launchers check
-  for (const binName of ["ledger", "guard", "ledger-hook", "wb-git", "dbcred", "cmdfmt", "lang-check", "wb-verify", "forge-review"]) {
+  for (const binName of ["ledger", "guard", "ledger-hook", "wb-git", "dbcred", "cmdfmt", "lang-check", "wb-verify", "forge-review", "forge-ship"]) {
     const p = join(root, ".workbench", "bin", binName);
     if (!existsSync(p)) {
       issues.push({

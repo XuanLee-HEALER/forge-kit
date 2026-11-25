@@ -1,4 +1,5 @@
 import { type WorkbenchConfig } from "../config";
+import { canonicalizeMaybePath } from "../shared/path";
 import { SQL_WRITE_RE } from "./sql-http";
 import {
   extractShellCommand,
@@ -51,14 +52,14 @@ export function checkLedgerTamper(
   input: CodexHookInput,
   cfg: WorkbenchConfig,
 ): string | null {
-  if (!cfg.guard.block_ledger_direct_edits) return null;
+  const policyPath = canonicalizeMaybePath(resolve(workbenchRoot,".workbench/ship-policy.yaml"));
   const ledgerDir = resolve(workbenchRoot, ".workbench", "ledger");
   const baseWorkdir = extractToolWorkdir(input);
 
-  // 1. File-editing & apply_patch tools directly touching .workbench/ledger/
   for (const rawPath of extractTouchedFilePaths(input)) {
     const abs = resolve(baseWorkdir, rawPath);
-    if (abs === ledgerDir || abs.startsWith(ledgerDir + "/")) {
+    if (input.tool_name !== "Read" && canonicalizeMaybePath(abs) === policyPath) return "ship-policy.yaml requires an operator edit.";
+    if (cfg.guard.block_ledger_direct_edits && (abs === ledgerDir || abs.startsWith(ledgerDir + "/"))) {
       return "物理保险丝：禁止直接修改 .workbench/ledger/ 下的账本文件，请使用 ledger CLI。";
     }
   }
@@ -69,6 +70,12 @@ export function checkLedgerTamper(
 
   for (const seg of splitShellSegments(cmd)) {
     const toks = splitShellTokens(seg);
+    const paths = toks?.slice(1).filter(t=>!t.startsWith("-")).map(t=>canonicalizeMaybePath(resolve(baseWorkdir,t))) ?? [];
+    if (toks?.[0]?.split("/").pop() === "find" && toks.includes("-delete") && toks[1]?.startsWith("-")) paths.push(canonicalizeMaybePath(baseWorkdir));
+    const ancestor = (/\b(rm|mv|rmdir|cp|rsync|tar|unzip|ditto)\b/.test(seg) || (toks?.some(t=>t.split("/").pop()==="find") && toks.includes("-delete"))) && paths.some(path=>policyPath.startsWith(path+"/"));
+    const gitDiff = toks?.[0]==="git" && toks[1]==="diff" && toks.slice(2).every(t=>t==="--" || canonicalizeMaybePath(resolve(baseWorkdir,t))===policyPath) && !hasUnquotedRedirect(seg,">");
+    if ((seg.includes("ship-policy.yaml") || paths.includes(policyPath) || ancestor) && !(gitDiff || (toks && isReadonlyLedgerHookInspection(cmd,seg,toks)))) return "ship-policy.yaml requires an operator edit.";
+    if (!cfg.guard.block_ledger_direct_edits) continue;
     if (toks) {
       const mentionsLedgerHook = toks.some((tok) => {
         const base = tok.split("/").pop() ?? "";

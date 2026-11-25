@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { ledgerDbPath } from "./types";
+import { fastTrackCommand } from "./fast-track";
 import { releaseCommand } from "./release";
 import { handoff, resume } from "./handoff";
 import { telemetryCli } from "./stats";
@@ -40,6 +41,8 @@ Commands:
   exempt    --repo <r> --branch <b> --reason <text> [--sha <sha> --ttl-hours <n>]
   status    [--task <id>] [--repo <r> --branch <b>] [--json]
   query     [--q <fts>] [--repo <r>] [--status <OPEN|HANDED_OFF|CLOSED|CANCELLED>] [--since <iso>] [--json]
+  fast-track prepare <task_id> --to <fat|pr|prod> --paths <globs> [--repos <repos>] [--ttl <minutes>]
+  fast-track status [<id>] [--task <task_id>] | revoke <id> [--reason <reason>]
   handoff   <task_id> [--sql host:path ...] [--rollback note]
   resume    <task_id> [--reason note]
   release   create --title text [--from-handoffs | --tasks ids | --prs repo#num,...] [--order repos]\n            PR selectors include every attachment of the selected handoff.
@@ -64,15 +67,20 @@ Commands:
 
   const root = findWorkbenchRoot();
   const telemetry = ["stats","tip","verify-tip"].includes(cmd);
-  const releaseStatus = cmd === "release" && rest[0] === "status";
+  const releaseStatus = (cmd === "release" || cmd === "fast-track") && rest[0] === "status";
   if (releaseStatus && !existsSync(ledgerDbPath(root))) {
-    if (rest.length !== 1) throw Error("Unknown release or invalid status arguments");
+    if (cmd==="fast-track") parseArgs({args:rest.slice(1),allowPositionals:true,options:{task:{type:"string"}}});
+    else if (rest.length !== 1) throw Error("Unknown release or invalid status arguments");
     console.log("[]");
     return;
   }
   const ledger = new Ledger(root, {readonly:telemetry || releaseStatus});
   try {
     if (telemetry) return telemetryCli(ledger,cmd,rest);
+    if (cmd === "fast-track") {
+      console.log(JSON.stringify(fastTrackCommand(ledger,rest), null, 2));
+      return;
+    }
     if (cmd === "release") {
       const result = releaseCommand(ledger,rest);
       console.log(JSON.stringify(result,null,2));

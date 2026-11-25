@@ -2,11 +2,11 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
-export function matchesGlob(filePath: string, glob: string): boolean {
+export function matchesGlob(filePath: string, glob: string, rootRelative = false): boolean {
   const normalized = filePath.replace(/\\/g, "/").replace(/^\/+/, "");
   const base = normalized.split("/").pop() ?? normalized;
   const normGlob = glob.replace(/\\/g, "/").replace(/^\.\//, "");
-  const target = normGlob.includes("/") ? normalized : base;
+  const target = rootRelative || normGlob.includes("/") ? normalized : base;
   let re = "^";
   let i = 0;
   while (i < normGlob.length) {

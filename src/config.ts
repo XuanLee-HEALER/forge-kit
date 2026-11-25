@@ -1,3 +1,5 @@
+import { parse as parseStrictYaml } from "yaml";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 
@@ -300,4 +302,62 @@ export function loadModelsConfig(root: string): ModelsConfig {
       },
     },
   };
+}
+
+export interface ShipPolicy {
+  enabled: boolean;
+  max_endpoint: "fat" | "pr" | "prod";
+  allow_prod: boolean;
+  forbid_db_rw: boolean;
+  max_files_changed: number;
+  max_lines_changed: number;
+  max_steward_rounds: number;
+  default_ttl_minutes: number;
+  require_independent_review: boolean;
+  require_ci_green_for_prod: boolean;
+  forbidden_paths: string[];
+}
+export function shipGlob(input: unknown): string {
+  if (typeof input !== "string") throw Error("Expected a relative path glob");
+  const glob = input.trim().replace(/^\.\//, "");
+  if (!glob || /[\\:\x00-\x1f\[\]{}]/.test(glob) || glob.split("/").some((s) => !s || s === "." || s === ".."))
+    throw Error("Invalid relative path glob: " + input);
+  return input.trim().startsWith("./") ? "./" + glob : glob;
+}
+
+export function loadShipPolicy(root: string) {
+  const bytes = readFileSync(join(root, ".workbench/ship-policy.yaml"));
+  const doc = parseStrictYaml(bytes.toString("utf8"), { uniqueKeys: true }) as {
+    fast_track?: Record<string, unknown>;
+  } | null;
+  const policy = doc?.fast_track;
+  if (!policy || typeof policy !== "object" || Object.keys(doc).length !== 1)
+    throw Error("Invalid fast_track policy");
+  const bools = [
+    "enabled",
+    "allow_prod",
+    "forbid_db_rw",
+    "require_independent_review",
+    "require_ci_green_for_prod",
+  ];
+  const limits = ["max_files_changed", "max_lines_changed", "max_steward_rounds", "default_ttl_minutes"];
+  const keys = [...bools, ...limits, "max_endpoint", "forbidden_paths"];
+  if (
+    Object.keys(policy).some((k) => !keys.includes(k)) ||
+    bools.some((k) => typeof policy[k] !== "boolean") ||
+    limits.some(
+      (k) => typeof policy[k] !== "number" || !Number.isSafeInteger(policy[k]) || Number(policy[k]) <= 0,
+    ) ||
+    !["fat", "pr", "prod"].includes(String(policy.max_endpoint)) ||
+    !Array.isArray(policy.forbidden_paths)
+  )
+    throw Error("Invalid or missing fast_track policy fields");
+  if (policy.allow_prod && !policy.require_ci_green_for_prod) throw Error("Production fast-track requires green CI");
+  return {
+    policy: { ...policy, forbidden_paths: policy.forbidden_paths.map(shipGlob) } as ShipPolicy,
+    hash: createHash("sha256").update(bytes).digest("hex"),
+  };
+}
+export function computeShipPolicyHash(root: string) {
+  return loadShipPolicy(root).hash;
 }

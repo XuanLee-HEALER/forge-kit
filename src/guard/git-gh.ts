@@ -139,7 +139,7 @@ export function isApprovedTagPushRefspec(params: {
   for (const rb of approvedRunbooks) {
     for (const entry of rb.actions.tags) {
       if (entry.repo.toLowerCase() !== loc.repo.toLowerCase()) continue;
-      if (entry.tag !== cleanDst) continue;
+      if (entry.tag !== cleanDst || (entry.remote && entry.remote !== [pushId.host,pushId.owner,pushId.repo].join("/"))) continue;
       const expectedSha = entry.sha.toLowerCase();
       if (liveTagCommit === expectedSha) return true;
       const expectedRev = runGit(loc.checkoutDir, ["rev-parse", "--verify", `${expectedSha}^{commit}`], 3000);

@@ -143,6 +143,7 @@ export interface ExemptionRecord {
 export type RunbookStatus = "PENDING" | "APPROVED" | "COMPLETED" | "REVOKED";
 
 export interface RunbookTagAction {
+  remote?: string;
   repo: string;
   tag: string;
   sha: string;
@@ -151,7 +152,7 @@ export interface RunbookTagAction {
 export interface RunbookPrAction {
   repo: string;
   number: number;
-  pin?: { url: string; head: string; branch: string; base: string };
+  pin?: { url: string; head: string; branch: string; base: string; base_oid?: string; merged_oid?:string };
 }
 
 export interface RunbookSqlFileAction {

@@ -1,0 +1,20 @@
+fast_track:
+  enabled: true
+  max_endpoint: pr
+  allow_prod: false
+  forbid_db_rw: true
+  max_files_changed: 25
+  max_lines_changed: 800
+  max_steward_rounds: 3
+  default_ttl_minutes: 240
+  require_independent_review: true
+  require_ci_green_for_prod: true
+  forbidden_paths:
+    - "**/migrations/**"
+    - "**/migration/**"
+    - "**/auth/**"
+    - "**/billing/**"
+    - "**/payment/**"
+    - "infra/**"
+    - ".workbench/**"
+    - ".codex/**"
