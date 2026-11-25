@@ -1,3 +1,5 @@
+import { normalizeDbHost, normalizeDbHosts } from "../config";
+import { loadDbEnvironments } from "../config";
 import { type ApprovedRunbookEntry } from "./runbook-state";
 import { canonicalizeOsPath, sha256File } from "../shared/path";
 import {
@@ -128,12 +130,21 @@ function isAllowedDbcredSubstitution(
   inner: string,
   workbenchRoot: string,
   workdir: string,
+  runbook: ApprovedRunbookEntry,
+  host: string,
 ): boolean {
   const trimmed = inner.trim();
   if (!trimmed || /[;|&`<>()\n\r\0'"]/.test(trimmed)) return false;
   const parts = trimmed.split(/[ \t]+/).filter(Boolean);
-  if (parts.length !== 2) return false;
-  const [bin, envArg] = parts;
+  const [bin, envArg, ...flags] = parts;
+  if (!envArg || !/^[A-Za-z0-9._/-]+$/.test(bin)) return false;
+  if (flags.length && !(flags.length === 1 && flags[0] === "--ro")) {
+    if (flags[0] !== "--rw" || flags[1] !== "--runbook" || flags[2] !== runbook.record.runbook_id) return false;
+    if (flags.length !== 3 && !(flags.length === 5 && flags[3] === "--session" &&
+        /^[A-Za-z0-9._-]+$/.test(flags[4]) && flags[4] === runbook.record.approved_session_id)) return false;
+    const destinations = normalizeDbHosts(loadDbEnvironments(workbenchRoot)[envArg]?.host ?? "");
+    if (!host || !destinations.every(destination => destination === host)) return false;
+  }
   if (!/^[A-Za-z0-9._-]+$/.test(envArg)) return false;
   // Never permit bare `dbcred` resolved via PATH; must be an explicit relative/absolute path
   if (!bin.includes("/")) return false;
@@ -154,6 +165,8 @@ function isSafeSingleSqlShellCommand(
   cmd: string,
   workbenchRoot: string,
   workdir: string,
+  runbook: ApprovedRunbookEntry,
+  host: string,
 ): boolean {
   let quote: "'" | '"' | null = null;
   let escape = false;
@@ -183,7 +196,7 @@ function isSafeSingleSqlShellCommand(
         const closeIdx = cmd.indexOf(")", i + 2);
         if (closeIdx === -1) return false;
         const inner = cmd.slice(i + 2, closeIdx);
-        if (!isAllowedDbcredSubstitution(inner, workbenchRoot, workdir)) return false;
+        if (!isAllowedDbcredSubstitution(inner, workbenchRoot, workdir, runbook, host)) return false;
         i = closeIdx;
         continue;
       }
@@ -558,8 +571,7 @@ const MYSQL_SHORT_VALUE_FLAGS = new Set(["h", "P", "u", "p", "D"]);
 const MYSQL_SHORT_BOOL_FLAGS = new Set(["v", "B", "N", "s", "A"]);
 
 function normalizeSqlHosts(bin: string, values: string[]): string[] {
-  return values.flatMap((value) => bin === "psql" ? value.split(",") : [value])
-    .map((host) => host.trim().toLowerCase());
+  return bin === "psql" || bin === "usql" ? values.flatMap(normalizeDbHosts) : values.map(normalizeDbHost);
 }
 
 function parseSqlClientArgs(bin: "psql" | "mysql" | "usql", toks: string[], inspectWrites: boolean) {
@@ -671,8 +683,8 @@ function parseApprovedSqlMigrationCommand(
   workbenchRoot: string,
   cmd: string,
   workdir: string,
+  runbook: ApprovedRunbookEntry,
 ): { host: string; sqlRealPath: string } | null {
-  if (!isSafeSingleSqlShellCommand(cmd, workbenchRoot, workdir)) return null;
   if (splitShellSegments(cmd).length !== 1) return null;
   const extracted = extractSqlTokensAndStdinRedirects(cmd);
   if (!extracted || extracted.args.length < 2) return null;
@@ -713,6 +725,7 @@ function parseApprovedSqlMigrationCommand(
   const normalizedHosts = new Set(normalizeSqlHosts(bin, hostCandidates));
   if (normalizedHosts.has("") || normalizedHosts.size !== 1) return null;
   const effectiveHost = [...normalizedHosts][0];
+  if (!isSafeSingleSqlShellCommand(cmd, workbenchRoot, workdir, runbook, effectiveHost)) return null;
 
   const sqlRealPath = canonicalizeOsPath(workdir, allFiles[0]);
   if (!sqlRealPath) return null;
@@ -934,24 +947,12 @@ export function checkProdDb(
   }
 
   if (SQL_FILE_FLAG_RE.test(cmd) || hasUnquotedRedirect(cmd, "<") || hasSqlClientFileOption(cmd)) {
-    if (approvedRunbooks.length > 0) {
-      const parsed = parseApprovedSqlMigrationCommand(workbenchRoot, cmd, toolWorkdir);
-      if (parsed && prodHosts.some((h) => h.toLowerCase() === parsed.host)) {
-        const liveSha = sha256File(parsed.sqlRealPath);
-        if (
-          liveSha &&
-          approvedRunbooks.some((rb) =>
-            rb.actions.sql_files.some(
-              (sf) =>
-                sf.host.toLowerCase() === parsed.host &&
-                sf.path === parsed.sqlRealPath &&
-                sf.sha256 === liveSha,
-            ),
-          )
-        ) {
-          return null;
-        }
-      }
+    for (const runbook of approvedRunbooks) {
+      const parsed = parseApprovedSqlMigrationCommand(workbenchRoot, cmd, toolWorkdir, runbook);
+      if (!parsed || !prodHosts.some(h => h.toLowerCase() === parsed.host)) continue;
+      const liveSha = sha256File(parsed.sqlRealPath);
+      if (liveSha && runbook.actions.sql_files.some(sf => normalizeDbHosts(sf.host).includes(parsed.host) &&
+          sf.path === parsed.sqlRealPath && sf.sha256 === liveSha)) return null;
     }
     return `物理保险丝：检测到连接 prod 数据库 (${matchedHost}) 且 SQL 来自文件或标准输入，禁止自动执行（如需发版迁移，请先创建 Runbook 登记 SQL 文件并由用户在对话中回复「批准 <runbook_id>」）。`;
   }

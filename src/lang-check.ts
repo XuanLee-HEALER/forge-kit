@@ -1,5 +1,9 @@
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
+import { runVerificationProcess } from "./verification-process";
+import { hasNonExecutingNpmFlags } from "./shared/pkg-manager";
+import { hasNonExecutingGoFlags } from "./shared/go";
+import { splitShellTokens } from "./shared/shell";
 import { parseArgs } from "node:util";
 import { runProcess } from "./git";
 
@@ -125,7 +129,63 @@ export function detectRepoLanguages(targetDir: string): CheckLanguage[] {
   return langs;
 }
 
-function execCheck(
+export function isPytestInfoSwitch(arg: string): boolean {
+  // pytest accepts grouped switches, including -VV for verbose version information.
+  return /^-[qvsxl]*[Vh]/.test(arg);
+}
+
+export function zeroTestRun(bin: string, code: number, output: string) {
+  const delegated = ["npm","pnpm","yarn","bun"].includes(bin);
+  // In delegated runs use the underlying runner's summary, not just the manager's name.
+  const collected = /^\s*(?:=+\s*)?(?:no|\d+(?:\/\d+)?)\s+tests?\s+collected(?:\s+in|\s+\(|\s*=+\s*$|\s*$)/im.test(output);
+  const pytestInfo = /^(?:This is pytest version \S+, imported from .+|pytest \d+\.\d+\S*|usage: (?:pytest|py\.test) \[options\].*)$/m.test(output);
+  const pytestOutput = collected || pytestInfo || /(?:^|\n)>\s+[^\n]*\bpytest\b|^platform .+ -- Python .+pytest-/m.test(output);
+  if (bin === "pytest" || (delegated && pytestOutput)) {
+    const options = splitShellTokens(process.env.PYTEST_ADDOPTS ?? "");
+    const nonExecuting = new Set(["--collect-only","--collectonly","--co","--setup-only","--setuponly","--setup-plan","--setupplan",
+      "--markers","--fixtures","--funcargs","--fixtures-per-test","--version","--help","-V","-h"]);
+    if (code === 5) return true;
+    if (code !== 0) return false;
+    const executed = /^\s*(?:=+\s*)?\d+ passed\b/m.test(output) || /^\s*[1-9]\d* pass\s*$/m.test(output);
+    if (pytestInfo && !executed) return true;
+    if (!options || options.some(a => nonExecuting.has(a.split("=")[0]) || isPytestInfoSwitch(a)) || collected) return true;
+  }
+  if (delegated && code === 5 && /no tests (?:ran|collected)/i.test(output)) return true;
+  if (code !== 0) return false;
+  if (bin === "cargo" || delegated) {
+    const summaries = [...output.matchAll(/^\s*(?:test result: [^\n]*?\b)?(\d+)\s+passed;\s*(\d+)\s+failed\b/gm)];
+    if (summaries.length) return summaries.every(match => Number(match[1]) + Number(match[2]) === 0);
+    const zero = /^\s*running 0 tests\b/m.test(output);
+    const ran = /^\s*running [1-9]\d* tests?\b/m.test(output);
+    if (zero || ran) return zero && !ran;
+  }
+  if (bin === "node" || delegated) {
+    if (/^# tests 0\s*$/m.test(output) || (/^# pass 0\s*$/m.test(output) && /^# fail 0\s*$/m.test(output))) return true;
+  }
+  if (bin === "go" || delegated) {
+    let skipped = false, ran = false;
+    for (const line of output.split("\n")) {
+      if (/^(?:ok\s|\?\s)/.test(line) && /\[no (?:test files|tests to run)\]\s*$/.test(line)) skipped = true;
+      else if (/^ok\s+\S|^\s*--- PASS:/.test(line)) ran = true;
+      if (!line.startsWith("{") || !line.includes('"Package"')) continue;
+      try {
+        const event = JSON.parse(line);
+        if (typeof event.Package !== "string") continue;
+        if (event.Action === "pass" && event.Test) ran = true;
+        if (event.Action === "skip" || /\[no (?:test files|tests to run)\]\s*$/.test(event.Output ?? "")) skipped = true;
+      } catch { /* A delegated runner can also emit unrelated JSON. */ }
+    }
+    if (bin === "go" || skipped || ran) return !ran;
+  }
+  if (!delegated || /^\s*[1-9]\d* pass\s*$/m.test(output)) return false;
+  return (/^\s*0 pass\s*$/m.test(output) && /^\s*0 fail\s*$/m.test(output)) ||
+    /^\s*(?:Ran\s+)?0 tests?(?: across \d+ files?\.?)?\s*$/im.test(output);
+}
+
+type OutputObserver = (phase: "static" | "dynamic", stdout: Uint8Array, stderr: Uint8Array) => void;
+
+function executeCheck(
+  onOutput: OutputObserver | undefined,
   language: CheckLanguage,
   phase: "static" | "dynamic",
   name: string,
@@ -134,27 +194,42 @@ function execCheck(
   extraEnv?: Record<string, string>,
   timeoutMs = 120_000,
 ): LangCheckItem {
+  const bin = basename(argv[0]);
+  const blocked = (bin === "npm" && hasNonExecutingNpmFlags()) ||
+    (bin === "go" && hasNonExecutingGoFlags(argv[0], cwd, argv.slice(1)));
+  if (blocked) {
+    return {
+      language, phase, name, command: argv.join(" "), status: "fail", exit_code: null,
+      duration_ms: 0, output_excerpt: bin + " configuration prevents verification",
+    };
+  }
   const started = Date.now();
-  const res = runProcess(argv, {
+  const res = runVerificationProcess(argv, phase === "dynamic", {
     cwd,
-    env: extraEnv ? { ...process.env, ...extraEnv } : undefined,
+    env: extraEnv,
     timeoutMs,
+    onOutput: (stdout, stderr) => onOutput?.(phase, stdout, stderr),
   });
   const duration_ms = Date.now() - started;
   const combined = `${res.stdout}${res.stderr}`.trim();
+  const skipped = res.noPytestCalls || (phase === "dynamic" && zeroTestRun(basename(argv[0]), res.code, combined));
   return {
     language,
     phase,
     name,
     command: argv.join(" "),
-    status: res.code === 0 ? "pass" : "fail",
+    status: skipped ? "skipped" : res.code === 0 ? "pass" : "fail",
     exit_code: res.code,
     duration_ms,
-    output_excerpt: combined ? combined.slice(-600) : undefined,
+    output_excerpt: skipped ? "no test files" : combined ? combined.slice(-600) : undefined,
   };
 }
 
-function runGoChecks(targetDir: string, mode: CheckMode): LangCheckItem[] {
+function bindCheck(observer?: OutputObserver) {
+  return executeCheck.bind(null, observer);
+}
+
+function runGoChecks(targetDir: string, mode: CheckMode, execCheck: ReturnType<typeof bindCheck>): LangCheckItem[] {
   const items: LangCheckItem[] = [];
   const goBin = whichBin("go", targetDir);
   if (!goBin) {
@@ -193,7 +268,7 @@ function runGoChecks(targetDir: string, mode: CheckMode): LangCheckItem[] {
   return items;
 }
 
-function runTsChecks(targetDir: string, mode: CheckMode): LangCheckItem[] {
+function runTsChecks(targetDir: string, mode: CheckMode, execCheck: ReturnType<typeof bindCheck>): LangCheckItem[] {
   const items: LangCheckItem[] = [];
   let pkg: { scripts?: Record<string, string> } | null = null;
   const pkgPath = join(targetDir, "package.json");
@@ -284,7 +359,7 @@ function runTsChecks(targetDir: string, mode: CheckMode): LangCheckItem[] {
   return items;
 }
 
-function runPythonChecks(targetDir: string, mode: CheckMode): LangCheckItem[] {
+function runPythonChecks(targetDir: string, mode: CheckMode, execCheck: ReturnType<typeof bindCheck>): LangCheckItem[] {
   const items: LangCheckItem[] = [];
   const pyBin = whichBin("python3", targetDir) ?? whichBin("python", targetDir);
 
@@ -350,6 +425,7 @@ export function runLangChecks(opts: {
   targetDir: string;
   mode?: CheckMode;
   lang?: "auto" | CheckLanguage;
+  onOutput?: OutputObserver;
 }): LangCheckReport {
   const mode: CheckMode = opts.mode ?? "all";
   const resolvedDir = existsSync(opts.targetDir)
@@ -365,10 +441,11 @@ export function runLangChecks(opts: {
       : detectRepoLanguages(resolvedDir);
 
   const checks: LangCheckItem[] = [];
+  const execCheck = bindCheck(opts.onOutput);
   for (const lang of detected) {
-    if (lang === "go") checks.push(...runGoChecks(resolvedDir, mode));
-    else if (lang === "ts") checks.push(...runTsChecks(resolvedDir, mode));
-    else if (lang === "python") checks.push(...runPythonChecks(resolvedDir, mode));
+    if (lang === "go") checks.push(...runGoChecks(resolvedDir, mode, execCheck));
+    else if (lang === "ts") checks.push(...runTsChecks(resolvedDir, mode, execCheck));
+    else if (lang === "python") checks.push(...runPythonChecks(resolvedDir, mode, execCheck));
   }
 
   const executed = checks.filter((c) => c.status !== "skipped").length;

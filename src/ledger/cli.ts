@@ -1,3 +1,4 @@
+import { telemetryCli } from "./stats";
 import { reviewNative, syncPr } from "./delivery-tools";
 import { findWorkbenchRoot } from "../config";
 import { runReviewFallback } from "./review-fallback";
@@ -35,6 +36,9 @@ Commands:
   exempt    --repo <r> --branch <b> --reason <text> [--sha <sha> --ttl-hours <n>]
   status    [--task <id>] [--repo <r> --branch <b>] [--json]
   query     [--q <fts>] [--repo <r>] [--status <OPEN|CLOSED|CANCELLED>] [--since <iso>] [--json]
+  stats     [--days N] [--json]
+  tip       <task_id>
+  verify-tip <task_id>@<hash> | --task <id> --tip <hash>
   verify    [--task <id>] [--json]
   close     <task_id> [--summary <text>] [--no-archive] [--force-incomplete --reason <text>]
   archive   <task_id>
@@ -48,8 +52,10 @@ Commands:
   }
 
   const root = findWorkbenchRoot();
-  const ledger = new Ledger(root);
+  const telemetry = ["stats","tip","verify-tip"].includes(cmd);
+  const ledger = new Ledger(root, {readonly:telemetry});
   try {
+    if (telemetry) return telemetryCli(ledger,cmd,rest);
     if (cmd === "open") {
       const { values } = parseArgs({
         args: rest,

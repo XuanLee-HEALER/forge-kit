@@ -21,8 +21,8 @@
     "engine": "postgres",
     "host": "db-prod.example.internal",
     "port": 5432,
-    "user": "prod_ro",
-    "password": "CHANGE_ME",
+    "ro": { "user": "prod_ro", "password": "CHANGE_ME" },
+    "rw": { "user": "prod_rw", "password": "CHANGE_ME" },
     "database": "app_prod",
     "sslmode": "require"
   }

@@ -3,6 +3,7 @@ import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
 import { findWorkbenchRoot, loadWorkbenchConfig } from "./config";
 import { listWorkbenchRepos, runGit, runProcess } from "./git";
+import { fatMerge } from "./ledger/fat-merge";
 import { Ledger } from "./ledger";
 
 export interface WorktreeInfo {
@@ -463,7 +464,8 @@ export function runWbGitCli(): void {
   const [cmd, ...rest] = process.argv.slice(2);
   const root = findWorkbenchRoot();
   if (!cmd || cmd === "--help" || cmd === "-h") {
-    console.log(`Usage: wb-git <status|sweep> [options]
+    console.log(`Usage: wb-git <status|sweep|fat-merge> [options]
+  fat-merge <repo> <feature-branch> [--task ID] [--fat-branch fat] [--cherry-pick] [--no-push] [--verify-cmd COMMAND]
   status [--prs] [--json] [--repo <name>] [--all-discovered]
   sweep  [--apply] [--repo <name>] [--keep <regex>] [--no-fetch] [--all-discovered]`);
     process.exit(0);
@@ -485,6 +487,14 @@ export function runWbGitCli(): void {
     });
     if (values.json) console.log(JSON.stringify(facts, null, 2));
     else printGitFacts(facts);
+  } else if (cmd === "fat-merge") {
+    const {values, positionals} = parseArgs({args:rest, allowPositionals:true, options:{
+      task:{type:"string"}, "verify-cmd":{type:"string"}, "fat-branch":{type:"string", default:"fat"}, "cherry-pick":{type:"boolean"}, "no-push":{type:"boolean"}
+    }});
+    if (positionals.length !== 2) throw Error("Expected <repo> <feature-branch>");
+    const ledger = new Ledger(root);
+    try { console.log(JSON.stringify(fatMerge(ledger,positionals[0],positionals[1],values["fat-branch"]!,values.task,values["cherry-pick"],values["no-push"],values["verify-cmd"]))); }
+    finally { ledger.closeDb(); }
   } else if (cmd === "sweep") {
     const { values } = parseArgs({
       args: rest,

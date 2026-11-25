@@ -66,6 +66,9 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     expect(existsSync(join(res.root, ".codex", "agents", "spec-reviewer.toml"))).toBe(true);
     expect(existsSync(join(res.root, ".workbench", "bin", "lang-check"))).toBe(true);
 
+    for (const name of ["wb-verify", "forge-review"])
+      expect(lstatSync(join(res.root, ".workbench/bin", name)).mode & 0o111).toBeTruthy();
+
     // Customize private rules + models.toml + inline YAML repos array
     writeFileSync(join(res.root, "AGENTS.local.md"), "# My Private Local Rules\n");
     writeFileSync(
@@ -110,6 +113,12 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
       "# My Private Local Rules\n",
     );
 
+    for (const bin of ["forge-review", "wb-verify"]) {
+      const check = Bun.spawnSync([join(res.root, ".workbench/bin", bin), "--task", "absent"],
+        { cwd:res.root, env:{...process.env,BUN_BIN:process.execPath} });
+      expect(check.exitCode).toBe(1);
+      expect(JSON.parse(check.stdout.toString()).ok).toBe(false);
+    }
     const doc = doctorWorkbench(res.root);
     expect(doc.ok).toBe(true);
     expect(doc.issues.length).toBe(0);

@@ -45,16 +45,16 @@ export class Ledger {
   readonly dbPath: string;
   readonly workbenchRoot: string;
 
-  constructor(workbenchRoot: string, opts?: { dbPath?: string; busyTimeoutMs?: number }) {
+  constructor(workbenchRoot: string, opts?: { dbPath?: string; busyTimeoutMs?: number; readonly?: boolean }) {
     this.workbenchRoot = workbenchRoot;
     this.dbPath = opts?.dbPath ?? ledgerDbPath(workbenchRoot);
-    mkdirSync(dirname(this.dbPath), { recursive: true });
-    this.db = new Database(this.dbPath, { create: true });
+    if (!opts?.readonly) mkdirSync(dirname(this.dbPath), { recursive: true });
+    this.db = new Database(this.dbPath, opts?.readonly ? { readonly:true } : { create:true });
     // Set busy_timeout FIRST (lower than outer hook timeout to prevent colliding timeouts).
     const busyMs = opts?.busyTimeoutMs ?? 2500;
     this.db.exec(`PRAGMA busy_timeout = ${busyMs};`);
     this.db.exec("PRAGMA foreign_keys = ON;");
-    ensureInitialized(this.db);
+    if (!opts?.readonly) ensureInitialized(this.db);
   }
 
   closeDb(): void {

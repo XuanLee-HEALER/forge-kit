@@ -35,6 +35,8 @@ bin_bundles = [
   "dbcred.js",
   "cmdfmt.js",
   "lang-check.js",
+  "wb-verify.js",
+  "forge-review.js",
 ]
 
 bin_wrappers = [
@@ -45,6 +47,8 @@ bin_wrappers = [
   "dbcred",
   "cmdfmt",
   "lang-check",
+  "wb-verify",
+  "forge-review",
 ]
 
 [private]

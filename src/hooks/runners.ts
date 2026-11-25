@@ -1,3 +1,7 @@
+import { parseNodeTestInvocation } from "../shared/test-inputs";
+import { tscTargets } from "../shared/tsc";
+import { extractMakeDirs, extractMakeTargets } from "../shared/make";
+export { hasMakeNonExecArgs } from "../shared/make";
 import {
   BUN_BUILD_VALUE_FLAGS,
   isScriptNameKind,
@@ -128,85 +132,6 @@ export function isPytestInvocation(cmdToks: string[]): { argsStart: number } | n
     return { argsStart: 3 };
   }
   return null;
-}
-
-const NODE_TEST_ALLOWED_VALUE_FLAGS = new Set([
-  "-r",
-  "--require",
-  "--import",
-  "--loader",
-  "--experimental-loader",
-  "-C",
-  "--conditions",
-  "--env-file",
-  "--env-file-if-exists",
-  "--test-name-pattern",
-  "--test-skip-pattern",
-  "--test-reporter",
-  "--test-reporter-destination",
-  "--test-shard",
-  "--test-timeout",
-  "--test-concurrency",
-  "--max-old-space-size",
-  "--redirect-warnings",
-  "--title",
-]);
-
-const NODE_TEST_ALLOWED_BOOL_FLAGS = new Set([
-  "--test",
-  "--test-force-exit",
-  "--experimental-test-coverage",
-  "--experimental-strip-types",
-  "--experimental-transform-types",
-  "--experimental-vm-modules",
-  "--no-warnings",
-  "--enable-source-maps",
-  "--trace-uncaught",
-  "--trace-warnings",
-]);
-
-function parseNodeTestInvocation(cmdToks: string[]): { files: string[] } | null {
-  const bin0 = (cmdToks[0] ?? "").split("/").pop() ?? "";
-  if (bin0 !== "node") return null;
-  let sawTestFlag = false;
-  let idx = 1;
-  // Parse strictly allowlisted Node CLI options BEFORE the first positional entry point
-  // (automatically rejects `--v8-options`, `-v`, `-h`, `-e`, `-p`, `-c`, `--watch`, `--test-only`, etc.)
-  while (idx < cmdToks.length) {
-    const t = cmdToks[idx];
-    if (t === "--") {
-      idx++;
-      break;
-    }
-    if (!t.startsWith("-") || t === "-") {
-      break;
-    }
-    const eq = t.indexOf("=");
-    const name = eq >= 0 ? t.slice(0, eq) : t;
-    if (name === "--test") {
-      if (eq >= 0) return null;
-      sawTestFlag = true;
-      idx++;
-      continue;
-    }
-    if (NODE_TEST_ALLOWED_BOOL_FLAGS.has(name) && eq < 0) {
-      idx++;
-      continue;
-    }
-    if (NODE_TEST_ALLOWED_VALUE_FLAGS.has(name)) {
-      if (eq < 0) {
-        if (idx + 1 >= cmdToks.length) return null;
-        idx += 2;
-      } else {
-        idx++;
-      }
-      continue;
-    }
-    return null;
-  }
-  if (!sawTestFlag) return null;
-  const files = cmdToks.slice(idx).filter((a) => a && a !== "--" && !a.startsWith("-"));
-  return { files };
 }
 
 const VITEST_NON_RUN_SUBCMDS = new Set([
@@ -382,7 +307,7 @@ export function classifyVerifyCommand(metaToks: ShellToken[]): VerificationHit |
       else if (!cmdToks[i].startsWith("-")) return null;
     }
   }
-  const makeTarget = bin0 === "make" ? extractSingleMakeTarget(cmdToks.slice(1)) : null;
+  const makeTarget = bin0 === "make" ? extractMakeTargets(cmdToks.slice(1)).join(" ") : null;
 
   // lang-check (forge-kit unified Go/TS/Python static & dynamic checker)
   if (parseLangCheckInvocation(cmdToks)) {
@@ -513,246 +438,6 @@ export function hasInfoOnlyFlag(toks: string[]): boolean {
   }
   return false;
 }
-
-const MAKE_ALL_LONG_OPTS = [
-  "always-make",
-  "directory",
-  "debug",
-  "environment-overrides",
-  "file",
-  "makefile",
-  "help",
-  "ignore-errors",
-  "include-dir",
-  "jobs",
-  "keep-going",
-  "load-average",
-  "max-load",
-  "check-symlink-times",
-  "just-print",
-  "dry-run",
-  "recon",
-  "old-file",
-  "assume-old",
-  "print-data-base",
-  "question",
-  "no-builtin-rules",
-  "no-builtin-variables",
-  "silent",
-  "quiet",
-  "no-keep-going",
-  "stop",
-  "touch",
-  "version",
-  "print-directory",
-  "no-print-directory",
-  "what-if",
-  "new-file",
-  "assume-new",
-  "warn-undefined-variables",
-  "NeXT-option",
-  "eval",
-  "output-sync",
-  "trace",
-];
-
-const MAKE_NON_EXEC_LONG = new Set([
-  "just-print",
-  "dry-run",
-  "recon",
-  "question",
-  "touch",
-  "version",
-  "help",
-  "ignore-errors",
-  "old-file",
-  "assume-old",
-  "eval",
-]);
-
-const MAKE_VALUE_LONG = new Set([
-  "directory",
-  "file",
-  "makefile",
-  "include-dir",
-  "what-if",
-  "new-file",
-  "assume-new",
-  "NeXT-option",
-]);
-
-const MAKE_VALUE_SHORT = new Set(["C", "f", "I", "W", "N"]);
-
-const MAKE_OPT_VALUE_SHORT = new Set(["j", "l", "O"]);
-
-const MAKE_NON_EXEC_SHORT = new Set(["n", "q", "t", "v", "h", "i", "o"]);
-
-function shouldConsumeMakeOptArg(opt: string, next: string | undefined): boolean {
-  if (!next) return false;
-  if (opt === "j" || opt === "jobs") return /^\d+$/.test(next);
-  if (opt === "l" || opt === "load-average" || opt === "max-load") {
-    // Matches GNU Make `decode_switches` floating arg: starts with digit or '.', parsed completely by C `strtod`
-    // (decimal float with optional scientific exponent, or C99 hex float).
-    return /^(?:(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?|0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)(?:[pP][+-]?\d+)?)$/.test(
-      next,
-    );
-  }
-  return false;
-}
-
-function extractSingleMakeTarget(args: string[]): string | null {
-  let target: string | null = null;
-  let afterDoubleDash = false;
-  for (let i = 0; i < args.length; i++) {
-    const tok = args[i];
-    if (!afterDoubleDash) {
-      if (tok === "--") {
-        afterDoubleDash = true;
-        continue;
-      }
-      if (tok.startsWith("--") && tok.length > 2) {
-        const eqIdx = tok.indexOf("=");
-        const name = eqIdx >= 0 ? tok.slice(2, eqIdx) : tok.slice(2);
-        const matches = MAKE_ALL_LONG_OPTS.filter((opt) => opt.startsWith(name));
-        if (eqIdx < 0 && matches.length === 1) {
-          const m = matches[0];
-          if (
-            MAKE_VALUE_LONG.has(m) ||
-            m === "old-file" ||
-            m === "assume-old" ||
-            m === "eval" ||
-            shouldConsumeMakeOptArg(m, args[i + 1])
-          ) {
-            i++;
-          }
-        }
-        continue;
-      }
-      if (tok.startsWith("-") && tok.length > 1) {
-        for (let j = 1; j < tok.length; j++) {
-          const ch = tok[j];
-          if (MAKE_VALUE_SHORT.has(ch) || ch === "o") {
-            if (j === tok.length - 1) i++;
-            break;
-          }
-          if (MAKE_OPT_VALUE_SHORT.has(ch)) {
-            if (j === tok.length - 1 && shouldConsumeMakeOptArg(ch, args[i + 1])) {
-              i++;
-            }
-            break;
-          }
-        }
-        continue;
-      }
-    }
-    if (/^[A-Za-z_][A-Za-z0-9_.-]*\s*(?:::=|:=|\+=|\?=|=)/.test(tok)) {
-      continue;
-    }
-    if (target !== null) return null;
-    target = tok;
-  }
-  return target;
-}
-
-export function hasMakeNonExecArgs(args: string[], inMakeflags = false): boolean {
-  for (let i = 0; i < args.length; i++) {
-    const tok = args[i];
-    if (tok === "--") break;
-    if (tok.startsWith("--") && tok.length > 2) {
-      const eqIdx = tok.indexOf("=");
-      const name = eqIdx >= 0 ? tok.slice(2, eqIdx) : tok.slice(2);
-      const matches = MAKE_ALL_LONG_OPTS.filter((opt) => opt.startsWith(name));
-      const nonExecMatch = matches.some((m) => {
-        if (inMakeflags && (m === "old-file" || m === "assume-old")) return false;
-        return MAKE_NON_EXEC_LONG.has(m);
-      });
-      if (nonExecMatch) return true;
-      if (eqIdx < 0 && matches.length === 1 && MAKE_VALUE_LONG.has(matches[0])) {
-        i++;
-      }
-      continue;
-    }
-    if ((tok.startsWith("-") && tok.length > 1) || (inMakeflags && i === 0 && !tok.includes("="))) {
-      const letters = tok.startsWith("-") ? tok.slice(1) : tok;
-      for (let j = 0; j < letters.length; j++) {
-        const ch = letters[j];
-        if (MAKE_NON_EXEC_SHORT.has(ch) && !(inMakeflags && ch === "o")) return true;
-        if (MAKE_VALUE_SHORT.has(ch) || (inMakeflags && ch === "o")) {
-          if (j === letters.length - 1) i++;
-          break;
-        }
-        if (MAKE_OPT_VALUE_SHORT.has(ch)) break;
-      }
-    }
-  }
-  return false;
-}
-
-const TSC_WATCH_ALWAYS_VALUE_OPTS = [
-  "fallbackpolling",
-  "watchdirectory",
-  "watchfile",
-];
-
-const TSC_WATCH_LIST_OPTS = [
-  "excludedirectories",
-  "excludefiles",
-];
-
-export const TSC_BUILD_ALWAYS_VALUE_OPTS = new Set([
-  "generatecpuprofile",
-  "generatetrace",
-  "locale",
-  ...TSC_WATCH_ALWAYS_VALUE_OPTS,
-]);
-
-export const TSC_BUILD_LIST_OPTS = new Set(TSC_WATCH_LIST_OPTS);
-
-export const TSC_NORMAL_ALWAYS_VALUE_OPTS = new Set([
-  "baseurl",
-  "charset",
-  "declarationdir",
-  "generatecpuprofile",
-  "generatetrace",
-  "ignoredeprecations",
-  "importsnotusedasvalues",
-  "jsx",
-  "jsxfactory",
-  "jsxfragmentfactory",
-  "jsximportsource",
-  "locale",
-  "m",
-  "maproot",
-  "maxnodemodulejsdepth",
-  "module",
-  "moduledetection",
-  "moduleresolution",
-  "newline",
-  "out",
-  "outdir",
-  "outfile",
-  "p",
-  "project",
-  "reactnamespace",
-  "rootdir",
-  "sourceroot",
-  "t",
-  "target",
-  "tsbuildinfofile",
-  ...TSC_WATCH_ALWAYS_VALUE_OPTS,
-]);
-
-export const TSC_NORMAL_LIST_OPTS = new Set([
-  "customconditions",
-  "lib",
-  "modulesuffixes",
-  "paths",
-  "plugins",
-  "rootdirs",
-  "typeroots",
-  "types",
-  ...TSC_WATCH_LIST_OPTS,
-]);
 
 function* jsonReportBlocks(text: string): Generator<string> {
   const start = /^[ \t]*\{/gm;
@@ -906,46 +591,6 @@ export function parseLangCheckPhases(outputText: string, passed: boolean): Repor
  * `go -C`, `bun --cwd`, `npm -C/--prefix`, `npx tsc -p/--project`).
  * Returns `null` if the target directory is ambiguous (e.g. missing value or multi-repo tsc --build).
  */
-function extractMakeDirs(args: string[], startDir: string): string | null {
-  let dir = startDir;
-  for (let i = 0; i < args.length; i++) {
-    const tok = args[i];
-    if (tok === "--") break;
-    if (tok.startsWith("--") && tok.length > 2) {
-      const eqIdx = tok.indexOf("=");
-      const name = eqIdx >= 0 ? tok.slice(2, eqIdx) : tok.slice(2);
-      const matches = MAKE_ALL_LONG_OPTS.filter((opt) => opt.startsWith(name));
-      if (matches.length === 1 && matches[0] === "directory") {
-        const val = eqIdx >= 0 ? tok.slice(eqIdx + 1) : args[++i];
-        if (!val) return null;
-        dir = resolve(dir, val);
-        continue;
-      }
-      if (eqIdx < 0 && matches.length === 1 && MAKE_VALUE_LONG.has(matches[0])) {
-        i++;
-      }
-      continue;
-    }
-    if (tok.startsWith("-") && tok.length > 1) {
-      for (let j = 1; j < tok.length; j++) {
-        const ch = tok[j];
-        if (ch === "C") {
-          const val = j < tok.length - 1 ? tok.slice(j + 1) : args[++i];
-          if (!val) return null;
-          dir = resolve(dir, val);
-          break;
-        }
-        if (MAKE_VALUE_SHORT.has(ch)) {
-          if (j === tok.length - 1) i++;
-          break;
-        }
-        if (MAKE_OPT_VALUE_SHORT.has(ch)) break;
-      }
-    }
-  }
-  return dir;
-}
-
 function commonDirAncestor(dirs: string[]): string {
   if (dirs.length === 1) return dirs[0];
   const partsList = dirs.map((d) => resolve(d).split("/"));
@@ -1391,44 +1036,9 @@ export function resolveVerifyTargetDir(
 
   const tscArgs = extractTscArgs(cmdToks);
   if (tscArgs) {
-    const stripTscOpt = (tok: string): string | null => {
-      if (!tok.startsWith("-") || tok.startsWith("---")) return null;
-      const name = (tok.startsWith("--") ? tok.slice(2) : tok.slice(1)).toLowerCase();
-      return name || null;
-    };
-    const firstOpt = tscArgs[0] ? stripTscOpt(tscArgs[0]) : null;
-    const isBuildMode = firstOpt === "b" || firstOpt === "build";
-    const alwaysValueOpts = isBuildMode ? TSC_BUILD_ALWAYS_VALUE_OPTS : TSC_NORMAL_ALWAYS_VALUE_OPTS;
-    const listValueOpts = isBuildMode ? TSC_BUILD_LIST_OPTS : TSC_NORMAL_LIST_OPTS;
-    let projectPath: string | null = null;
-    const buildProjects: string[] = [];
-    const sourceFiles: string[] = [];
-    for (let i = isBuildMode ? 1 : 0; i < tscArgs.length; i++) {
-      const tok = tscArgs[i];
-      const optName = stripTscOpt(tok);
-      if (!optName) {
-        if (isBuildMode) buildProjects.push(tok);
-        else sourceFiles.push(tok);
-        continue;
-      }
-      if (!isBuildMode && (optName === "p" || optName === "project")) {
-        const val = tscArgs[++i];
-        if (!val) return null;
-        projectPath = val === "null" ? null : val;
-        continue;
-      }
-      if (alwaysValueOpts.has(optName)) {
-        i++;
-        continue;
-      }
-      if (listValueOpts.has(optName)) {
-        const next = tscArgs[i + 1];
-        if (next !== undefined && (next === "null" || !next.trim().startsWith("-"))) i++;
-        continue;
-      }
-      const next = tscArgs[i + 1];
-      if (next === "true" || next === "false" || next === "null") i++;
-    }
+    const targets = tscTargets(tscArgs);
+    if (!targets) return null;
+    const {isBuildMode, projectPath, sourceFiles, buildProjects} = targets;
     if (!isBuildMode && projectPath) {
       const resolved = resolve(curDir, projectPath);
       return resolved.endsWith(".json") ? dirname(resolved) : resolved;

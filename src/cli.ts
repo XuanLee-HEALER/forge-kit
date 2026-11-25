@@ -20,6 +20,9 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import { parseArgs } from "node:util";
 import {
   collectProdDbHosts,
+  isProductionDb,
+  resolveDbEnvironmentsPath,
+  loadDbEnvironments,
   findWorkbenchRoot,
   loadModelsConfig,
   loadWorkbenchConfig,
@@ -839,8 +842,16 @@ export function doctorWorkbench(targetDir?: string): {
     });
   }
 
+  if (resolveDbEnvironmentsPath(root)) {
+    const hosts = collectProdDbHosts(root,loadWorkbenchConfig(root));
+    for (const [name, entry] of Object.entries(loadDbEnvironments(root))) {
+      if (entry && isProductionDb(name, entry, hosts) && (!entry.ro?.user || !entry.rw?.user))
+        issues.push({ level: "warn", check: "db-credentials", message: "Migrate production credentials to split ro/rw accounts." });
+    }
+  }
+
   // 5. Binaries & review-agents launchers check
-  for (const binName of ["ledger", "guard", "ledger-hook", "wb-git", "dbcred", "cmdfmt", "lang-check"]) {
+  for (const binName of ["ledger", "guard", "ledger-hook", "wb-git", "dbcred", "cmdfmt", "lang-check", "wb-verify", "forge-review"]) {
     const p = join(root, ".workbench", "bin", binName);
     if (!existsSync(p)) {
       issues.push({

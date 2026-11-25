@@ -953,6 +953,14 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
       tool_name: "Bash",
       tool_input: { command },
     });
+    const dbEnv = join(wbRoot, ".workbench/env");
+    mkdirSync(dbEnv, {recursive:true});
+    writeFileSync(join(dbEnv, "environments.json"), JSON.stringify({prod: {host:"pg-prod.demo.internal.:5432",
+      ro:{user:"reader"}, rw:{user:"writer"}}}));
+    const rwMigration = (args: string) => `psql "postgresql://$(.workbench/bin/dbcred prod --rw --runbook ${args})@pg-prod.demo.internal/app" -f "${sqlFile}"`;
+    expect(checkMigration(rwMigration("rb-1124-chain --session sess-chain"))).toBeNull();
+    expect(checkMigration(rwMigration("rb-other --session sess-chain"))).toContain("prod 数据库");
+    expect(checkMigration(rwMigration("rb-1124-chain --session other"))).toContain("prod 数据库");
     const dsn = "'postgresql://pg-prod.demo.internal:5432/app'";
     const migration = `psql -d ${dsn} -f '${sqlFile}'`;
     for (const selectors of [`-d ${dsn} -d plaindb`, `--dbname=${dsn} plaindb`, `-d ${dsn} plaindb`]) {

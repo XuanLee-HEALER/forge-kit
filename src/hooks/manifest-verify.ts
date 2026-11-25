@@ -1,3 +1,4 @@
+import { hasNonExecutingTscFlags } from "../shared/tsc";
 import {
   delegatesToScript,
   findNearestPackageDir,
@@ -20,10 +21,6 @@ import {
   parseLangCheckInvocation,
   parseLangCheckPhases,
   resolveVerifyTargetDir,
-  TSC_BUILD_ALWAYS_VALUE_OPTS,
-  TSC_BUILD_LIST_OPTS,
-  TSC_NORMAL_ALWAYS_VALUE_OPTS,
-  TSC_NORMAL_LIST_OPTS,
 } from "./runners";
 import {
   BENIGN_TRAILING_CMDS,
@@ -490,62 +487,7 @@ export function hasNonExecutingVerifyFlag(
   }
 
   const tscArgs = extractTscArgs(cmdToks);
-  if (tscArgs) {
-    const stripTscOpt = (tok: string): string | null => {
-      if (!tok.startsWith("-") || tok.startsWith("---")) return null;
-      const name = (tok.startsWith("--") ? tok.slice(2) : tok.slice(1)).toLowerCase();
-      return name || null;
-    };
-    const firstOpt = tscArgs[0] ? stripTscOpt(tscArgs[0]) : null;
-    const isBuildMode = firstOpt === "b" || firstOpt === "build";
-    const alwaysValueOpts = isBuildMode ? TSC_BUILD_ALWAYS_VALUE_OPTS : TSC_NORMAL_ALWAYS_VALUE_OPTS;
-    const listValueOpts = isBuildMode ? TSC_BUILD_LIST_OPTS : TSC_NORMAL_LIST_OPTS;
-    const tscFlags = new Map<string, boolean>();
-    const mapCanon = (optName: string): string | null => {
-      if (optName === "help" || optName === "h" || optName === "?") return "help";
-      if (optName === "version" || (!isBuildMode && optName === "v")) return "version";
-      if (optName === "showconfig") return "showConfig";
-      if (optName === "listfilesonly") return "listFilesOnly";
-      if (optName === "init") return "init";
-      if (optName === "all") return "all";
-      if (optName === "nocheck") return "noCheck";
-      if (optName === "clean") return "clean";
-      if (optName === "dry" || (isBuildMode && optName === "d")) return "dry";
-      return null;
-    };
-    for (let i = isBuildMode ? 1 : 0; i < tscArgs.length; i++) {
-      const tok = tscArgs[i];
-      // Fail closed on positional `@file` response files (e.g. `@/dev/stdin`), which can inject `--version`/`--dry`/`--help`.
-      if (tok.startsWith("@")) return true;
-      const optName = stripTscOpt(tok);
-      if (!optName) continue;
-      // Non-list value options always consume the next argument verbatim (e.g. `--outDir --version`).
-      if (alwaysValueOpts.has(optName)) {
-        i++;
-        continue;
-      }
-      // List / tsconfig-only non-bool options (e.g. `--types`, `--lib`) only consume the next arg
-      // when it is `"null"` or does not start with `"-"` after trimming (matching TypeScript parseListTypeOption).
-      if (listValueOpts.has(optName)) {
-        const next = tscArgs[i + 1];
-        if (next !== undefined && (next === "null" || !next.trim().startsWith("-"))) {
-          i++;
-        }
-        continue;
-      }
-      const canon = mapCanon(optName);
-      if (!canon) continue;
-      let val = true;
-      // Per TypeScript parseCommandLine: boolean option values are strictly lowercase "true" / "false" / "null" (clears option).
-      const next = tscArgs[i + 1];
-      if (next === "true" || next === "false" || next === "null") {
-        val = next === "true";
-        i++;
-      }
-      tscFlags.set(canon, val);
-    }
-    return Array.from(tscFlags.values()).some(Boolean);
-  }
+  if (tscArgs) return hasNonExecutingTscFlags(tscArgs);
 
   const eslintArgs = extractEslintArgs(cmdToks);
   if (eslintArgs) {

@@ -48,7 +48,28 @@ export interface ModelsConfig {
   };
 }
 
+export interface DbCredentialPair {
+  user: string;
+  password?: string;
+}
+
+export function normalizeDbHost(value: string): string {
+  const host = value.trim().toLowerCase();
+  const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(host);
+  return (bracketed ? bracketed[1] : host.replace(/^([^:]+):\d+$/, "$1")).replace(/\.+$/, "");
+}
+
+export function normalizeDbHosts(value: string): string[] {
+  return value.split(",").map(normalizeDbHost);
+}
+
+export function isProductionDb(name: string, entry: DbEnvEntry, hosts: string[]) {
+  return /prod/i.test(name) || normalizeDbHosts(entry.host ?? "").some(host => hosts.includes(host));
+}
+
 export interface DbEnvEntry {
+  ro?: DbCredentialPair;
+  rw?: DbCredentialPair;
   host?: string;
   port?: number;
   user?: string;
@@ -209,16 +230,16 @@ export function loadWorkbenchConfig(root: string): WorkbenchConfig {
   };
 }
 
+export function resolveDbEnvironmentsPath(root: string) {
+  return [join(root, ".workbench/env/environments.json"), join(root, ".agents/skills/dbop/environments.json")].find(p => existsSync(p));
+}
+
 export function loadDbEnvironments(
   root: string,
   opts?: { strict?: boolean },
 ): Record<string, DbEnvEntry> {
-  const candidates = [
-    join(root, ".workbench", "env", "environments.json"),
-    join(root, ".agents", "skills", "dbop", "environments.json"),
-  ];
-  for (const p of candidates) {
-    if (!existsSync(p)) continue;
+  const p = resolveDbEnvironmentsPath(root);
+  if (p) {
     try {
       const parsed = JSON.parse(readFileSync(p, "utf8"));
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -243,25 +264,20 @@ export function collectProdDbHosts(
   cfg: WorkbenchConfig,
   opts?: { strict?: boolean },
 ): string[] {
-  const hosts = new Set<string>();
-  for (const h of cfg.guard.prod_db_hosts) {
-    if (h.trim()) hosts.add(h.trim());
-  }
-  for (const t of cfg.guard.prod_db_targets) {
-    if (t.host.trim()) hosts.add(t.host.trim());
-  }
-  const envs = loadDbEnvironments(root, opts);
+  return productionHosts(cfg,loadDbEnvironments(root,opts));
+}
+
+export function productionHosts(cfg: WorkbenchConfig, envs: Record<string,DbEnvEntry>) {
+  const values = [...cfg.guard.prod_db_hosts, ...cfg.guard.prod_db_targets.map(t => t.host)];
   for (const [key, entry] of Object.entries(envs)) {
-    if (key.toLowerCase().includes("prod") && entry?.host?.trim()) {
-      hosts.add(entry.host.trim());
-    }
+    if (/prod/i.test(key) && entry?.host) values.push(entry.host);
   }
-  return [...hosts];
+  return [...new Set(values.flatMap(normalizeDbHosts).filter(Boolean))];
 }
 
 export function loadModelsConfig(root: string): ModelsConfig {
   const parsed = parseTomlFile<Partial<ModelsConfig>>(
-    join(root, ".workbench", "models.toml"),
+    process.env.FORGE_MODELS_TOML || join(root, ".workbench", "models.toml"),
   );
   return {
     tiers: {
