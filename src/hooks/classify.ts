@@ -1,3 +1,6 @@
+import { verifiedPr } from "../ledger/delivery-tools";
+import { getSpecState } from "../ledger/spec";
+import { coversReviewBase, reviewMeetsFloor } from "../ledger/review-range";
 import { redactSecrets } from "../cmdfmt";
 import { findWorkbenchRoot, loadWorkbenchConfig } from "../config";
 import { getHeadAndParents, locateRepo, runGit } from "../git";
@@ -228,6 +231,8 @@ export function classifyPostToolEvidence(
         targetRepoSpec,
         targetHost: targetRepoSpec ? null : host || null,
         prUrlRepoSpec,
+        prUrl: urlMatch?.[0].trim(),
+        ghEnv: Object.fromEntries(["GH_HOST", "GH_REPO", "GH_CONFIG_DIR"].map(k => [k, gh.prefix.effective(k)])),
       });
       continue;
     }
@@ -393,6 +398,9 @@ export function handleLedgerHook(
             resolvedPinnedSha = refRes.stdout.trim();
           }
         }
+        if (item.kind === "review" && item.meta?.resumed && (!resolvedPinnedSha ||
+            !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(resolvedPinnedSha) ||
+            runGit(loc.checkoutDir, ["cat-file", "-t", resolvedPinnedSha]).stdout.trim() !== "commit")) continue;
         let effectiveSha = resolvedPinnedSha ?? loc.headSha;
         if (item.targetBranch) {
           if (item.targetOwner) {
@@ -445,17 +453,43 @@ export function handleLedgerHook(
           ? ledger.findOpenTasksByRepoCommits(loc.repo, getHeadAndParents(loc.checkoutDir))
           : ledger.findOpenTasksByRepoBranch(loc.repo, effectiveBranch);
         if (openTasks.length !== 1) continue;
+        if (item.kind === "review" && item.status !== "fail") {
+          const activeFloor = getSpecState(ledger, openTasks[0].task_id, { metadataOnly: true }).evidence_floor_seq.review;
+          if (!reviewMeetsFloor("pass", item.meta, openTasks[0].task_id, activeFloor, undefined, "hook")) continue;
+        }
+        if (item.kind === "review" && item.meta?.review_task_id !== undefined &&
+            item.meta.review_task_id !== openTasks[0].task_id) continue;
+        if (item.kind === "pr" && item.status === "pass") {
+          if (!item.prUrl || effectiveDetached || !effectiveSha) continue;
+          try {
+            const pr = verifiedPr(loc.checkoutDir, effectiveBranch, effectiveSha, item.prUrl, { ...process.env, ...item.ghEnv });
+            item.meta = { pr_url: pr.url, pr_head_oid: pr.headRefOid };
+          }
+          catch { continue; }
+        }
+        if (item.kind === "review" && item.meta?.role === "codex-review" && item.requirePinnedSha && resolvedPinnedSha) {
+          const parents = runGit(loc.checkoutDir, ["rev-list", "--parents", "-n", "1", resolvedPinnedSha]);
+          if (parents.code) continue;
+          const [commit, parent] = parents.stdout.trim().split(/\s+/);
+          item.meta.base = parent ?? commit;
+        }
+        if (item.kind === "review" && item.status !== "fail") {
+          const attachments = ledger.getTaskRepos(openTasks[0].task_id).filter(r => r.repo === loc.repo && (effectiveDetached || r.branch === effectiveBranch));
+          if (!attachments.length || !attachments.every(r => coversReviewBase(workbenchRoot, r, item.meta?.base))) continue;
+        }
 
         if (item.requirePinnedSha && !resolvedPinnedSha) {
           // Do not guess live checkout HEAD when pinned SHA/ref is required!
           continue;
         }
         const targetSha = effectiveSha;
-        const toolUseKey = input.tool_use_id
+        const executionId = item.kind === "review" && item.meta?.execution_id;
+        const toolUseKey = typeof executionId === "string" ? `review-execution:${executionId}` : input.tool_use_id
           ? `${input.tool_use_id}:${idx}`
           : null;
 
         ledger.recordEvidence({
+          source: "hook",
           task_id: openTasks[0].task_id,
           kind: item.kind,
           status: item.status,

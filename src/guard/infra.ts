@@ -7,7 +7,6 @@ const KUBECTL_READ_VERBS = new Set([
   "describe",
   "logs",
   "top",
-  "port-forward",
   "version",
   "explain",
   "api-resources",
@@ -58,6 +57,9 @@ export function checkKubectl(
       const tok = toks[i].replace(/^[$`(\s]+/, "");
       if (tok !== "kubectl" && !tok.endsWith("/kubectl")) continue;
 
+      if (toks.slice(i + 1).some(a => a === "--raw" || a.startsWith("--raw="))) {
+        return "安全护栏：禁止 kubectl --raw 直接访问 API（含 secret）。";
+      }
       const words: string[] = [];
       let skipNext = false;
       for (let j = i + 1; j < toks.length; j++) {
@@ -85,6 +87,7 @@ export function checkKubectl(
       }
 
       const verb = words[0];
+      if (verb === "port-forward") return "安全护栏：禁止 kubectl port-forward 建立集群隧道。";
       const sub = words[1] ?? "";
       const isReadonly =
         verb in KUBECTL_READ_SUB ? KUBECTL_READ_SUB[verb].has(sub) : KUBECTL_READ_VERBS.has(verb);
@@ -113,9 +116,9 @@ export function checkKubectl(
   return null;
 }
 
-export function checkCloudAndRedisOps(cmd: string): string | null {
-  if (/\baliyun\s+sls\s+(create|delete|put|update|apply)-/i.test(cmd)) {
-    return "物理保险丝：禁止执行阿里云 SLS 写操作命令。";
+export function checkCloudAndRedisOps(cmd: string, patterns: string[] = []): string | null {
+  for (const pattern of patterns) {
+    if (new RegExp(pattern, "i").test(cmd)) return "安全护栏：命令命中 guard.custom_block_patterns。";
   }
   if (/\bredis-cli\b/i.test(cmd) && /\b(flushdb|flushall|config\s+set|shutdown)\b/i.test(cmd)) {
     return "物理保险丝：禁止执行破坏性 Redis 命令（FLUSHDB/FLUSHALL/CONFIG SET/SHUTDOWN）。";

@@ -1,3 +1,5 @@
+import { prRemoteRefs, reachableFromRefs, resolveTaskCheckout } from "./checkout";
+import { coversReviewBase, reviewMeetsFloor } from "./review-range";
 import { Database } from "bun:sqlite";
 import { runGit } from "../git";
 import {
@@ -14,6 +16,9 @@ import { amendSpec, freezeSpec, getSpecState, listActiveSpecLocks } from "./spec
 import { appendEventInTx, withImmediateTx } from "./transactions";
 import {
   ENDPOINT_RANK,
+  EXECUTABLE_EVIDENCE,
+  evidenceSource,
+  type EvidenceSource,
   ledgerDbPath,
   normalizeReviewRole,
   nowIso,
@@ -32,7 +37,7 @@ import {
   type TaskSpecState,
   type VerificationDepth,
 } from "./types";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export class Ledger {
@@ -75,6 +80,18 @@ export class Ledger {
     }
   }
 
+  private resolveBase(repo?: string, branch?: string, worktree?: string | null, ref?: string | null) {
+    if (ref == null) return null;
+    if (!repo || !ref.trim()) throw new Error("--base requires an attached repository and a commit reference");
+    const dir = branch ? resolveTaskCheckout(this.workbenchRoot, { repo, branch, worktree: worktree ?? null }).dir
+      : worktree || join(this.workbenchRoot, repo);
+    if (existsSync(join(dir, ".git"))) {
+      const result = runGit(dir, ["rev-parse", "--verify", "--end-of-options", ref + "^{commit}"]);
+      if (!result.code && /^[a-f0-9]{40}$/.test(result.stdout.trim())) return result.stdout.trim();
+    }
+    throw new Error("Cannot resolve --base to a commit in " + repo + ": " + ref);
+  }
+
   openTask(params: {
     task_id: string;
     title: string;
@@ -111,6 +128,7 @@ export class Ledger {
         this.assertRepoBranchFreeForOpenTask(params.repo, params.branch, params.task_id);
       }
 
+      const base = this.resolveBase(params.repo, params.branch, params.worktree, params.base_sha);
       const ts = nowIso();
       this.db
         .query(
@@ -128,13 +146,13 @@ export class Ledger {
         session_id: params.session_id,
         repo: params.repo,
         branch: params.branch,
-        sha: params.head_sha ?? params.base_sha,
+        sha: params.head_sha ?? base,
         ts,
         payload: {
           title: params.title,
           endpoint: params.endpoint,
           verification_depth: params.depth,
-          base_sha: params.base_sha ?? null,
+          base_sha: base,
         },
       });
 
@@ -144,8 +162,8 @@ export class Ledger {
           repo: params.repo,
           branch: params.branch,
           worktree: params.worktree ?? null,
-          base_sha: params.base_sha ?? null,
-          head_sha: params.head_sha ?? params.base_sha ?? null,
+          base_sha: base,
+          head_sha: params.head_sha ?? base,
           actor: params.actor ?? "agent",
           session_id: params.session_id,
         });
@@ -173,6 +191,29 @@ export class Ledger {
     }
     this.assertRepoBranchFreeForOpenTask(params.repo, params.branch, params.task_id);
 
+    const previous = this.db.query("SELECT base_sha, worktree FROM task_repos WHERE task_id = ? AND repo = ? AND branch = ?")
+      .get(params.task_id, params.repo, params.branch) as { base_sha: string | null; worktree: string | null } | null;
+    const history = this.db.query(`SELECT json_extract(payload_json, '$.base_sha') AS base_sha,
+      json_type(payload_json, '$.base_repair') AS repair FROM events
+      WHERE task_id = ? AND repo = ? AND branch = ? AND event_type = 'REPO_ATTACHED' ORDER BY seq`)
+      .all(params.task_id, params.repo, params.branch) as Array<{ base_sha: string | null; repair: string | null }>;
+    if (params.worktree && !existsSync(join(params.worktree, ".git"))) throw new Error("Cannot verify supplied worktree: " + params.worktree);
+    const checkout = resolveTaskCheckout(this.workbenchRoot, { ...params, worktree: params.worktree ?? previous?.worktree ?? null }, true);
+    const repairIndex = history.map(row => row.repair).lastIndexOf("object");
+    const activeHistory = repairIndex < 0 ? history : history.slice(repairIndex);
+    let recovered = false;
+    let base = params.base_sha ?? null;
+    for (const candidate of new Set([...activeHistory, ...(previous ? [previous] : [])].map(row => row.base_sha))) {
+      if (!candidate || !/^[a-f0-9]{7,64}$/i.test(candidate) || !existsSync(join(checkout.dir, ".git"))) continue;
+      const commit = runGit(checkout.dir, ["rev-parse", "--verify", "--end-of-options", candidate + "^{commit}"]);
+      if (!commit.code) { base = commit.stdout.trim(); recovered = true; break; }
+    }
+    if (!base && (history.length || previous)) throw new Error("Recover the original attachment start with --base <commit-sha>");
+    const worktree = checkout.registered ? realpathSync(checkout.dir) : params.worktree ? realpathSync(params.worktree) : null;
+    if (!base && existsSync(join(checkout.dir, ".git"))) {
+      const start = runGit(checkout.dir, ["rev-parse", "--verify", "--end-of-options", "refs/heads/" + params.branch + "^{commit}"]);
+      if (!start.code) base = start.stdout.trim();
+    }
     const ts = nowIso();
     this.db
       .query(
@@ -180,15 +221,15 @@ export class Ledger {
          VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(repo, branch, task_id) DO UPDATE SET
            worktree = COALESCE(excluded.worktree, task_repos.worktree),
-           base_sha = COALESCE(task_repos.base_sha, excluded.base_sha),
+           base_sha = COALESCE(excluded.base_sha, task_repos.base_sha),
            head_sha = COALESCE(excluded.head_sha, task_repos.head_sha)`,
       )
       .run(
         params.repo,
         params.branch,
-        params.worktree ?? null,
+        worktree,
         params.task_id,
-        params.base_sha ?? null,
+        base,
         params.head_sha ?? null,
         ts,
       );
@@ -200,11 +241,14 @@ export class Ledger {
       session_id: params.session_id,
       repo: params.repo,
       branch: params.branch,
-      sha: params.head_sha ?? params.base_sha ?? null,
+      sha: params.head_sha ?? base,
       ts,
       payload: {
-        worktree: params.worktree ?? null,
-        base_sha: params.base_sha ?? null,
+        worktree,
+        base_sha: base,
+        ...(!recovered && params.base_sha && (history.length || previous) ? {
+          base_repair: { supersedes: previous?.base_sha ?? activeHistory.at(-1)?.base_sha ?? null },
+        } : {}),
         head_sha: params.head_sha ?? null,
       },
     });
@@ -220,7 +264,7 @@ export class Ledger {
     actor?: string;
     session_id?: string | null;
   }): EventRecord {
-    return withImmediateTx(this.db, () => this.attachRepoInTx(params));
+    return withImmediateTx(this.db, () => this.attachRepoInTx({ ...params, base_sha: this.resolveBase(params.repo, params.branch, params.worktree, params.base_sha) }));
   }
 
   detachRepo(params: {
@@ -502,7 +546,8 @@ export class Ledger {
       | "pr"
       | "fat"
       | "prod"
-      | "note";
+      | "note" | "verify" | "deploy" | "smoke" | "manual";
+    source?: EvidenceSource;
     status: "pass" | "fail" | "fallback" | "info";
     summary: string;
     repo?: string | null;
@@ -537,6 +582,7 @@ export class Ledger {
         payload: {
           kind: params.kind,
           status: params.status,
+          source: params.source ?? "manual",
           summary: params.summary,
           ...(normalizedMeta ? { meta: normalizedMeta } : {}),
         },
@@ -551,6 +597,7 @@ export class Ledger {
       }
 
       if (
+        (params.source === "tool" || params.source === "hook") &&
         params.repo &&
         params.sha &&
         (params.kind === "test" || params.kind === "build" || params.kind === "lint") &&
@@ -748,6 +795,8 @@ export class Ledger {
     task_id: string;
     repo: string;
     head_sha: string;
+    branch?: string;
+    checkoutDir?: string;
     checkEndpoint?: boolean;
   }): {
     ready: boolean;
@@ -755,6 +804,10 @@ export class Ledger {
     hasExplicitFailure: boolean;
     recordedReviewRoles: string[];
   } {
+    return this.checkReadiness(params, false);
+  }
+
+  private checkReadiness(params: { task_id: string; repo: string; head_sha: string; branch?: string; checkoutDir?: string; checkEndpoint?: boolean }, closing: boolean) {
     const task = this.getTask(params.task_id);
     if (!task) {
       return {
@@ -776,7 +829,11 @@ export class Ledger {
       );
     }
 
-    const specState = this.getSpecState(params.task_id);
+    const specState = getSpecState(this, params.task_id, { delivery: params, closing });
+    if (specState.drifted_locked_tests.length) {
+      hasExplicitFailure = true;
+      missing.push("冻结测试文件发生漂移 (" + specState.drifted_locked_tests.join(", ") + ")，请恢复测试文件或执行 ledger amend --scope test_spec 后重新 freeze");
+    }
     if (specState.state === "AMENDED") {
       missing.push(
         `spec is in AMENDED state (scope=${specState.amend_scope ?? "unknown"}); finish revisions and run \`ledger freeze ${params.task_id}\` before delivery`,
@@ -790,29 +847,41 @@ export class Ledger {
 
     const events = this.db
       .query(
-        `SELECT seq, payload_json FROM events
+        `SELECT seq, actor, branch, payload_json FROM events
          WHERE task_id = ? AND event_type = 'EVIDENCE_CAPTURED'
            AND repo = ? AND sha = ?
          ORDER BY seq ASC`,
       )
       .all(params.task_id, params.repo, params.head_sha) as Array<{
       seq: number;
+      branch: string | null;
+      actor: string;
       payload_json: string;
     }>;
 
     const floors = specState.evidence_floor_seq;
+    const reviewFloor = this.db.query("SELECT ts FROM events WHERE task_id = ? AND seq = ?")
+      .get(params.task_id, floors.review) as { ts: string } | null;
     const latestByKind = new Map<string, string>();
+    const attachments = this.getTaskRepos(params.task_id).filter(r => r.repo === params.repo && (!params.branch || r.branch === params.branch));
+    if (task.verification_depth === "full" || (task.verification_depth === "targeted" && params.checkEndpoint)) {
+      for (const r of attachments) if (!r.base_sha) {
+        missing.push(`review baseline missing: ledger attach ${params.task_id} --repo ${r.repo} --branch ${r.branch} --base <original-start-sha>`);
+      }
+    }
     const latestReviewByRole = new Map<string, string>();
     let latestEndpointStatus: string | null = null;
 
     for (const ev of events) {
       try {
         const p = JSON.parse(ev.payload_json) as {
+          source?: EvidenceSource;
           kind?: string;
           status?: string;
-          meta?: { role?: string };
+          meta?: { pr_head_oid?: string; pr_url?: string; role?: string; started_at?: string; review_floor_seq?: number; base?: string };
         };
         if (!p.kind || !p.status) continue;
+        if (EXECUTABLE_EVIDENCE.has(p.kind) && evidenceSource(p, ev.actor) === "manual") continue;
         if (p.kind === "lint") {
           if (ev.seq >= floors.lint) latestByKind.set("lint", p.status);
         } else if (p.kind === "test" || p.kind === "build") {
@@ -821,16 +890,19 @@ export class Ledger {
           if (ev.seq >= floors.test) latestByKind.set("hurl", p.status);
         }
         if (p.kind === "review") {
-          if (ev.seq >= floors.review) {
+          if (ev.seq < floors.review || !reviewMeetsFloor(p.status, p.meta, params.task_id, floors.review, reviewFloor?.ts, evidenceSource(p, ev.actor))) continue;
+          if (p.status === "fail" || (attachments.length > 0 && attachments.every(r => coversReviewBase(this.workbenchRoot, r, p.meta?.base)))) {
             const roleKey = normalizeReviewRole(p.meta?.role);
             latestReviewByRole.set(roleKey, p.status);
           }
         }
         if (
-          (task.endpoint === "pr" && p.kind === "pr") ||
+          (task.endpoint === "pr" && p.kind === "pr" && attachments.length === 1 && ev.branch === attachments[0].branch) ||
           (task.endpoint === "fat" && (p.kind === "fat" || p.kind === "hurl")) ||
           (task.endpoint === "prod" && p.kind === "prod")
         ) {
+          if (p.kind === "pr" && p.status === "pass" &&
+              (p.meta?.pr_head_oid !== params.head_sha || !p.meta.pr_url)) continue;
           const endpointFloor = task.endpoint === "fat" ? floors.fat : 0;
           if (ev.seq >= endpointFloor && (p.status === "pass" || p.status === "fail")) {
             latestEndpointStatus = p.status;
@@ -913,7 +985,8 @@ export class Ledger {
         );
       } else if (latestEndpointStatus !== "pass") {
         missing.push(
-          `endpoint "${task.endpoint}" requires recorded ${task.endpoint} delivery evidence for ${params.repo}@${params.head_sha.slice(0, 8)}`,
+          `endpoint "${task.endpoint}" requires recorded ${task.endpoint} delivery evidence for ${params.repo}@${params.head_sha.slice(0, 8)}` +
+          (task.endpoint === "pr" ? `; run ledger pr-sync ${params.task_id} --repo ${params.repo} to verify the remote PR head` : ""),
         );
       }
     }
@@ -955,10 +1028,7 @@ export class Ledger {
           // Verify against LIVE git branch HEAD when the repo exists on disk so unrecorded commits
           // cannot let closeTask succeed using stale earlier evidence!
           let effectiveSha = r.head_sha;
-          const candidateDir =
-            r.worktree && existsSync(r.worktree)
-              ? r.worktree
-              : join(this.workbenchRoot, r.repo);
+          const { dir: candidateDir } = resolveTaskCheckout(this.workbenchRoot, r, true);
           if (existsSync(candidateDir)) {
             const liveRes = runGit(
               candidateDir,
@@ -973,44 +1043,17 @@ export class Ledger {
               // 2) recorded head_sha resolves to a real commit reachable from `origin`'s exact
               //    delivery destination ref (NEVER a local-only tag, another remote, or an unmerged feature ref for fat), AND
               // 3) that exact SHA already has complete verification + endpoint delivery evidence.
-              const allowedRemoteRefs = new Set(
-                task.endpoint === "fat"
-                  ? ["refs/remotes/origin/fat"]
-                  : task.endpoint === "pr"
-                    ? [`refs/remotes/origin/${r.branch}`, "refs/remotes/origin/main", "refs/remotes/origin/master"]
-                    : task.endpoint === "prod"
-                      ? ["refs/remotes/origin/main", "refs/remotes/origin/master"]
-                      : [],
-              );
-              const remoteRefs =
-                allowedRemoteRefs.size > 0 && r.head_sha
-                  ? runGit(
-                      candidateDir,
-                      [
-                        "for-each-ref",
-                        "--format=%(refname)",
-                        "--contains",
-                        `${r.head_sha}^{commit}`,
-                        ...allowedRemoteRefs,
-                      ],
-                      3000,
-                    )
-                  : null;
-              const matchedExactRemoteRef = Boolean(
-                remoteRefs &&
-                  remoteRefs.code === 0 &&
-                  remoteRefs.stdout
-                    .split(/\r?\n/)
-                    .map((line) => line.trim())
-                    .some((ref) => allowedRemoteRefs.has(ref)),
-              );
-              if (matchedExactRemoteRef && r.head_sha) {
-                const deliveredCheck = this.checkPushReadiness({
+              const remoteRefs = task.endpoint === "fat" ? ["refs/remotes/origin/fat"]
+                : task.endpoint === "pr" ? prRemoteRefs(candidateDir, r.branch)
+                : task.endpoint === "prod" ? ["refs/remotes/origin/main", "refs/remotes/origin/master"] : [];
+              if (r.head_sha && reachableFromRefs(candidateDir, r.head_sha, remoteRefs)) {
+                const deliveredCheck = this.checkReadiness({
                   task_id: params.task_id,
                   repo: r.repo,
+                  branch: r.branch,
                   head_sha: r.head_sha,
                   checkEndpoint: true,
-                });
+                }, true);
                 if (deliveredCheck.ready) {
                   continue;
                 }
@@ -1032,12 +1075,13 @@ export class Ledger {
             allMissing.push(`${r.repo}:${r.branch} has no recorded head_sha`);
             continue;
           }
-          const check = this.checkPushReadiness({
+          const check = this.checkReadiness({
             task_id: params.task_id,
             repo: r.repo,
+            branch: r.branch,
             head_sha: effectiveSha,
             checkEndpoint: true,
-          });
+          }, true);
           if (!check.ready) allMissing.push(...check.missing);
         }
         if (allMissing.length > 0) {
@@ -1300,15 +1344,23 @@ export class Ledger {
         .join("; ");
 
       const specState = this.getSpecState(t.task_id);
+      const recentEvidence = this.db.query(
+        "SELECT actor, payload_json FROM events WHERE task_id = ? AND event_type = 'EVIDENCE_CAPTURED' ORDER BY seq DESC LIMIT 4",
+      ).all(t.task_id) as Pick<EventRecord, "actor" | "payload_json">[];
+      const evidence = recentEvidence.map(row => {
+        const payload = JSON.parse(row.payload_json);
+        return `[${evidenceSource(payload, row.actor)}] ${payload.kind}/${payload.status}`;
+      }).join(", ");
+      const driftCount = specState.drifted_files.length + specState.drifted_locked_tests.length;
       const specBadge =
         specState.state === "FROZEN"
-          ? ` | spec:FROZEN${specState.drifted_files.length ? `(DRIFT:${specState.drifted_files.length})` : ""}`
+          ? ` | spec:FROZEN${driftCount ? `(DRIFT:${driftCount})` : ""}`
           : specState.state === "AMENDED"
             ? ` | spec:AMENDED(${specState.amend_scope ?? "?"})`
             : "";
 
       lines.push(
-        `- ${t.task_id} (${t.endpoint}/${t.verification_depth}): ${t.title} [${repoDesc}]${specBadge}${blockerText}${activeDecs ? ` | decisions: ${activeDecs}` : ""}`,
+        `- ${t.task_id} (${t.endpoint}/${t.verification_depth}): ${t.title} [${repoDesc}]${specBadge}${evidence ? " | " + evidence : ""}${blockerText}${activeDecs ? ` | decisions: ${activeDecs}` : ""}`,
       );
     }
     return lines.join("\n");

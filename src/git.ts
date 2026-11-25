@@ -24,7 +24,7 @@ export function runProcess(
   try {
     const proc = Bun.spawnSync(argv, {
       cwd: opts?.cwd,
-      env: opts?.env,
+      env: opts?.env ?? process.env,
       stdout: "pipe",
       stderr: "pipe",
       timeout: opts?.timeoutMs ?? 10_000,
@@ -43,12 +43,21 @@ export function runProcess(
   }
 }
 
+// Internal commands select a checkout explicitly. Git's inherited repository selectors override -C.
+export function checkoutEnvironment(source = process.env) {
+  const env = { ...source };
+  for (const name of ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE"]) delete env[name];
+  return env;
+}
+
 export function runGit(
   dir: string,
   args: string[],
   timeoutMs = 10_000,
 ): GitRunResult {
-  return runProcess(["git", "-C", dir, ...args], { timeoutMs });
+  return runProcess(["git", "-C", dir, ...args], { timeoutMs, env: checkoutEnvironment() });
 }
 
 /**
@@ -77,11 +86,8 @@ export function locateRepo(
   );
   if (info.code !== 0) return null;
   // Strip ONLY line endings (never `.trim()`, which would truncate valid trailing NBSP in branch/dir names!)
-  const lines = info.stdout
-    .replace(/\r?\n$/, "")
-    .split("\n")
-    .map((l) => l.replace(/\r$/, ""));
-  if (lines.length < 3) return null;
+  const lines = info.stdout.replace(/\n$/, "").split("\n");
+  if (lines.length !== 3) return null;
 
   let top: string;
   let common: string;

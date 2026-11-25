@@ -7,6 +7,8 @@ export interface CapturedEvidence {
   targetOwner?: string | null;
   targetRepoSpec?: string | null;
   targetHost?: string | null;
+  prUrl?: string;
+  ghEnv?: Record<string, string>;
   prUrlRepoSpec?: string | null;
   pinnedSha?: string | null;
   pinnedRef?: string | null;

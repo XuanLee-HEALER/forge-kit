@@ -6,6 +6,7 @@ import {
   extractTouchedFilePaths,
   type CodexHookInput,
 } from "../hook-io";
+import { listActiveSpecLocks } from "../ledger/spec";
 import { Ledger } from "../ledger/store";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
@@ -668,7 +669,7 @@ export function checkSpecAndTestLocks(
   let ledger: Ledger | null = null;
   try {
     ledger = new Ledger(workbenchRoot);
-    const activeLocks = ledger.listActiveSpecLocks();
+    const activeLocks = listActiveSpecLocks(ledger, true);
     if (activeLocks.length === 0) return null;
 
     const allOpenBoundWorktrees = new Set<string>();
@@ -739,7 +740,7 @@ export function checkSpecAndTestLocks(
       return {
         task_id: st.task_id,
         lockedSpecFiles,
-        lockedTestGlobs: unlockedTest ? [] : st.locked_test_globs,
+        lockedTestGlobs: scopes.has("test_spec") || scopes.has("invariant") ? [] : st.locked_test_globs,
         explicitRoots,
         unboundWorktrees,
       };

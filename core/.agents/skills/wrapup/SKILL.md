@@ -14,7 +14,7 @@ description: >
 
 - **定向收尾（`targeted`）**：风险边界清晰的局部修复、低风险小改、纯文档/注释。执行：
   1. 固定 `base..head` SHA 与受影响调用链；
-  2. 执行独立只读业务评审（`codex review --base <base-SHA>` 或全新只读 subagent，如 `analyst` / 只读沙箱，**不要**将只读评审派给可写 `dev`），逐条核实发现并修确认问题；
+  2. 执行独立只读业务评审（`.workbench/bin/ledger review-native --task <id> --repo <仓> --base <base-SHA>` 或全新只读 subagent，如 `analyst` / 只读沙箱，**不要**将只读评审派给可写 `dev`），逐条核实发现并修确认问题；
   3. 跑受影响的构建、测试与生成物核验（接口语义若发现实质变化则升级为完整收尾）；
   4. 确认最终 SHA 覆盖全部验证并记录至账本，无需机械追加专项 CLI。
 - **完整收尾（`full`）**：资金/权限规则、协议行为、迁移、事务/并发、复杂跨模块或风险未排除。按下方顺序执行。
@@ -25,7 +25,7 @@ description: >
    - 记录目标仓库、`base..head` SHA 与工作树状态；评审期间不改被审代码，不混入他人未提交改动。
    - 在启动 AI 评审前，先跑完对应语言的静态与动态检查（仓内原生命令或 `.workbench/bin/lang-check <repo> --mode all`：Go `go vet`/`go test -race`、TS `tsc`/`biome`/`eslint`、Python `ruff`/`pyright`/`PYTHONDEVMODE=1 pytest`），让确定性工具先扫清语法、类型、lint 与数据竞争问题（`full` 深度任务推送前强依赖当前 SHA 的 `lint` 通过证据）。
 2. **业务对齐评审（隔离上下文）**：
-   - 使用原生 `codex review`（只读、固定 `--base <base-SHA>`、显式设置模型与 effort，用 `-c project_doc_max_bytes=0` 避免被审仓旧入口干扰，通过 `-c developer_instructions=...` 传入工作台入口、目标仓配置、`.workbench/specs/<task_id>/ssot.md`（如有）与固定范围）。不可用时回退到全新只读 subagent（`fork_turns="none"`），并标注回退原因。
+   - 运行 `.workbench/bin/ledger review-native --task <id> --repo <仓> --base <base-SHA>`。它在启动只读评审前记录分支 HEAD、覆盖起点与规范冻结序号，并在入账前复核。不可用时回退到全新只读 subagent（`fork_turns="none"`），并标注回退原因。
    - 必查项：对照 `ssot.md` 逐条核验 `INV-*` 业务不变量与外部契约、资金/权益服务端权威原则、测试与实现同步及可移植性、接口文档同步。
    - **逐条核实**：每条发现回到代码与数据自行确认（确认存在 / 误报），业务口径分歧交用户裁决；修复确认问题后固定新 `head` 并复审修复范围。
 3. **并行专项评审（独立只读 CLI，自动注入语言坑点）**：
@@ -52,10 +52,10 @@ description: >
 
 主线程自动执行**统一只读原生回退**：
 - 保存原始 CLI 失败证据；
-- 派生全新、只读、上下文隔离的原生 Codex subagent（`fork_turns="none"`，按 `.workbench/models.toml` 选择对应模型与 effort）；
+- 执行 `.workbench/bin/ledger review-fallback <task_id> --repo <repo> --role <role> --sha <完整 HEAD>`。执行器核对账本中的失败记录，以工作台 standard 模型和 effort 启动全新隔离的只读原生 Codex 会话；
 - **直接加载对应角色提示词** `review-agents/prompts/{quality,performance,simplify,comments}.md` + 固定 `base..head` SHA 作为唯一审查依据（不注入实现自评，只读不改代码）；
 - 主线程照常逐条核实回退建议后再委派 `dev` 实施；
-- 在账本记录 `ledger record <task_id> --kind review --status fallback --role <quality|performance|simplify|comments> --repo <repo> --sha <sha> --summary "<role> native_fallback (credit_balance_exhausted)"`，汇报中同时如实说明“CLI 余额不足未完成 + 已完成原生只读回退”，绝不记作 CLI 通过。
+- 保留原 CLI 失败和原生只读回退报告，在汇报中列明角色、SHA、回退原因和结果；可执行评审只接受实际工具或 hook 证据，禁止手工补记评审通过。
 
 ## 汇报
 

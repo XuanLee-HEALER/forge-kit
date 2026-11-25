@@ -35,6 +35,8 @@ description: >
 
 ## 2. 准备 PR
 
+已有 PR 推送新提交后，运行 `.workbench/bin/ledger pr-sync <task_id> --repo <仓> [--pr <编号或 URL>]` 核验远端 HEAD 并更新证据。
+
 1. 核对分支来源相对 `origin/main`：从 `main` 切出且未混入测试分支独有历史的功能分支直接复用；仅在混入脏历史时才从最新 `origin/main` 重建干净分支移植提交（严禁将 `fat` 合并进 `main`）。
 2. 创建或更新 PR 时固定使用工作台格式：
    - 标题：`type: 一句话描述`
@@ -62,7 +64,7 @@ description: >
      [--pr <repo>:<pr号>] [--tag <repo>:<tag>:<sha>] \
      [--sql <prod-host>:<sql路径>] [--kubectl "<精确kubectl命令>"]
    ```
-   将 Runbook 与生成的 `rb-...` 编号发给用户确认；用户在本会话回复 **`批准 <runbook_id>`** 后，`UserPromptSubmit` Hook 自动为本会话签发 30 分钟精确白名单通行证，随后 Agent 自动推进合 PR、打 tag 并显式 `git push origin <tag>`、执行已登记迁移/`kubectl`、跟踪部署、只读核验与错误日志观察；全部完成后执行 `.workbench/bin/ledger runbook complete <runbook_id>`（未批准前绝不强行绕过；`git push --tags`、读 k8s `secret`、未登记的 prod 写操作永久禁止）。
+   将 Runbook 与生成的 `rb-...` 编号发给用户确认；用户在主会话单独回复整句 **`批准 <runbook_id>`** 或 **`approve <runbook_id>`**（不附带其他文字或标点）后，`UserPromptSubmit` Hook 自动为本会话签发 30 分钟精确白名单通行证，随后 Agent 自动推进合 PR、打 tag 并显式 `git push origin <tag>`、执行已登记迁移/`kubectl`、跟踪部署、只读核验与错误日志观察；全部完成后执行 `.workbench/bin/ledger runbook complete <runbook_id>`（未批准前绝不强行绕过；`git push --tags`、读 k8s `secret`、未登记的 prod 写操作永久禁止）。
    - **纯运维/补跑已上线 SQL（无业务仓代码改动）**：无需开设 `--endpoint prod` 开发任务账本（避免无分支挂载而被迫 `--force-incomplete` 关账），直接执行 `.workbench/bin/ledger runbook create --title "<说明>" --sql <prod-host>:<sql路径>` 签发发版单，经用户回复 `批准 <runbook_id>` 后执行并回查；如需留存排查与核验上下文，可开设 `--endpoint investigation` 排查账本或写入运维日志。
 3. 涉及共享队列任务格式/语义变化时，核对滚动部署与回滚期间新旧版本共存兼容性。
 

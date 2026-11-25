@@ -21,6 +21,15 @@ export function evaluatePreToolUse(
   workbenchRoot: string,
   input: CodexHookInput,
 ): string | null {
+  const start = performance.now();
+  const reason = evaluatePolicies(workbenchRoot, input);
+  return performance.now() - start >= GUARD_BUDGET_MS ? GUARD_TIMEOUT_MESSAGE : reason;
+}
+
+export const GUARD_BUDGET_MS = 7000;
+export const GUARD_TIMEOUT_MESSAGE = "安全守卫检查超时，已拒绝执行。";
+
+function evaluatePolicies(workbenchRoot: string, input: CodexHookInput): string | null {
   const cfg = loadWorkbenchConfig(workbenchRoot);
 
   // Tier 1a: Ledger immutability & frozen spec/test physical locks (applies to ALL tools: file-edit, apply_patch, shell)
@@ -48,7 +57,7 @@ export function evaluatePreToolUse(
   const fuseReason =
     checkProdDb(cmd, prodHosts, toolWorkdir, approvedRunbooks, workbenchRoot) ??
     checkKubectl(cmd, approvedRunbooks) ??
-    checkCloudAndRedisOps(cmd) ??
+    checkCloudAndRedisOps(cmd, cfg.guard.custom_block_patterns) ??
     checkGitPhysicalFuse(workbenchRoot, cmd, toolWorkdir, cfg, approvedRunbooks);
   if (fuseReason) return fuseReason;
 

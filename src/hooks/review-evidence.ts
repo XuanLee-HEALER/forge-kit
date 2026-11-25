@@ -1,11 +1,11 @@
 import { normalizeReviewRole } from "../ledger/types";
 import type { CapturedEvidence } from "./types";
-import { existsSync, readFileSync } from "node:fs";
+import { runGit } from "../git";
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 
 function parseReviewJsonOutput(
   outputText: string,
-  outFilePath?: string,
 ): {
   status?: string;
   passed?: boolean;
@@ -13,15 +13,16 @@ function parseReviewJsonOutput(
   head?: string;
   base?: string;
   role?: string;
+  repo?: string;
+  executionId?: string;
+  startedAt?: string;
+  reviewFloorSeq?: number;
+  reviewTaskId?: string;
+  reviewStarted?: boolean;
 } | null {
-  const candidates: string[] = [];
-  if (outFilePath && existsSync(outFilePath)) {
-    try {
-      candidates.push(readFileSync(outFilePath, "utf8"));
-    } catch {
-      // Ignore unreadable out file
-    }
-  }
+  const receipts = outputText.split(/\r?\n/).filter(line => line.startsWith("FORGE_REVIEW_RECEIPT "));
+  if (receipts.length > 1) return null;
+  const candidates = receipts.map(line => line.slice("FORGE_REVIEW_RECEIPT ".length));
   const trimmed = outputText.trim();
   if (trimmed.startsWith("{")) candidates.push(trimmed);
   const firstBrace = trimmed.indexOf("{");
@@ -34,7 +35,14 @@ function parseReviewJsonOutput(
     try {
       const obj = JSON.parse(raw) as Record<string, unknown>;
       if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+        const execution = obj.reviewExecution as { id?: unknown; startedAt?: unknown } | undefined;
         return {
+          repo: typeof obj.repo === "string" ? obj.repo : undefined,
+          reviewStarted: obj.reviewStarted !== false,
+          ...(Object.hasOwn(obj, "reviewTaskId") && { reviewTaskId: typeof obj.reviewTaskId === "string" ? obj.reviewTaskId : "" }),
+          ...(Object.hasOwn(obj, "reviewFloorSeq") && { reviewFloorSeq: Number.isSafeInteger(obj.reviewFloorSeq) && Number(obj.reviewFloorSeq) >= 0 ? Number(obj.reviewFloorSeq) : -1 }),
+          executionId: typeof execution?.id === "string" ? execution.id : undefined,
+          startedAt: typeof execution?.startedAt === "string" ? execution.startedAt : undefined,
           status: typeof obj.status === "string" ? obj.status : undefined,
           passed: typeof obj.passed === "boolean" ? obj.passed : undefined,
           errorCode: typeof obj.errorCode === "string" ? obj.errorCode : undefined,
@@ -289,6 +297,7 @@ function parseCodexReviewCommand(
     return null;
   }
 
+  if (hasBase || (hasCommitFlag && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(commitVal ?? ""))) return null; // Only the launch-time ledger runner can attest this range.
   return { targetDir, hasCommitFlag, commitVal };
 }
 
@@ -322,7 +331,8 @@ export function classifyReviewEvidence(
     reviewCliMatch &&
     segCmdToks.some(
       (t) =>
-        t === "--status" ||
+        hasCliFlag([t], "--status") ||
+        hasCliFlag([t], "--list") ||
         t === "--help" ||
         t === "-h" ||
         t === "--version" ||
@@ -335,20 +345,34 @@ export function classifyReviewEvidence(
 
   const role = normalizeReviewRole(reviewCliMatch ? reviewCliMatch[1] : "codex-review");
   const repoVal = reviewCliMatch ? extractCliFlagValue(segCmdToks, "--repo") : null;
-  const outVal = reviewCliMatch ? extractCliFlagValue(segCmdToks, "--out") : null;
+  const resumed = Boolean(reviewCliMatch && hasCliFlag(segCmdToks, "--resume"));
+  const parsedJson = reviewCliMatch ? parseReviewJsonOutput(outputText) : null;
+  if (parsedJson?.reviewStarted === false) return [];
+  if (reviewCliMatch && nonCdCount !== 1) return [];
+  if (resumed && (!parsedJson?.repo || !parsedJson.head || ((exitCode === 0 || parsedJson.status === "findings") && !parsedJson.executionId))) return [];
   const headVal = reviewCliMatch ? extractCliFlagValue(segCmdToks, "--head") : null;
   const commitVal = parsedCodexReview ? parsedCodexReview.commitVal : null;
   const targetDir = parsedCodexReview
     ? parsedCodexReview.targetDir
+    : resumed && parsedJson?.repo
+      ? resolve(curDir, parsedJson.repo)
     : repoVal
       ? resolve(curDir, repoVal)
       : curDir;
-  const outFilePath = outVal ? resolve(curDir, outVal) : undefined;
-  const parsedJson = reviewCliMatch
-    ? parseReviewJsonOutput(outputText, outFilePath)
-    : null;
-
   if (reviewCliMatch) {
+    if (parsedJson?.role && normalizeReviewRole(parsedJson.role) !== role) return [];
+    if (exitCode === 0 && parsedJson?.status === "pass") {
+      if (!parsedJson.role || !parsedJson.repo || !parsedJson.head || !parsedJson.base) return [];
+      try {
+        const root = runGit(targetDir, ["rev-parse", "--show-toplevel"]);
+        if (root.code || realpathSync(root.stdout.replace(/\n$/, "")) !== realpathSync(parsedJson.repo)) return [];
+      } catch { return []; }
+      for (const [ref, sha] of [[headVal, parsedJson.head], [extractCliFlagValue(segCmdToks, "--base"), parsedJson.base]]) {
+        if (!sha || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha)) return [];
+        const commit = runGit(targetDir, ["rev-parse", "--verify", "--end-of-options", (ref ?? sha) + "^{commit}"]);
+        if (commit.code || commit.stdout.trim() !== sha) return [];
+      }
+    }
     // Ignore in-flight / polling JSON statuses completely
     if (
       parsedJson?.status === "running" ||
@@ -358,10 +382,10 @@ export function classifyReviewEvidence(
     ) {
       return [];
     }
-    // On exit 0, require terminal status === "completed" and passed !== false
+    // The shipped CLI emits pass. Older executors emitted completed/passed.
     if (
       exitCode === 0 &&
-      (parsedJson?.status !== "completed" || parsedJson?.passed === false)
+      ((parsedJson?.status !== "completed" && parsedJson?.status !== "pass") || parsedJson.passed === false)
     ) {
       return [];
     }
@@ -409,15 +433,21 @@ export function classifyReviewEvidence(
   // - For review-agents CLI: prefer parsedJson.head or explicit `--head <ref>` (requirePinnedSha = true).
   // - For `codex review --commit ...` (even empty `--commit=`!): ALWAYS set requirePinnedSha = true
   //   so an older or malformed `--commit` review NEVER falls back to live HEAD!
-  const hasCommitFlag = parsedCodexReview ? parsedCodexReview.hasCommitFlag : false;
-  const hasHeadFlag = reviewCliMatch ? hasCliFlag(segCmdToks, "--head") : false;
   const explicitHeadSha =
     headVal && /^[0-9a-f]{7,40}$/i.test(headVal) ? headVal : null;
   const pinnedSha = parsedJson?.head ?? explicitHeadSha;
   const pinnedRef = !pinnedSha ? (commitVal || headVal || null) : null;
-  const requirePinnedSha = Boolean(reviewCliMatch) || hasCommitFlag || hasHeadFlag;
+  // Plain-text native output has no dependable passing verdict.
+  let nativePass = false;
+  if (parsedCodexReview && exitCode === 0) {
+    try {
+      const report = JSON.parse(outputText);
+      nativePass = report.overall_correctness === "patch is correct" &&
+        Array.isArray(report.findings) && report.findings.length === 0;
+    } catch { /* Only structured verdicts can establish a pass. */ }
+  }
 
-  const status: "pass" | "fail" = exitCode === 0 ? "pass" : "fail";
+  const status: "pass" | "fail" = exitCode === 0 && (!parsedCodexReview || nativePass) ? "pass" : "fail";
   return [{
     kind: "review",
     status,
@@ -425,9 +455,13 @@ export function classifyReviewEvidence(
     targetDir,
     pinnedSha,
     pinnedRef,
-    requirePinnedSha,
+    requirePinnedSha: true,
     meta: {
       role,
+      ...(parsedJson?.executionId ? { execution_id: parsedJson.executionId, started_at: parsedJson.startedAt } : {}),
+      ...(parsedJson?.reviewTaskId !== undefined ? { review_task_id: parsedJson.reviewTaskId } : {}),
+      ...(parsedJson?.reviewFloorSeq !== undefined ? { review_floor_seq: parsedJson.reviewFloorSeq } : {}),
+      ...(resumed ? { resumed: true } : {}),
       exit_code: exitCode,
       report_status: parsedJson?.status ?? null,
       error_code: parsedJson?.errorCode ?? null,

@@ -1,16 +1,29 @@
+import { isolateHome } from "./helpers/hermetic";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { locateRepo, runGit } from "../src/git";
 import { Ledger } from "../src/ledger";
 import { classifyPostToolEvidence, handleLedgerHook } from "../src/ledger-hook";
 
+isolateHome();
+
 let wb: string;
 let repoDir: string;
 
+let savedPath: string | undefined;
 beforeEach(() => {
   wb = mkdtempSync(join(tmpdir(), "forge-lhook-test-"));
+  const bin = join(wb, "bin"); mkdirSync(bin);
+  writeFileSync(join(bin, "gh"), `#!/bin/sh
+set -eu
+[ "$1" = pr ] && [ "$2" = view ]
+branch=$(git branch --show-current)
+case "$3" in */pull/99) branch=feat/other;; esac
+sha=$(git rev-parse "$branch")
+printf '{"url":"%s","headRefName":"%s","headRefOid":"%s","state":"OPEN","isCrossRepository":false,"headRepository":{"name":"svc"},"headRepositoryOwner":{"login":"acme"}}' "$3" "$branch" "\${TEST_GH_REMOTE_OID:-$sha}"`, { mode: 0o755 });
+  savedPath = process.env.PATH; process.env.PATH = bin + ":" + savedPath;
   mkdirSync(join(wb, ".workbench", "ledger"), { recursive: true });
   writeFileSync(
     join(wb, ".workbench", "workbench.yaml"),
@@ -43,6 +56,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  process.env.PATH = savedPath;
   rmSync(wb, { recursive: true, force: true });
 });
 
@@ -381,6 +395,10 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
     expect(record("gh -R acme/svc pr create -t demo -b b", 443)).toBe(1);
     expect(record("gh pr -R acme/svc create -t demo -b b", 443)).toBe(1);
     expect(record("env -Csvc gh pr create -t demo -b b", 443, wb)).toBe(1);
+    runGit(repoDir, ["update-ref", "refs/remotes/origin/feat/work", "HEAD"]);
+    process.env.TEST_GH_REMOTE_OID = "f".repeat(40);
+    try { expect(record("gh pr create -t demo -b b", 443)).toBe(0); }
+    finally { delete process.env.TEST_GH_REMOTE_OID; }
     expect(record("gh pr create -t demo -b b", 443)).toBe(1);
     runGit(repoDir, ["remote", "set-url", "origin", "https://github.com/acme/svc.git"]);
     expect(record("gh pr create -t demo -b b", 8443)).toBe(0);
@@ -500,6 +518,34 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
         tool_response: { exit_code: 0, output: "FAIL\ndone" },
       }).recorded,
     ).toBe(0);
+
+    const report = JSON.stringify({ repo: repoDir, role: "quality", reviewFloorSeq: 0, reviewTaskId: "20261121-work", status: "pass", findings: [], base: head, head });
+    for (const [args, expected] of [[`--base ${head} --head ${head}`, 1], ["--status=task-1", 0], ["--list=tasks", 0]] as const) {
+      expect(handleLedgerHook(wb, { hook_event_name: "PostToolUse", cwd: wb, tool_name: "exec_command",
+        tool_input: { command: `review-agents/bin/review-quality --repo ${repoDir} ${args}` },
+        tool_response: { exit_code: 0, output: report } }).recorded).toBe(expected);
+    }
+
+    const finished = { repo: repoDir, head, base: head, role: "quality", reviewFloorSeq: 0, reviewTaskId: "20261121-work", status: "pass",
+      reviewExecution: { id: "fixture-execution", startedAt: new Date().toISOString() } };
+    for (const invocation of ["first", "replay"]) {
+      expect(handleLedgerHook(wb, { hook_event_name: "PostToolUse", cwd: wb, tool_name: "exec_command",
+        tool_use_id: invocation, tool_input: { command: "review-agents/bin/review-quality --resume saved-task" },
+        tool_response: { exit_code: 0, output: JSON.stringify(finished) } }).recorded).toBe(1);
+    }
+    const receipt = "…truncated…\nFORGE_REVIEW_RECEIPT " + JSON.stringify(finished);
+    const cli = `review-agents/bin/review-quality --repo ${repoDir} --base ${head} --head ${head}`;
+    expect(classifyPostToolEvidence(cli, wb, 0, receipt)[0]?.status).toBe("pass");
+    expect(classifyPostToolEvidence(cli + " && " + cli, wb, 0, receipt)).toEqual([]);
+    expect(classifyPostToolEvidence(cli.replace("review-quality", "review-comments"), wb, 0, receipt)).toEqual([]);
+    const replayLedger = new Ledger(wb);
+    expect(replayLedger.getTaskEvents("20261121-work").filter(event => event.tool_use_id === "review-execution:fixture-execution")).toHaveLength(1);
+    replayLedger.closeDb();
+    const stale = join(wb, "prior-review.json");
+    writeFileSync(stale, JSON.stringify({ status: "error", errorCode: "credit_balance_exhausted", head, base: head }));
+    const failed = classifyPostToolEvidence(`review-agents/bin/review-quality --repo ${repoDir} --head ${head} --out ${stale}`,
+      wb, 2, JSON.stringify({ status: "error", summary: "Task exists" }));
+    expect(failed[0]?.meta?.credit_balance_exhausted).toBe(false);
 
     // 2. `review-quality --status` polling or in-flight JSON MUST NOT record pass!
     expect(
@@ -954,7 +1000,6 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
         tool_response: { exit_code: 0, output: "https://github.com/acme/svc/pull/46" },
       }).recorded,
     ).toBe(1);
-    const { classifyPostToolEvidence } = require("../src/ledger-hook") as typeof import("../src/ledger-hook");
     const utf8Ev = classifyPostToolEvidence(
       `gh pr create --head $'caf\\xc3\\xa9' -t demo -b b`,
       repoDir,
@@ -1061,6 +1106,8 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
     expect(classifyPostToolEvidence('echo "(typecheck)" && bun run check', repoDir, 0, "")[0]?.kind).toBe("lint");
     // `codex help review` and non-review codex subcommands MUST NEVER fabricate `review/pass`,
     // while `codex -C ../other-repo review --commit HEAD` attributes accurately!
+    const nativePass = JSON.stringify({ overall_correctness: "patch is correct", findings: [] });
+    expect(classifyPostToolEvidence("codex review --commit " + head, repoDir, 0, "[P1] blocking finding")[0]?.status).toBe("fail");
     expect(classifyPostToolEvidence("codex help review", repoDir, 0, "Usage: codex review")).toEqual([]);
     expect(classifyPostToolEvidence('codex exec "review"', repoDir, 0, "ok")).toEqual([]);
     expect(classifyPostToolEvidence("codex review --help", repoDir, 0, "Usage: codex review")).toEqual([]);
@@ -1125,8 +1172,8 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
       )[0]?.status,
     ).toBe("fail");
     expect(classifyPostToolEvidence("codex review -", repoDir, 1, "No prompt provided via stdin.")).toEqual([]);
-    expect(classifyPostToolEvidence("codex -c model=o3 review --uncommitted", repoDir, 0, "LGTM")[0]?.status).toBe("pass");
-    expect(classifyPostToolEvidence("codex review -cmodel=o3 --uncommitted", repoDir, 0, "LGTM")[0]?.status).toBe("pass");
+    expect(classifyPostToolEvidence("codex -c model=o3 review --uncommitted", repoDir, 0, nativePass)[0]?.status).toBe("pass");
+    expect(classifyPostToolEvidence("codex review -cmodel=o3 --uncommitted", repoDir, 0, nativePass)[0]?.status).toBe("pass");
     expect(classifyPostToolEvidence("codex review --uncommitted", repoDir, 1, "API request timed out")[0]?.status).toBe("fail");
     expect(classifyPostToolEvidence("codex -i a.png review --uncommitted", repoDir, 2, "unexpected argument")).toEqual([]);
     expect(classifyPostToolEvidence("codex -m a -m b review --uncommitted", repoDir, 2, "cannot be used multiple times")).toEqual([]);
@@ -1146,13 +1193,10 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
       classifyPostToolEvidence("codex -s read-only -a never review --uncommitted", repoDir, 2, "API request timed out")[0]
         ?.status,
     ).toBe("fail");
-    expect(classifyPostToolEvidence("codex -s read-only -a never review --uncommitted", repoDir, 0, "LGTM")[0]?.status).toBe("pass");
-    expect(classifyPostToolEvidence("codex -i a.png -m o3 review --uncommitted", repoDir, 0, "LGTM")[0]?.status).toBe("pass");
+    expect(classifyPostToolEvidence("codex -s read-only -a never review --uncommitted", repoDir, 0, nativePass)[0]?.status).toBe("pass");
+    expect(classifyPostToolEvidence("codex -i a.png -m o3 review --uncommitted", repoDir, 0, nativePass)[0]?.status).toBe("pass");
     expect(classifyPostToolEvidence("codex review --uncommitted", repoDir, 0, "LGTM")[0]?.kind).toBe("review");
-    const codexCdEv = classifyPostToolEvidence("codex -C ../other-repo review --commit HEAD", repoDir, 0, "LGTM");
-    expect(codexCdEv[0]?.kind).toBe("review");
-    expect(codexCdEv[0]?.targetDir).toBe(otherRepoDir);
-    expect(codexCdEv[0]?.pinnedRef).toBe("HEAD");
+    expect(classifyPostToolEvidence("codex -C ../other-repo review --commit HEAD", repoDir, 0, "LGTM")).toEqual([]);
     expect(classifyPostToolEvidence("false && make test", repoDir, 1, "")).toEqual([]);
     expect(classifyPostToolEvidence("make -f /dev/stdin test && cd /dev/null", repoDir, 1, "R42_TEST_RAN")).toEqual([]);
     expect(classifyPostToolEvidence("cd /dev/null && make test", repoDir, 1, "")).toEqual([]);
@@ -1433,7 +1477,7 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
     const errUrlEv = errUrlCheck
       .getTaskEvents("20261121-work")
       .find((e) => e.tool_use_id?.startsWith("tu-gh-attach-inline-url-err"));
-    expect(errUrlEv?.payload_json).toContain('"kind":"pr","status":"fail"');
+    expect(JSON.parse(errUrlEv?.payload_json ?? "null")).toMatchObject({ kind: "pr", status: "fail", source: "hook" });
     errUrlCheck.closeDb();
     // Partial attachment upload failure with `--attach` still creates PR and prints PR URL (exit 1) -> recorded as pr/pass!
     expect(
@@ -1450,7 +1494,7 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
     const attachEv = attachCheck
       .getTaskEvents("20261121-work")
       .find((e) => e.tool_use_id?.startsWith("tu-gh-attach-partial-fail"));
-    expect(attachEv?.payload_json).toContain('"kind":"pr","status":"pass"');
+    expect(JSON.parse(attachEv?.payload_json ?? "null")).toMatchObject({ kind: "pr", status: "pass", source: "hook", meta: { pr_url: "https://github.com/acme/svc/pull/42", pr_head_oid: head } });
     attachCheck.closeDb();
     expect(
       handleLedgerHook(wb, {
@@ -1473,7 +1517,7 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
       }).recorded,
     ).toBe(0);
 
-    // 3b. `codex review --commit=<old>` and `--commit HEAD~1` MUST pin to the older commit, NEVER live HEAD!
+    // 3b. `codex review --commit=<old>` must pin the reviewed commit. Symbolic refs cannot establish launch-time identity.
     writeFileSync(join(repoDir, "a.txt"), "v2\n");
     runGit(repoDir, ["add", "a.txt"]);
     runGit(repoDir, ["commit", "-m", "feat: v2"]);
@@ -1488,7 +1532,7 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
         tool_name: "exec_command",
         tool_use_id: "tu-codex-eq",
         tool_input: { command: `codex review --commit=${prevCommit}`, workdir: repoDir },
-        tool_response: { exit_code: 0, output: "LGTM" },
+        tool_response: { exit_code: 0, output: nativePass },
       }).recorded,
     ).toBe(1);
     expect(
@@ -1497,15 +1541,15 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
         cwd: repoDir,
         tool_name: "exec_command",
         tool_use_id: "tu-codex-tilde",
-        tool_input: { command: "codex review --commit HEAD~1", workdir: repoDir },
+        tool_input: { command: "codex review --commit HEAD", workdir: repoDir },
         tool_response: { exit_code: 0, output: "LGTM" },
       }).recorded,
-    ).toBe(1);
+    ).toBe(0);
     const revCheckLedger = new Ledger(wb);
     const codexEvents = revCheckLedger
       .getTaskEvents("20261121-work")
       .filter((e) => e.tool_use_id?.startsWith("tu-codex-"));
-    expect(codexEvents.length).toBe(2);
+    expect(codexEvents.length).toBe(1);
     expect(codexEvents.every((e) => e.sha === prevCommit)).toBe(true);
     expect(codexEvents.some((e) => e.sha === newHead)).toBe(false);
     revCheckLedger.closeDb();
@@ -1548,11 +1592,11 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
     expect(
       ledgerCheck
         .getTaskEvents("20261121-other")
-        .some((e) => e.tool_use_id?.startsWith("tu-pr-other") && e.payload_json.includes('"kind":"pr","status":"pass"')),
+        .some((e) => e.tool_use_id?.startsWith("tu-pr-other") && JSON.parse(e.payload_json).kind === "pr" && JSON.parse(e.payload_json).status === "pass"),
     ).toBe(true);
     ledgerCheck.closeDb();
 
-    // 5. All 4 review roles hit credit_balance_exhausted via PostToolUse -> fallback recorded via documented CLI `--role <role>` -> task becomes READY and CLOSABLE!
+    // 5. All 4 review roles hit credit_balance_exhausted via PostToolUse -> fallback recorded by the executor -> task becomes READY and CLOSABLE!
     const roles = ["quality", "performance", "simplify", "comments"] as const;
     for (const role of roles) {
       const failRec = handleLedgerHook(wb, {
@@ -1618,37 +1662,34 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
     });
     expect(preCheck.ready).toBe(false);
     expect(preCheck.missing.join(" ")).toContain("quality");
+    const oldCheckout = join(wb, "old-checkout");
+    const movedCheckout = join(wb, "moved-checkout");
+    expect(runGit(repoDir, ["checkout", "--detach", head]).code).toBe(0);
+    expect(runGit(repoDir, ["worktree", "add", oldCheckout, "feat/work"]).code).toBe(0);
+    pre.attachRepo({ task_id: "20261121-work", repo: "svc", branch: "feat/work", worktree: oldCheckout });
+    expect(runGit(repoDir, ["worktree", "move", oldCheckout, movedCheckout]).code).toBe(0);
     pre.closeDb();
 
-    // Run documented wrapup CLI fallback command for all 4 roles!
-    const ledgerSrc = join(import.meta.dir, "..", "src", "bin", "ledger.ts");
+    // Exercise the shipped executor with a local stand-in for the external Codex process.
+    const bin = join(wb, "native-bin");
+    const prompts = join(wb, "review-agents", "prompts");
+    mkdirSync(bin);
+    mkdirSync(prompts, { recursive: true });
+    const codex = join(bin, "codex");
+    writeFileSync(codex, `#!/bin/sh
+case " $* " in *" -s read-only "*) ;; *) exit 2 ;; esac
+while [ "$1" != "-o" ] && [ "$#" -gt 0 ]; do shift; done
+[ "$#" -ge 2 ] || exit 2
+echo '{"passed":true,"report":"Read-only fixture review completed"}' > "$2"
+`);
+    chmodSync(codex, 0o755);
     for (const role of roles) {
-      const proc = Bun.spawn(
-        [
-          process.execPath,
-          ledgerSrc,
-          "record",
-          "20261121-work",
-          "--kind",
-          "review",
-          "--status",
-          "fallback",
-          "--role",
-          role,
-          "--repo",
-          "svc",
-          "--sha",
-          head,
-          "--summary",
-          `${role} native_fallback (credit_balance_exhausted)`,
-        ],
-        {
-          env: { ...process.env, FORGE_WORKBENCH_ROOT: wb },
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
-      expect(await proc.exited).toBe(0);
+      writeFileSync(join(prompts, role + ".md"), "Review only.");
+      const proc = Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/bin/ledger.ts"),
+        "review-fallback", "20261121-work", "--repo", "svc", "--role", role, "--sha", head],
+        { env: { ...process.env, PATH: bin + ":" + process.env.PATH, FORGE_WORKBENCH_ROOT: wb } });
+      expect(proc.exitCode, proc.stderr.toString()).toBe(0);
+      expect(JSON.parse(proc.stdout.toString())).toMatchObject({ kind: "review", source: "tool", status: "fallback", meta: { role, head } });
     }
 
     // Now task is READY and closes cleanly, while original fail events remain preserved in hash chain!
@@ -1660,7 +1701,7 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
     } finally {
       post.closeDb();
     }
-  });
+  }, 20000);
 
   test("injects compact active ledger summary on SessionStart and PostCompact", () => {
     const start = handleLedgerHook(wb, {

@@ -22,6 +22,7 @@ export interface GuardConfig {
   require_prod_db_hosts: boolean;
   protected_branches: string[];
   prod_tag_patterns: string[];
+  custom_block_patterns?: string[];
   block_shared_worktree_ops: boolean;
   block_ledger_direct_edits: boolean;
 }
@@ -81,7 +82,7 @@ const DEFAULT_GUARD: GuardConfig = {
   prod_db_targets: [],
   require_prod_db_hosts: false,
   protected_branches: ["main", "master"],
-  prod_tag_patterns: ["^api-v", "^crontab-v", "^release-v", "^v\\d+\\.\\d+"],
+  prod_tag_patterns: ["^release-v", "^v[0-9]+\\.[0-9]+\\.[0-9]+"],
   block_shared_worktree_ops: true,
   block_ledger_direct_edits: true,
 };
@@ -146,6 +147,10 @@ export function loadWorkbenchConfig(root: string): WorkbenchConfig {
   );
   const ledgerRaw = (raw?.ledger ?? {}) as Partial<LedgerConfig>;
   const guardRaw = (raw?.guard ?? {}) as Partial<GuardConfig>;
+  if (guardRaw.custom_block_patterns !== undefined && (!Array.isArray(guardRaw.custom_block_patterns) ||
+      !guardRaw.custom_block_patterns.every(pattern => typeof pattern === "string"))) {
+    throw new Error("guard.custom_block_patterns must be an array of regex strings");
+  }
 
   return {
     name: raw?.name || "workbench",
@@ -187,6 +192,7 @@ export function loadWorkbenchConfig(root: string): WorkbenchConfig {
         : DEFAULT_GUARD.prod_db_targets,
       require_prod_db_hosts:
         guardRaw.require_prod_db_hosts ?? DEFAULT_GUARD.require_prod_db_hosts,
+      custom_block_patterns: guardRaw.custom_block_patterns ?? [],
       protected_branches: Array.isArray(guardRaw.protected_branches)
         ? guardRaw.protected_branches.map(String)
         : DEFAULT_GUARD.protected_branches,

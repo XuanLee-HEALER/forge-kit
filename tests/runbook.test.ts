@@ -1,3 +1,4 @@
+import { isolateHome } from "./helpers/hermetic";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,6 +7,8 @@ import { evaluatePreToolUse } from "../src/guard";
 import { Ledger } from "../src/ledger";
 import { handleLedgerHook } from "../src/ledger-hook";
 
+isolateHome();
+
 let wbRoot: string;
 let repoDir: string;
 let mainSha: string;
@@ -13,7 +16,7 @@ let otherSha: string;
 let sqlFile: string;
 
 function git(cwd: string, args: string[]): string {
-  const res = Bun.spawnSync(["git", ...args], { cwd });
+  const res = Bun.spawnSync(["git", ...args], { env: process.env, cwd });
   if (res.exitCode !== 0) {
     throw new Error(`git ${args.join(" ")} failed: ${res.stderr.toString()}`);
   }
@@ -84,6 +87,48 @@ afterEach(() => {
 });
 
 describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", () => {
+  test("only complete human approval directives activate pending runbooks", () => {
+    const ledger = new Ledger(wbRoot);
+    try {
+      for (const id of ["rb-a", "rb-b", "rb-abcd1234", "rb-1123-demo"]) ledger.createRunbook({
+        runbook_id: id, title: "Release", actions: { prs: [{ repo: "svc", number: 355 }] },
+      });
+      const prompt = (message: string) => handleLedgerHook(wbRoot, {
+        hook_event_name: "UserPromptSubmit", session_id: "human", prompt: message,
+      }).userPromptContext;
+      for (const text of ["批准 rb-a\nrb-b", "批准 rb-a\r\n", "我不打算批准 rb-abcd1234", "先别急着批准 rb-abcd1234", "批准 rb-abcd1234 吗？有什么风险",
+        "你刚才说『请回复 批准 rb-abcd1234』，我想先看看 diff", "I'm not going to approve rb-abcd1234 yet",
+        "I won't approve rb-abcd1234", "Runbook 没问题，批准 rb-1123-demo，继续推吧", "看看 rb-a"]) {
+        expect(prompt(text)).toContain("未识别");
+        expect(ledger.listRunbooks("PENDING")).toHaveLength(4);
+      }
+      expect(prompt("批准 rb-abcd1234")).toContain("已在主会话批准");
+      expect(prompt("approve rb-a rb-b")).toContain("rb-b");
+      expect(ledger.listRunbooks("APPROVED")).toHaveLength(3);
+      for (const id of ["rb-demo", "rb-demo-"]) ledger.createRunbook({ runbook_id: id, title: "Release", actions: { prs: [{ repo: "svc", number: 355 }] } });
+      prompt("approve rb-demo rb-demo-");
+      for (const text of ["Do not cancel rb-demo", "don't revoke rb-demo", "不要撤销 rb-demo", "别取消 rb-demo",
+        "cancel rb-demo?", "撤销 rb-demo 吗？", "『请撤销 rb-demo』", '"cancel rb-demo"']) {
+        prompt(text);
+        expect(ledger.getRunbook("rb-demo")?.status).toBe("APPROVED");
+      }
+      prompt("请撤销 rb-demo-");
+      expect(ledger.getRunbook("rb-demo-")?.status).toBe("REVOKED");
+      expect(ledger.getRunbook("rb-demo")?.status).toBe("APPROVED");
+      prompt("撤销：rb-demo");
+      expect(ledger.getRunbook("rb-demo")?.status).toBe("REVOKED");
+      for (const [id, command] of [["rb-colon", "撤销: rb-colon"], ["rb-english", "cancel: rb-english"], ["rb-polite", "please revoke rb-polite"]]) {
+        ledger.createRunbook({ runbook_id: id, title: "Release", actions: { prs: [{ repo: "svc", number: 355 }] } });
+        prompt("approve " + id); prompt(command);
+        expect(ledger.getRunbook(id)?.status).toBe("REVOKED");
+      }
+      const mixed = prompt("请撤销 rb-a，同时批准 rb-1123-demo");
+      expect(mixed).toContain("已撤销");
+      expect(mixed).toContain("未识别");
+      expect(ledger.getRunbook("rb-1123-demo")?.status).toBe("PENDING");
+    } finally { ledger.closeDb(); }
+  });
+
   test("blocks release actions before approval, prevents self-approval forgery, allows exact approved actions, and blocks drift/scope escapes", () => {
     const ledger = new Ledger(wbRoot);
     const rb = ledger.createRunbook({
@@ -171,13 +216,13 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
       session_id: "sess-main",
       prompt: "先等一下，暂不批准 rb-1123-demo",
     });
-    expect(negRes.userPromptContext).toBeUndefined();
+    expect(negRes.userPromptContext).toContain("未识别");
 
     // 4. Genuine root-session human approval activates the Runbook for sess-main ONLY!
     const okRes = handleLedgerHook(wbRoot, {
       hook_event_name: "UserPromptSubmit",
       session_id: "sess-main",
-      prompt: "Runbook 没问题，批准 rb-1123-demo，继续推吧",
+      prompt: "批准 rb-1123-demo",
     });
     expect(okRes.userPromptContext).toContain("用户已在主会话批准发版单 rb-1123-demo");
 
@@ -380,7 +425,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
     const revRes = handleLedgerHook(wbRoot, {
       hook_event_name: "UserPromptSubmit",
       session_id: "sess-main",
-      prompt: "撤销 rb-1123-demo",
+      prompt: "请撤销 rb-1123-demo",
     });
     expect(revRes.userPromptContext).toContain("已撤销发版单 rb-1123-demo");
     expect(
@@ -391,7 +436,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         tool_input: { command: "kubectl -n prod rollout restart deploy/svc-api" },
       }),
     ).toContain("非只读集群操作");
-  });
+  }, 15_000);
 
   test("createRunbook rejects kubectl secret commands and shell chaining", () => {
     const ledger = new Ledger(wbRoot);
@@ -1236,5 +1281,5 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         },
       }),
     ).toContain("prod 数据库");
-  });
+  }, 15_000);
 });

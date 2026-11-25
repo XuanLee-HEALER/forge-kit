@@ -1,3 +1,4 @@
+import { isolateHome } from "./helpers/hermetic";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   existsSync,
@@ -22,6 +23,8 @@ import {
 import { loadWorkbenchConfig } from "../src/config";
 import { runGit } from "../src/git";
 import { Ledger } from "../src/ledger";
+
+isolateHome();
 
 let target: string;
 
@@ -145,15 +148,15 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     });
     const repo = join(res.root, "main-svc");
     mkdirSync(repo, { recursive: true });
-    Bun.spawnSync(["git", "init", "-b", "main"], { cwd: repo });
-    Bun.spawnSync(["git", "config", "user.email", "a@b.c"], { cwd: repo });
-    Bun.spawnSync(["git", "config", "user.name", "A"], { cwd: repo });
+    Bun.spawnSync(["git", "init", "-b", "main"], { env: process.env, cwd: repo });
+    Bun.spawnSync(["git", "config", "user.email", "a@b.c"], { env: process.env, cwd: repo });
+    Bun.spawnSync(["git", "config", "user.name", "A"], { env: process.env, cwd: repo });
     writeFileSync(join(repo, "f.txt"), "hi\n");
-    Bun.spawnSync(["git", "add", "f.txt"], { cwd: repo });
-    Bun.spawnSync(["git", "commit", "-m", "init"], { cwd: repo });
+    Bun.spawnSync(["git", "add", "f.txt"], { env: process.env, cwd: repo });
+    Bun.spawnSync(["git", "commit", "-m", "init"], { env: process.env, cwd: repo });
 
     const linkedWt = join(res.root, "linked-wt");
-    Bun.spawnSync(["git", "worktree", "add", "-b", "feat/wt", linkedWt, "main"], { cwd: repo });
+    Bun.spawnSync(["git", "worktree", "add", "-b", "feat/wt", linkedWt, "main"], { env: process.env, cwd: repo });
 
     expect(() => addRepo({ repoPath: linkedWt, workbenchDir: res.root })).toThrow(
       "linked git worktree",
@@ -198,7 +201,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     }
   });
 
-  test("ledger CLI ignores --role for non-review evidence kinds", () => {
+  test("ledger CLI only accepts manual evidence and rejects actor overrides", () => {
     const res = initWorkbench({
       targetDir: target,
       name: "role-check",
@@ -207,25 +210,20 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const ledgerBin = join(res.root, ".workbench", "bin", "ledger");
     const opened = Bun.spawnSync(
       [ledgerBin, "open", "--id", "role-test-1", "--title", "Role test", "--endpoint", "local", "--depth", "targeted"],
-      { cwd: res.root },
+      { env: process.env, cwd: res.root },
     );
     expect(opened.exitCode).toBe(0);
 
-    const lintRec = Bun.spawnSync(
-      [ledgerBin, "record", "role-test-1", "--kind", "lint", "--status", "pass", "--role", "review-quality", "--summary", "tsc pass"],
-      { cwd: res.root },
-    );
-    expect(lintRec.exitCode).toBe(0);
-    expect(lintRec.stderr.toString()).toContain("--role only applies to --kind review");
-    const lintEv = JSON.parse(lintRec.stdout.toString()) as { payload_json: string };
-    expect(JSON.parse(lintEv.payload_json).meta).toBeUndefined();
-
-    const revRec = Bun.spawnSync(
-      [ledgerBin, "record", "role-test-1", "--kind", "review", "--status", "pass", "--role", "review-quality", "--summary", "quality pass"],
-      { cwd: res.root },
-    );
-    expect(revRec.exitCode).toBe(0);
-    const revEv = JSON.parse(revRec.stdout.toString()) as { payload_json: string };
-    expect(JSON.parse(revEv.payload_json).meta).toEqual({ role: "quality" });
+    const record = (kind: string, extra: string[] = []) => Bun.spawnSync(
+      [ledgerBin, "record", "role-test-1", "--kind", kind, "--status", "pass", "--summary", "x", ...extra], { env: process.env, cwd: res.root });
+    for (const kind of ["test", "build", "lint", "review", "hurl"]) {
+      const proc = record(kind);
+      expect(proc.exitCode).not.toBe(0);
+      expect(proc.stderr.toString()).toContain("actual verification or review tool");
+    }
+    expect(record("fat", ["--actor", "hook"]).exitCode).not.toBe(0);
+    const fat = record("fat");
+    expect(fat.exitCode).toBe(0);
+    expect(JSON.parse(JSON.parse(fat.stdout.toString()).payload_json).source).toBe("manual");
   });
 });

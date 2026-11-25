@@ -47,9 +47,9 @@ export function createRunbook(ledger: LedgerReader, params: {
   const runbook_id =
     params.runbook_id?.trim().toLowerCase() ||
     `rb-${mm}${dd}-${randomBytes(2).toString("hex")}`;
-  if (!/^rb-[a-z0-9-]{4,32}$/.test(runbook_id)) {
+  if (!/^rb-[a-z0-9-]{1,32}$/.test(runbook_id)) {
     throw new Error(
-      `Invalid runbook_id "${runbook_id}" (must match /^rb-[a-z0-9-]{4,32}$/)`,
+      `Invalid runbook_id "${runbook_id}" (must match /^rb-[a-z0-9-]{1,32}$/)`,
     );
   }
 
@@ -182,7 +182,7 @@ export function approveRunbookFromUserPrompt(ledger: LedgerReader, params: {
   return withImmediateTx(ledger.db, () => {
     const rb = ledger.getRunbook(id);
     if (!rb) throw new Error(`Runbook not found: ${id}`);
-    if (rb.status === "COMPLETED" || rb.status === "REVOKED") {
+    if (rb.status !== "PENDING") {
       throw new Error(`Runbook ${id} is ${rb.status} and cannot be approved`);
     }
     if (sha256String(rb.actions_json) !== rb.actions_hash) {

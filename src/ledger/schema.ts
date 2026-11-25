@@ -145,8 +145,7 @@ export function verify(ledger: LedgerReader, task_id?: string): {
   errors: string[];
 } {
   // Consistent read snapshot prevents false tip mismatch during concurrent writes.
-  ledger.db.exec("BEGIN DEFERRED;");
-  try {
+  return ledger.db.transaction(() => {
     if (task_id && !ledger.getTask(task_id)) {
       return {
         ok: false,
@@ -213,11 +212,5 @@ export function verify(ledger: LedgerReader, task_id?: string): {
       checked_events: checkedEvents,
       errors,
     };
-  } finally {
-    try {
-      ledger.db.exec("COMMIT;");
-    } catch {
-      // Ignore
-    }
-  }
+  }).deferred();
 }

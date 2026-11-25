@@ -2,6 +2,7 @@ import { type WorkbenchConfig } from "../config";
 import { getBranchDiffStats, getHeadAndParents, getStagedDiffStats, locateRepo, runGit } from "../git";
 import { isApprovedTagPushRefspec, parseDeliverySegment } from "./git-gh";
 import { type ApprovedRunbookEntry } from "./runbook-state";
+import { getSpecState } from "../ledger/spec";
 import { Ledger } from "../ledger/store";
 import { resolve } from "node:path";
 import {
@@ -375,6 +376,12 @@ export function checkLedgerGate(
               cfg.guard.protected_branches,
             );
             if (branchStats && evaluateDiffExemptEligibility(branchStats, cfg).eligible) {
+              for (const task of openTasks) {
+                const spec = getSpecState(ledger, task.task_id, { delivery: { repo: loc.repo, head_sha: deliverySha, checkoutDir: loc.isDetached ? loc.checkoutDir : undefined } });
+                if (spec.state === "AMENDED" || spec.drift_detected) {
+                  return `账本门禁：${task.task_id} 冻结规范或测试尚未就绪 ${[...spec.drifted_files, ...spec.drifted_locked_tests].join(", ")}`;
+                }
+              }
               continue;
             }
             return `账本门禁：${loc.repo}@${deliverySha.slice(0, 8)} 的实际提交改动不满足免账本豁免条件，请开立正式开发账本并完成验证。`;
@@ -397,7 +404,9 @@ export function checkLedgerGate(
           let readiness = ledger.checkPushReadiness({
             task_id: task.task_id,
             repo: loc.repo,
+            branch: deliveryDetached ? undefined : deliveryBranch,
             head_sha: deliverySha,
+            checkoutDir: loc.isDetached ? loc.checkoutDir : undefined,
           });
           if (!readiness.ready && !readiness.hasExplicitFailure && deliveryDetached) {
             const parents = new Set(getHeadAndParents(loc.checkoutDir));
@@ -408,7 +417,9 @@ export function checkLedgerGate(
               readiness = ledger.checkPushReadiness({
                 task_id: task.task_id,
                 repo: loc.repo,
+                branch: boundRepo.branch,
                 head_sha: boundRepo.head_sha,
+                checkoutDir: loc.checkoutDir,
               });
             }
           }
@@ -417,7 +428,7 @@ export function checkLedgerGate(
             return (
               `账本门禁：任务 ${task.task_id} (${loc.repo}@${deliverySha.slice(0, 8)}) 尚未满足交付前检查：\n` +
               readiness.missing.map((m) => `  - ${m}`).join("\n") +
-              `\n请补跑对应验证/评审（PostToolUse 将自动记账）或通过 ledger record 补录证据后再重试。`
+              `\n请补跑对应验证/评审工具以产出真实证据后再重试。`
             );
           }
         }

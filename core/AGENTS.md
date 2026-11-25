@@ -1,80 +1,57 @@
 # {{WORKBENCH_NAME}} 工作台
 
-本目录是多仓库工程工作台，每个带 `.git` 的业务子目录为独立仓库；工作台根目录本身不是业务仓库。本文件是工作台唯一常驻入口，按任务需要读取 `AGENTS.local.md`、`.agents/skills/` 中的流程 skill 以及 `.workbench/repos/` 对应仓库配置。
+业务子目录各有独立 Git 仓库。接单先读本文件及现有 `AGENTS.local.md`，按需查 `.agents/skills/` 和 `.workbench/repos/<repo>.md`。环境及护栏配置在 `.workbench/workbench.yaml`，实例专属约定放本地入口。
 
-## 目录与基本规矩
+## 工作树与交付物
 
-- **Git**：根目录无默认仓库，执行 Git 一律用 `git -C <仓库路径>` 或在目标仓/worktree 目录内执行；commit 遵循 `<type>(<scope>): <subject>`。新建 worktree 一律用 `git -C <仓> worktree add` 置于 `<仓>.worktrees/<name>`，**禁止调用 Codex Desktop 内置 `create_worktree`**（会把会话 `cwd` 切离工作台导致 `.codex/hooks.json` 失效）；合并部署后及时清理 worktree 与本地已合分支。
-- **共享工作树红线**：禁止 `git stash`、`git checkout --`、`git restore`、`git reset`、`git commit --amend`、`git add -A`、`git add .`。提交前检查 `git status`，逐文件 `git add` 并带 pathspec 提交。
-- **PR 格式**：标题 `type: 一句话描述`；正文固定三节：「改动内容」（直白业务语言）、「关键文件改动」、「对历史影响」（无影响写「无」）。
-- **一次性脚本**：未另指定位置时归档至 `one-off-scripts/`，按职责分目录并更新该目录 `README.md`，不散放工作台根目录。
-- **工作台扩展**：本工作台特有约定与公司专属规则放 `AGENTS.local.md`，仓库命令与专属边界放 `.workbench/repos/<repo>.md`，环境/护栏配置放 `.workbench/workbench.yaml`。
+- [自律] Git 用 `git -C <仓>` 或在目标 worktree 内执行。默认在当前分支修改。新 worktree 用 `git -C <仓> worktree add` 放到 `<仓>.worktrees/<name>`；禁用 Desktop 的 `create_worktree`，以免会话离开工作台而丢失 hooks。部署后清理已合分支与 worktree。
+- [hook][自律] 共享工作树禁止 stash、checkout --、restore、reset、commit --amend、add -A 和 add .。提交前查 status，逐文件 add，带 pathspec 提交。commit 用 `<type>(<scope>): <subject>`。
+- [自律] PR 标题用 `type: 一句话描述`，正文写「改动内容」「关键文件改动」「对历史影响」，业务语言直述，无影响写「无」。一次性脚本默认放 `one-off-scripts/` 对应职责目录并更新其 README。
 
-## 需求与问题判断
+## 判断与开工
 
-简单任务直接按以下四条裁决；需求存在多解、缺陷后果不明或评审意见可能扩大范围时，读取 `.agents/skills/business-analysis/SKILL.md`。
+按已确认的不变量、用户目标与既有取舍判断。查证入口、状态、代码和数据后，修复真实路径中的违反项。可接受例外要说明触发条件、后果与边界；涉及安全、资金、不可恢复数据必须核实影响。仅将阻断交付的承诺列为不变量，区分用户裁决与建议，出现新证据再重议。遇多解、后果不明或评审建议扩围，读 `business-analysis`。
 
-- **应修**：有证据表明实际路径违反已确认不变量，或妨碍核心目标，且修正符合既有取舍。
-- **可放过**：已有取舍覆盖，或后果轻微、可恢复且修复成本高于收益（一句话说明触发条件与接受的后果）。**涉及安全、资金或不可恢复数据损失，必须核实影响，低概率本身不足以放过。**
-- **先查事实，再决定是否问**：入口、状态、代码与数据事实自行查证；仅当改变用户权益、核心行为、可接受损失或超出授权时，带着推荐方案与具体代价询问用户。
-- **接受的例外有终点**：只把足以阻断交付的承诺记为不变量；区分用户裁决与 agent 建议，不在新证据出现前反复推翻已定取舍。
+改变用户权益、核心行为、可接受损失或授权范围时，带推荐方案与代价请用户裁决。业务口径改动等用户明确开工；架构、外部依赖或 SSOT 变更先落设计文档并确认。已裁决队列逐项推进至清空。不估人天，第三方库行为查源码或文档。
 
-## 交付终点 × 验证深度
+## 交付终点与验证深度
 
-接单或派工先明确两个正交决定（用户新指定的停止位置优先；未明说默认在**本地**交付）：
+以用户最新指定的终点为准，默认 `local`。
 
-| 交付终点 | 完成条件 |
+| 终点 | 完成条件 |
 |---|---|
-| `investigation` | 查证事实，交付根因/结论/方案，等待确认后才动手 |
-| `local` | 完成实现、适用验证与收尾，汇报证据与缺口即停 |
-| `fat` | 本地验证与收尾通过后合入测试分支、推送并按授权验收 |
-| `pr` | 创建或更新目标 PR 并汇报证据，开好即停（`main` PR 始终由用户合并） |
-| `prod` | 核对目标提交、既有证据与生产依赖，按 `ship` / 发布规则执行；不可逆操作保留人工确认 |
+| investigation | 查证并汇报根因、结论或方案，等确认再实施 |
+| local | 完成实现、适用验证与收尾，汇报证据和缺口 |
+| fat | 本地通过后合入测试分支、推送并按授权验收 |
+| pr | 创建或更新目标 PR，后续推送用 `ledger pr-sync <task_id> --repo <仓>` 核验最新 HEAD，汇报后停止；main PR 由用户合并 |
+| prod | 核对目标 SHA、证据和依赖，按 ship 发布，不可逆操作经人工确认 |
 
-- **验证深度只由实际影响决定**（与分支来源、worktree 或文件数无关）：
-  - **定向验证（`targeted`）**：风险边界清晰的局部修改、低风险小修、纯文档/注释。执行独立定向评审 + 受影响的构建/测试/生成核验。
-  - **完整验证（`full`）**：资金/计费、权限规则、协议行为变化、数据库迁移、事务/并发、跨模块变更或关键风险未排除。按 `.agents/skills/wrapup/SKILL.md` 执行完整收尾。
+按实际风险选深度。边界清晰的局部小修或文档用 `targeted`，独立定向评审并运行受影响的构建、测试或生成核验。资金、权限、协议、迁移、事务并发、跨模块变更或风险未排除用 `full`，执行 `wrapup` 完整收尾。
 
-## 工程底线
+## 工程与验证
 
-- **资金与权益的服务端权威原则**：金额、积分、额度、折扣、结算或权益发放，客户端输入仅作意图声明，服务端必须依据自身状态、可信计量或已校验凭据独立裁决，且**核验、计价与实际执行必须绑定同一业务对象与状态**；无法取得可信依据时不得静默采信客户端数据。
-- **什么时候动手与连续推进**：业务口径类改动须等用户明确“开工/按方案做”（确认问题存在不等于批准）；架构性、外部依赖或 SSOT 变更先落设计文档确认后再实现；**已经用户裁决的待办队列不清空不停，完成一项立刻推进下一项**；未要求新建分支/worktree 时在当前分支修改；方案与汇报不写人天估算；第三方库行为先查源码或文档。
-- **验证与测试纪律（AI-Native 契约优先）**：
-  - **刻意克制低价值 Mock 单测**：业务 CRUD 与胶水层不堆砌 Mock 单元测试，优先用独立上下文生成的黑盒 **Hurl / 集成测试** 验证真实接口与不变量；**仅对纯算法、计费/额度公式、状态机跃迁或并发不变量**编写无 Mock 表驱动单测。
-  - **静态与动态基线前置**：`full` 深度任务在推分支/提 PR 前必须具备当前 SHA 的静态检查（`lint`/typecheck，可用仓原生命令或 `.workbench/bin/lang-check`）与执行验证通过证据；未实际运行集成测试时用真正不执行初始化的编译检查（如 Go `go test -c -tags=integration`）。
-  - 单测通过不等于验收通过，汇报须区分「已执行」「仅编译/静态检查」「未验证」，并将本地检查与 FAT/Hurl 验收分开列示。
-  - 契约或持久化格式变化须同步相关测试与接口文档，不靠弱化断言或偷改冻结 Hurl 消错；提交的测试/回归资产必须可移植（无个人路径、本机隐式状态与真实凭据）。
-  - **网页/浏览器自动化测试必须由用户主动要求**，适用于所有项目与环境；不得因开发或验收授权自行打开浏览器测试。
-  - 表单任务默认遵循 `.agents/skills/form-ux/SKILL.md`；本机隔离组件实验默认遵循 `.agents/skills/test-environment/SKILL.md`。
+- [自律] 资金和权益由服务端依据可信状态、计量或凭据裁决。客户端仅声明意图；核验、计价和执行绑定同一对象及状态。无可信依据时停止。
+- [自律] 优先由独立上下文编写 Hurl 或集成契约验证。纯算法、计费公式、状态机或并发不变量用无 Mock 表驱动测试；避免给 CRUD 与胶水层堆 Mock。
+- [hook][自律] full 交付前须有当前 SHA 的静态检查与执行验证，可用仓原生命令或 `.workbench/bin/lang-check`。仅检查集成测试编译时使用不会执行初始化的命令，如 Go 的 `go test -c -tags=integration`。汇报区分已执行、仅编译、未验证，分列本地及 FAT/Hurl 验收。
+- [自律] 契约、持久化格式变化同步测试和接口文档。回归资产不含个人路径、本机隐式状态或真实凭据。禁止削弱冻结断言以消除失败。
+- [自律] 浏览器自动化测试只在用户主动要求时执行。表单任务读 `form-ux`，本机隔离实验读 `test-environment`。
 
-## 环境与安全红线
+## 环境与发布红线
 
-- **问题出在哪个环境，就只查哪个环境**；线上问题看 prod 事实，不拿测试环境数据推断；测试环境问题不主动访问 prod（只读亦同）。
-- **凭据不回显**：读取配置或接口返回时只输出键名或脱敏摘要，不打印密钥、token 或完整敏感字段。
-- **物理保险丝由 `.codex/hooks.json` 强制执行**：prod 库写操作、非只读 `kubectl`、读 k8s `secret`、`gh pr merge`、推生产 tag、破坏共享工作树及直接改 `.workbench/ledger/` 均由底层护栏拦截。**发版 Runbook 签发**：需自动推进发版时，先用 `.workbench/bin/ledger runbook create` 登记精确项（单 tag+SHA / PR / 迁移 SQL / 非只读 `kubectl`）并给用户确认；用户于本会话回复 `批准 <id>` 后由 `UserPromptSubmit` Hook 签发短期白名单通行证自动放行（`--tags`/强推 `main`/读 `secret` 永久禁止）。
+- [自律][凭据] 只查问题所在环境；测试问题不访问 prod，线上结论用 prod 事实。凭据只展示键名或脱敏摘要。用 dbcred 的授权能力区分只读与写入。
+- [平台] 数据库权限、Kubernetes RBAC（不给 secrets 读取权）、GitHub 分支和 tag 规则及必需状态检查由部署方落实。
+- [hook] PreToolUse 检查可识别的 prod 写操作、集群变更、secret、端口转发、受保护分支与 tag、PR 合并及账本直接修改。发版先用 `ledger runbook create` 登记精确 tag+SHA、PR、迁移 SQL 或 kubectl 命令。
+- [hook][自律] 用户在主会话**单独回复整句** `批准 <runbook_id>` 或 `approve <runbook_id>`，不附带其他文字或标点。多个编号用空格分隔。批准仅对登记项、会话和有效期生效。禁止批量推 tag、强推 main、读取 secret。
 
-## 开发任务账本（Ledger）、Spec 冻结与被动机制
+## 任务账本与冻结
 
-- 仅针对 `.workbench/workbench.yaml` 登记的**业务仓库开发任务**；运维查数、查日志、沟通与 `one-off-scripts/` 无需开账本。
-- 账本通过 `.workbench/bin/ledger` 管理，**按任务建账、以 `(repo, branch)` 唯一路由**（跨仓任务用 `ledger attach` 挂入同一 `task_id`）。
-- `full` 开发周期的三件套文档（`ssot.md`、`tech-spec.md`、`test-spec.md`）默认存于 `.workbench/specs/<task_id>/`（仅用户主动要求时移入业务仓）；定稿后通过 `ledger freeze` 写入哈希链并由 `guard` 物理锁定（含锁定 Hurl 测试防篡改），周期内确需修改须经用户确认执行 `ledger amend` 并按依赖辐射重跑下游。
-- 被动 Hook 在 `git commit` / `git push` / `gh pr create` 前校验账本底线门禁（静态检查、执行验证、核心评审通过且无失败角色；完整四层评审覆盖由 `wrapup` SOP 推进并在 `ledger status` 审计），并在新会话或压缩后回注活跃任务摘要；纯文档/注释/typo 极小改动可用 `ledger exempt` 豁免。
+- 仅登记业务仓开发任务。运维查数、日志、沟通和一次性脚本无需开账。用 `.workbench/bin/ledger` 按任务建账，按 (repo, branch) 唯一路由，跨仓用 attach。
+- full 周期的 ssot.md、tech-spec.md、test-spec.md 默认在 `.workbench/specs/<task_id>/`，用户主动要求才移入业务仓。定稿用 freeze 保存摘要和锁定测试，交付时核对工作树与 Git；变更须用户确认后 amend，按影响重跑下游并重新 freeze。
+- [hook] commit、push、PR 前校验账本绑定及适用证据。完整深度须静态检查、执行验证和核心评审通过，无失败角色；四层覆盖由 wrapup 推进，在 status 审计。极小文档、注释、typo 可用 exempt。新会话或压缩后 hook 回注摘要。可执行证据来自工具或 hook，手工验收注明来源。
+- 账本哈希链用于一致性检查。独立保存 Ledger-Tip 可见证历史；同一系统用户的写权限仍由操作系统控制。
 
-## 模型与子代理调度
+## 调度与流程入口
 
-模型映射统一维护在 `.workbench/models.toml` 与 `.codex/agents/*.toml`，禁止在流程中硬编码模型 ID：
+模型按 `.workbench/models.toml` 映射并同步到 `.codex/agents/*.toml`，流程不硬编码 ID。mechanical 用只读 scanner 检索；standard 用可写 dev 实施；deep 用只读 analyst 或 spec-reviewer 处理复杂权衡、高风险根因和文档评审，说明选用理由。小任务可自行完成。独立 review CLI 须实际隔离运行，不以自审代替。
 
-| 逻辑档位 | 适用任务 | 对应代理 |
-|---|---|---|
-| `mechanical` | 边界清晰的只读检索、核查与机械整理 | `.codex/agents/scanner.toml` |
-| `standard` | 常规开发、修复、测试与文档修改（仅写操作） | `.codex/agents/dev.toml` |
-| `deep` | 复杂架构权衡、高不确定性根因、高风险/Paperwork 只读评审（需写明理由） | `.codex/agents/analyst.toml` / `spec-reviewer.toml` |
-
-按职责选代理（只读检索用 `scanner`，只读评审用 `codex review` / `analyst` / `spec-reviewer`，勿将只读任务派给可写 `dev`）；小任务可直接处理。独立 review CLI 必须实际调用并保持隔离，不可自审替代。
-
-## 流程 Skills 与仓库配置
-
-- **开发与交付**：`ready`（新会话热身定位）、`grill`（需求追问与 `ssot.md` 定稿）、`feature`（双轨/5阶段规范驱动开发）、`bugfix`（需求变更全周期 vs 局部 `amend` 辐射 + 缺陷棘轮）、`wrapup`（静态/动态检查 + 四层独立评审）、`ship`（FAT/PR/发布交付）、`business-analysis`（口径权衡）、`form-ux`（表单规范）、`test-environment`（隔离容器实验）。
-- **独立只读评审 CLI**：`implementation-review`（自动注入 Go/TS/Python 坑点）、`simplicity-performance-review`、`code-simplification-review`、`comment-normalization-review`（位于 `.agents/skills/` 相对软链）。
-- **工具与仓库配置**：仓库卡见 `.workbench/repos/`；多仓分支与清理用 `.workbench/bin/wb-git`；跨语言静态/动态检查用 `.workbench/bin/lang-check`。
-- **工作台特有规则**：如存在 `AGENTS.local.md`，开工一并读取。
+按阶段读 ready（热身）、grill（需求和 SSOT）、feature（双轨五阶段）、bugfix（amend 辐射与缺陷棘轮）、wrapup（验证与独立评审）、ship（交付）。四个专项入口为 implementation-review、simplicity-performance-review、code-simplification-review、comment-normalization-review。多仓管理用 wb-git，仓库命令查对应仓库卡。

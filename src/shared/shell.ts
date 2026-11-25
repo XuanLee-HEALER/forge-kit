@@ -93,6 +93,7 @@ export interface ShellToken {
   value: string;
   /** True ONLY when the `NAME=` prefix (up to and including `=`) was completely unquoted and unescaped (POSIX ASSIGNMENT_WORD). */
   isEnvAssign: boolean;
+  hasExpansion?: boolean;
 }
 
 export function splitShellTokensWithMeta(segment: string): ShellToken[] | null {
@@ -101,6 +102,7 @@ export function splitShellTokensWithMeta(segment: string): ShellToken[] | null {
   let hasToken = false;
   let quote: "'" | '"' | null = null;
   let escape = false;
+  let hasExpansion = false;
   let sawEq = false;
   let sawQuoteOrEscapeBeforeEq = false;
   let validEnvAssign = false;
@@ -110,7 +112,9 @@ export function splitShellTokensWithMeta(segment: string): ShellToken[] | null {
     tokens.push({
       value: Buffer.from(curBytes).toString("utf8"),
       isEnvAssign: validEnvAssign,
+      ...(hasExpansion && { hasExpansion }),
     });
+    hasExpansion = false;
     curBytes = [];
     hasToken = false;
     sawEq = false;
@@ -139,6 +143,7 @@ export function splitShellTokensWithMeta(segment: string): ShellToken[] | null {
       }
       continue;
     }
+    if ((ch === "$" && (quote || segment[i + 1] !== "'")) || ch === "`") hasExpansion = true;
     if (quote === '"') {
       if (ch === "\\") {
         const next = segment[i + 1];

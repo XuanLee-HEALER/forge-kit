@@ -1,7 +1,9 @@
+import { scanLockedTests } from "./locked-tests";
 import { appendEventInTx, withImmediateTx } from "./transactions";
 import {
   type EventRecord,
   type LedgerReader,
+  type LockedGitlinks,
   type SpecAmendedPayload,
   type SpecAmendScope,
   type SpecFrozenPayload,
@@ -9,7 +11,7 @@ import {
 } from "./types";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { sha256File } from "../shared/path";
+import { matchesGlob, sha256File } from "../shared/path";
 
 export const SPEC_AMEND_STALE_MAP: Record<SpecAmendScope, string[]> = {
   requirement: ["ssot", "tech_spec", "test_spec", "lint", "test", "review", "fat"],
@@ -150,21 +152,70 @@ export function freezeSpec(ledger: LedgerReader, params: {
           `Cannot re-freeze: out-of-scope spec document(s) changed (${unauthorizedDocs.join(", ")}) outside amend scope(s) [${[...scopes].join(", ")}]; restore them or add an authorizing \`ledger amend\``,
         );
       }
-      if (!allowTest && params.locked_test_globs !== undefined) {
+      if (!scopes.has("test_spec") && !scopes.has("invariant") && params.locked_test_globs !== undefined) {
         const dropped = prevSpec.locked_test_globs.filter((g) => !lockedGlobs.includes(g));
         if (dropped.length > 0) {
           throw new Error(
-            `Cannot remove locked test glob(s) (${dropped.join(", ")}) outside test_spec/invariant/requirement amend scope`,
+            `Cannot remove locked test glob(s) (${dropped.join(", ")}) outside test_spec/invariant amend scope`,
           );
         }
       }
     }
 
+    if (prevSpec.drifted_locked_tests.length) {
+      throw new Error("冻结测试文件发生漂移 (" + prevSpec.drifted_locked_tests.join(", ") + ")，请恢复测试文件或执行 ledger amend --scope test_spec 后重新 freeze");
+    }
+    const testsUnlocked = prevSpec.amend_scopes.some(scope => scope === "test_spec" || scope === "invariant");
+    const snapshot = scanLockedTests(ledger, params.task_id, lockedGlobs, { amendedSnapshot: testsUnlocked });
+    const activeRepos = new Set(ledger.getTaskRepos(params.task_id).map(r => r.repo));
+    if (prevSpec.freeze_seq !== null) {
+      const row = ledger.db.query("SELECT payload_json FROM events WHERE task_id = ? AND seq = ?")
+        .get(params.task_id, prevSpec.freeze_seq) as { payload_json: string };
+      const prior = JSON.parse(row.payload_json) as Partial<SpecFrozenPayload>;
+      for (const [key, hash] of Object.entries(prior.locked_test_files ?? {})) {
+        const slash = key.indexOf("/");
+        if (activeRepos.has(key.slice(0, slash)) || !lockedGlobs.some(g => matchesGlob(key.slice(slash + 1), g))) continue;
+        snapshot.files[key] = hash;
+        for (const [target, source] of [[snapshot.blobs, prior.locked_test_blobs], [snapshot.modes, prior.locked_test_modes],
+          [snapshot.tracked, prior.tracked_locked_tests]] as const) {
+          if (source?.[key] !== undefined) target[key] = source[key];
+        }
+      }
+      for (const [repo, refs] of Object.entries(prior.locked_test_revisions ?? {}))
+        if (!activeRepos.has(repo)) snapshot.revisions[repo] = refs;
+      for (const [key, entries] of Object.entries(prior.locked_gitlinks ?? {})) {
+        if (!activeRepos.has(JSON.parse(key)[0])) snapshot.gitlinks[key] = entries;
+      }
+    }
+    for (const glob of lockedGlobs) {
+      if (!/[*?]/.test(glob) && !Object.keys(snapshot.files).some(key => matchesGlob(key.slice(key.indexOf("/") + 1), glob))) {
+        throw new Error("Cannot freeze requested test path: " + glob);
+      }
+    }
+    if (snapshot.drift.length) throw new Error("冻结测试文件与 Git HEAD 不一致或不是普通文件: " + snapshot.drift.join(", "));
+    if (prevSpec.locked_test_globs.length && !testsUnlocked) {
+      // Validate the actual snapshot we are about to persist, including additions under an already frozen glob.
+      const activeRepos = ledger.getTaskRepos(params.task_id).map(r => r.repo + "/");
+      for (const key of new Set([...Object.keys(prevSpec.locked_test_files), ...Object.keys(snapshot.files)])) {
+        if (!activeRepos.some(prefix => key.startsWith(prefix))) continue;
+        const rel = key.slice(key.indexOf("/") + 1);
+        if (prevSpec.locked_test_globs.some(glob => matchesGlob(rel, glob)) &&
+            prevSpec.locked_test_files[key] !== snapshot.files[key]) {
+          throw new Error("冻结测试文件发生漂移: " + key);
+        }
+      }
+    }
     const payload: SpecFrozenPayload = {
       spec_dir: relDir,
       files,
       hashes,
       locked_test_globs: lockedGlobs,
+      locked_test_files: snapshot.files,
+      locked_test_modes: snapshot.modes,
+      locked_test_blobs: snapshot.blobs,
+      locked_gitlinks: snapshot.gitlinks,
+      locked_test_revisions: snapshot.revisions,
+      tracked_locked_tests: snapshot.tracked,
     };
     return appendEventInTx(ledger.db, {
       task_id: params.task_id,
@@ -200,7 +251,7 @@ export function amendSpec(ledger: LedgerReader, params: {
     if (task.status !== "OPEN") {
       throw new Error(`Cannot amend spec on ${task.status} task ${params.task_id}`);
     }
-    const cur = ledger.getSpecState(params.task_id);
+    const cur = getSpecState(ledger, params.task_id, { metadataOnly: true });
     if (cur.state === "NONE") {
       throw new Error(`Task ${params.task_id} has no frozen spec yet; run ledger freeze first`);
     }
@@ -222,7 +273,7 @@ export function amendSpec(ledger: LedgerReader, params: {
   return { event: ev, spec: ledger.getSpecState(params.task_id) };
 }
 
-export function getSpecState(ledger: LedgerReader, task_id: string): TaskSpecState {
+export function getSpecState(ledger: LedgerReader, task_id: string, options: { metadataOnly?: boolean; closing?: boolean; delivery?: { repo: string; head_sha: string; checkoutDir?: string } } = {}): TaskSpecState {
   const rows = ledger.db
     .query(
       `SELECT seq, event_type, payload_json FROM events
@@ -236,6 +287,12 @@ export function getSpecState(ledger: LedgerReader, task_id: string): TaskSpecSta
   let specDir: string | null = null;
   let files: { ssot: string; tech_spec: string; test_spec: string } | null = null;
   let hashes: { ssot: string; tech_spec: string; test_spec: string } | null = null;
+  let lockedFiles: Record<string, string> | undefined;
+  let gitlinks: LockedGitlinks = {};
+  let freezeRefs: Record<string, string[]> = {};
+  let frozenModes: Record<string, string> | undefined;
+  let frozenOids: Record<string, string> = {};
+  let trackedFiles: Record<string, string> = {};
   let lockedTestGlobs: string[] = [];
   let amendScope: SpecAmendScope | null = null;
   let amendReason: string | null = null;
@@ -251,6 +308,12 @@ export function getSpecState(ledger: LedgerReader, task_id: string): TaskSpecSta
         freezeSeq = row.seq;
         specDir = p.spec_dir ?? specDir;
         if (p.files) files = p.files;
+        lockedFiles = p.locked_test_files;
+        gitlinks = p.locked_gitlinks ?? {};
+        freezeRefs = p.locked_test_revisions ?? {};
+        frozenModes = p.locked_test_modes;
+        frozenOids = p.locked_test_blobs ?? {};
+        trackedFiles = p.tracked_locked_tests ?? {};
         if (p.hashes) hashes = p.hashes;
         if (Array.isArray(p.locked_test_globs)) {
           lockedTestGlobs = p.locked_test_globs.map(String);
@@ -296,6 +359,9 @@ export function getSpecState(ledger: LedgerReader, task_id: string): TaskSpecSta
       files: null,
       hashes: null,
       locked_test_globs: [],
+      locked_test_files: {},
+      drifted_locked_tests: [],
+      drift_detected: false,
       amend_scope: null,
       amend_scopes: [],
       amend_reason: null,
@@ -307,7 +373,7 @@ export function getSpecState(ledger: LedgerReader, task_id: string): TaskSpecSta
 
   const isAmended = amendSeq !== null && amendSeq > freezeSeq;
   const driftedFiles: string[] = [];
-  if (!isAmended && files && hashes) {
+  if (!options.metadataOnly && !isAmended && files && hashes) {
     const wbReal = existsSync(ledger.workbenchRoot)
       ? realpathSync(ledger.workbenchRoot)
       : resolve(ledger.workbenchRoot);
@@ -359,6 +425,11 @@ export function getSpecState(ledger: LedgerReader, task_id: string): TaskSpecSta
     }
   }
 
+  const unlocked = isAmended && (pendingAmendScopes.has("test_spec") || pendingAmendScopes.has("invariant"));
+  const driftedTests = options.metadataOnly || unlocked || !lockedTestGlobs.length ? [] : lockedFiles
+    ? scanLockedTests(ledger, task_id, lockedTestGlobs, { frozen: lockedFiles, frozenBlobs: trackedFiles,
+        delivery: options.delivery, closing: options.closing, frozenModes, frozenOids, freezeRefs, gitlinks }).drift
+    : ["legacy snapshot missing"];
   return {
     task_id,
     state: isAmended ? "AMENDED" : "FROZEN",
@@ -368,6 +439,9 @@ export function getSpecState(ledger: LedgerReader, task_id: string): TaskSpecSta
     files,
     hashes,
     locked_test_globs: lockedTestGlobs,
+    locked_test_files: lockedFiles ?? {},
+    drifted_locked_tests: driftedTests,
+    drift_detected: Boolean(driftedTests.length || driftedFiles.length),
     amend_scope: isAmended ? amendScope : null,
     amend_scopes: isAmended ? [...pendingAmendScopes] : [],
     amend_reason: isAmended ? amendReason : null,
@@ -377,11 +451,11 @@ export function getSpecState(ledger: LedgerReader, task_id: string): TaskSpecSta
   };
 }
 
-export function listActiveSpecLocks(ledger: LedgerReader): TaskSpecState[] {
+export function listActiveSpecLocks(ledger: LedgerReader, metadataOnly = false): TaskSpecState[] {
   const open = ledger.listOpenTasks();
   const out: TaskSpecState[] = [];
   for (const t of open) {
-    const st = ledger.getSpecState(t.task_id);
+    const st = getSpecState(ledger, t.task_id, { metadataOnly });
     if (st.state !== "NONE") out.push(st);
   }
   return out;

@@ -25,6 +25,7 @@ import {
   resolveSegmentCwd,
   splitShellSegments,
   splitShellTokens,
+  splitShellTokensWithMeta,
   unwrapShellPrefix,
 } from "../shared/shell";
 
@@ -160,6 +161,68 @@ export function isApprovedTagPushRefspec(params: {
   return false;
 }
 
+// Recognize top-level operation kinds. GitHub validates field names and argument types.
+function readOnlyGraphql(document: string): boolean {
+  const tokens = /"""(?:\\"""|(?!""")[\s\S])*"""|"(?:\\[^\r\n]|[^"\\\r\n])*"|#[^\r\n]*|[_A-Za-z]\w*|[\s,\uFEFF]+|./gy;
+  const stack: string[] = [];
+  let definition = "", queries = 0;
+  for (const [token] of document.matchAll(tokens)) {
+    if (/^[\s,#\uFEFF]/.test(token)) continue;
+    if (!definition) {
+      if (token !== "query" && token !== "fragment") return false;
+      definition = token;
+      if (token === "query") queries++;
+      continue;
+    }
+    if (token === '"' || token === "'") return false;
+    if (token === "{" || token === "(" || token === "[") stack.push(token);
+    if (token === "}" || token === ")" || token === "]") {
+      const open = stack.pop();
+      if (open !== ({ "}": "{", ")": "(", "]": "[" })[token]) return false;
+      if (token === "}" && !stack.length) definition = "";
+    }
+  }
+  return queries > 0 && !definition && !stack.length;
+}
+
+function parseGhApi(args: string[]) {
+  const valueFlags = new Set(["-X", "--method", "-f", "--raw-field", "-F", "--field", "--input", "-H", "--header",
+    "--hostname", "--cache", "-q", "--jq", "-t", "--template", "-p", "--preview"]);
+  const booleanFlags = new Set(["--include", "--paginate", "--silent", "--slurp", "--verbose", "--help"]);
+  const fields: string[] = [];
+  let method = "", body = false, endpoint = "", positional = false;
+  for (let j = 0; j < args.length; j++) {
+    const arg = args[j];
+    if (!positional && arg === "--") { positional = true; continue; }
+    if (positional || !arg.startsWith("-")) {
+      if (endpoint) return null;
+      endpoint = arg;
+      continue;
+    }
+    let flag: string, value: string | undefined;
+    if (arg.startsWith("--")) {
+      const eq = arg.indexOf("=");
+      flag = eq < 0 ? arg : arg.slice(0, eq);
+      if (booleanFlags.has(flag)) continue;
+      if (eq >= 0) value = arg.slice(eq + 1);
+    } else {
+      // pflag consumes boolean shorthands one by one. The first value flag owns the remainder.
+      let k = 1;
+      while (k < arg.length && "ish".includes(arg[k])) k++;
+      if (k === arg.length) continue;
+      flag = "-" + arg[k];
+      if (k + 1 < arg.length) value = arg.slice(k + 1).replace(/^=/, "");
+    }
+    if (!valueFlags.has(flag)) return null;
+    value ??= args[++j];
+    if (!value) return null;
+    if (flag === "-X" || flag === "--method") method = value.toUpperCase();
+    if (["-f", "-F", "--raw-field", "--field"].includes(flag)) fields.push(value);
+    if (flag === "--input") body = true;
+  }
+  return { endpoint, fields, method, body };
+}
+
 export function checkGitPhysicalFuse(
   workbenchRoot: string,
   cmd: string,
@@ -177,6 +240,33 @@ export function checkGitPhysicalFuse(
 
     // gh pr merge fuse (allowed ONLY when exact repo + PR number is in an active approved Runbook)
     const { prefix, gh, git } = parseDeliverySegment(toks);
+    if (prefix.bin === "gh" && prefix.args.includes("api")) {
+      const api = parseGhApi(prefix.args.slice(prefix.args.indexOf("api") + 1));
+      if (!api) return "安全护栏：无法确认 gh api 的请求参数。";
+      const { endpoint, method, fields, body } = api;
+      let pathname: string;
+      try {
+        pathname = decodeURIComponent(new URL(endpoint, "https://api.github.com/").pathname);
+      } catch {
+        return "安全护栏：无法解析 gh api 请求路径。";
+      }
+      const resource = pathname.replace(/\/{2,}/g, "/").replace(/^\/api\/v3\//i, "/")
+        .replace(/^\/repos\/[^/]+\/[^/]+\//i, "/").replace(/^\//, "");
+      const sensitive = /^(?:pulls|git\/refs|merges|releases)(?:[/?#]|$)/i.test(resource);
+      if (/(?:^|\/)graphql\/?$/i.test(pathname)) {
+        const queries = fields.filter(f => f.startsWith("query="));
+        const query = queries[0]?.slice(6) ?? "";
+        if (body || endpoint.includes("?") || splitShellTokensWithMeta(segments[i])?.some(t => t.hasExpansion && t.value.includes("query=")) || queries.length !== 1 || !readOnlyGraphql(query) || fields.some(f =>
+            !/^[A-Za-z_]\w*(?:\[(?:[A-Za-z_]\w*)?\])*=/.test(f) || f.startsWith("query["))) {
+          return "安全护栏：GraphQL 请求必须包含可核验的显式只读 query。";
+        }
+      }
+      const effectiveMethod = (method || (fields.length || body ? "POST" : "GET")).toUpperCase();
+      const writes = effectiveMethod !== "GET" && effectiveMethod !== "HEAD";
+      if (sensitive && writes) {
+        return "安全护栏：禁止通过 gh api 合并 PR 或修改发布资源。";
+      }
+    }
     if (git?.subcmd === "push" || git?.subcmd === "commit" || gh?.subcmd === "merge" || gh?.subcmd === "create" || gh?.subcmd === "new") {
       if (prefix.ambiguous) return "物理保险丝：无法解析 env 交付命令。";
       if (prefix.dirs.some(hasShellExpansion)) return "物理保险丝：检测到未展开的 shell 变量路径。";

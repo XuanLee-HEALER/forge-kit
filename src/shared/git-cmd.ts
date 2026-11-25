@@ -325,12 +325,13 @@ export function extractCommandPositionGit(
 }
 
 export function getCanonicalGitCommonDir(dir: string): string | null {
-  const res = runGit(dir, ["rev-parse", "--git-common-dir"], 3000);
-  if (res.code !== 0 || !res.stdout.trim()) return null;
+  const res = runGit(dir, ["rev-parse", "--path-format=absolute", "--git-common-dir"], 3000);
+  const path = res.stdout.replace(/\n$/, "");
+  if (res.code !== 0 || !path) return null;
   try {
-    return realpathSync(resolve(dir, res.stdout.trim()));
+    return realpathSync(path);
   } catch {
-    return resolve(dir, res.stdout.trim());
+    return null;
   }
 }
 

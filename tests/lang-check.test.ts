@@ -1,9 +1,12 @@
+import { isolateHome } from "./helpers/hermetic";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { detectRepoLanguages, runLangChecks } from "../src/lang-check";
 import { classifyPostToolEvidence } from "../src/ledger-hook";
+
+isolateHome();
 
 let dir: string;
 
@@ -28,7 +31,7 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks) and ledg
     writeFileSync(join(pyRepo, "app.py"), "def add(a: int, b: int) -> int:\n    return a + b\n");
     expect(detectRepoLanguages(pyRepo)).toEqual(["python"]);
     const pyPass = runLangChecks({ targetDir: pyRepo, mode: "static" });
-    expect(pyPass.ok).toBe(true);
+    expect(pyPass.ok, JSON.stringify(pyPass.checks)).toBe(true);
     expect(pyPass.executed).toBeGreaterThanOrEqual(1);
 
     writeFileSync(join(pyRepo, "broken.py"), "def oops(:\n  pass\n");

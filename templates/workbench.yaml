@@ -38,9 +38,8 @@ guard:
     - "main"
     - "master"
   prod_tag_patterns:
-    - "^api-v"
-    - "^crontab-v"
     - "^release-v"
-    - "^v\\d+\\.\\d+"
+    - '^v[0-9]+\.[0-9]+\.[0-9]+'
+  custom_block_patterns: []
   block_shared_worktree_ops: true
   block_ledger_direct_edits: true

@@ -19,7 +19,7 @@ This document defines the logical layering, dependency rules, and module boundar
    - `src/bin/*.ts`, `src/cli.ts`, and `tests/*.test.ts` continue to work without breaking imports.
 5. **Pure Structural Refactoring Invariant (Zero Behavior Drift).**
    - When refactoring structure, do NOT change security semantics, error messages, CLI flags, SQLite schema, or hook JSON formats.
-   - Every existing test (103/103 across main + `review-agents`) and all 8 `bun build` entrypoints MUST pass unchanged.
+   - Both test suites (workbench and `review-agents`) and all 8 `bun build` entrypoints MUST pass unchanged.
 
 ---
 
@@ -115,4 +115,4 @@ Layer 0: Shared Primitives & Core Utilities (No dependency on Layers 1–3)
 3. **100% public export parity**: Every symbol previously exported by `src/guard.ts`, `src/ledger.ts`, and `src/ledger-hook.ts` remains exported from those facade files with identical signatures.
 4. **Clean build artifacts**: All 8 `dist/*.js` entrypoints build cleanly via `bun run build`.
 5. **No duplication**: Shared helpers (`canonicalizeOsPath`, `unwrapShellPrefix`, `extractGhPrSubcommand`, `parseGitRemoteRepo`, `parseGhRepoSpec`, etc.) live in ONE canonical module in `src/shared/`.
-6. **Zero private leaks & clean workspace**: `core/AGENTS.md` unchanged (9,947 bytes), zero private identifiers, zero untracked temporary files.
+6. **Zero private leaks & clean workspace**: `wc -c < core/AGENTS.md` must report fewer than 8,000 bytes, zero private identifiers, zero untracked temporary files.

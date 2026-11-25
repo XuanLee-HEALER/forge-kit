@@ -1,7 +1,9 @@
+import { reviewNative, syncPr } from "./delivery-tools";
 import { findWorkbenchRoot } from "../config";
+import { runReviewFallback } from "./review-fallback";
 import { Ledger } from "./store";
 import {
-  normalizeReviewRole,
+  evidenceSource,
   type DeliveryEndpoint,
   type RunbookPrAction,
   type RunbookSqlFileAction,
@@ -26,7 +28,10 @@ Commands:
   spec-status <task_id>
   decide      <task_id> --key <k> --summary <text> [--supersedes <seq>]
   blocker   <task_id> <open|close> --id <bid> --summary <text>
-  record    <task_id> --kind <commit|build|test|lint|review|hurl|pr|fat|prod|note> --status <pass|fail|fallback|info> --summary <text> [--role <role> --repo <r> --branch <b> --sha <sha> --meta <json>]
+  record    <task_id> --kind <fat|prod|verify|deploy|smoke|manual|note> --status <pass|fail|fallback|info> --summary <text> [--repo <r> --branch <b> --sha <sha> --meta <json>]
+  review-native --task <id> --repo <repo> --base <ref> [--branch <branch>]
+  pr-sync <task_id> --repo <repo> [--pr <number-or-url>] [--branch <branch>]
+  review-fallback <task_id> --repo <repo> --role <role> --sha <full-sha>
   exempt    --repo <r> --branch <b> --reason <text> [--sha <sha> --ttl-hours <n>]
   status    [--task <id>] [--repo <r> --branch <b>] [--json]
   query     [--q <fts>] [--repo <r>] [--status <OPEN|CLOSED|CANCELLED>] [--since <iso>] [--json]
@@ -263,6 +268,26 @@ Commands:
         actor: values.actor,
       });
       console.log(JSON.stringify(ev, null, 2));
+    } else if (cmd === "review-native") {
+      const { values } = parseArgs({ args: rest, options: { task: { type: "string" }, repo: { type: "string" },
+        base: { type: "string" }, branch: { type: "string" } } });
+      if (!values.task || !values.repo || !values.base) throw new Error("Expected --task, --repo and --base");
+      const result = JSON.parse(reviewNative(ledger, values.task, values.repo, values.base, values.branch).payload_json);
+      console.log(JSON.stringify(result));
+      if (result.status !== "pass") process.exitCode = 1;
+    } else if (cmd === "pr-sync") {
+      const [task, ...args] = rest;
+      const { values } = parseArgs({ args, options: { repo: { type: "string" }, pr: { type: "string" }, branch: { type: "string" } } });
+      if (!task || !values.repo) throw new Error("Expected task ID and --repo");
+      console.log(syncPr(ledger, task, values.repo, values.pr, values.branch).payload_json);
+    } else if (cmd === "review-fallback") {
+      const [task, ...args] = rest;
+      const { values } = parseArgs({ args, options: { repo: { type: "string" }, role: { type: "string" }, sha: { type: "string" } } });
+      if (!task || !values.repo || !values.role || !values.sha) throw new Error("Expected task ID, --repo, --role and --sha");
+      const event = runReviewFallback(ledger, task, values.repo, values.role, values.sha);
+      const result = JSON.parse(event.payload_json);
+      console.log(JSON.stringify(result));
+      if (result.status === "fail") process.exitCode = 1;
     } else if (cmd === "record") {
       const task_id = rest[0];
       const { values } = parseArgs({
@@ -271,49 +296,29 @@ Commands:
           kind: { type: "string" },
           status: { type: "string", default: "info" },
           summary: { type: "string" },
-          role: { type: "string" },
           repo: { type: "string" },
           branch: { type: "string" },
           sha: { type: "string" },
           meta: { type: "string" },
-          actor: { type: "string", default: "agent" },
         },
       });
       if (!task_id || !values.kind || !values.summary) {
         throw new Error("Usage: ledger record <task_id> --kind <k> --status <s> --summary <text>");
       }
-      const parsedMeta = values.meta
-        ? (JSON.parse(values.meta) as Record<string, unknown>)
-        : {};
-      if (values.role) {
-        if (values.kind === "review") {
-          parsedMeta.role = normalizeReviewRole(values.role);
-        } else {
-          console.error(
-            `Warning: --role only applies to --kind review; ignored for --kind ${values.kind}`,
-          );
-        }
-      }
+      const manualKinds = ["fat", "prod", "verify", "deploy", "smoke", "manual", "note"] as const;
+      const kind = manualKinds.find(kind => kind === values.kind);
+      if (!kind) throw new Error("ledger record accepts manual attestations only; run the actual verification or review tool for executable evidence.");
+      const parsedMeta = values.meta ? JSON.parse(values.meta) : {};
       const ev = ledger.recordEvidence({
         task_id,
-        kind: values.kind as
-          | "commit"
-          | "build"
-          | "test"
-          | "lint"
-          | "review"
-          | "hurl"
-          | "pr"
-          | "fat"
-          | "prod"
-          | "note",
+        kind,
+        source: "manual",
         status: values.status as "pass" | "fail" | "fallback" | "info",
         summary: values.summary,
         repo: values.repo,
         branch: values.branch,
         sha: values.sha,
         meta: Object.keys(parsedMeta).length > 0 ? parsedMeta : undefined,
-        actor: values.actor,
       });
       console.log(JSON.stringify(ev, null, 2));
     } else if (cmd === "exempt") {
@@ -351,12 +356,17 @@ Commands:
       if (values.task) {
         const task = ledger.getTask(values.task);
         if (!task) throw new Error(`Task not found: ${values.task}`);
+        const events = ledger.getTaskEvents(values.task);
         const data = {
           task,
           spec: ledger.getSpecState(values.task),
           repos: ledger.getTaskRepos(values.task),
           blockers: ledger.getTaskBlockers(values.task),
-          events: ledger.getTaskEvents(values.task),
+          events,
+          evidence: events.filter(event => event.event_type === "EVIDENCE_CAPTURED").map(event => {
+            const payload = JSON.parse(event.payload_json);
+            return `[${evidenceSource(payload, event.actor)}] ${payload.kind}/${payload.status}`;
+          }),
         };
         console.log(JSON.stringify(data, null, 2));
       } else if (values.repo && values.branch) {

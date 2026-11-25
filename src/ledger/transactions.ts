@@ -98,6 +98,7 @@ export function appendEventInTx(db: Database, params: {
 }
 
 export function withImmediateTx<T>(db: Database, fn: () => T): T {
+  if (db.inTransaction) return db.transaction(fn)();
   db.exec("BEGIN IMMEDIATE;");
   try {
     const result = fn();

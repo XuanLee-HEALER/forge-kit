@@ -6,6 +6,7 @@ export {
   nowIso,
   type DeliveryEndpoint,
   type EventRecord,
+  type EvidenceSource,
   type ExemptionRecord,
   type RunbookActions,
   type RunbookPrAction,

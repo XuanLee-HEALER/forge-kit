@@ -1,10 +1,13 @@
+import { isolateHome } from "./helpers/hermetic";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runGit } from "../src/git";
 import { evaluatePreToolUse, resolveGhDefaultHost } from "../src/guard";
 import { Ledger } from "../src/ledger";
+
+isolateHome();
 
 let wb: string;
 let repoDir: string;
@@ -32,6 +35,8 @@ guard:
     - "pg-prod.internal"
     - "mysql-prod.internal"
     - "ck-prod.internal"
+  custom_block_patterns:
+    - "example-admin purge"
   protected_branches:
     - "main"
   prod_tag_patterns:
@@ -55,10 +60,26 @@ afterEach(() => {
   rmSync(wb, { recursive: true, force: true });
 });
 
+test("guard denies secret/raw, tunnels and release API writes and permits ordinary reads", () => {
+  for (const cmd of ["kubectl get --raw /api/v1/secrets", "kubectl --raw=/api/v1/secrets",
+    "kubectl port-forward service/db 8000:8000",
+    "gh api -X PATCH repos/acme/svc/git/refs/heads/test", "gh api repos/acme/svc/releases -f tag_name=v1",
+    "gh api repos/acme/svc/pulls/42/merge -f body=value",
+    "gh api -X POST https://git.example/api/v3/repos/acme/svc/releases", "gh api -p sample -X DELETE repos/acme/svc/releases/1", "gh api --preview sample -X POST repos/acme/releases/releases", "gh api graphql -f 'query=mutation { mergePullRequest(input: {}) { clientMutationId } }'",
+    "gh api repos/acme/svc/releases/1 -iX DELETE", "gh api -iXDELETE repos/acme/svc/releases/1",
+    "gh api -iF tag=v1 repos/acme/svc/releases", "gh api repos/acme/svc/releases -if tag=v1",
+    "gh api -iZ repos/acme/svc/releases", "gh api repos/acme/svc/pulls/42/merge -X PUT",
+    "gh api /api/graphql -F query=@missing", "gh api -X POST repos/acme/app/releases", "example-admin purge", "redis-cli FLUSHALL"]) expect(evaluatePreToolUse(wb, shellInput(cmd))).toBeTruthy();
+  for (const cmd of ["gh api repos/acme/svc/pulls/42/merge", "gh api https://api.github.com/repos/acme/svc/pulls/1/merge", "gh api repos/acme/svc/releases/1 -iX GET", "gh api -iH 'Accept: application/json' repos/acme/svc/releases",
+    "gh api -X GET repos/acme/svc/pulls/42/merge", "gh api -iXHEAD repos/acme/svc/pulls/42/merge", "kubectl get pods", "gh api repos/acme/svc/releases", "gh api -X POST repos/acme/releases/issues", "gh api -X GET repos/acme/app/releases -f per_page=1", "gh api graphql -f 'query=query { viewer { login } }'", "gh api graphql -f 'query=query Repo($name: String!) { repository(name: $name, owner: \"acme\") { id } }' -f name=app", "gh api graphql -f 'query=query { search(query: \"subscription\", type: ISSUE, first: 1) { issueCount } }'", "gh api graphql -f 'query=query Nodes($ids: [ID!]!) { nodes(ids: $ids) { id } }' -F 'ids[]=abc'", "redis-cli PING"])
+    expect(evaluatePreToolUse(wb, shellInput(cmd))).toBeNull();
+});
+
 describe("Tier 1 Physical Fuses & Fail-Closed", () => {
   test("guard binary fails closed on malformed JSON stdin", async () => {
     const guardSrc = join(import.meta.dir, "..", "src", "bin", "guard.ts");
     const proc = Bun.spawn([process.execPath, guardSrc], {
+      env: process.env,
       stdin: new Response("{broken json"),
       stdout: "pipe",
       stderr: "pipe",
@@ -243,6 +264,21 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
       evaluatePreToolUse(wb, shellInput("git -C app-api push origin feat/demo")),
     ).toBeNull();
 
+    const owner = new Ledger(wb);
+    const task_id = "docs-exemption";
+    try {
+      owner.openTask({ task_id, title: "Docs", endpoint: "local", depth: "targeted", repo: "app-api", branch: "feat/demo" });
+      const specs = join(wb, ".workbench/specs", task_id);
+      mkdirSync(specs, { recursive: true });
+      for (const name of ["ssot", "tech-spec", "test-spec"]) writeFileSync(join(specs, name + ".md"), name);
+      const contract = join(repoDir, "frozen.hurl");
+      writeFileSync(contract, "original");
+      owner.freezeSpec({ task_id, locked_test_globs: ["*.hurl"] });
+      writeFileSync(contract, "modified");
+      expect(evaluatePreToolUse(wb, shellInput("git -C app-api push origin feat/demo"))).toContain("frozen.hurl");
+      owner.cancelTask({ task_id, reason: "fixture complete" });
+    } finally { owner.closeDb(); }
+
     // Now switch to modifying protected business code (.ts) on the SAME branch -> BLOCKED despite existing exemption!
     writeFileSync(join(repoDir, "billing.ts"), "export const fee = 10;\n");
     runGit(repoDir, ["add", "billing.ts"]);
@@ -288,6 +324,34 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     ).toContain("受保护主分支");
   });
 
+  test("explicit feature push allows clean sibling main and blocks dirty detached checkout", () => {
+    const rel = "frozen.hurl", file = join(repoDir, rel);
+    writeFileSync(file, "frozen"); runGit(repoDir, ["add", rel]); runGit(repoDir, ["commit", "-m", "contract"]);
+    const head = runGit(repoDir, ["rev-parse", "HEAD"]).stdout.trim(), task_id = "detached-checkout";
+    const ledger = new Ledger(wb);
+    try {
+      ledger.openTask({ task_id, title: task_id, endpoint: "fat", depth: "targeted", repo: "app-api", branch: "feat/demo", head_sha: head });
+      const docs = join(wb, ".workbench/specs", task_id); mkdirSync(docs, { recursive: true });
+      for (const name of ["ssot", "tech-spec", "test-spec"]) writeFileSync(join(docs, name + ".md"), name);
+      ledger.freezeSpec({ task_id, locked_test_globs: [rel] });
+      ledger.recordEvidence({ task_id, repo: "app-api", sha: head, kind: "test", status: "pass", source: "tool", summary: "pass" });
+      const push = (ref = "HEAD:fat") => evaluatePreToolUse(wb, shellInput("git -C app-api push origin " + ref));
+      const featureDir = join(wb, "feature-checkout");
+      expect(runGit(repoDir, ["switch", "main"]).code).toBe(0);
+      expect(runGit(repoDir, ["worktree", "add", featureDir, "feat/demo"]).code).toBe(0);
+      expect(runGit(repoDir, ["status", "--porcelain"]).stdout).toBe("");
+      expect(existsSync(file)).toBe(false);
+      expect(push("feat/demo:feat/demo")).toBeNull();
+
+      expect(runGit(repoDir, ["worktree", "remove", featureDir]).code).toBe(0);
+      expect(runGit(repoDir, ["switch", "--detach", head]).code).toBe(0);
+      expect(push("feat/demo:feat/demo")).toBeNull();
+      expect(push()).toBeNull();
+      writeFileSync(file, "dirty");
+      expect(push()).toContain(rel);
+      expect(push("feat/demo:feat/demo")).toContain(rel);
+    } finally { ledger.closeDb(); }
+  });
   test("detached external FAT merge worktree traces back to OPEN task and verifies readiness", () => {
     // Create fat branch at base
     runGit(repoDir, ["branch", "fat", "main"]);
@@ -324,6 +388,7 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
       // Record passing test on featSha -> detached FAT push now ALLOWED!
       const ledger2 = new Ledger(wb);
       ledger2.recordEvidence({
+        source: "hook",
         task_id: "20261121-fat-flow",
         kind: "test",
         status: "pass",
@@ -388,6 +453,7 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
       const mergedHead = runGit(tmpWt, ["rev-parse", "HEAD"]).stdout.trim();
       const ledger3 = new Ledger(wb);
       ledger3.recordEvidence({
+        source: "hook",
         task_id: "20261121-fat-flow",
         kind: "test",
         status: "fail",

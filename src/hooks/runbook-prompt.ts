@@ -29,30 +29,21 @@ export function handleUserPromptRunbookDirectives(
   const sessionId = (input.session_id ?? "").trim();
   if (!prompt || !sessionId) return undefined;
 
-  const revokeIds = new Set<string>();
-  const revokeRe =
-    /(?:撤销|取消|作废|撤回|revoke|cancel)\s*(?:发版|执行|runbook|release)?\s*[:：]?\s*(rb-[a-z0-9-]{4,32})\b/gi;
-  for (const m of prompt.matchAll(revokeRe)) {
-    if (m[1]) revokeIds.add(m[1].toLowerCase());
-  }
-
-  const approveIds = new Set<string>();
-  const approveRe =
-    /(?:批准(?:发版|执行|runbook)?|确认(?:发版|执行|runbook)|同意(?:发版|执行|runbook)|approve(?:\s+runbook|\s+release)?)\s*[:：]?\s*(rb-[a-z0-9-]{4,32})\b/gi;
-  const negPrefixRe = /(?:不要|暂不|不|别|未|don't|do\s+not|not|never)\s*$/i;
-  for (const m of prompt.matchAll(approveRe)) {
-    const id = m[1]?.toLowerCase();
-    if (!id || revokeIds.has(id)) continue;
-    const before = prompt.slice(Math.max(0, (m.index ?? 0) - 16), m.index ?? 0);
-    if (negPrefixRe.test(before)) continue;
-    approveIds.add(id);
-  }
-
-  if (revokeIds.size === 0 && approveIds.size === 0) return undefined;
-
+  const ids = prompt.match(/rb-[a-z0-9-]+/gi);
+  if (!ids) return undefined;
+  const approve = !/[\r\n]/.test(input.prompt ?? "") && /^(?:批准|approve)[ \t]+(rb-[a-z0-9-]+(?:[ \t]+rb-[a-z0-9-]+)*)$/i.test(prompt);
+  const revoke = !/[\r\n]/.test(input.prompt ?? "") && prompt.match(
+    /^(?:(?:请[ \t]*)?(?:撤销|取消|作废|撤回)[ \t]*|(?:please[ \t]+)?(?:revoke|cancel)(?=[ \t:：])[ \t]*)(?:(?:发版|执行|runbook|release)[ \t]*)?[:：]?[ \t]*(rb-[a-z0-9-]+(?:[ \t]+rb-[a-z0-9-]+)*)(?:，同时批准[ \t]+rb-[a-z0-9-]+)?[。.!！]?$/i,
+  );
+  const mentioned = [...new Set(ids.map(id => id.toLowerCase()))];
+  const revokeIds = revoke ? [...new Set(revoke[1].toLowerCase().split(/[ \t]+/))] : [];
+  const approveIds = approve ? mentioned : [];
   const ledger = new Ledger(workbenchRoot);
   const notes: string[] = [];
   try {
+    if (!approve && (/批准|approve/i.test(prompt) || !revoke && mentioned.some(id => ledger.getRunbook(id)?.status === "PENDING"))) {
+      notes.push("未识别为 Runbook 批准。请单独回复「批准 <runbook_id>」或「approve <runbook_id>」，不附带其他文字或标点。");
+    }
     for (const id of revokeIds) {
       try {
         ledger.revokeRunbook(id);

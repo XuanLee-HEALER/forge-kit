@@ -9,6 +9,15 @@ export function normalizeReviewRole(role?: string | null): string {
   return raw;
 }
 
+export type EvidenceSource = "tool" | "hook" | "manual";
+
+export function evidenceSource(payload: { source?: unknown }, actor: string): EvidenceSource {
+  const source = Object.hasOwn(payload, "source") ? payload.source : actor;
+  return source === "hook" || source === "tool" ? source : "manual";
+}
+
+export const EXECUTABLE_EVIDENCE = new Set(["lint", "test", "build", "hurl", "review", "pr"]);
+
 export type TaskStatus = "OPEN" | "CLOSED" | "CANCELLED";
 
 export type DeliveryEndpoint = "investigation" | "local" | "fat" | "pr" | "prod";
@@ -17,11 +26,20 @@ export type VerificationDepth = "targeted" | "full";
 
 export type SpecAmendScope = "requirement" | "invariant" | "tech_spec" | "test_spec";
 
+export type LockedTreeEntry = { path: string; mode: string; oid: string };
+export type LockedGitlinks = Record<string, LockedTreeEntry[]>;
+
 export interface SpecFrozenPayload {
   spec_dir: string;
   files: { ssot: string; tech_spec: string; test_spec: string };
   hashes: { ssot: string; tech_spec: string; test_spec: string };
   locked_test_globs: string[];
+  locked_test_modes: Record<string, string>;
+  locked_test_blobs: Record<string, string>;
+  locked_gitlinks: LockedGitlinks;
+  locked_test_revisions: Record<string, string[]>;
+  tracked_locked_tests: Record<string, string>;
+  locked_test_files: Record<string, string>;
 }
 
 export interface SpecAmendedPayload {
@@ -39,11 +57,14 @@ export interface TaskSpecState {
   files: { ssot: string; tech_spec: string; test_spec: string } | null;
   hashes: { ssot: string; tech_spec: string; test_spec: string } | null;
   locked_test_globs: string[];
+  locked_test_files: Record<string, string>;
   amend_scope: SpecAmendScope | null;
   amend_scopes: SpecAmendScope[];
   amend_reason: string | null;
   stale_stages: string[];
   drifted_files: string[];
+  drifted_locked_tests: string[];
+  drift_detected: boolean;
   evidence_floor_seq: { lint: number; test: number; review: number; fat: number };
 }
 
@@ -227,6 +248,7 @@ export function ledgerDbPath(workbenchRoot: string): string {
 export interface LedgerReader {
   readonly db: Database;
   readonly workbenchRoot: string;
+  getTaskRepos(task_id: string): TaskRepoRecord[];
   getTask(task_id: string): TaskRecord | null;
   getTaskEvents(task_id: string): EventRecord[];
   getRunbook(runbook_id: string): RunbookRecord | null;
