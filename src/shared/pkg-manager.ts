@@ -1,6 +1,3 @@
-import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-
 // npm environment settings take precedence over project, user and global npmrc files.
 export const npmExecutionOptions = {
   npm_config_usage: "false",
@@ -63,27 +60,6 @@ function isNpmWorkspaceSelectFlag(tok: string): boolean {
     return val !== "false" && val !== "0" && val !== "";
   }
   return false;
-}
-
-export function resolvePkgManagerEffectiveDir(pm: ParsedPkgManager, curDir: string): string | null {
-  if (pm.invalidDirFlag || pm.hasAmbiguousFilter) return null;
-  let dir = curDir;
-  if (pm.dirOffsets.length > 0) {
-    dir = resolve(curDir, pm.dirOffsets[pm.dirOffsets.length - 1]);
-  }
-  if (pm.useWorkspaceRoot) {
-    let probe = dir;
-    while (true) {
-      if (existsSync(join(probe, "pnpm-workspace.yaml"))) {
-        dir = probe;
-        break;
-      }
-      const parent = dirname(probe);
-      if (parent === probe) break;
-      probe = parent;
-    }
-  }
-  return dir;
 }
 
 // npm 11 config definitions with non-boolean values, including their value-taking aliases.

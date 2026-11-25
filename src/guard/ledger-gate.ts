@@ -26,53 +26,17 @@ function evaluateDiffExemptEligibility(
   stats: { files: string[]; changedLines: number },
   cfg: WorkbenchConfig,
 ): { eligible: boolean; files: string[]; changedLines: number; reason?: string } {
-  if (stats.files.length === 0) {
-    return { eligible: true, ...stats };
+  const rules = cfg.ledger;
+  let reason: string | undefined;
+  if (stats.files.length > rules.exempt_max_files) reason = "改动文件数超出豁免上限";
+  else if (stats.changedLines > rules.exempt_max_lines) reason = "改动行数超出豁免上限";
+  else {
+    const protectedFile = stats.files.find(f => rules.protected_code_globs.some(g => matchesGlob(f, g)));
+    const outside = stats.files.find(f => rules.exempt_allowed_globs.length && !rules.exempt_allowed_globs.some(g => matchesGlob(f, g)));
+    if (protectedFile) reason = "涉及受保护业务代码文件 " + protectedFile;
+    else if (outside) reason = "不在允许免账本范围 " + outside;
   }
-  if (stats.files.length > cfg.ledger.exempt_max_files) {
-    return {
-      eligible: false,
-      ...stats,
-      reason: `改动文件数 (${stats.files.length}) 超出豁免上限 (${cfg.ledger.exempt_max_files})`,
-    };
-  }
-  if (stats.changedLines > cfg.ledger.exempt_max_lines) {
-    return {
-      eligible: false,
-      ...stats,
-      reason: `改动行数 (${stats.changedLines}) 超出豁免上限 (${cfg.ledger.exempt_max_lines})`,
-    };
-  }
-  const protectedHit = stats.files.find((f) =>
-    cfg.ledger.protected_code_globs.some((g) => matchesGlob(f, g)),
-  );
-  if (protectedHit) {
-    return {
-      eligible: false,
-      ...stats,
-      reason: `涉及受保护业务代码文件 (${protectedHit})`,
-    };
-  }
-  if (cfg.ledger.exempt_allowed_globs.length > 0) {
-    const disallowed = stats.files.find(
-      (f) => !cfg.ledger.exempt_allowed_globs.some((g) => matchesGlob(f, g)),
-    );
-    if (disallowed) {
-      return {
-        eligible: false,
-        ...stats,
-        reason: `文件 ${disallowed} 不在允许免账本范围 (exempt_allowed_globs) 内`,
-      };
-    }
-  }
-  return { eligible: true, ...stats };
-}
-
-function isStagedDiffExemptEligible(
-  checkoutDir: string,
-  cfg: WorkbenchConfig,
-): { eligible: boolean; files: string[]; changedLines: number; reason?: string } {
-  return evaluateDiffExemptEligibility(getStagedDiffStats(checkoutDir), cfg);
+  return { ...stats, eligible: !reason, reason };
 }
 
 function pathBelongsToRegisteredRepo(
@@ -151,13 +115,8 @@ export function checkLedgerGate(
 
       if (!ledger) ledger = new Ledger(workbenchRoot);
 
-      type DeliveryTarget = {
-        branch: string;
-        sha: string | null;
-        isDetached: boolean;
-      };
-
-      const targets: DeliveryTarget[] = [];
+      const current = { branch: loc.branch, sha: loc.headSha, isDetached: loc.isDetached };
+      const targets: (typeof current)[] = [];
       if (isGitPush && git) {
         const parsedPush = parseGitPushArgs(git.subArgs);
         const reason = isImplicitPushAmbiguous(parsedPush, git.configs, targetDir, new Set(cfg.guard.protected_branches));
@@ -171,11 +130,7 @@ export function checkLedgerGate(
         }
         const { refspecs } = parsedPush;
         if (refspecs.length === 0) {
-          targets.push({
-            branch: loc.branch,
-            sha: loc.headSha,
-            isDetached: loc.isDetached,
-          });
+          targets.push(current);
         } else {
           for (const spec of refspecs) {
             const rawSrc = spec.includes(":") ? spec.split(":")[0] : spec;
@@ -203,11 +158,7 @@ export function checkLedgerGate(
               continue;
             }
             if (srcRef === "HEAD" || srcRef === "@") {
-              targets.push({
-                branch: loc.branch,
-                sha: loc.headSha,
-                isDetached: loc.isDetached,
-              });
+              targets.push(current);
             } else {
               const rev = runGit(loc.checkoutDir, ["rev-parse", "--verify", srcRef], 3000);
               if (rev.code !== 0 || !rev.stdout.trim()) {
@@ -252,67 +203,24 @@ export function checkLedgerGate(
           return "账本门禁：无法确认 gh 默认目标仓与当前仓 origin 一致，请显式指定 -R。";
         }
 
-        const prHead = parsedGh.head;
-        if (prHead) {
-          let branchName = prHead;
-          if (prHead.includes(":")) {
-            const [owner, ...restParts] = prHead.split(":");
-            branchName = restParts.join(":");
-            if (
-              !owner ||
-              !originIdentity ||
-              owner.toLowerCase() !== originIdentity.owner
-            ) {
-              return `账本门禁（fail-closed）：PR head \`${prHead}\` 的 owner 与当前仓 origin 不匹配，拒绝放行跨 fork 未核验 PR。`;
-            }
-          }
-          const cleanBranch = branchName.replace(/^refs\/heads\//, "");
-          const rev = runGit(
-            loc.checkoutDir,
-            ["rev-parse", "--verify", `refs/heads/${cleanBranch}`],
-            3000,
-          );
-          if (rev.code !== 0 || !rev.stdout.trim()) {
-            return `账本门禁（fail-closed）：无法解析本地 PR head 分支 \`${prHead}\`，拒绝放行 gh pr create。`;
-          }
-          const localSha = rev.stdout.trim();
-          // If origin/<branch> exists locally and has diverged from local branch, fail closed!
-          const remoteRev = runGit(
-            loc.checkoutDir,
-            ["rev-parse", "--verify", `refs/remotes/origin/${cleanBranch}`],
-            3000,
-          );
-          if (remoteRev.code === 0 && remoteRev.stdout.trim() && remoteRev.stdout.trim() !== localSha) {
-            return `账本门禁（fail-closed）：本地分支 \`${cleanBranch}\` (${localSha.slice(0, 8)}) 与远端跟踪分支 \`origin/${cleanBranch}\` (${remoteRev.stdout.trim().slice(0, 8)}) 已分叉，请先推送对齐后再创建 PR。`;
-          }
-          targets.push({
-            branch: cleanBranch,
-            sha: localSha,
-            isDetached: false,
-          });
-        } else {
-          if (!loc.isDetached && loc.headSha) {
-            const remoteRev = runGit(
-              loc.checkoutDir,
-              ["rev-parse", "--verify", `refs/remotes/origin/${loc.branch}`],
-              3000,
-            );
-            if (remoteRev.code === 0 && remoteRev.stdout.trim() && remoteRev.stdout.trim() !== loc.headSha) {
-              return `账本门禁（fail-closed）：当前分支 \`${loc.branch}\` (${loc.headSha.slice(0, 8)}) 与远端跟踪分支 \`origin/${loc.branch}\` (${remoteRev.stdout.trim().slice(0, 8)}) 已分叉，请先推送对齐后再创建 PR。`;
-            }
-          }
-          targets.push({
-            branch: loc.branch,
-            sha: loc.headSha,
-            isDetached: loc.isDetached,
-          });
+        let branch = loc.branch, sha = loc.headSha, isDetached = loc.isDetached;
+        if (parsedGh.head) {
+          const parts = parsedGh.head.split(":");
+          if (parts.length > 1 && parts.shift()?.toLowerCase() !== originIdentity?.owner)
+            return "账本门禁：PR head 的 owner 与当前仓 origin 不匹配，拒绝放行跨 fork 未核验 PR。";
+          branch = parts.join(":").replace(/^refs\/heads\//, "");
+          const rev = runGit(loc.checkoutDir, ["rev-parse", "--verify", "refs/heads/" + branch], 3000);
+          if (rev.code || !rev.stdout.trim()) return "账本门禁：无法解析本地 PR head 分支。";
+          sha = rev.stdout.trim();
+          isDetached = false;
         }
+        if (!isDetached && sha) {
+          const tracking = runGit(loc.checkoutDir, ["rev-parse", "--verify", "refs/remotes/origin/" + branch], 3000);
+          if (!tracking.code && tracking.stdout.trim() !== sha) return "账本门禁：本地分支与远端跟踪分支已分叉，请先推送对齐后再创建 PR。";
+        }
+        targets.push({ branch, sha, isDetached });
       } else {
-        targets.push({
-          branch: loc.branch,
-          sha: loc.headSha,
-          isDetached: loc.isDetached,
-        });
+        targets.push(current);
       }
 
       for (const target of targets) {
@@ -335,10 +243,8 @@ export function checkLedgerGate(
             return `账本门禁：${loc.repo}:${deliveryBranch} 命中多个 OPEN 账本 (${ids})，请先收敛归属后再提交。`;
           }
 
-          const eligibility = isStagedDiffExemptEligible(loc.checkoutDir, cfg);
-          if (exemption && eligibility.eligible) {
-            continue;
-          }
+          const eligibility = evaluateDiffExemptEligibility(getStagedDiffStats(loc.checkoutDir), cfg);
+          if (exemption && eligibility.eligible) continue;
 
           const allOpen = ledger.listOpenTasks();
           const attachHint =

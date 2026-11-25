@@ -898,7 +898,8 @@ export class Ledger {
         }
         if (
           (task.endpoint === "pr" && p.kind === "pr" && attachments.length === 1 && ev.branch === attachments[0].branch) ||
-          (task.endpoint === "fat" && (p.kind === "fat" || p.kind === "hurl")) ||
+          (task.endpoint === "fat" && (p.kind === "fat" ||
+            (p.kind === "hurl" && evidenceSource(p, ev.actor) === "hook"))) ||
           (task.endpoint === "prod" && p.kind === "prod")
         ) {
           if (p.kind === "pr" && p.status === "pass" &&
@@ -930,7 +931,7 @@ export class Ledger {
     } else if (task.verification_depth === "full") {
       if (latestByKind.get("lint") !== "pass") {
         missing.push(
-          `full verification requires passing static check (lint) evidence for ${params.repo}@${params.head_sha.slice(0, 8)} (run repo lint/typecheck or .workbench/bin/lang-check --mode static)`,
+          `full verification requires passing static check (lint) evidence for ${params.repo}@${params.head_sha.slice(0, 8)} (run .workbench/bin/wb-verify --task ${params.task_id} --repo ${params.repo} --mode static)`,
         );
       }
       if (!hasPassingExecVerify) {

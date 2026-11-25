@@ -654,7 +654,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         "could not be resolved on disk",
       );
 
-      // Subsequent FAT/hurl failure on the SAME SHA MUST revoke an earlier hurl pass!
+      // Local Hurl verifies the revision. FAT acceptance has its own latest result.
       ledger.openTask({
         task_id: "20261121-fat-revoke",
         title: "FAT failure revokes earlier pass",
@@ -695,12 +695,15 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         branch: "main",
         sha: sha1,
       });
+      expect(() => ledger.closeTask({ task_id: "20261121-fat-revoke" })).toThrow('endpoint "fat" requires recorded fat delivery evidence');
+      ledger.recordEvidence({ task_id: "20261121-fat-revoke", repo: "live-svc", branch: "main", sha: sha1,
+        kind: "fat", source: "manual", status: "pass", summary: "deployment verified" });
       ledger.recordEvidence({
         source: "tool",
         task_id: "20261121-fat-revoke",
-        kind: "hurl",
+        kind: "fat",
         status: "fail",
-        summary: "hurl failed on re-run",
+        summary: "FAT acceptance failed on re-run",
         repo: "live-svc",
         branch: "main",
         sha: sha1,
@@ -777,6 +780,8 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       expect(missingLint.ready).toBe(false);
       expect(missingLint.missing.join(" ")).toContain("static check (lint)");
 
+      ledger.recordEvidence({ task_id: "20261123-cycle", repo: "api-svc", sha: api.head, source: "manual",
+        kind: "fat", status: "pass", summary: "deployment accepted" });
       // Record static lint -> now ready=true (pure Hurl without unit tests works cleanly!)
       ledger.recordEvidence({
         source: "tool",
@@ -850,6 +855,8 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         repo: "api-svc",
         sha: api.head,
       });
+      ledger.recordEvidence({ task_id: "20261123-cycle", repo: "api-svc", sha: api.head, source: "manual",
+        kind: "fat", status: "pass", summary: "deployment accepted" });
       const readyAfter = ledger.checkPushReadiness({
         task_id: "20261123-cycle",
         repo: "api-svc",

@@ -1,10 +1,9 @@
-import { normalizeDbHost, normalizeDbHosts } from "../config";
-import { loadDbEnvironments } from "../config";
+import { normalizeDbHosts, loadDbEnvironments } from "../config";
 import { type ApprovedRunbookEntry } from "./runbook-state";
 import { canonicalizeOsPath, sha256File } from "../shared/path";
 import {
-  expandEnvSplitStrings,
-  hasShellExpansion,
+  tokenizeSimpleShellCommand,
+  hasUnquotedPipe,
   hasUnquotedRedirect,
   splitShellSegments,
   splitShellTokens,
@@ -12,115 +11,32 @@ import {
   unwrapShellPrefix,
 } from "../shared/shell";
 
+const psqlOption = (arg: string) => arg.replace(/^-(?!-)[01aAbeEHnqstwWxXz]+/, "-");
+
 export const SQL_WRITE_RE =
   /\b(insert|update|delete|merge|replace|alter|drop|create|truncate|grant|revoke|copy|call|do|reindex|vacuum|refresh|comment|lock|set|begin|commit|setval|nextval|pg_terminate_backend|pg_cancel_backend|optimize|attach|detach|rename|kill)\b/i;
 
-const SQL_FILE_FLAG_RE = /(^|\s)(-f|--file)(\s|=|$)|\\i\b/;
-
-export function isHttpWriteCommand(cmd: string, depth = 0): boolean {
+export function isHttpWriteCommand(cmd: string): boolean {
   for (const seg of splitShellSegments(cmd)) {
-    const toks = splitShellTokens(seg);
-    if (!toks || toks.length === 0) {
-      // Fail closed on unparseable shell segment mentioning an HTTP client
-      if (/\b(curl|wget|http|https)\b/.test(seg)) return true;
-      continue;
+    const toks = splitShellTokens(seg) ?? [];
+    const { bin, args } = unwrapShellPrefix(toks);
+    if (!bin) continue;
+    if (["sh", "bash", "zsh"].includes(bin) && args.some(a => /^-[a-z]*c$/.test(a))) {
+      const i = args.findIndex(a => /^-[a-z]*c$/.test(a));
+      if (args[i + 1] && isHttpWriteCommand(args[i + 1])) return true;
     }
-    let matchedDirect = false;
-    for (let i = 0; i < toks.length; i++) {
-      const bin = toks[i].split("/").pop() ?? "";
-      if (bin !== "curl" && bin !== "wget" && bin !== "http" && bin !== "https") {
-        // Inspect nested/wrapped shell arguments (e.g. `bash -c 'curl -XPOST ...'`).
-        // Fail closed if nesting exceeds max depth so deeply nested wrappers cannot bypass!
-        if (/\b(curl|wget|http|https)\b/.test(toks[i])) {
-          if (depth >= 3) return true;
-          if (isHttpWriteCommand(toks[i], depth + 1)) return true;
-        }
-        continue;
-      }
-      matchedDirect = true;
-      const rest = toks.slice(i + 1);
-      for (let j = 0; j < rest.length; j++) {
-        const a = rest[j];
-        if (/:8123\b/i.test(a) || /[?&]query=/i.test(a)) return true;
-
-        if (bin === "curl") {
-          if (a === "-X" || a === "--request") {
-            const method = (rest[j + 1] ?? "").toUpperCase();
-            if (method && method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
-              return true;
-            }
-            j++;
-            continue;
-          }
-          if (a.startsWith("-X") && a.length > 2) {
-            const method = a.slice(2).toUpperCase();
-            if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
-              return true;
-            }
-            continue;
-          }
-          if (a.startsWith("--request=")) {
-            const method = a.slice("--request=".length).toUpperCase();
-            if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
-              return true;
-            }
-            continue;
-          }
-          if (
-            a === "-d" ||
-            a.startsWith("-d") ||
-            a === "-F" ||
-            a.startsWith("-F") ||
-            a === "-T" ||
-            a.startsWith("-T") ||
-            a === "--json" ||
-            a.startsWith("--json=") ||
-            a === "--form" ||
-            a.startsWith("--form=") ||
-            a === "--form-string" ||
-            a.startsWith("--form-string=") ||
-            a === "--upload-file" ||
-            a.startsWith("--upload-file=") ||
-            a === "--data" ||
-            a.startsWith("--data-") ||
-            a.startsWith("--data=")
-          ) {
-            return true;
-          }
-        } else if (bin === "wget") {
-          if (
-            a === "--post-data" ||
-            a.startsWith("--post-data=") ||
-            a === "--post-file" ||
-            a.startsWith("--post-file=") ||
-            a === "--body-data" ||
-            a.startsWith("--body-data=") ||
-            a === "--body-file" ||
-            a.startsWith("--body-file=")
-          ) {
-            return true;
-          }
-          if (a === "--method" || a.startsWith("--method=")) {
-            const method = (a === "--method" ? rest[j + 1] ?? "" : a.slice("--method=".length)).toUpperCase();
-            if (method && method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
-              return true;
-            }
-          }
-        } else if (bin === "http" || bin === "https") {
-          if (/^(POST|PUT|DELETE|PATCH)$/i.test(a)) {
-            return true;
-          }
-        }
-      }
-      break;
-    }
-    if (!matchedDirect) {
-      for (const t of toks) {
-        if (/\b(curl|wget|http|https)\b/.test(t) && t !== seg) {
-          if (depth >= 3) return true;
-          if (isHttpWriteCommand(t, depth + 1)) return true;
-        }
-      }
+    if (!["curl", "wget", "http", "https"].includes(bin)) continue;
+    if (/^https?$/.test(bin) && !args.some(a => /^(GET|HEAD|OPTIONS)$/i.test(a)) &&
+        (hasUnquotedRedirect(seg, "<") || args.some(a => /^[\w.-]+(?::?=(?!=)|@)/.test(a)) ||
+         (hasUnquotedPipe(cmd) && /\|\s*(?:[^\s|]+\/)?https?\s/.test(cmd)))) return true;
+    for (const [i, arg] of args.entries()) {
+      if (/:8123\b|[?&]query=/i.test(arg)) return true;
+      if (bin === "curl" && /^(?:-[fsSsvkLqI]*[dFT]|--(?:data|form|upload-file|json)\b)/.test(arg)) return true;
+      if (bin === "wget" && /^--(?:post|body)-(?:data|file)\b/.test(arg)) return true;
+      const methodFlag = /^(?:-[fsSsvkLqI]*X|--request=?|--method=?)(.*)$/.exec(arg);
+      const method = methodFlag && (methodFlag[1] || args[i + 1]);
+      if (method && !/^(GET|HEAD|OPTIONS)$/i.test(method)) return true;
+      if (/^https?$/.test(bin) && /^(POST|PUT|PATCH|DELETE)$/i.test(arg)) return true;
     }
   }
   return false;
@@ -154,811 +70,196 @@ function isAllowedDbcredSubstitution(
   return candidateReal === expectedReal;
 }
 
-/**
- * Quote-aware single-command safety check for Runbook-approved SQL migration files:
- * - Permits literal `&` / `?` inside single/double quotes (e.g. PostgreSQL DSN query params).
- * - Permits ONLY exact double-quoted `$(<path-to-.workbench/bin/dbcred> <env>)` credential substitution.
- * - Permits ONLY exact `2>&1` / `1>&2` fd duplication; rejects ALL other output redirections (`>`).
- * - Rejects shell chaining (`;`, `&&`, `||`, `|`, `&`, `\n`), subshells, backticks, heredocs, and arbitrary `$(...)`.
- */
-function isSafeSingleSqlShellCommand(
-  cmd: string,
-  workbenchRoot: string,
-  workdir: string,
-  runbook: ApprovedRunbookEntry,
-  host: string,
-): boolean {
-  let quote: "'" | '"' | null = null;
-  let escape = false;
-  for (let i = 0; i < cmd.length; i++) {
-    const ch = cmd[i];
-    const next = cmd[i + 1];
-    if (ch === "\0" || ch === "\n" || ch === "\r") return false;
-    if (escape) {
-      escape = false;
+// The approval grammar accepts literal argv, one file input, and an optional
+// credential substitution in a quoted URI. Anything outside it needs another command.
+function migrationMatches(cmd: string, root: string, cwd: string, runbook: ApprovedRunbookEntry, prodHosts: string[]) {
+  const credentials: string[] = [];
+  const words: string[] = [];
+  const files: string[] = [];
+  let stdin = false;
+  const lexer = /\s+|(?:2>&1|1>&2)(?=\s|$)|(?:0?<)|(?:[A-Za-z_]\w*=)?'(?:[^']*)'|(?:[A-Za-z_]\w*=)?"(?:[^"\\]*)"|[^\s'"\\;&|<>$()#~*?\x60]+/gy;
+  if (/[\r\n\0]/.test(cmd)) return false;
+  for (let pos = 0; pos < cmd.length;) {
+    lexer.lastIndex = pos;
+    const token = lexer.exec(cmd)?.[0];
+    if (!token) return false;
+    pos = lexer.lastIndex;
+    if (!token.trim()) continue;
+    if (/^\d+$/.test(token) && cmd[pos] === "<") return false;
+    if (token === "<" || token === "0<") {
+      if (stdin) return false;
+      stdin = true;
       continue;
     }
-    if (quote === "'") {
-      if (ch === "'") quote = null;
-      continue;
+    if (pos < cmd.length && !/[\s<]/.test(cmd[pos])) return false;
+    if (token === "2>&1" || token === "1>&2") continue;
+    let value = token;
+    if (token.startsWith('"')) {
+      value = token.replace(/^("(?:postgres(?:ql)?|mysql):\/\/)\$\(([^()]*)\)(?=@)/i, (_, scheme, inner) => {
+        credentials.push(inner);
+        return scheme + "credential";
+      });
     }
-    if (quote === '"') {
-      if (ch === "\\") {
-        escape = true;
-        continue;
-      }
-      if (ch === '"') {
-        quote = null;
-        continue;
-      }
-      if (ch === "`") return false;
-      if (ch === "$" && next === "(") {
-        const closeIdx = cmd.indexOf(")", i + 2);
-        if (closeIdx === -1) return false;
-        const inner = cmd.slice(i + 2, closeIdx);
-        if (!isAllowedDbcredSubstitution(inner, workbenchRoot, workdir, runbook, host)) return false;
-        i = closeIdx;
-        continue;
-      }
-      continue;
-    }
-    if (ch === "\\") {
-      escape = true;
-      continue;
-    }
-    if (ch === "$" && next === "'") {
-      // Reject Bash ANSI-C `$'...'` quoting for approved SQL migrations to guarantee zero escape-decoding ambiguity
-      return false;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      continue;
-    }
-    // Reject ALL unquoted `$(...)` (dbcred substitution is only allowed inside double quotes)
-    if (ch === "$" && next === "(") return false;
-    if (ch === "<") {
-      if (next === "<" || next === ">" || next === "&") return false;
-      // Reject numbered input redirections on non-stdin fds (e.g. `3< migration.sql`), allow only plain `<` or `0<`
-      let dStart = i - 1;
-      while (dStart >= 0 && cmd[dStart] >= "0" && cmd[dStart] <= "9") dStart--;
-      const numStr = cmd.slice(dStart + 1, i);
-      const beforeNum = dStart >= 0 ? cmd[dStart] : undefined;
-      if (
-        numStr.length > 0 &&
-        (beforeNum === undefined || beforeNum === " " || beforeNum === "\t") &&
-        numStr !== "0"
-      ) {
-        return false;
-      }
-      continue;
-    }
-    if (ch === ">") {
-      // Allow ONLY standalone `2>&1` or `1>&2` fd duplication; reject all file output redirections (`> file`, `>> file`, etc.)
-      const prev = cmd[i - 1];
-      const beforePrev = cmd[i - 2];
-      const targetFd = cmd[i + 2];
-      const afterTarget = cmd[i + 3];
-      const validSrcFd =
-        (prev === "2" || prev === "1") &&
-        (beforePrev === undefined || beforePrev === " " || beforePrev === "\t");
-      const validDup =
-        validSrcFd &&
-        next === "&" &&
-        (targetFd === "1" || targetFd === "2") &&
-        targetFd !== prev &&
-        (afterTarget === undefined || afterTarget === " " || afterTarget === "\t");
-      if (!validDup) return false;
-      i += 2; // consume `>&1` / `>&2`
-      continue;
-    }
-    if (ch === ";" || ch === "|" || ch === "&" || ch === "`" || ch === "(" || ch === ")") {
-      return false;
-    }
+    if (/[$\x60]/.test(value)) return false;
+    value = value.replace(/^(.*?)['"](.*)['"]$/, "$1$2");
+    (stdin ? files : words).push(value);
+    stdin = false;
   }
-  return !escape && quote === null;
-}
-
-/**
- * Quote-aware tokenization for a validated single SQL command that separates `< file` / `<file`
- * stdin redirections and drops benign `2>&1` / `1>&2` fd duplications.
- */
-function extractSqlTokensAndStdinRedirects(
-  cmd: string,
-): { args: string[]; stdinFiles: string[] } | null {
-  const rawTokens: Array<{ kind: "word" | "stdin" | "fddup"; value: string }> = [];
-  let cur = "";
-  let hasWord = false;
-  let quote: "'" | '"' | null = null;
-  let escape = false;
-
-  const flush = () => {
-    if (!hasWord) return;
-    if (cur === "2>&1" || cur === "1>&2") {
-      rawTokens.push({ kind: "fddup", value: cur });
-    } else {
-      rawTokens.push({ kind: "word", value: cur });
-    }
-    cur = "";
-    hasWord = false;
-  };
-
-  for (let i = 0; i < cmd.length; i++) {
-    const ch = cmd[i];
-    const next = cmd[i + 1];
-    if (escape) {
-      cur += ch;
-      hasWord = true;
-      escape = false;
-      continue;
-    }
-    if (quote === "'") {
-      if (ch === "'") quote = null;
-      else cur += ch;
-      hasWord = true;
-      continue;
-    }
-    if (quote === '"') {
-      if (ch === "\\") {
-        if (next === '"' || next === "\\" || next === "$" || next === "`") {
-          escape = true;
-        } else {
-          cur += ch;
-        }
-      } else if (ch === '"') {
-        quote = null;
-      } else {
-        cur += ch;
-      }
-      hasWord = true;
-      continue;
-    }
-    if (ch === "\\") {
-      escape = true;
-      continue;
-    }
-    if (ch === "$" && next === "'") {
-      return null;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      hasWord = true;
-      continue;
-    }
-    if (ch === " " || ch === "\t") {
-      flush();
-      continue;
-    }
-    if (ch === "<") {
-      if (hasWord && /^\d+$/.test(cur)) {
-        if (cur !== "0") return null; // Only fd 0 (`0<` or `<`) feeds client stdin!
-        cur = "";
-        hasWord = false;
-      } else {
-        flush();
-      }
-      rawTokens.push({ kind: "stdin", value: "<" });
-      continue;
-    }
-    cur += ch;
-    hasWord = true;
+  const env = new Map<string, string>();
+  while (words.length && /^[A-Za-z_]\w*=/.test(words[0])) {
+    const [key, ...parts] = words.shift()!.split("=");
+    env.set(key, parts.join("="));
   }
-  if (quote !== null || escape) return null;
-  flush();
-
-  const args: string[] = [];
-  const stdinFiles: string[] = [];
-  for (let i = 0; i < rawTokens.length; i++) {
-    const tok = rawTokens[i];
-    if (tok.kind === "fddup") continue;
-    if (tok.kind === "stdin") {
-      const nextTok = rawTokens[++i];
-      if (!nextTok || nextTok.kind !== "word" || !nextTok.value) return null;
-      stdinFiles.push(nextTok.value);
-      continue;
-    }
-    args.push(tok.value);
-  }
-  return { args, stdinFiles };
-}
-
-function extractHostsFromConnStr(connStr: string): { hosts: string[]; invalid: boolean } {
+  const bin = words.shift()?.split("/").pop();
+  if (stdin || !bin || !["mysql", "psql", "usql"].includes(bin)) return false;
+  const setting = (key: string) => env.get(key) ?? process.env[key] ?? "";
+  if (["PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE", "PSQLRC", "USQLRC", "MYSQL_HOME",
+       "MYSQL_GROUP_SUFFIX", "MYSQL_TEST_LOGIN_FILE"].some(key => setting(key))) return false;
   const hosts: string[] = [];
-  const trimmed = connStr.trim();
-  const uriMatch = trimmed.match(/^(?:postgres(?:ql)?|mysql):\/\/(.*)$/i);
-  if (uriMatch) {
-    // Replace validated `$(.../dbcred <env>)` placeholders before URI authority/path splitting
-    // so slashes inside the helper path (e.g. `.workbench/bin/dbcred`) never truncate the authority!
-    const rest = uriMatch[1].replace(/\$\([^)]*\)/g, "CRED");
-    const qIdx = rest.indexOf("?");
-    const beforeQuery = qIdx >= 0 ? rest.slice(0, qIdx) : rest;
-    const queryStr = qIdx >= 0 ? rest.slice(qIdx + 1) : "";
-    const slashIdx = beforeQuery.indexOf("/");
-    const authority = slashIdx >= 0 ? beforeQuery.slice(0, slashIdx) : beforeQuery;
-    const atIdx = authority.lastIndexOf("@");
-    const hostPortList = atIdx >= 0 ? authority.slice(atIdx + 1) : authority;
-    let invalid = false;
-    const addEncodedHost = (encoded: string) => {
-      try {
-        for (const entry of decodeURIComponent(encoded).split(",")) {
-          if (entry.trim()) hosts.push(entry.trim());
-          else invalid = true;
-        }
-      } catch {
-        invalid = true;
-      }
-    };
-    if (hostPortList.length > 0) {
-      for (const part of hostPortList.split(",")) {
-        const p = part.trim();
-        let host = p;
-        if (p.startsWith("[")) {
-          const endBracket = p.indexOf("]");
-          if (endBracket < 0) { invalid = true; continue; }
-          host = p.slice(1, endBracket);
-        } else {
-          const colonIdx = p.lastIndexOf(":");
-          if (colonIdx >= 0) host = p.slice(0, colonIdx);
-        }
-        addEncodedHost(host);
-      }
-    }
-    if (queryStr) {
-      for (const pair of queryStr.split("&")) {
-        if (!pair) continue;
-        const eqIdx = pair.indexOf("=");
-        const rawKey = eqIdx >= 0 ? pair.slice(0, eqIdx) : pair;
-        const rawVal = eqIdx >= 0 ? pair.slice(eqIdx + 1) : "";
-        try {
-          const key = decodeURIComponent(rawKey).toLowerCase();
-          if (key === "host") {
-            for (const entry of rawVal.split(",")) addEncodedHost(entry);
-          } else {
-            decodeURIComponent(rawVal);
-            if (key === "service" || key === "hostaddr") invalid = true;
-          }
-        } catch {
-          invalid = true;
-        }
-      }
-    }
-    return { hosts, invalid };
-  }
-
-  // libpq keyword=value connection string (e.g. `host = prod-db.internal dbname=app`)
-  if (trimmed.includes("=")) {
-    let i = 0;
-    while (i < trimmed.length) {
-      while (i < trimmed.length && (trimmed[i] === " " || trimmed[i] === "\t")) i++;
-      if (i >= trimmed.length) break;
-      const eqIdx = trimmed.indexOf("=", i);
-      if (eqIdx < 0) return { hosts, invalid: true };
-      const key = trimmed.slice(i, eqIdx).trim().toLowerCase();
-      if (!/^[a-z_][a-z0-9_]*$/.test(key)) return { hosts, invalid: true };
-      i = eqIdx + 1;
-      while (i < trimmed.length && (trimmed[i] === " " || trimmed[i] === "\t")) i++;
-      if (i >= trimmed.length) return { hosts, invalid: true };
-      let val = "";
-      if (trimmed[i] === "'") {
-        i++;
-        let closed = false;
-        while (i < trimmed.length) {
-          if (trimmed[i] === "\\" && i + 1 < trimmed.length) {
-            val += trimmed[i + 1];
-            i += 2;
-          } else if (trimmed[i] === "'") {
-            i++;
-            closed = true;
-            break;
-          } else {
-            val += trimmed[i++];
-          }
-        }
-        if (!closed) return { hosts, invalid: true };
-      } else {
-        while (i < trimmed.length && trimmed[i] !== " " && trimmed[i] !== "\t") {
-          if (trimmed[i] === "\\" && i + 1 < trimmed.length) {
-            val += trimmed[i + 1];
-            i += 2;
-          } else {
-            val += trimmed[i++];
-          }
-        }
-      }
-      if (key === "service" || key === "hostaddr") return { hosts, invalid: true };
-      if (key === "host") {
-        if (!val.trim()) return { hosts, invalid: true };
-        for (const h of val.split(",")) {
-          if (!h.trim()) return { hosts, invalid: true };
-          hosts.push(h.trim());
-        }
-      }
-    }
-  }
-  return { hosts, invalid: false };
-}
-
-const DISALLOWED_PSQL_ENV_VARS = new Set([
-  "PSQLRC",
-  "PGSERVICE",
-  "PGSERVICEFILE",
-  "PGHOSTADDR",
-]);
-
-const DISALLOWED_MYSQL_ENV_VARS = new Set([
-  "MYSQL_HOME",
-  "MYSQL_GROUP_SUFFIX",
-  "MYSQL_TEST_LOGIN_FILE",
-]);
-
-const DISALLOWED_USQL_ENV_VARS = new Set([
-  "USQLRC",
-  "PSQLRC",
-  "PGSERVICE",
-  "PGSERVICEFILE",
-  "PGHOSTADDR",
-  "MYSQL_HOME",
-]);
-
-const PSQL_LONG_VALUE_FLAGS = new Set([
-  "--host",
-  "--port",
-  "--username",
-  "--dbname",
-  "--file",
-  "--set",
-  "--variable",
-  "--pset",
-]);
-
-const PSQL_LONG_BOOL_FLAGS = new Set([
-  "--no-psqlrc",
-  "--quiet",
-  "--echo-all",
-  "--echo-errors",
-  "--echo-queries",
-  "--single-transaction",
-  "--tuples-only",
-  "--no-align",
-  "--csv",
-  "--expanded",
-  "--no-password",
-  "--password",
-]);
-
-const PSQL_SHORT_VALUE_FLAGS = new Set(["h", "p", "U", "d", "f", "v", "P"]);
-
-const PSQL_SHORT_BOOL_FLAGS = new Set(["X", "q", "a", "b", "e", "1", "t", "A", "x", "w", "W"]);
-
-const USQL_LONG_VALUE_FLAGS = new Set(["--file", "--set", "--variable", "--pset"]);
-
-const USQL_LONG_BOOL_FLAGS = new Set([
-  "--no-rc",
-  "--quiet",
-  "--single-transaction",
-  "--no-align",
-  "--tuples-only",
-  "--json",
-  "--csv",
-]);
-
-const USQL_SHORT_VALUE_FLAGS = new Set(["f", "v", "P"]);
-
-const USQL_SHORT_BOOL_FLAGS = new Set(["X", "q", "1", "A", "t", "J", "C"]);
-
-const MYSQL_LONG_VALUE_FLAGS = new Set([
-  "--host",
-  "--port",
-  "--user",
-  "--password",
-  "--database",
-  "--default-character-set",
-  "--ssl-mode",
-  "--protocol",
-]);
-
-const MYSQL_LONG_BOOL_FLAGS = new Set([
-  "--verbose",
-  "--batch",
-  "--skip-column-names",
-  "--silent",
-  "--ssl",
-  "--skip-ssl",
-  "--no-auto-rehash",
-]);
-
-const MYSQL_SHORT_VALUE_FLAGS = new Set(["h", "P", "u", "p", "D"]);
-
-const MYSQL_SHORT_BOOL_FLAGS = new Set(["v", "B", "N", "s", "A"]);
-
-function normalizeSqlHosts(bin: string, values: string[]): string[] {
-  return bin === "psql" || bin === "usql" ? values.flatMap(normalizeDbHosts) : values.map(normalizeDbHost);
-}
-
-function parseSqlClientArgs(bin: "psql" | "mysql" | "usql", toks: string[], inspectWrites: boolean) {
-  const hostCandidates: string[] = [];
-  const longValueFlags =
-    bin === "psql"
-      ? PSQL_LONG_VALUE_FLAGS
-      : bin === "usql"
-        ? USQL_LONG_VALUE_FLAGS
-        : MYSQL_LONG_VALUE_FLAGS;
-  const longBoolFlags =
-    bin === "psql"
-      ? PSQL_LONG_BOOL_FLAGS
-      : bin === "usql"
-        ? USQL_LONG_BOOL_FLAGS
-        : MYSQL_LONG_BOOL_FLAGS;
-  const shortValueFlags =
-    bin === "psql"
-      ? PSQL_SHORT_VALUE_FLAGS
-      : bin === "usql"
-        ? USQL_SHORT_VALUE_FLAGS
-        : MYSQL_SHORT_VALUE_FLAGS;
-  const shortBoolFlags =
-    bin === "psql"
-      ? PSQL_SHORT_BOOL_FLAGS
-      : bin === "usql"
-        ? USQL_SHORT_BOOL_FLAGS
-        : MYSQL_SHORT_BOOL_FLAGS;
-
-  const flagFiles: string[] = [];
-  const positionals: string[] = [];
-  let dbname: string | undefined;
-  let stopFlags = false;
-
-  for (let i = 0; i < toks.length; i++) {
-    const t = toks[i];
-    if (!stopFlags && t === "--") {
-      stopFlags = true;
+  let database: string | undefined;
+  for (let i = 0; i < words.length; i++) {
+    // psql scans boolean shorthands until the first option consuming a value.
+    const arg = bin === "psql" ? psqlOption(words[i]) : words[i];
+    if (bin === "psql" && arg === "-" && words[i] !== "-") continue;
+    if (bin === "mysql" && (arg === "--ssl-mode" || arg.startsWith("--ssl-mode="))) {
+      const mode = arg === "--ssl-mode" ? words[++i] : arg.slice("--ssl-mode=".length);
+      if (!/^(DISABLED|PREFERRED|REQUIRED|VERIFY_CA|VERIFY_IDENTITY)$/i.test(mode ?? "")) return false;
       continue;
     }
-    if (!stopFlags && t.startsWith("--")) {
-      const eq = t.indexOf("=");
-      const name = eq >= 0 ? t.slice(0, eq) : t;
-      const eqVal = eq >= 0 ? t.slice(eq + 1) : null;
-      if (longBoolFlags.has(name)) {
-        if (eqVal !== null) return null;
-        continue;
-      }
-      if (longValueFlags.has(name) || (inspectWrites && name === (bin === "psql" ? "--command" : "--execute"))) {
-        const val = eqVal !== null ? eqVal : toks[++i];
-        if (val === undefined || val === "") return null;
-        if (name === "--file") flagFiles.push(val);
-        else if (name === "--host") hostCandidates.push(val);
-        else if (name === "--dbname" && bin === "psql") {
-          if (dbname !== undefined) return null;
-          dbname = val;
-        }
-        continue;
-      }
-      return null; // Reject unknown or dangerous long flag (`--command`, `--execute`, `--output`, `--defaults-file`, etc.)
-    }
-    if (!stopFlags && t.startsWith("-") && t.length > 1) {
-      for (let j = 1; j < t.length; j++) {
-        const ch = t[j];
-        if (shortBoolFlags.has(ch)) continue;
-        if (shortValueFlags.has(ch) || (inspectWrites && ch === (bin === "psql" ? "c" : "e"))) {
-          const val = j < t.length - 1 ? t.slice(j + 1) : toks[++i];
-          if (val === undefined || val === "") return null;
-          if (ch === "f") flagFiles.push(val);
-          else if (ch === "h") hostCandidates.push(val);
-          else if (ch === "d" && bin === "psql") {
-            if (dbname !== undefined) return null;
-            dbname = val;
-          }
-          break;
-        }
-        return null; // Reject unknown or dangerous short flag (`-c`, `-Xc`, `-e`, `-Be`, `-o`, etc.)
-      }
-      continue;
-    }
-    positionals.push(t);
-  }
-
-  // Parse positional connection targets per client grammar
-  if (bin === "psql") {
-    if (positionals.length > 2 || (dbname !== undefined && positionals.length > 0)) return null;
-    const connection = dbname ?? positionals[0];
+    if (bin !== "mysql" && /^(?:-X|-w|-q|--quiet|--single-transaction)$/.test(arg)) continue;
+    if (bin === "psql" && ["--no-psqlrc", "--no-password"].includes(arg)) continue;
+    const connectionFlag = bin === "mysql" ? /^(?:-([uP])(.*)|--(port|user)(?:=(.*))?)$/ :
+      /^(?:-([Up])(.*)|--(port|username)(?:=(.*))?)$/;
+    const connection = bin !== "usql" && connectionFlag.exec(arg);
     if (connection) {
-      const parsedConn = extractHostsFromConnStr(connection);
-      if (parsedConn.invalid) return null;
-      hostCandidates.push(...parsedConn.hosts);
+      const value = connection[2] || connection[4] || words[++i];
+      if (!value || !/^[\w.-]+$/.test(value)) return false;
+      continue;
     }
-  } else if (bin === "usql") {
-    // usql requires a single explicit URI DSN positional
-    if (positionals.length !== 1 || !/^(?:postgres(?:ql)?|mysql):\/\//i.test(positionals[0])) {
-      return null;
-    }
-    const parsedConn = extractHostsFromConnStr(positionals[0]);
-    if (parsedConn.invalid) return null;
-    hostCandidates.push(...parsedConn.hosts);
-  } else {
-    if (positionals.length > 1) return null;
+    if (bin !== "mysql" && arg === "-v" && words[i + 1] === "ON_ERROR_STOP=1") { i++; continue; }
+    const flag = /^(--file|--host|--dbname)(?:=(.*))?$/.exec(arg) ?? /^(-[fhd])(.*)$/.exec(arg);
+    if (flag) {
+      const value = flag[2] || words[++i];
+      if (!value || value.startsWith("-")) return false;
+      if (["-f", "--file"].includes(flag[1]) && bin !== "mysql") files.push(value);
+      else if (["-h", "--host"].includes(flag[1]) && bin !== "usql") hosts.push(value);
+      else if (["-d", "--dbname"].includes(flag[1]) && bin === "psql" && database === undefined) database = value;
+      else return false;
+    } else if (!arg.startsWith("-") && database === undefined) database = arg;
+    else return false;
   }
-
-  return { hostCandidates, flagFiles };
+  if (database && /^(postgres(?:ql)?|mysql):\/\//i.test(database) && bin !== "mysql") {
+    try {
+      const uri = new URL(database);
+      if (!uri.hostname || [...uri.searchParams.keys()].some(k => !["sslmode", "application_name"].includes(k))) return false;
+      hosts.push(decodeURIComponent(uri.hostname));
+    } catch { return false; }
+  } else if (bin === "usql" || database && !/^[\w.-]+$/.test(database)) return false;
+  if (!hosts.length) hosts.push(setting(bin === "mysql" ? "MYSQL_HOST" : "PGHOST"));
+  const destinations = new Set(hosts.flatMap(normalizeDbHosts));
+  const [host] = destinations;
+  if (!host || destinations.size !== 1 || !prodHosts.includes(host) || files.length !== 1) return false;
+  if (!credentials.every(inner => isAllowedDbcredSubstitution(inner, root, cwd, runbook, host))) return false;
+  const path = canonicalizeOsPath(cwd, files[0]);
+  return !!path && runbook.actions.sql_files.some(f => f.path === path && normalizeDbHosts(f.host).includes(host) && f.sha256 === sha256File(path));
 }
 
-function parseApprovedSqlMigrationCommand(
-  workbenchRoot: string,
-  cmd: string,
-  workdir: string,
-  runbook: ApprovedRunbookEntry,
-): { host: string; sqlRealPath: string } | null {
-  if (splitShellSegments(cmd).length !== 1) return null;
-  const extracted = extractSqlTokensAndStdinRedirects(cmd);
-  if (!extracted || extracted.args.length < 2) return null;
-  const { args: toks, stdinFiles } = extracted;
-
-  // Identify client binary FIRST, then apply case-sensitive client-specific env & option rules!
-  const rawEnvPairs: Array<[string, string]> = [];
-  let idx = 0;
-  while (idx < toks.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[idx])) {
-    const eq = toks[idx].indexOf("=");
-    rawEnvPairs.push([toks[idx].slice(0, eq), toks[idx].slice(eq + 1)]);
-    idx++;
-  }
-  const bin = (toks[idx] ?? "").split("/").pop() ?? "";
-  if (bin !== "psql" && bin !== "usql" && bin !== "mysql") return null;
-
-  const disallowedEnv =
-    bin === "psql"
-      ? DISALLOWED_PSQL_ENV_VARS
-      : bin === "usql"
-        ? DISALLOWED_USQL_ENV_VARS
-        : DISALLOWED_MYSQL_ENV_VARS;
-  const inlineEnv = new Map(rawEnvPairs);
-  for (const key of disallowedEnv) {
-    if (inlineEnv.get(key) ?? process.env[key]) return null;
-  }
-  const hostEnvKey = bin === "psql" ? "PGHOST" : bin === "mysql" ? "MYSQL_HOST" : null;
-  const parsed = parseSqlClientArgs(bin, toks.slice(idx + 1), false);
-  if (!parsed) return null;
-  const { hostCandidates, flagFiles } = parsed;
-  const allFiles = [...flagFiles, ...stdinFiles];
-  if (allFiles.length !== 1 || !allFiles[0]) return null;
-
-  if (hostCandidates.length === 0 && hostEnvKey) {
-    const host = inlineEnv.get(hostEnvKey) ?? process.env[hostEnvKey];
-    if (host) hostCandidates.push(host);
-  }
-  const normalizedHosts = new Set(normalizeSqlHosts(bin, hostCandidates));
-  if (normalizedHosts.has("") || normalizedHosts.size !== 1) return null;
-  const effectiveHost = [...normalizedHosts][0];
-  if (!isSafeSingleSqlShellCommand(cmd, workbenchRoot, workdir, runbook, effectiveHost)) return null;
-
-  const sqlRealPath = canonicalizeOsPath(workdir, allFiles[0]);
-  if (!sqlRealPath) return null;
-  return { host: effectiveHost, sqlRealPath };
-}
-
-function findSqlClient(toks: string[]) {
-  const idx = toks.findIndex((tok) => /(?:^|\/)(psql|mysql|usql)$/.test(tok));
-  return { bin: toks[idx]?.split("/").pop(), args: toks.slice(idx + 1) };
-}
-
-function extractCheckProdDbHosts(bin: "psql" | "usql" | "mysql", args: string[]) {
-  const parsedArgs = parseSqlClientArgs(bin, args, true);
-  if (parsedArgs) {
-    const hosts = parsedArgs.hostCandidates;
-    return { hosts, unsafeOverride: normalizeSqlHosts(bin, hosts).some((h) => !h || hasShellExpansion(h)) };
-  }
-  // Even with unsupported options, inspect known host selectors. Ambiguous operands
-  // must not suppress the inherited host when deciding whether production is in scope.
-  const hosts: string[] = [];
-  let unsafeOverride = false;
-  let stopFlags = false;
-  let positionals = 0;
+// Only disregard an inherited host when the client has a literal host operand.
+function hasExplicitHost(bin: string | undefined, args: string[]): boolean {
   for (let i = 0; i < args.length; i++) {
-    const tok = args[i];
-    if (!stopFlags && tok === "--") { stopFlags = true; continue; }
-    let conn = tok;
-    if (!stopFlags && tok.startsWith("-")) {
-      const eq = tok.indexOf("=");
-      const opt = eq < 0 ? tok : tok.slice(0, eq);
-      if (["--defaults-file", "--defaults-extra-file", "--defaults-group-suffix", "--login-path"].includes(opt)) {
-        unsafeOverride = true;
-      }
-      if (opt === "--host" || opt === "--dbname" || /^-[hd]/.test(tok)) {
-        const value = tok.startsWith("--") ? (eq < 0 ? args[++i] : tok.slice(eq + 1))
-          : tok.slice(2) || args[++i];
-        if (!value) { unsafeOverride = true; continue; }
-        if (opt === "--host" || tok.startsWith("-h")) { hosts.push(value); continue; }
-        conn = value;
-      } else {
-        const values = bin === "mysql" ? MYSQL_LONG_VALUE_FLAGS : PSQL_LONG_VALUE_FLAGS;
-        if (eq < 0 && (values.has(opt) || ["-c", "-e", "-f", "-U", "-u", "-P", "-v", "--execute", "--command", "--connect-timeout"].includes(opt))) i++;
-        else if (eq < 0 && !opt.startsWith("--")) unsafeOverride = true;
-        else if (eq < 0 && opt.startsWith("--") &&
-          !(bin === "mysql" ? MYSQL_LONG_BOOL_FLAGS : PSQL_LONG_BOOL_FLAGS).has(opt)) unsafeOverride = true;
-        continue;
-      }
+    let arg = bin === "psql" ? psqlOption(args[i]) : args[i];
+    const host = /^(?:-h(.*)|--host(?:=(.*))?)$/.exec(arg);
+    if (host) {
+      const value = arg === "-h" || arg === "--host" ? args[i + 1] : host[1] ?? host[2];
+      return !!value && normalizeDbHosts(value).every(h => /^[\w.:[\]-]+$/.test(h) && !h.startsWith("-"));
     }
-    if (stopFlags || !tok.startsWith("-")) positionals++;
-    if (bin !== "mysql" && (/^(postgres(?:ql)?|mysql):\/\//i.test(conn) || conn.includes("="))) {
-      if (positionals > 1) unsafeOverride = true;
-      const parsed = extractHostsFromConnStr(conn);
-      hosts.push(...parsed.hosts);
-      if (parsed.invalid) unsafeOverride = true;
+    const valueFlag = bin === "psql" ? /^-[cfvUpPL]/ : bin === "mysql" ? /^-[uePD]/ : /^-[qd]/;
+    if (valueFlag.test(arg)) { if (arg.length === 2) i++; continue; }
+    if (/^--(?:command|execute|file|username|user|port|set|query|database)$/.test(arg)) { i++; continue; }
+    if (bin === "psql" && (arg === "-d" || arg === "--dbname")) arg = args[++i] ?? "";
+    if (bin === "psql") arg = arg.replace(/^(?:--dbname=|-d)(?=postgres)/i, "");
+    if (/^postgres(?:ql)?:\/\//i.test(arg) && bin === "psql") {
+      try {
+        const uri = new URL(arg);
+        return !!uri.hostname && !["host", "service", "hostaddr"].some(key => uri.searchParams.has(key));
+      } catch { return false; }
     }
-  }
-  if (normalizeSqlHosts(bin, hosts).some((h) => !h || hasShellExpansion(h))) unsafeOverride = true;
-  return { hosts, unsafeOverride };
-}
-
-function hasSqlClientFileOption(cmd: string): boolean {
-  for (const seg of splitShellSegments(cmd)) {
-    const toks = splitShellTokens(seg);
-    if (!toks || toks.length === 0) continue;
-    const prefix = unwrapShellPrefix(toks);
-    const { bin, args } = prefix.ambiguous ? findSqlClient(expandEnvSplitStrings(toks)) : prefix;
-    if (bin !== "psql" && bin !== "usql" && bin !== "mysql") continue;
-    for (const t of args) {
-      if (t === "--") break;
-      if (t === "--file" || t.startsWith("--file=")) return true;
-      if (t.startsWith("-") && !t.startsWith("--") && t.length > 1) {
-        if (bin === "psql" || bin === "usql") {
-          for (let j = 1; j < t.length; j++) {
-            const ch = t[j];
-            if (ch === "f") return true;
-            if (PSQL_SHORT_VALUE_FLAGS.has(ch) || ch === "c" || ch === "o" || ch === "L") break;
-          }
-        }
-      }
-    }
+    if (bin === "psql" && /^(--no-psqlrc|--no-password|--quiet|--single-transaction)$/.test(arg)) continue;
+    if (arg.startsWith("-") && arg !== "-" && !/^--[\w-]+=/.test(arg)) return false;
   }
   return false;
 }
 
-const SAFE_LEDGER_CLI_SUBCMDS = new Set([
-  "runbook",
-  "open",
-  "close",
-  "record",
-  "decide",
-  "blocker",
-  "status",
-  "query",
-  "attach",
-  "detach",
-  "reopen",
-  "set-endpoint",
-  "cancel",
-  "verify",
-]);
-
-/**
- * Verify that `cmd` is a standalone, metacharacter-free invocation of this workbench's own
- * canonical `.workbench/bin/ledger` CLI (which only operates on local `.workbench/ledger/ledger.sqlite`
- * and never connects to remote databases). Prevents `checkProdDb` from falsely blocking commands like
- * `.workbench/bin/ledger runbook create --sql <prod-host>:<file>` or `ledger record --summary "... <prod-host> ..."`.
- */
-function isSafeWorkbenchLedgerCliCommand(
-  cmd: string,
-  workbenchRoot: string,
-  workdir: string,
-): boolean {
-  let quote: "'" | '"' | null = null;
-  let escape = false;
-  for (let i = 0; i < cmd.length; i++) {
-    const ch = cmd[i];
-    const next = cmd[i + 1];
-    if (ch === "\0" || ch === "\n" || ch === "\r") return false;
-    if (escape) {
-      escape = false;
-      continue;
-    }
-    if (quote === "'") {
-      if (ch === "'") quote = null;
-      continue;
-    }
-    if (quote === '"') {
-      if (ch === "\\") {
-        escape = true;
-        continue;
+function productionHost(cmd: string, prodHosts: string[]) {
+  for (const segment of splitShellSegments(cmd)) {
+    const tokens = splitShellTokens(stripUnquotedShellRedirections(segment)) ?? [];
+    const { bin, args, effective, ambiguous } = unwrapShellPrefix(tokens);
+    const hosts: string[] = [];
+    // Decode individual escapes so an unrelated malformed selector cannot hide a valid host.
+    let hostText = segment;
+    if (ambiguous || bin === "psql" || bin === "mysql" || bin === "clickhouse-client") {
+      const explicit = hasExplicitHost(bin, args);
+      const uncertain = ambiguous || args.some(a => /^(?:--defaults|--login-path)|[$\x60]/.test(a));
+      if (explicit && !uncertain) hostText = args.join(" ");
+      else {
+        if (bin === "clickhouse-client" || ambiguous) hosts.push(effective("CLICKHOUSE_HOST"));
+        if (bin === "psql" || ambiguous) hosts.push(effective("PGHOST"));
+        if (bin === "mysql" || ambiguous) hosts.push(effective("MYSQL_HOST"));
       }
-      if (ch === '"') {
-        quote = null;
-        continue;
-      }
-      if (ch === "`" || (ch === "$" && next === "(")) return false;
-      continue;
+      if (bin === "psql" || ambiguous) hosts.push(effective("PGHOSTADDR"));
     }
-    if (ch === "\\") {
-      escape = true;
-      continue;
-    }
-    if (ch === "$" && next === "'") {
-      return false;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      continue;
-    }
-    if (ch === "$" && next === "(") return false;
-    if (
-      ch === ";" ||
-      ch === "|" ||
-      ch === "&" ||
-      ch === ">" ||
-      ch === "<" ||
-      ch === "`" ||
-      ch === "(" ||
-      ch === ")"
-    ) {
-      return false;
-    }
+    const literal = hostText.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))).toLowerCase();
+    const inherited = hosts.flatMap(normalizeDbHosts);
+    const host = prodHosts.find(h => literal.includes(h) || inherited.includes(h));
+    if (host) return host;
   }
-  if (escape || quote !== null) return false;
-  if (splitShellSegments(cmd).length !== 1) return false;
-  const toks = splitShellTokens(cmd);
-  if (!toks || toks.length < 2) return false;
-  const bin = toks[0];
-  if (!bin.includes("/")) return false;
-  const expectedLedger = canonicalizeOsPath(workbenchRoot, ".workbench/bin/ledger");
-  const candidateLedger = canonicalizeOsPath(workdir, bin);
-  if (!expectedLedger || !candidateLedger || candidateLedger !== expectedLedger) {
-    return false;
-  }
-  return SAFE_LEDGER_CLI_SUBCMDS.has(toks[1]);
 }
 
-export function checkProdDb(
-  cmd: string,
-  prodHosts: string[],
-  toolWorkdir = process.cwd(),
-  approvedRunbooks: ApprovedRunbookEntry[] = [],
-  workbenchRoot = toolWorkdir,
-): string | null {
-  if (prodHosts.length === 0) return null;
-  if (isSafeWorkbenchLedgerCliCommand(cmd, workbenchRoot, toolWorkdir)) return null;
-  const matchedHosts: string[] = [];
-  for (const seg of splitShellSegments(cmd)) {
-    const toks = splitShellTokens(stripUnquotedShellRedirections(seg)) ?? [];
-    const { bin, effective, args, ambiguous } = unwrapShellPrefix(toks);
-    let literal = seg;
-    const hosts: string[] = [];
-    if (ambiguous) {
-      const client = findSqlClient(expandEnvSplitStrings(toks));
-      if (client.bin === "psql" || client.bin === "mysql" || client.bin === "usql") {
-        hosts.push(...normalizeSqlHosts(client.bin, extractCheckProdDbHosts(client.bin, client.args).hosts));
-      }
-      for (const key of ["PGHOST", "PGHOSTADDR", "MYSQL_HOST"]) {
-        hosts.push(...normalizeSqlHosts("psql", [effective(key), process.env[key] ?? ""]));
-      }
-    } else if (bin === "psql" || bin === "mysql" || bin === "usql") {
-      const parsed = extractCheckProdDbHosts(bin, args);
-      hosts.push(...parsed.hosts);
-      if (hosts.length && !parsed.unsafeOverride) literal = args.join(" ");
-      else if (bin !== "usql") hosts.push(effective(bin === "psql" ? "PGHOST" : "MYSQL_HOST"));
-      if (bin === "psql") hosts.push(effective("PGHOSTADDR"));
-    }
-    const normalized = normalizeSqlHosts(bin ?? "", hosts);
-    matchedHosts.push(...prodHosts.filter((h) => literal.toLowerCase().includes(h.toLowerCase()) || normalized.includes(h.toLowerCase())));
+function literalCurlRead(cmd: string) {
+  const argv = tokenizeSimpleShellCommand(cmd);
+  if (!argv || argv[0]?.split("/").pop() !== "curl") return false;
+  let body: string | undefined, urls = 0;
+  for (let i = 1; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--data-binary" || arg.startsWith("--data-binary=")) {
+      if (body !== undefined) return false;
+      body = arg === "--data-binary" ? argv[++i] : arg.slice(14);
+    } else if (arg === "-H" || arg === "--header") {
+      if (!/^Content-Type:\s*[\w.+/-]+(?:\s*;\s*charset=[\w-]+)?$/i.test(argv[++i] ?? "")) return false;
+    } else if (arg === "-X" || arg === "--request") {
+      if (argv[++i]?.toUpperCase() !== "POST") return false;
+    } else if (/^https?:\/\//i.test(arg) && !/[?&]query=/i.test(arg)) urls++;
+    else if (!/^-[fsSkL]+$/.test(arg)) return false;
   }
-  if (matchedHosts.length === 0) return null;
-  const matchedHost = matchedHosts[0];
+  return urls === 1 && !!body && /^\s*(select|show|describe|explain)\b[^;]*;?\s*$/i.test(body) &&
+    !SQL_WRITE_RE.test(body) && !/[$\x60]/.test(body);
+}
 
-  // ClickHouse HTTP write or POST/PUT/DELETE via curl/wget/http
-  if (isHttpWriteCommand(cmd)) {
-    if (SQL_WRITE_RE.test(cmd) || !/\bselect\b/i.test(cmd)) {
-      return `物理保险丝：检测到向 prod 数据库 (${matchedHost}) 发送写请求，禁止自动执行。`;
-    }
+export function checkProdDb(cmd: string, prodHosts: string[], toolWorkdir = process.cwd(),
+  approvedRunbooks: ApprovedRunbookEntry[] = [], workbenchRoot = toolWorkdir): string | null {
+  if (!prodHosts.length) return null;
+  const host = productionHost(cmd, prodHosts.map(h => h.toLowerCase()));
+  if (!host) return null;
+  const argv = tokenizeSimpleShellCommand(cmd);
+  const ledgerPath = canonicalizeOsPath(workbenchRoot, ".workbench/bin/ledger");
+  if (ledgerPath && argv?.[0]?.includes("/") && canonicalizeOsPath(toolWorkdir, argv[0]) === ledgerPath
+      && /^(runbook|open|close|record|decide|blocker|status|query|attach|detach|reopen|set-endpoint|cancel|verify)$/.test(argv[1])) return null;
+  const binaryBody = /(?:^|\s)--data-binary(?:=|\s)/.test(cmd);
+  const readQuery = binaryBody ? literalCurlRead(cmd) :
+    /(?:[?&]query=|(?:-d|--data(?:-raw)?)\s+['"]?)select\b/i.test(cmd) && !SQL_WRITE_RE.test(cmd);
+  if (isHttpWriteCommand(cmd) && !readQuery) {
+    return "物理保险丝：检测到向 prod 数据库 (" + host + ") 发送写请求，禁止自动执行。";
   }
-
-  if (SQL_FILE_FLAG_RE.test(cmd) || hasUnquotedRedirect(cmd, "<") || hasSqlClientFileOption(cmd)) {
-    for (const runbook of approvedRunbooks) {
-      const parsed = parseApprovedSqlMigrationCommand(workbenchRoot, cmd, toolWorkdir, runbook);
-      if (!parsed || !prodHosts.some(h => h.toLowerCase() === parsed.host)) continue;
-      const liveSha = sha256File(parsed.sqlRealPath);
-      if (liveSha && runbook.actions.sql_files.some(sf => normalizeDbHosts(sf.host).includes(parsed.host) &&
-          sf.path === parsed.sqlRealPath && sf.sha256 === liveSha)) return null;
-    }
-    return `物理保险丝：检测到连接 prod 数据库 (${matchedHost}) 且 SQL 来自文件或标准输入，禁止自动执行（如需发版迁移，请先创建 Runbook 登记 SQL 文件并由用户在对话中回复「批准 <runbook_id>」）。`;
+  const sqlClient = /\b(?:psql|mysql|usql|clickhouse-client|sqlite3)\b/.test(cmd);
+  const pipedInput = hasUnquotedPipe(cmd) && /\|\s*(?:(?:env\s+)?(?:\w+=\S+\s+)*)(?:[^\s|]+\/)?(?:psql|mysql|usql|clickhouse-client|sqlite3)\b/.test(cmd);
+  const psqlFile = splitShellSegments(cmd).some(seg => {
+    const { bin, args } = unwrapShellPrefix(splitShellTokens(seg) ?? []);
+    return bin === "psql" && args.some(arg => /^-[^-cdfhLopPUv]*f/.test(arg));
+  });
+  if (sqlClient && (psqlFile || pipedInput || /\s(?:--(?:file|queries-file)(?:=|\s)|-[Xq1]*f)|\\i\b|\.read\s|\bsource\s/i.test(cmd) || hasUnquotedRedirect(cmd, "<"))) {
+    if (approvedRunbooks.some(r => migrationMatches(cmd, workbenchRoot, toolWorkdir, r, prodHosts))) return null;
+    return "物理保险丝：连接 prod 数据库 (" + host + ") 且 SQL 来自文件或标准输入，请先批准对应 Runbook。";
   }
-  const m = cmd.match(SQL_WRITE_RE);
-  if (m) {
-    return `物理保险丝：检测到连接 prod 数据库 (${matchedHost}) 且包含写操作关键字 ${m[1].toUpperCase()}，禁止自动执行。`;
-  }
-  return null;
+  const write = cmd.match(SQL_WRITE_RE);
+  return write ? "物理保险丝：连接 prod 数据库 (" + host + ") 且包含写操作关键字 " + write[1].toUpperCase() : null;
 }

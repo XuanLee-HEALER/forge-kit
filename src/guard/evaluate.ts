@@ -49,7 +49,7 @@ function evaluatePolicies(workbenchRoot: string, input: CodexHookInput): string 
   if (
     cfg.guard.require_prod_db_hosts &&
     prodHosts.length === 0 &&
-    (/\b(usql|psql|mysql)\b/.test(cmd) || isHttpWriteCommand(cmd))
+    (/\b(usql|psql|mysql|sqlite3|clickhouse-client)\b/.test(cmd) || isHttpWriteCommand(cmd))
   ) {
     return "物理保险丝（fail-closed）：工作台已启用 require_prod_db_hosts，但未配置任何 prod_db_hosts，拒绝执行数据库/HTTP 写命令直至补齐配置。";
   }

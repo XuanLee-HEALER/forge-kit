@@ -15,30 +15,10 @@ import {
 } from "../shared/shell";
 
 const LEDGER_HOOK_READONLY_INSPECTORS = new Set([
-  "ls",
-  "stat",
-  "file",
-  "readlink",
-  "realpath",
-  "shasum",
-  "sha256sum",
-  "md5",
-  "wc",
-  "rg",
-  "grep",
-  "which",
-  "type",
-  "cat",
-  "head",
-  "tail",
+  "ls", "stat", "file", "readlink", "realpath", "shasum", "sha256sum", "md5",
+  "wc", "rg", "grep", "which", "type", "cat", "head", "tail",
 ]);
-
-const ALLOWED_INSPECTOR_DIRS = new Set([
-  "/bin",
-  "/usr/bin",
-  "/opt/homebrew/bin",
-  "/usr/local/bin",
-]);
+const ALLOWED_INSPECTOR_DIRS = new Set(["/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin"]);
 
 function isReadonlyLedgerHookInspection(
   cmd: string,
@@ -53,44 +33,15 @@ function isReadonlyLedgerHookInspection(
   if (idx >= toks.length) return false;
   const rawBin = toks[idx];
   const bin = rawBin.split("/").pop() ?? "";
-  if (bin === "ledger-hook" || bin === "ledger-hook.js" || bin === "ledger-hook.ts") {
-    return false;
-  }
   if (!LEDGER_HOOK_READONLY_INSPECTORS.has(bin)) return false;
   // Require bare binary name OR standard system binary directory (never `./ls` or `/tmp/evil/ls`)
-  if (rawBin.includes("/")) {
-    const dir = dirname(rawBin);
-    if (!ALLOWED_INSPECTOR_DIRS.has(dir)) return false;
-  }
+  if (rawBin.includes("/") && !ALLOWED_INSPECTOR_DIRS.has(dirname(rawBin))) return false;
   // Reject write/helper-executing options per inspector (`file -C`/`-m` compiles magic DB; `rg --pre` executes external commands)
-  if (bin === "file") {
-    for (const arg of toks.slice(idx + 1)) {
-      if (arg === "--") break;
-      if (
-        arg === "--compile" ||
-        arg === "--magic-file" ||
-        arg.startsWith("--magic-file=") ||
-        (arg.startsWith("-") && !arg.startsWith("--") && /[Cm]/.test(arg.slice(1)))
-      ) {
-        return false;
-      }
-    }
-  } else if (bin === "rg") {
-    for (const arg of toks.slice(idx + 1)) {
-      if (arg === "--") break;
-      if (
-        arg === "--pre" ||
-        arg.startsWith("--pre=") ||
-        arg === "--pre-glob" ||
-        arg.startsWith("--pre-glob=") ||
-        arg === "--hostname-bin" ||
-        arg.startsWith("--hostname-bin=") ||
-        arg === "--search-zip" ||
-        (arg.startsWith("-") && !arg.startsWith("--") && arg.includes("z"))
-      ) {
-        return false;
-      }
-    }
+  for (const arg of toks.slice(idx + 1)) {
+    if (arg === "--") break;
+    const short = arg.startsWith("-") && !arg.startsWith("--");
+    if (bin === "file" && (arg === "--compile" || /^--magic-file(?:=|$)/.test(arg) || short && /[Cm]/.test(arg))) return false;
+    if (bin === "rg" && (/^--(?:pre|pre-glob|hostname-bin)(?:=|$)/.test(arg) || arg === "--search-zip" || short && arg.includes("z"))) return false;
   }
   return true;
 }

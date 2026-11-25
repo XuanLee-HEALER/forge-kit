@@ -22,7 +22,7 @@
 |---|---|
 | investigation | 查证并汇报根因、结论或方案，等确认再实施 |
 | local | 完成实现、适用验证与收尾，汇报证据和缺口 |
-| fat | 本地通过后合入测试分支、推送并按授权验收 |
+| fat | 本地通过后用 `wb-git fat-merge <repo> <branch>` 合入测试分支、推送并按授权验收 |
 | pr | 创建或更新目标 PR，后续推送用 `ledger pr-sync <task_id> --repo <仓>` 核验最新 HEAD，汇报后停止；main PR 由用户合并 |
 | prod | 核对目标 SHA、证据和依赖，按 ship 发布，不可逆操作经人工确认 |
 
@@ -32,13 +32,13 @@
 
 - [自律] 资金和权益由服务端依据可信状态、计量或凭据裁决。客户端仅声明意图；核验、计价和执行绑定同一对象及状态。无可信依据时停止。
 - [自律] 优先由独立上下文编写 Hurl 或集成契约验证。纯算法、计费公式、状态机或并发不变量用无 Mock 表驱动测试；避免给 CRUD 与胶水层堆 Mock。
-- [hook][自律] full 交付前须有当前 SHA 的静态检查与执行验证，可用仓原生命令或 `.workbench/bin/lang-check`。仅检查集成测试编译时使用不会执行初始化的命令，如 Go 的 `go test -c -tags=integration`。汇报区分已执行、仅编译、未验证，分列本地及 FAT/Hurl 验收。
+- [hook][自律] full 交付前须有当前 SHA 的静态检查与执行验证，使用干净工作树运行 `.workbench/bin/wb-verify`，四角色评审用 `.workbench/bin/forge-review`。仅检查集成测试编译时使用不会执行初始化的命令，如 Go 的 `go test -c -tags=integration`。汇报区分已执行、仅编译、未验证，分列本地及 FAT/Hurl 验收。
 - [自律] 契约、持久化格式变化同步测试和接口文档。回归资产不含个人路径、本机隐式状态或真实凭据。禁止削弱冻结断言以消除失败。
 - [自律] 浏览器自动化测试只在用户主动要求时执行。表单任务读 `form-ux`，本机隔离实验读 `test-environment`。
 
 ## 环境与发布红线
 
-- [自律][凭据] 只查问题所在环境；测试问题不访问 prod，线上结论用 prod 事实。凭据只展示键名或脱敏摘要。用 dbcred 的授权能力区分只读与写入。
+- [自律][凭据] 只查问题所在环境；测试问题不访问 prod，线上结论用 prod 事实。凭据只展示键名或脱敏摘要。dbcred 默认只读，生产写凭据用 `dbcred <env> --rw --runbook <id>`。
 - [平台] 数据库权限、Kubernetes RBAC（不给 secrets 读取权）、GitHub 分支和 tag 规则及必需状态检查由部署方落实。
 - [hook] PreToolUse 检查可识别的 prod 写操作、集群变更、secret、端口转发、受保护分支与 tag、PR 合并及账本直接修改。发版先用 `ledger runbook create` 登记精确 tag+SHA、PR、迁移 SQL 或 kubectl 命令。
 - [hook][自律] 用户在主会话**单独回复整句** `批准 <runbook_id>` 或 `approve <runbook_id>`，不附带其他文字或标点。多个编号用空格分隔。批准仅对登记项、会话和有效期生效。禁止批量推 tag、强推 main、读取 secret。
@@ -47,8 +47,8 @@
 
 - 仅登记业务仓开发任务。运维查数、日志、沟通和一次性脚本无需开账。用 `.workbench/bin/ledger` 按任务建账，按 (repo, branch) 唯一路由，跨仓用 attach。
 - full 周期的 ssot.md、tech-spec.md、test-spec.md 默认在 `.workbench/specs/<task_id>/`，用户主动要求才移入业务仓。定稿用 freeze 保存摘要和锁定测试，交付时核对工作树与 Git；变更须用户确认后 amend，按影响重跑下游并重新 freeze。
-- [hook] commit、push、PR 前校验账本绑定及适用证据。完整深度须静态检查、执行验证和核心评审通过，无失败角色；四层覆盖由 wrapup 推进，在 status 审计。极小文档、注释、typo 可用 exempt。新会话或压缩后 hook 回注摘要。可执行证据来自工具或 hook，手工验收注明来源。
-- 账本哈希链用于一致性检查。独立保存 Ledger-Tip 可见证历史；同一系统用户的写权限仍由操作系统控制。
+- [hook] commit、push、PR 前校验账本绑定及适用证据。完整深度须静态检查、执行验证和核心评审通过，无失败角色；四层覆盖由 wrapup 推进，在 status 审计。极小文档、注释、typo 可用 exempt。新会话或压缩后 hook 回注摘要。新验证与评审由执行器写入 source=tool；hook 记录提交与经远端核验的 PR，手工验收注明来源。
+- 账本哈希链用于一致性检查。用 `ledger stats` 查看汇总，用 `ledger tip <task_id>` 生成 PR 正文的 Ledger-Tip 见证；同一系统用户的写权限仍由操作系统控制。
 
 ## 调度与流程入口
 

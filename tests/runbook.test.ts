@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { isolateHome } from "./helpers/hermetic";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -967,6 +968,27 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
       expect(checkMigration(`psql ${selectors} -f '${sqlFile}'`)).toContain("prod 数据库");
     }
     expect(checkMigration(`PGHOST=pg-prod.demo.internal PGHOST= psql -f '${sqlFile}'`)).toContain("prod 数据库");
+    expect(checkMigration(`mysql -h pg-prod.demo.internal -u deploy -P3306 app < '${sqlFile}'`)).toBeNull();
+    expect(checkMigration(`psql -h pg-prod.demo.internal -U deploy -p 5432 -f '${sqlFile}'`)).toBeNull();
+    expect(checkMigration(`psql -h pg-prod.demo.internal 3< '${sqlFile}'`)).toContain("prod 数据库");
+    for (const options of ["-1 -f", "-X1 -f", "-1v ON_ERROR_STOP=1 -f", "-af", "-ef", "-Wf", "-Hf", "-Xf", "-1f"]) {
+      expect(checkMigration(`psql -h pg-prod.demo.internal ${options} '${sqlFile}'`)).toBeNull();
+      expect(checkMigration(`psql -h pg-prod.demo.internal ${options} other.sql`)).toContain("prod 数据库");
+    }
+    expect(checkMigration("PGHOST=pg-prod.demo.internal psql postgresql://deploy@/app -af neutral.txt")).toContain("prod 数据库");
+    expect(checkMigration("PGHOST=pg-prod.demo.internal psql -h localhost -f schema.sql")).toBeNull();
+    expect(checkMigration("MYSQL_HOST=pg-prod.demo.internal mysql --host=localhost app <schema.sql")).toBeNull();
+    expect(checkMigration("CLICKHOUSE_HOST=pg-prod.demo.internal clickhouse-client --host localhost --queries-file schema.sql")).toBeNull();
+    expect(checkMigration("PGHOST=pg-prod.demo.internal psql -af schema.sql -h localhost")).toBeNull();
+    expect(checkMigration("MYSQL_HOST=pg-prod.demo.internal mysql -u deploy -h localhost app <schema.sql")).toBeNull();
+    expect(checkMigration("PGHOST=pg-prod.demo.internal psql --no-psqlrc -h localhost -f schema.sql")).toBeNull();
+    const tlsCommand = `mysql --ssl-mode=VERIFY_IDENTITY -h pg-prod.demo.internal app < '${sqlFile}'`;
+    expect(checkMigration(tlsCommand)).toBeNull();
+    const approvedSql = readFileSync(sqlFile);
+    try {
+      writeFileSync(sqlFile, "-- changed migration");
+      expect(checkMigration(tlsCommand)).toContain("prod 数据库");
+    } finally { writeFileSync(sqlFile, approvedSql); }
     const previousHostAddr = process.env.PGHOSTADDR;
     try {
       process.env.PGHOSTADDR = "127.0.0.1";

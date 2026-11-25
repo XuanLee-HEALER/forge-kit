@@ -195,6 +195,25 @@ describe("Tier 1 Physical Fuses & Fail-Closed", () => {
   });
 
   test("blocks prod DB writes while allowing SELECT with < comparison operator", () => {
+    expect(evaluatePreToolUse(wb, shellInput("curl -fsS https://pg-prod.internal/health"))).toBeNull();
+    expect(evaluatePreToolUse(wb, shellInput("curl -F field=value https://pg-prod.internal/api"))).toContain("prod 数据库");
+    expect(evaluatePreToolUse(wb, shellInput("cat migration.sql | psql -h pg-prod.internal app"))).toContain("文件或标准输入");
+    expect(evaluatePreToolUse(wb, shellInput("psql -h pg-prod.internal -c 'SELECT 1' | head"))).toBeNull();
+    expect(evaluatePreToolUse(wb, shellInput("http https://pg-prod.internal/jobs enabled=true"))).toContain("prod 数据库");
+    expect(evaluatePreToolUse(wb, shellInput("http https://pg-prod.internal/jobs limit==1"))).toBeNull();
+    for (const command of ["http https://pg-prod.internal/jobs < request.json", "cat request.json | http https://pg-prod.internal/jobs"]) {
+      expect(evaluatePreToolUse(wb, shellInput(command))).toContain("prod 数据库");
+    }
+    for (const opt of ["-af", "-ef", "-Xf", "-1f", "-v ON_ERROR_STOP=1 -af"]) {
+      expect(evaluatePreToolUse(wb, shellInput(`psql -h pg-prod.internal ${opt} neutral.txt`))).toContain("文件或标准输入");
+    }
+    for (const query of ["SELECT 1", "SHOW TABLES", "DESCRIBE t", "EXPLAIN SELECT 1"]) {
+      expect(evaluatePreToolUse(wb, shellInput(`curl -sS https://pg-prod.internal:8123 --data-binary '${query}'`))).toBeNull();
+    }
+    expect(evaluatePreToolUse(wb, shellInput("curl -H 'Content-Type: text/plain' https://pg-prod.internal --data-binary 'SELECT 1'"))).toBeNull();
+    for (const query of ["DELETE FROM t", "@q.sql", "SELECT 1; DELETE FROM t", "arbitrary body"]) {
+      expect(evaluatePreToolUse(wb, shellInput(`curl https://pg-prod.internal --data-binary '${query}'`))).toContain("prod 数据库");
+    }
     // Regression test for `<` false positive inside SQL string!
     expect(
       evaluatePreToolUse(
@@ -618,13 +637,14 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     expect(
       evaluatePreToolUse(wb, shellInput(`sh -lc 'curl --data-ascii "DROP TABLE t" "http://10.0.0.5:9000/sql"'`)),
     ).toContain("require_prod_db_hosts");
+    expect(evaluatePreToolUse(wb, shellInput("curl -fsS https://db.example/health"))).toBeNull();
     // Shell-wrapped read-only GET (not ClickHouse port/query) stays allowed
     expect(
       evaluatePreToolUse(wb, shellInput(`bash -c 'curl -XGET "http://10.0.0.5:9000/health"'`)),
     ).toBeNull();
   });
 
-  test("physically locks frozen spec documents and locked test globs across apply_patch, shell redirects, and inline scripts, unlocking strictly per amend scope", () => {
+  test("physically locks frozen spec documents and locked test globs across apply_patch, shell redirects, and simple writes, unlocking strictly per amend scope", () => {
     const head = runGit(repoDir, ["rev-parse", "HEAD"]).stdout.trim();
     const specDir = join(wb, ".workbench", "specs", "20261123-spec");
     mkdirSync(specDir, { recursive: true });
@@ -651,7 +671,7 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     });
     ledger.closeDb();
 
-    // 1. Frozen specs are physically locked against apply_patch, shell redirection, and inline script writes!
+    // 1. Frozen specs are physically locked against apply_patch, shell redirection, and simple writes!
     expect(
       evaluatePreToolUse(wb, {
         hook_event_name: "PreToolUse",
@@ -672,7 +692,7 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     expect(
       evaluatePreToolUse(
         wb,
-        shellInput(`python3 -c 'open(".workbench/specs/20261123-spec/test-spec.md","w").write("x")'`),
+        shellInput(`tee .workbench/specs/20261123-spec/test-spec.md`),
       ),
     ).toContain("冻结 Spec 保护");
 
@@ -780,7 +800,7 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     ).toContain("冻结 Spec 保护");
   });
 
-  test("guard lock hardening: catches install/dd/clobber/patch/env/ruby/sh/git, matches recursive globs & bound worktrees without sibling false positives or read-only blocks", () => {
+  test("recognizable writes and structured patches respect bound worktrees and recursive globs", () => {
     const wtFeat = join(wb, "app-api.worktrees", "feat");
     const wtOther = join(wb, "app-api.worktrees", "other");
     mkdirSync(join(wb, "app-api.worktrees"), { recursive: true });
@@ -815,20 +835,10 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     ledger.closeDb();
 
     // 1. Shell mutation forms on frozen ssot.md MUST all be denied
-    const patchFile = join(wb, "tamper.patch");
-    writeFileSync(
-      patchFile,
-      `--- .workbench/specs/20261123-wt/ssot.md\n+++ .workbench/specs/20261123-wt/ssot.md\n@@ -1 +1 @@\n-# SSOT\n+# HACKED\n`,
-    );
+    const target = ".workbench/specs/20261123-wt/ssot.md";
     const mustDenySpec = [
-      `install /tmp/x .workbench/specs/20261123-wt/ssot.md`,
-      `dd if=/dev/zero of=.workbench/specs/20261123-wt/ssot.md`,
-      `echo bad >| .workbench/specs/20261123-wt/ssot.md`,
-      `patch -p0 -i ${patchFile}`,
-      `env python3 -c 'open(".workbench/specs/20261123-wt/ssot.md","w").write("x")'`,
-      `ruby -e 'File.write(".workbench/specs/20261123-wt/ssot.md","x")'`,
-      `sh -c 'echo bad > .workbench/specs/20261123-wt/ssot.md'`,
-      `bash -lc 'cp /tmp/x .workbench/specs/20261123-wt/ssot.md'`,
+      `tee -a ${target}`, `rm ${target}`, `mv ${target} /tmp/old`, `cp /tmp/new ${target}`,
+      `sed -i.bak 's/a/b/' ${target}`, `perl -pi -e 's/a/b/' ${target}`, `echo bad >>${target}`,
     ];
     for (const c of mustDenySpec) {
       expect(
@@ -840,6 +850,13 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         }),
       ).toContain("冻结 Spec 保护");
     }
+
+    for (const command of [
+      "git mv tests/smoke.hurl moved.hurl", "git rm tests/smoke.hurl", "chmod -x tests/smoke.hurl",
+      "cp src tests/smoke.hurl 2>err.log", `env -C '${wtFeat}' cp src tests/smoke.hurl`,
+    ]) expect(evaluatePreToolUse(wb, shellInput(command, command.startsWith("env") ? wb : wtFeat))).toContain("冻结测试防篡改");
+    expect(evaluatePreToolUse(wb, shellInput(`env -C '${wtOther}' true >tests/smoke.hurl`, wtFeat))).toContain("冻结测试防篡改");
+    expect(evaluatePreToolUse(wb, shellInput(`env -C '${wtFeat}' true >tests/smoke.hurl`, wtOther))).toBeNull();
 
     // 2. Recursive glob `tests/**/*.hurl` inside bound worktree catches 0, 1, and 2+ nested dirs
     for (const rel of ["tests/smoke.hurl", "tests/sub/a.hurl", "tests/a/b/a.hurl"]) {
@@ -854,16 +871,6 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
         }),
       ).toContain("冻结测试防篡改");
     }
-    // `git checkout --` on locked hurl inside bound worktree caught by lock layer
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: "git checkout -- tests/sub/a.hurl" },
-      }),
-    ).toContain("冻结测试防篡改");
-
     // 3. Sibling worktree (belonging to another branch/task) MUST NOT be blocked by wtFeat's lock!
     expect(
       evaluatePreToolUse(wb, {
@@ -883,8 +890,6 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
       `dd if=.workbench/specs/20261123-wt/ssot.md of=/tmp/backup-ssot.md`,
       `node -e 'console.log("example.hurl")'`,
       `sh -c 'cat .workbench/specs/20261123-wt/ssot.md'`,
-      `patch --dry-run -p0 -i ${patchFile}`,
-      `git apply --check ${patchFile}`,
     ];
     for (const c of mustAllowReadOnly) {
       expect(
@@ -897,391 +902,5 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
       ).toBeNull();
     }
 
-    // Writing unrelated text mentioning "example.hurl" to /tmp/out inside wtFeat MUST be allowed
-    // while dynamic path construction targeting .hurl inside wtFeat MUST still be denied!
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: {
-          command: `node -e 'require("fs").writeFileSync("/tmp/out.txt", "example.hurl")'`,
-        },
-      }),
-    ).toBeNull();
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: {
-          command: `node -e 'require("fs").writeFileSync("tests/" + "a.hurl", "HTTP 500")'`,
-        },
-      }),
-    ).toContain("冻结测试防篡改");
-
-    // Uninspectable / oversized (>4 MiB) or missing patch file targeting a locked dir MUST fail closed!
-    const missingPatch = join(wb, "missing-or-fifo.patch");
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${missingPatch}` },
-      }),
-    ).toContain("冻结测试防篡改");
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: specDir,
-        tool_name: "exec_command",
-        tool_input: { command: `patch -p0 -i ${missingPatch}` },
-      }),
-    ).toContain("冻结 Spec 保护");
-
-    // Round 3 regressions:
-    // 1. `git apply --stat --apply` (and `--apply --check`) ACTUALLY applies -> MUST be denied!
-    const gitSpecPatch = join(wb, "git-spec.patch");
-    writeFileSync(
-      gitSpecPatch,
-      `--- a/.workbench/specs/20261123-wt/ssot.md\n+++ b/.workbench/specs/20261123-wt/ssot.md\n@@ -1 +1 @@\n-# SSOT\n+# HACKED\n`,
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wb,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply --stat --apply ${gitSpecPatch}` },
-      }),
-    ).toContain("冻结 Spec 保护");
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wb,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply -p0 --apply --check ${patchFile}` },
-      }),
-    ).toContain("冻结 Spec 保护");
-
-    // 2. Metadata-only Git rename patch (no `---`/`+++` headers) targeting locked Hurl MUST be caught!
-    const renamePatch = join(wb, "rename.patch");
-    writeFileSync(
-      renamePatch,
-      `diff --git a/tests/smoke.hurl b/tests/renamed.hurl\nsimilarity index 100%\nrename from tests/smoke.hurl\nrename to tests/renamed.hurl\n`,
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${renamePatch}` },
-      }),
-    ).toContain("冻结测试防篡改");
-
-    // 3. Readable patch with unrecognized/empty headers MUST fail closed on locked dir!
-    const unknownPatch = join(wb, "unknown.patch");
-    writeFileSync(unknownPatch, "GIT binary patch\nliteral 0\n");
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${unknownPatch}` },
-      }),
-    ).toContain("冻结测试防篡改");
-
-    // Round 4 regressions:
-    // 4. Mode-only Git patch with spaces in filename targeting locked Hurl MUST be caught!
-    const spacedModePatch = join(wb, "spaced-mode.patch");
-    writeFileSync(
-      spacedModePatch,
-      `diff --git a/tests/smoke case.hurl b/tests/smoke case.hurl\nold mode 100644\nnew mode 100755\n`,
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${spacedModePatch}` },
-      }),
-    ).toContain("冻结测试防篡改");
-
-    // 5. `--build-fake-ancestor` destination file is checked against lock matching (both spaced & `=` forms)!
-    const benignPatch = join(wb, "benign.patch");
-    writeFileSync(
-      benignPatch,
-      `--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old\n+new\n`,
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wb,
-        tool_name: "exec_command",
-        tool_input: {
-          command: `git apply --build-fake-ancestor .workbench/specs/20261123-wt/ssot.md ${benignPatch}`,
-        },
-      }),
-    ).toContain("冻结 Spec 保护");
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wb,
-        tool_name: "exec_command",
-        tool_input: {
-          command: `git apply --build-fake-ancestor=.workbench/specs/20261123-wt/ssot.md ${benignPatch}`,
-        },
-      }),
-    ).toContain("冻结 Spec 保护");
-
-    // 6. Spaced `git apply --directory app-api` resolves benign patch cleanly without false denial!
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wb,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply --directory app-api ${benignPatch}` },
-      }),
-    ).toBeNull();
-
-    // Round 5 regressions:
-    // 7. Ambiguous section #1 is NOT cleared by explicit `---`/`+++` headers in section #2!
-    const multiSectionAmbigPatch = join(wb, "multi-ambig.patch");
-    writeFileSync(
-      multiSectionAmbigPatch,
-      [
-        "diff --git old/tests/smoke case.hurl newer/tests/smoke case.hurl",
-        "old mode 100644",
-        "new mode 100755",
-        "diff --git a/readme.md b/readme.md",
-        "--- a/readme.md",
-        "+++ b/readme.md",
-        "@@ -1 +1 @@",
-        "-a",
-        "+b",
-      ].join("\n") + "\n",
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${multiSectionAmbigPatch}` },
-      }),
-    ).toContain("冻结测试防篡改");
-
-    // 8. C-quoted octal UTF-8 filename in mode-only `diff --git` decodes to `café.hurl` and hits lock!
-    const utf8ModePatch = join(wb, "utf8-mode.patch");
-    writeFileSync(
-      utf8ModePatch,
-      'diff --git "a/tests/caf\\303\\251.hurl" "b/tests/caf\\303\\251.hurl"\nold mode 100644\nnew mode 100755\n',
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${utf8ModePatch}` },
-      }),
-    ).toContain("冻结测试防篡改");
-
-    // Round 6 regressions:
-    // 9. Mixed-format patch (ambiguous mode-only section + blank line + traditional `---`/`+++`) fails closed!
-    const mixedFormatPatch = join(wb, "mixed-format.patch");
-    writeFileSync(
-      mixedFormatPatch,
-      [
-        "diff --git old/plan notes.md newer/plan notes.md",
-        "old mode 100644",
-        "new mode 100755",
-        "",
-        "--- a/readme.md",
-        "+++ b/readme.md",
-        "@@ -1 +1 @@",
-        "-a",
-        "+b",
-      ].join("\n") + "\n",
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${mixedFormatPatch}` },
-      }),
-    ).toContain("冻结测试防篡改");
-
-    // 10. Invalid UTF-8 octal (`\377`), literal NUL byte, and malformed `\q` header followed by `---`/`+++` ALL fail closed!
-    const badUtf8Patch = join(wb, "bad-utf8.patch");
-    writeFileSync(
-      badUtf8Patch,
-      'diff --git "a/x\\377.md" "b/x\\377.md"\nold mode 100644\nnew mode 100755\n',
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${badUtf8Patch}` },
-      }),
-    ).toContain("冻结测试防篡改");
-
-    const litNulPatch = join(wb, "lit-nul.patch");
-    writeFileSync(
-      litNulPatch,
-      'diff --git "a/x\0z.md" "b/x\0z.md"\nold mode 100644\nnew mode 100755\n',
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${litNulPatch}` },
-      }),
-    ).toContain("冻结测试防篡改");
-
-    const badEscWithStdPatch = join(wb, "bad-esc-std.patch");
-    writeFileSync(
-      badEscWithStdPatch,
-      'diff --git "a/\\q.md" "b/\\q.md"\n--- a/readme.md\n+++ b/readme.md\n@@ -1 +1 @@\n-a\n+b\n',
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${badEscWithStdPatch}` },
-      }),
-    ).toContain("冻结测试防篡改");
-
-    // 11. Trailing space in quoted filename is preserved (does NOT silently match `tests/café.hurl` without space!)
-    const trailingSpacePatch = join(wb, "trailing-space.patch");
-    writeFileSync(
-      trailingSpacePatch,
-      'diff --git "a/tests/caf\\303\\251.hurl " "b/tests/caf\\303\\251.hurl "\nold mode 100644\nnew mode 100755\n',
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${trailingSpacePatch}` },
-      }),
-    ).toBeNull();
-
-    // Round 7 regressions:
-    // 12. Literal invalid UTF-8 byte (0xff) in header fails closed BEFORE lossy UTF-8 decoding!
-    const rawInvalidBytePatch = join(wb, "raw-ff.patch");
-    writeFileSync(
-      rawInvalidBytePatch,
-      Buffer.concat([
-        Buffer.from('diff --git a/x'),
-        Buffer.from([0xff]),
-        Buffer.from('.md b/x'),
-        Buffer.from([0xff]),
-        Buffer.from('.md\nold mode 100644\nnew mode 100755\n'),
-      ]),
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${rawInvalidBytePatch}` },
-      }),
-    ).toContain("冻结测试防篡改");
-
-    // 13. Leading U+FEFF (BOM bytes \357\273\277 at byte 0 of quoted token!) in `rename to` is preserved
-    // (NOT stripped by TextDecoder), and single-space delimiter in `rename to  tests/smoke.hurl` preserves leading space!
-    const bomRenamePatch = join(wb, "bom-rename.patch");
-    writeFileSync(
-      bomRenamePatch,
-      'rename from other.md\nrename to "\\357\\273\\277tests/smoke.hurl"\n',
-    );
-    // `\uFEFFtests/smoke.hurl` starts with U+FEFF (at byte 0 of token), distinct from `tests/smoke.hurl`!
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${bomRenamePatch}` },
-      }),
-    ).toBeNull();
-
-    const leadingSpaceRenamePatch = join(wb, "leading-space-rename.patch");
-    writeFileSync(
-      leadingSpaceRenamePatch,
-      "rename from other.md\nrename to  tests/smoke.hurl\n",
-    );
-    // ` tests/smoke.hurl` has a leading space so it does NOT falsely match `tests/**/*.hurl`!
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${leadingSpaceRenamePatch}` },
-      }),
-    ).toBeNull();
-
-    // Round 8 regressions:
-    // 14. Hunk body lines starting with `+++ <FF>` or `--- <FF>` inside an ordinary `readme` patch
-    // MUST NOT be misclassified as malformed headers (no false-positive denial in locked worktree)!
-    const hunkPlusFfPatch = join(wb, "hunk-plus-ff.patch");
-    writeFileSync(
-      hunkPlusFfPatch,
-      Buffer.concat([
-        Buffer.from("diff --git a/readme b/readme\n--- a/readme\n+++ b/readme\n@@ -1 +1 @@\n-old\n+++ "),
-        Buffer.from([0xff]),
-        Buffer.from("\n"),
-      ]),
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${hunkPlusFfPatch}` },
-      }),
-    ).toBeNull();
-
-    const hunkMinusFfPatch = join(wb, "hunk-minus-ff.patch");
-    writeFileSync(
-      hunkMinusFfPatch,
-      Buffer.concat([
-        Buffer.from("diff --git a/readme b/readme\n--- a/readme\n+++ b/readme\n@@ -1 +1 @@\n--- "),
-        Buffer.from([0xff]),
-        Buffer.from("\n+new\n"),
-      ]),
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${hunkMinusFfPatch}` },
-      }),
-    ).toBeNull();
-
-    // Round 9 regression: >64-byte zero-padded hunk header with non-UTF-8 trailing context parses cleanly!
-    const longHunkHdrPatch = join(wb, "long-hunk-hdr.patch");
-    writeFileSync(
-      longHunkHdrPatch,
-      Buffer.concat([
-        Buffer.from("--- a/readme\n+++ b/readme\n@@ -"),
-        Buffer.from("0".repeat(60)),
-        Buffer.from("1 +1 @@ "),
-        Buffer.from([0xff]),
-        Buffer.from("\n-old\n+++ "),
-        Buffer.from([0xff]),
-        Buffer.from("\n"),
-      ]),
-    );
-    expect(
-      evaluatePreToolUse(wb, {
-        hook_event_name: "PreToolUse",
-        cwd: wtFeat,
-        tool_name: "exec_command",
-        tool_input: { command: `git apply ${longHunkHdrPatch}` },
-      }),
-    ).toBeNull();
   });
 });

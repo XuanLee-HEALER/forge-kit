@@ -6,7 +6,7 @@ model = "gpt-6.1-terra"
 effort = "medium"
 
 [tiers.standard]
-model = "gpt-6.2-sol"
+model = "gpt-6.2-astra"
 effort = "medium"
 
 [tiers.deep]

@@ -5,72 +5,17 @@ description: >
   触发词：合 fat、推 fat、上 fat、fat 验收、提 PR、进 main、上线流程、走发布流程、清理分支、ship。
 ---
 
-# ship：开发交付与发布
+# 按授权终点交付
 
-按 `AGENTS.md` 与目标仓 `.workbench/repos/<repo>.md` 执行；若存在公司专属发布 skill（如 `release`），生产发布阶段协同调用。
+| 阶段 | 进入条件 | 完成条件 |
+|---|---|---|
+| FAT | wrapup 通过且已授权测试环境 | 记录推送的 FAT SHA、部署结果和实际验收情况 |
+| PR | 已授权创建或更新 PR | PR 正文含账本见证，远端 HEAD 与验证 SHA 一致 |
+| Prod | 已明确授权生产且精确 Runbook 已获批 | 登记动作完成，部署、只读回查与回滚条件已核对 |
+| Cleanup | PR 已合并且部署成功 | 本次临时工作树与分支已清理，账本按终点关闭 |
 
-## 选择阶段
-
-- **上测试环境（FAT）**：已完成本地验证与 `wrapup`，且本次授权包含 FAT。
-- **准备 PR**：按目标分支整理干净分支与证据，创建或更新 PR 后即停（`main` PR 始终由用户合并）。
-- **生产发布**：仅在本次明确授权生产发布时执行，核对目标提交、既有验收与生产依赖，不为发布重跑整套开发 FAT 流程。
-- **发布后清理**：PR 已合并且部署确认成功后，清理本次创建的临时分支与 worktree（或使用 `.workbench/bin/wb-git sweep`）。
-
-## 1. 上测试环境（FAT）
-
-1. 确认当前 `HEAD SHA` 已通过 `wrapup` 且账本无未关闭 blocker。
-2. 使用 `<仓>.worktrees/<临时名>` 下的 detached worktree 合并至测试分支（不在共享工作树切分支，**禁止调用 Codex Desktop 内置 `create_worktree`** 切离工作台根目录；若仓库配置指定了 cherry-pick 规则，按仓库配置执行；功能分支 `<featSha>` 始终作为账本主提交承载 `lint`/`test`/`review`/`fat` 证据，若 cherry-pick 到远端 `origin/fat` 产生了新提交 `<fatSha>`，在临时 worktree 建临时集成分支并通过 `ledger attach <task_id> --repo <r> --branch <临时分支> --head <fatSha>` 挂载，待该 `<fatSha>` 具备推送前置验证证据后推送至 `origin/fat`，并**仅在步骤 4 跟踪部署与验收通过后**以 `--sha <featSha>` 记录 `--kind fat --status pass`（摘要写明对应 `<fatSha>`），清理临时分支并执行 `ledger detach <task_id> --repo <r> --branch <临时分支> --reason "已推 origin/fat 并清理"` 后再关账）：
-   ```bash
-   git -C <仓> fetch origin
-   git -C <仓> worktree add --detach <临时目录> origin/fat
-   git -C <临时目录> merge <功能分支>
-   # 在临时目录跑受影响构建/测试后推送
-   git -C <临时目录> push origin HEAD:fat
-   git -C <仓> worktree remove <临时目录>
-   ```
-3. 测试环境历史漂移不补、不顺手修；仅确保本次改动正确落地。
-4. 跟踪部署状态；按授权执行测试环境迁移与验收：
-   - **后端接口变更**：须运行覆盖变化的 Hurl/接口测试并彻底清理本轮夹具——建第一条数据前注册失败/中断兜底清理，用运行 ID 归属整组按依赖逆序清理，提供按同一运行 ID 幂等补清入口，核验残留数为零；清理失败须返回失败并列剩余 ID；若真人业务引用了测试夹具，保留真人订单并报告外键约束，绝不级联删除真人数据。
-   - **前端变更**：完成类型检查、lint、构建、相关组件测试与 `wrapup` 并合入测试环境后，明确汇报“已合测试环境，待用户测试”，不表述为页面已验收；网页自动化测试仍须用户主动要求。
-
-## 2. 准备 PR
-
-已有 PR 推送新提交后，运行 `.workbench/bin/ledger pr-sync <task_id> --repo <仓> [--pr <编号或 URL>]` 核验远端 HEAD 并更新证据。
-
-1. 核对分支来源相对 `origin/main`：从 `main` 切出且未混入测试分支独有历史的功能分支直接复用；仅在混入脏历史时才从最新 `origin/main` 重建干净分支移植提交（严禁将 `fat` 合并进 `main`）。
-2. 创建或更新 PR 时固定使用工作台格式：
-   - 标题：`type: 一句话描述`
-   - 正文：
-     ```markdown
-     ## 改动内容
-
-     - <直白准确的业务语言概括实际变化，可省略实现细节>
-
-     ## 关键文件改动
-
-     - `<仓库相对路径>`：<一句话说明改动>
-
-     ## 对历史影响
-
-     <对已有数据、进行中任务或旧行为的实际影响；确实无影响写「无」>
-     ```
-
-## 3. 生产发布
-
-1. 核对目标 SHA 位于 `origin/main` 历史且无夹带未授权提交；发布期间新增冲突修复按实际风险补查。
-2. **Runbook 签发自动推进**：先整理完整可读的发版 Runbook（精确列出仓库、目标 SHA、待合 PR 号、annotated tag 名、如需的 prod 迁移 SQL 文件路径 / `kubectl` 命令与回滚方案），执行：
-   ```bash
-   .workbench/bin/ledger runbook create --title "<发版标题>" \
-     [--pr <repo>:<pr号>] [--tag <repo>:<tag>:<sha>] \
-     [--sql <prod-host>:<sql路径>] [--kubectl "<精确kubectl命令>"]
-   ```
-   将 Runbook 与生成的 `rb-...` 编号发给用户确认；用户在主会话单独回复整句 **`批准 <runbook_id>`** 或 **`approve <runbook_id>`**（不附带其他文字或标点）后，`UserPromptSubmit` Hook 自动为本会话签发 30 分钟精确白名单通行证，随后 Agent 自动推进合 PR、打 tag 并显式 `git push origin <tag>`、执行已登记迁移/`kubectl`、跟踪部署、只读核验与错误日志观察；全部完成后执行 `.workbench/bin/ledger runbook complete <runbook_id>`（未批准前绝不强行绕过；`git push --tags`、读 k8s `secret`、未登记的 prod 写操作永久禁止）。
-   - **纯运维/补跑已上线 SQL（无业务仓代码改动）**：无需开设 `--endpoint prod` 开发任务账本（避免无分支挂载而被迫 `--force-incomplete` 关账），直接执行 `.workbench/bin/ledger runbook create --title "<说明>" --sql <prod-host>:<sql路径>` 签发发版单，经用户回复 `批准 <runbook_id>` 后执行并回查；如需留存排查与核验上下文，可开设 `--endpoint investigation` 排查账本或写入运维日志。
-3. 涉及共享队列任务格式/语义变化时，核对滚动部署与回滚期间新旧版本共存兼容性。
-
-## 4. 清理与收尾
-
-1. PR 已合并且部署确认成功后，立刻清理本次创建的 `<仓>.worktrees/<name>`、`git -C <仓> worktree prune` 及已合入远端的本地临时分支（或运行 `.workbench/bin/wb-git sweep`），核验 `git -C <仓> worktree list` 无本次残留；若 PR 尚未合并则明确标注留待合并后清理。若账本曾挂有已改名或废弃的临时分支，先执行 `.workbench/bin/ledger detach <task_id> --repo <r> --branch <b>` 再关账。
-2. 若同一任务从 `fat` 继续推进到 `pr` 或 `prod`，优先使用 `.workbench/bin/ledger reopen <task_id> --endpoint <pr|prod>`（或尚在 `OPEN` 时用 `ledger set-endpoint`）延续原账本并直接复用同 SHA 已有验证证据，不要另开重复账本手抄证据。
-3. 执行 `.workbench/bin/ledger close <task_id>` 归档本次账本。
-4. 仅汇报实际发生的 PR、tag、部署、验收与清理结果。
+1. 核对任务、仓库卡、目标分支和已验证 SHA。同任务升级终点用 ledger set-endpoint 或 reopen。
+2. **FAT**　运行 `.workbench/bin/wb-git fat-merge <repo> <branch> [--cherry-pick]`，依仓库卡选择策略。保存 feat_sha、fat_sha，跟踪部署。后端执行受影响的接口验收，按本轮运行 ID 逆序清理夹具并核验残留。真实业务记录引用夹具时保留真实记录，报告受阻的夹具 ID，验收记为失败，前端交由用户测试。实际验收通过后在功能 SHA 登记 fat 证据。
+3. **PR**　核对相对 origin/main 的差异与历史。用 `.workbench/bin/ledger tip <task_id>` 取得整行 `Ledger-Tip: <task_id>@<hash>`，附在 PR 正文末尾。标题用 type 加一句话描述，正文写改动内容、关键文件及历史影响。后续推送运行 `.workbench/bin/ledger pr-sync <task_id> --repo <repo>` 更新远端证据。授权终点为 PR 时交给用户合并。
+4. **Prod**　获取最新 origin/main，核对发布范围只含授权改动。发布 tag 前用 `git merge-base --is-ancestor <sha> origin/main` 确认目标已合入。列明仓库、解析后的目标 SHA、PR、annotated tag、SQL 文件及主机、准确的 kubectl 命令、回滚方案和新旧版本兼容性。通过 `.workbench/bin/ledger runbook create` 登记精确动作，向用户展示上述清单及生成的编号。用户须在主会话**单独发送整句** `批准 <runbook_id>` 或 `approve <runbook_id>`，不附说明或标点。仅在签发会话及有效期内执行登记操作。数据库默认用只读 `.workbench/bin/dbcred <env>`，批准迁移才用 `.workbench/bin/dbcred <env> --rw --runbook <id>`。监测部署、错误日志及只读核验结果，再执行 `ledger runbook complete <runbook_id>`。若关联 prod 任务，以部署回查的实际结果运行 `ledger record <task_id> --kind prod --status <pass|fail> --repo <repo> --branch <branch> --sha <sha> --summary "<验收结果>"`。
+5. **Cleanup**　用 wb-git sweep 或按范围删除已合入的本地临时分支和工作树，核对 git worktree list。解绑已废弃的临时挂载，运行 ledger close，汇报实际交付记录。

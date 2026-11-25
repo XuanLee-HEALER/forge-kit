@@ -1,6 +1,4 @@
 import { verifiedPr } from "../ledger/delivery-tools";
-import { getSpecState } from "../ledger/spec";
-import { coversReviewBase, reviewMeetsFloor } from "../ledger/review-range";
 import { redactSecrets } from "../cmdfmt";
 import { findWorkbenchRoot, loadWorkbenchConfig } from "../config";
 import { getHeadAndParents, locateRepo, runGit } from "../git";
@@ -15,24 +13,8 @@ import {
   readHookStdinStrict,
   type CodexHookInput,
 } from "../hook-io";
-import {
-  hasAmbiguousControlFlow,
-  hasNonExecutingVerifyFlag,
-  isFailFastSetSegment,
-  safeTrailingSegments,
-} from "./manifest-verify";
-import { classifyReviewEvidence } from "./review-evidence";
 import { handleUserPromptRunbookDirectives } from "./runbook-prompt";
-import {
-  classifyVerifyCommand,
-  extractTscArgs,
-  hasInfoOnlyFlag,
-  isValidHurlExecution,
-  parseLangCheckInvocation,
-  parseLangCheckPhases,
-  resolveVerifyTargetDir,
-} from "./runners";
-import { SHELL_CONTROL_OR_STATE_BUILTINS, type CapturedEvidence } from "./types";
+import type { CapturedEvidence } from "./types";
 import { Ledger } from "../ledger/store";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -45,11 +27,12 @@ import {
 } from "../shared/gh-remote";
 import { extractGitSubcommand, resolveGitDirFlags } from "../shared/git-cmd";
 import {
+  tokenizeSimpleShellCommand,
   resolveCdTarget,
   splitLeadingEnv,
   splitShellSegments,
   splitShellTokensWithMeta,
-  stripUnquotedShellRedirections,
+  hasOnlyAndSeparators,
   unwrapShellPrefix,
 } from "../shared/shell";
 
@@ -60,84 +43,26 @@ export function classifyPostToolEvidence(
   outputText: string,
 ): CapturedEvidence[] {
   if (exitCode === null) return [];
-  if (hasAmbiguousControlFlow(cmd)) return [];
-
+  const script = cmd.replace(/^[ \t]*set[ \t]+(?:-e|-eu|-euo[ \t]+pipefail|-o[ \t]+errexit)[ \t]*(?:\r?\n|&&|;)[ \t]*/, "");
+  if (!hasOnlyAndSeparators(script.trimEnd(), script !== cmd)) return [];
   const results: CapturedEvidence[] = [];
-  const segments = splitShellSegments(cmd);
+  const segments = splitShellSegments(script);
   const passed = exitCode === 0;
+  // Attribute the observed HEAD only across literal, read-only suffixes.
+  while (passed && segments.length > 1) {
+    const tail = tokenizeSimpleShellCommand(segments.at(-1)!) ?? [];
+    const last = extractGitSubcommand(tail);
+    const { bin } = unwrapShellPrefix(tail);
+    if (!(bin === "echo" || bin === "true" || (bin === "git" && last && ["status", "log", "rev-parse"].includes(last.subcmd)))) break;
+    segments.pop();
+  }
   let curDir = workdir;
   let prevDir: string | null = null;
-
-  const hasLeadingFailFastSet =
-    segments.length > 0 && isFailFastSetSegment(segments[0]);
-
-  // Reject any command containing shell control/state-mutating builtins (e.g. `exit 0 && make test`,
-  // `exec true && make test`, `pushd ../other && make test`, `! make test`, `export MAKEFLAGS=-n && make test`),
-  // function definitions, or bare shell variable assignments in a multi-segment chain.
-  // Exception: a verified fail-fast `set -e` / `set -euo pipefail` header strictly at segment 0.
   for (let segIdx = 0; segIdx < segments.length; segIdx++) {
-    if (segIdx === 0 && hasLeadingFailFastSet) continue;
-    const seg = segments[segIdx];
-    const meta = splitShellTokensWithMeta(seg);
-    if (!meta || meta.length === 0) continue;
-    const { envToks, cmdToks } = splitLeadingEnv(meta);
-    if (cmdToks.length === 0) {
-      if (envToks.length > 0 && segments.length > 1) return [];
-      continue;
-    }
-    const head = cmdToks[0];
-    if (SHELL_CONTROL_OR_STATE_BUILTINS.has(head)) {
-      return [];
-    }
-  }
-
-  const nonCdSegments = segments.filter((s, idx) => {
-    if (idx === 0 && hasLeadingFailFastSet) return false;
-    const t = splitShellTokensWithMeta(s);
-    if (!t || t.length === 0) return false;
-    return splitLeadingEnv(t).cmdToks[0] !== "cd";
-  });
-
-  // In a multi-segment chain that exits non-zero, only an optional leading fail-fast `set -e`
-  // plus leading valid `cd` segments followed by a single final command unambiguously attribute
-  // the failure to that final command.
-  // Any other multi-segment failure (e.g. `false && make test`, `make test && cd /dev/null`,
-  // `cd missing/.. && make test`) is ambiguous and MUST NOT record a false `fail`.
-  if (!passed && segments.length > 1) {
-    let probeDir = workdir;
-    let probePrev: string | null = null;
-    for (let i = 0; i < segments.length - 1; i++) {
-      if (i === 0 && hasLeadingFailFastSet) continue;
-      const t = splitShellTokensWithMeta(segments[i]);
-      if (!t || splitLeadingEnv(t).cmdToks[0] !== "cd") {
-        return [];
-      }
-      const nextDir = resolveCdTarget(probeDir, probePrev, t);
-      if (!nextDir) {
-        return [];
-      }
-      probePrev = probeDir;
-      probeDir = nextDir;
-    }
-    const lastToks = splitShellTokensWithMeta(segments[segments.length - 1]);
-    if (
-      !lastToks ||
-      lastToks.length === 0 ||
-      splitLeadingEnv(lastToks).cmdToks[0] === "cd" ||
-      (segments.length - 1 === 0 && hasLeadingFailFastSet)
-    ) {
-      return [];
-    }
-  }
-
-  let sawVerification = false;
-  for (let segIdx = 0; segIdx < segments.length; segIdx++) {
-    if (segIdx === 0 && hasLeadingFailFastSet) continue;
     const seg = segments[segIdx];
     const metaToks = splitShellTokensWithMeta(seg);
     if (!metaToks || metaToks.length === 0) continue;
     const toks = metaToks.map((t) => t.value);
-    // Shell pipeline negation (`! make test`) flips non-zero failures into exit 0 — reject entire command!
     if (toks[0] === "!" || toks[0] === "coproc") {
       return [];
     }
@@ -149,14 +74,20 @@ export function classifyPostToolEvidence(
       continue;
     }
 
-    // 1. git commit
     const git = extractGitSubcommand(toks);
-    if (git?.subcmd === "commit" && passed && !sawVerification) {
+    if (segIdx !== segments.length - 1) {
+      if (passed && git && unwrapShellPrefix(toks).bin === "git" && ["add", "diff", "status"].includes(git.subcmd)) continue;
+      return [];
+    }
+    if (git?.subcmd === "commit" && passed) {
       const prefix = unwrapShellPrefix(toks);
+      if (git.hasUnsafeGlobalOverride || git.subArgs.some(a => /^(--dry-run|--short|--porcelain(?:=.*)?|--long|--help)$/.test(a))) continue;
+      if (prefix.effective("GIT_DIR") || prefix.effective("GIT_WORK_TREE")) continue;
       if (prefix.bin !== "git" || prefix.ambiguous || prefix.dirs.some((d) => /[$`]/.test(d))) continue;
       const baseDir = resolveGitDirFlags(curDir, prefix.dirs, true);
       if (!baseDir) continue;
-      const targetDir = resolveGitDirFlags(baseDir, git.gitDirFlags, false) ?? baseDir;
+      const targetDir = resolveGitDirFlags(baseDir, git.gitDirFlags, false);
+      if (!targetDir) continue;
       results.push({
         kind: "commit",
         status: "pass",
@@ -174,7 +105,6 @@ export function classifyPostToolEvidence(
       if (!targetDir) continue;
       const parsedGh = parseGhPrCreateArgs(gh.subArgs);
       if (
-        nonCdSegments.length > 1 ||
         parsedGh.parseError ||
         parsedGh.help ||
         parsedGh.dryRun ||
@@ -237,78 +167,6 @@ export function classifyPostToolEvidence(
       continue;
     }
 
-    const reviews = classifyReviewEvidence(splitLeadingEnv(metaToks).cmdToks, curDir, exitCode, outputText, nonCdSegments.length);
-    if (reviews) {
-      results.push(...reviews);
-      continue;
-    }
-
-    // 3. Direct build / test / lint / hurl / lang-check execution (token-based; strips unquoted redirections so `> /dev/null` is never treated as a test path!)
-    const strippedMetaToks = splitShellTokensWithMeta(stripUnquotedShellRedirections(seg)) ?? metaToks;
-    const verifyHit = classifyVerifyCommand(strippedMetaToks);
-    if (verifyHit) {
-      sawVerification = true;
-      // Suppress attribution if ANY later segment in the same shell invocation can mutate git checkout/HEAD
-      // (e.g. `set -e\nnpm test\ngit switch other` or `npm test && git commit`), so the post-tool live SHA
-      // never falsely credits an untested branch/commit!
-      if (!safeTrailingSegments(segments.slice(segIdx + 1), curDir, 0, [], prevDir)) {
-        continue;
-      }
-      const targetDir = resolveVerifyTargetDir(verifyHit.cmdToks, verifyHit.envToks, curDir);
-      if (!targetDir) {
-        continue;
-      }
-      // Never record `--help` / `--version` / `help` / dry-run / collect-only commands as passing verification!
-      // Note: `tsc` handles its own `--help`/`--version` boolean values (e.g. `--help false` still typechecks).
-      const isTscCmd = extractTscArgs(verifyHit.cmdToks) !== null;
-      if (
-        (!isTscCmd && hasInfoOnlyFlag(verifyHit.cmdToks)) ||
-        hasNonExecutingVerifyFlag(verifyHit.cmdToks, verifyHit.envToks, targetDir, outputText, passed)
-      ) {
-        continue;
-      }
-      if (
-        verifyHit.kind === "hurl" &&
-        !isValidHurlExecution(verifyHit.cmdToks, curDir, outputText)
-      ) {
-        continue;
-      }
-      if (verifyHit.kind === "lang-check") {
-        // Exit 2 means no applicable checks executed (fail-closed) -> never record pass/fail!
-        if (exitCode === 2) continue;
-        const parsedLc = parseLangCheckInvocation(verifyHit.cmdToks);
-        if (!parsedLc) continue;
-        // For `--mode all`, check JSON/text report if present to record per-phase outcomes accurately
-        let phases: Array<{ kind: "lint" | "test"; status: "pass" | "fail" }> = [];
-        if (parsedLc.mode === "static") {
-          phases = [{ kind: "lint", status: passed ? "pass" : "fail" }];
-        } else if (parsedLc.mode === "dynamic") {
-          phases = [{ kind: "test", status: passed ? "pass" : "fail" }];
-        } else {
-          // mode === "all": requires standalone invocation (`nonCdSegments.length === 1`) so combined
-          // output from chained `lang-check repoA && lang-check repoB` can never cross-credit phases!
-          if (nonCdSegments.length > 1) continue;
-          phases = parseLangCheckPhases(outputText, passed);
-        }
-        for (const ph of phases) {
-          results.push({
-            kind: ph.kind,
-            status: ph.status,
-            summary: `${redactSecrets(seg).slice(0, 140)} (exit=${exitCode})`,
-            targetDir,
-            meta: { exit_code: exitCode, mode: parsedLc.mode },
-          });
-        }
-        continue;
-      }
-      results.push({
-        kind: verifyHit.kind,
-        status: passed ? "pass" : "fail",
-        summary: `${redactSecrets(seg).slice(0, 140)} (exit=${exitCode})`,
-        targetDir,
-        meta: { exit_code: exitCode },
-      });
-    }
   }
 
   return results;
@@ -348,8 +206,7 @@ export function handleLedgerHook(
     const ledger = new Ledger(workbenchRoot);
     try {
       let recorded = 0;
-      for (let idx = 0; idx < items.length; idx++) {
-        const item = items[idx];
+      for (const [idx, item] of items.entries()) {
         const loc = locateRepo(workbenchRoot, item.targetDir);
         if (!loc || !registeredRepos.has(loc.repo)) continue;
 
@@ -358,50 +215,17 @@ export function handleLedgerHook(
           const originUrl = runGit(loc.checkoutDir, ["remote", "get-url", "origin"], 3000).stdout.trim();
           const originId = parseGitRemoteRepo(originUrl);
           if (item.targetHost && item.targetHost !== originId?.host) continue;
-          if (item.targetRepoSpec) {
-            const targetId = parseGhRepoSpec(item.targetRepoSpec);
-            if (
-              !originId ||
-              !targetId ||
-              originId.host !== targetId.host ||
-              originId.owner !== targetId.owner ||
-              originId.repo !== targetId.repo
-            ) {
-              continue;
-            }
-          }
-          if (item.prUrlRepoSpec) {
-            const urlId = parseGhRepoSpec(item.prUrlRepoSpec);
-            if (
-              !originId ||
-              !urlId ||
-              originId.host !== urlId.host ||
-              originId.owner !== urlId.owner ||
-              originId.repo !== urlId.repo
-            ) {
-              continue;
-            }
-          }
+          const specs = [item.targetRepoSpec, item.prUrlRepoSpec].filter((v): v is string => !!v);
+          if (specs.some(spec => {
+            const id = parseGhRepoSpec(spec);
+            return !id || !originId || id.host !== originId.host || id.owner !== originId.owner || id.repo !== originId.repo;
+          })) continue;
         }
 
         // Resolve explicit target branch (e.g. `gh pr create --head feat/other`) instead of current checkout
         let effectiveBranch = loc.branch;
         let effectiveDetached = loc.isDetached;
-        let resolvedPinnedSha = item.pinnedSha ?? null;
-        if (!resolvedPinnedSha && item.pinnedRef) {
-          const refRes = runGit(
-            loc.checkoutDir,
-            ["rev-parse", "--verify", `${item.pinnedRef}^{commit}`],
-            3000,
-          );
-          if (refRes.code === 0 && refRes.stdout.trim()) {
-            resolvedPinnedSha = refRes.stdout.trim();
-          }
-        }
-        if (item.kind === "review" && item.meta?.resumed && (!resolvedPinnedSha ||
-            !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(resolvedPinnedSha) ||
-            runGit(loc.checkoutDir, ["cat-file", "-t", resolvedPinnedSha]).stdout.trim() !== "commit")) continue;
-        let effectiveSha = resolvedPinnedSha ?? loc.headSha;
+        let effectiveSha = loc.headSha;
         if (item.targetBranch) {
           if (item.targetOwner) {
             const originUrl = runGit(loc.checkoutDir, ["remote", "get-url", "origin"], 3000).stdout.trim();
@@ -453,12 +277,6 @@ export function handleLedgerHook(
           ? ledger.findOpenTasksByRepoCommits(loc.repo, getHeadAndParents(loc.checkoutDir))
           : ledger.findOpenTasksByRepoBranch(loc.repo, effectiveBranch);
         if (openTasks.length !== 1) continue;
-        if (item.kind === "review" && item.status !== "fail") {
-          const activeFloor = getSpecState(ledger, openTasks[0].task_id, { metadataOnly: true }).evidence_floor_seq.review;
-          if (!reviewMeetsFloor("pass", item.meta, openTasks[0].task_id, activeFloor, undefined, "hook")) continue;
-        }
-        if (item.kind === "review" && item.meta?.review_task_id !== undefined &&
-            item.meta.review_task_id !== openTasks[0].task_id) continue;
         if (item.kind === "pr" && item.status === "pass") {
           if (!item.prUrl || effectiveDetached || !effectiveSha) continue;
           try {
@@ -467,27 +285,6 @@ export function handleLedgerHook(
           }
           catch { continue; }
         }
-        if (item.kind === "review" && item.meta?.role === "codex-review" && item.requirePinnedSha && resolvedPinnedSha) {
-          const parents = runGit(loc.checkoutDir, ["rev-list", "--parents", "-n", "1", resolvedPinnedSha]);
-          if (parents.code) continue;
-          const [commit, parent] = parents.stdout.trim().split(/\s+/);
-          item.meta.base = parent ?? commit;
-        }
-        if (item.kind === "review" && item.status !== "fail") {
-          const attachments = ledger.getTaskRepos(openTasks[0].task_id).filter(r => r.repo === loc.repo && (effectiveDetached || r.branch === effectiveBranch));
-          if (!attachments.length || !attachments.every(r => coversReviewBase(workbenchRoot, r, item.meta?.base))) continue;
-        }
-
-        if (item.requirePinnedSha && !resolvedPinnedSha) {
-          // Do not guess live checkout HEAD when pinned SHA/ref is required!
-          continue;
-        }
-        const targetSha = effectiveSha;
-        const executionId = item.kind === "review" && item.meta?.execution_id;
-        const toolUseKey = typeof executionId === "string" ? `review-execution:${executionId}` : input.tool_use_id
-          ? `${input.tool_use_id}:${idx}`
-          : null;
-
         ledger.recordEvidence({
           source: "hook",
           task_id: openTasks[0].task_id,
@@ -496,14 +293,11 @@ export function handleLedgerHook(
           summary: item.summary,
           repo: loc.repo,
           branch: effectiveDetached ? null : effectiveBranch,
-          sha: targetSha,
-          meta:
-            item.meta && resolvedPinnedSha
-              ? { ...item.meta, head: resolvedPinnedSha }
-              : item.meta,
+          sha: effectiveSha,
+          meta: item.meta,
           actor: "hook",
           session_id: input.session_id ?? null,
-          tool_use_id: toolUseKey,
+          tool_use_id: input.tool_use_id ? `${input.tool_use_id}:${idx}` : null,
         });
         recorded++;
       }

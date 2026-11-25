@@ -497,3 +497,65 @@ export function parseGhPrMergeTarget(args: string[], checkoutDir: string | null,
   const targetRepo = repo ?? origin?.repo;
   return targetRepo ? { host, owner, repo: targetRepo, number } : null;
 }
+
+// Recognize top-level operation kinds. GitHub validates field names and argument types.
+export function readOnlyGraphql(document: string): boolean {
+  const tokens = /"""(?:\\"""|(?!""")[\s\S])*"""|"(?:\\[^\r\n]|[^"\\\r\n])*"|#[^\r\n]*|[_A-Za-z]\w*|[\s,\uFEFF]+|./gy;
+  const stack: string[] = [];
+  let definition = "", queries = 0;
+  for (const [token] of document.matchAll(tokens)) {
+    if (/^[\s,#\uFEFF]/.test(token)) continue;
+    if (!definition) {
+      if (token !== "query" && token !== "fragment") return false;
+      definition = token;
+      if (token === "query") queries++;
+      continue;
+    }
+    if (token === '"' || token === "'") return false;
+    if (token === "{" || token === "(" || token === "[") stack.push(token);
+    if (token === "}" || token === ")" || token === "]") {
+      const open = stack.pop();
+      if (open !== ({ "}": "{", ")": "(", "]": "[" })[token]) return false;
+      if (token === "}" && !stack.length) definition = "";
+    }
+  }
+  return queries > 0 && !definition && !stack.length;
+}
+
+export function parseGhApi(args: string[]) {
+  const valueFlags = new Set(["-X", "--method", "-f", "--raw-field", "-F", "--field", "--input", "-H", "--header",
+    "--hostname", "--cache", "-q", "--jq", "-t", "--template", "-p", "--preview"]);
+  const booleanFlags = new Set(["--include", "--paginate", "--silent", "--slurp", "--verbose", "--help"]);
+  const fields: string[] = [];
+  let method = "", body = false, endpoint = "", positional = false;
+  for (let j = 0; j < args.length; j++) {
+    const arg = args[j];
+    if (!positional && arg === "--") { positional = true; continue; }
+    if (positional || !arg.startsWith("-")) {
+      if (endpoint) return null;
+      endpoint = arg;
+      continue;
+    }
+    let flag: string, value: string | undefined;
+    if (arg.startsWith("--")) {
+      const eq = arg.indexOf("=");
+      flag = eq < 0 ? arg : arg.slice(0, eq);
+      if (booleanFlags.has(flag)) continue;
+      if (eq >= 0) value = arg.slice(eq + 1);
+    } else {
+      // pflag consumes boolean shorthands one by one. The first value flag owns the remainder.
+      let k = 1;
+      while (k < arg.length && "ish".includes(arg[k])) k++;
+      if (k === arg.length) continue;
+      flag = "-" + arg[k];
+      if (k + 1 < arg.length) value = arg.slice(k + 1).replace(/^=/, "");
+    }
+    if (!valueFlags.has(flag)) return null;
+    value ??= args[++j];
+    if (!value) return null;
+    if (flag === "-X" || flag === "--method") method = value.toUpperCase();
+    if (["-f", "-F", "--raw-field", "--field"].includes(flag)) fields.push(value);
+    if (flag === "--input") body = true;
+  }
+  return { endpoint, fields, method, body };
+}

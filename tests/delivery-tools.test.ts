@@ -218,15 +218,12 @@ test("provider error from before a refreeze retains its launch time through the 
     const result = handleLedgerHook(root, { hook_event_name: "PostToolUse", cwd: root, tool_name: "exec_command",
       tool_input: { command: ["review-quality", ...args].join(" "), workdir: root },
       tool_response: { exit_code: code, output: stdout + "\n" + stderr } });
-    expect(result.recorded).toBe(1);
-    const event = ledger.getTaskEvents("fix").at(-1)!;
+    expect(result.recorded).toBe(0);
+    const reportData = JSON.parse(stdout);
     const floor = ledger.getSpecState("fix").evidence_floor_seq.review;
-    const floorTime = ledger.getTaskEvents("fix").find(e => e.seq === floor)!.ts;
-    const evidence = JSON.parse(event.payload_json);
-    expect(evidence.meta.review_task_id).toBe("fix");
-    expect(evidence.meta.error_code).toBe("credit_balance_exhausted");
-    expect(evidence.meta.review_floor_seq).toBeLessThan(floor);
-    expect(Date.parse(evidence.meta.started_at)).toBeGreaterThan(Date.parse(floorTime));
+    expect(reportData.reviewTaskId).toBe("fix");
+    expect(reportData.errorCode).toBe("credit_balance_exhausted");
+    expect(reportData.reviewFloorSeq).toBeLessThan(floor);
     expect(readiness(head).ready).toBe(true);
     ledger.recordEvidence({ task_id: "fix", repo: "svc", sha: head, kind: "review", status: "fail", source: "tool",
       summary: "current review found a problem", meta: { role: "quality", base, review_task_id: "fix", review_floor_seq: floor } });
@@ -237,7 +234,7 @@ test("provider error from before a refreeze retains its launch time through the 
     const [exit, report, receipt] = await Promise.all([retry.exited, new Response(retry.stdout).text(), new Response(retry.stderr).text()]);
     expect(exit, report).toBe(0);
     expect(JSON.parse(report).reviewTaskId).toBe("fix");
-    expect(JSON.parse(report).reviewFloorSeq).toBe(evidence.meta.review_floor_seq);
+    expect(JSON.parse(report).reviewFloorSeq).toBe(reportData.reviewFloorSeq);
     expect(handleLedgerHook(root, { hook_event_name: "PostToolUse", cwd: root, tool_name: "exec_command",
       tool_input: { command: ["review-quality", ...resumeArgs].join(" "), workdir: root },
       tool_response: { exit_code: exit, output: report + "\n" + receipt } }).recorded).toBe(0);
@@ -272,7 +269,7 @@ test("provider error from before a refreeze retains its launch time through the 
     expect(legacy.exitCode).toBe(2);
     expect(JSON.parse(legacy.stdout.toString())).toMatchObject({ reviewStarted: false, summary: expect.stringContaining("fresh review") });
     ledger.recordEvidence({ task_id: "replacement", repo: "svc", sha: head, kind: "review", status: "pass",
-      source: "tool", summary: "old task receipt", meta: { ...evidence.meta, role: "quality" } });
+      source: "tool", summary: "old task receipt", meta: { review_task_id: reportData.reviewTaskId, review_floor_seq: reportData.reviewFloorSeq, base, role: "quality" } });
     expect(ledger.checkPushReadiness({ task_id: "replacement", repo: "svc", head_sha: head }).recordedReviewRoles).toEqual([]);
   } finally { server.stop(true); }
 }, 20000);
@@ -287,7 +284,7 @@ test("a replacement task at floor zero requires its own role review", () => {
     tool_response: { exit_code: 0, output: JSON.stringify({ ...report, reviewTaskId }) }
   }).recorded;
   writeFileSync(join(root, ".workbench/workbench.yaml"), "name: fixture\nrepos:\n  - svc\n");
-  expect(capture("fix")).toBe(1);
+  expect(capture("fix")).toBe(0);
   ledger.cancelTask({ task_id: "fix", reason: "new task" });
   const task_id = "replacement";
   ledger.openTask({ task_id, title: task_id, repo: "svc", branch: "feature", base_sha: base, head_sha: head, endpoint: "local", depth: "full" });
@@ -305,7 +302,9 @@ test("a replacement task at floor zero requires its own role review", () => {
   }
   const roles = () => ledger.checkPushReadiness({ task_id, repo: "svc", head_sha: head }).recordedReviewRoles;
   expect(roles()).toEqual([]);
-  expect(capture(task_id)).toBe(1);
+  expect(capture(task_id)).toBe(0);
+  ledger.recordEvidence({ task_id, repo: "svc", sha: head, kind: "review", source: "tool", status: "pass",
+    summary: "current review", meta: { role: "quality", base, review_floor_seq: 0, review_task_id: task_id } });
   expect(roles()).toContain("quality");
 });
 

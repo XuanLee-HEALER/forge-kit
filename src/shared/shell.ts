@@ -638,9 +638,10 @@ export function hasPrecedingDynamicCd(segments: string[], targetIndex: number): 
   return false;
 }
 
-export function hasOnlyAndSeparators(cmd: string): boolean {
+export function hasOnlyAndSeparators(cmd: string, allowNewlines = false): boolean {
   let quote: "'" | '"' | "$'" | null = null;
   let escape = false;
+  let sawAnd = false;
   for (let i = 0; i < cmd.length; i++) {
     const ch = cmd[i];
     const next = cmd[i + 1];
@@ -675,9 +676,12 @@ export function hasOnlyAndSeparators(cmd: string): boolean {
       quote = ch;
       continue;
     }
-    if (ch === ";" || ch === "\n" || ch === "\r" || ch === "|") return false;
+    if (ch === ";" || ch === "|") return false;
+    // Under errexit an unsuccessful AND-list may still be followed by a successful line.
+    if ((ch === "\n" || ch === "\r") && (!allowNewlines || sawAnd)) return false;
     if (ch === "&") {
       if (next === "&") {
+        sawAnd = true;
         i++;
         continue;
       }

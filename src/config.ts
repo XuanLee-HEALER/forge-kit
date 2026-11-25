@@ -286,7 +286,7 @@ export function loadModelsConfig(root: string): ModelsConfig {
         effort: "medium",
       },
       standard: parsed?.tiers?.standard ?? {
-        model: "gpt-6.2-sol",
+        model: "gpt-6.2-astra",
         effort: "medium",
       },
       deep: parsed?.tiers?.deep ?? {

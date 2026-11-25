@@ -4,10 +4,10 @@ Forge-kit targets honest agents under pressure to finish and ordinary operator m
 
 ## Controls in descending order of authority
 
-1. Credentials and platform policy limit what a process can do. Separate RO/RW access through dbcred and database grants, deny secret access with Kubernetes RBAC, and enforce GitHub branch/tag rulesets and required status checks.
+1. Credentials and platform policy limit what a process can do. Use separate database grants and the read-only default of the dbcred capability broker. For production RW credentials, dbcred checks the trusted runtime session and the active runbook’s SQL host. Deployment owners deny secret access with Kubernetes RBAC and enforce GitHub branch/tag rulesets and required status checks.
 2. UserPromptSubmit binds exact whole-message human approval to a pending runbook, its actions, a root session and an expiry.
-3. Post-hoc Git and hash checks bind frozen artifacts and delivery evidence to the relevant checkout and revision.
-4. Executor-produced evidence carries `source=tool`. M1 also accepts passive `source=hook` observations for executable checks. Manual attestations are labeled and cannot satisfy those checks. Legacy events fall back to their stored actor only when source is absent.
+3. Post-hoc Git tree, executable-bit and SHA-256 checks bind frozen artifacts and delivery evidence to the relevant checkout and revision.
+4. wb-verify and forge-review execute checks and persist `source=tool` evidence. Targeted native review also records tool evidence. PostToolUse observes commits and verifies PR creation against the remote HEAD. Existing ledgers retain historical hook evidence. Manual attestations are labeled and cannot satisfy those checks. Legacy events fall back to their stored actor only when source is absent.
 5. PreToolUse is a safety belt for recognizable operations. Its parser does not establish an adversarial execution sandbox. A deliberately obscured shell pipeline, a Git alias or dynamically expanded command falls outside this parser's threat model. Production authority must be restricted even when the hook never runs.
 
 ## Ledger integrity

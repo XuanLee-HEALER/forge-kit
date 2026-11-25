@@ -69,6 +69,10 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     for (const name of ["wb-verify", "forge-review"])
       expect(lstatSync(join(res.root, ".workbench/bin", name)).mode & 0o111).toBeTruthy();
 
+    const defaults = readFileSync(join(res.root, ".codex/config.toml"), "utf8");
+    expect(defaults).toContain('model = "gpt-6.2-astra"');
+    expect(defaults).toContain('model_reasoning_effort = "medium"');
+
     // Customize private rules + models.toml + inline YAML repos array
     writeFileSync(join(res.root, "AGENTS.local.md"), "# My Private Local Rules\n");
     writeFileSync(

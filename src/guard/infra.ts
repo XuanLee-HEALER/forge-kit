@@ -3,18 +3,8 @@ import { normalizeKubectlTokens } from "../ledger/runbook";
 import { splitShellSegments, splitShellTokens, tokenizeSimpleShellCommand } from "../shared/shell";
 
 const KUBECTL_READ_VERBS = new Set([
-  "get",
-  "describe",
-  "logs",
-  "top",
-  "version",
-  "explain",
-  "api-resources",
-  "api-versions",
-  "cluster-info",
-  "events",
-  "wait",
-  "diff",
+  "get", "describe", "logs", "top", "version", "explain", "api-resources",
+  "api-versions", "cluster-info", "events", "wait", "diff",
 ]);
 
 const KUBECTL_READ_SUB: Record<string, Set<string>> = {
@@ -24,21 +14,8 @@ const KUBECTL_READ_SUB: Record<string, Set<string>> = {
 };
 
 const KUBECTL_VALUE_FLAGS = new Set([
-  "-n",
-  "--namespace",
-  "--kubeconfig",
-  "--context",
-  "--cluster",
-  "--user",
-  "-s",
-  "--server",
-  "--as",
-  "--request-timeout",
-  "--token",
-  "-o",
-  "--output",
-  "-l",
-  "--selector",
+  "-n", "--namespace", "--kubeconfig", "--context", "--cluster", "--user", "-s",
+  "--server", "--as", "--request-timeout", "--token", "-o", "--output", "-l", "--selector",
 ]);
 
 export function checkKubectl(
