@@ -14,10 +14,21 @@ Codex-native, self-contained multi-repo engineering workbench kit built with **B
 
 See the [threat model](docs/THREAT_MODEL.md) for enforcement boundaries and the [modular architecture](docs/MODULAR_ARCHITECTURE.md) for the source layout. The full test command runs both the workbench and independent review suites.
 
+## v0.4 delivery workflows
+
+| Choose this workflow when… | How delivery finishes |
+|---|---|
+| **Single-thread delivery** — one feature owner follows the change to its authorized endpoint | Run `wb-verify` and `forge-review`, deliver to FAT or PR, or obtain human runbook approval for production. Close the task after acceptance. |
+| **PR handoff and batch release train** — multiple verified features ship together | Each feature thread runs `ledger handoff` and posts the returned PR trailers. The release thread verifies live PR heads, obtains one runbook approval and closes the batch with execution receipts. |
+| **Unattended fast-track** — an operator can approve the frozen scope in advance | Set limits in `.workbench/ship-policy.yaml`, prepare an envelope with `ledger fast-track prepare`, then use `forge-ship evaluate` and `forge-ship run` in the approving session. A PR feeds the release train. |
+
+The standard model tier defaults to `gpt-6.2-astra` with `medium` reasoning effort. Customize it in the workbench’s `.workbench/models.toml`. [Delivery commands and completion criteria](core/.agents/skills/ship/SKILL.md)
+
 ## Quick Start
 
 ```bash
 # 1. Build standalone Bun bundles inside forge-kit
+git submodule update --init --recursive
 bun install
 bun run build
 bun run test:all

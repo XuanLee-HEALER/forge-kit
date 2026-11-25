@@ -795,3 +795,26 @@ test("renames check both source and destination against forbidden paths", () => 
     git(f.wt, "reset", "--hard", f.base);
   }
 }, 30000);
+
+test("an in-scope 401-line rename counts only edited lines", () => {
+  const seed = feature("api", 1);
+  const original = Array.from({ length: 401 }, (_, i) => "line " + i + "\n").join("");
+  mkdirSync(join(seed.dir, "src"));
+  writeFileSync(join(seed.dir, "src/old.ts"), original);
+  git(seed.dir, "add", "src");
+  git(seed.dir, "commit", "-m", "seed large file");
+  git(seed.dir, "push", "origin", "main");
+  const f = feature("api", 3);
+  freeze(f);
+  const to = "src/new\tname.ts";
+  git(f.wt, "mv", "src/old.ts", to);
+  for (const [expected, content] of [
+    [0, original],
+    [2, original.replace("line 200\n", "edited\n")],
+  ] as const) {
+    commitFile(f, to, content);
+    gh(f);
+    verifyFeature(f);
+    expect(ship(activate(f)).plan.changed_lines).toBe(expected);
+  }
+}, 30000);

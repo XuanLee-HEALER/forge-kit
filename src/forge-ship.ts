@@ -105,9 +105,10 @@ function diffScope(
 ) {
   const range = row.base_sha + ".." + head;
   const common = ["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none", "-z"];
+  const renameDiff = [...common, "--no-renames", "-M", "-l0"];
   const tokens = git(
     dir,
-    [...common, "--raw", "--no-abbrev", "--no-renames", "-M", "-l0", range, "--"],
+    [...renameDiff, "--raw", "--no-abbrev", range, "--"],
     env,
   ).split("\0");
   for (let i = 0; i < tokens.length - 1; ) {
@@ -126,11 +127,16 @@ function diffScope(
     }
   }
   let lines = 0;
-  for (const entry of git(dir, [...common, "--numstat", "--no-renames", range, "--"], env)
-    .split("\0")
-    .filter(Boolean)) {
+  const stats = git(dir, [...renameDiff, "--numstat", range, "--"], env).split("\0");
+  for (let i = 0; i < stats.length - 1; i++) {
+    const entry = stats[i];
     const m = /^(\d+)\t(\d+)\t/.exec(entry);
     if (!m) throw Error("Binary or unreadable diff in " + row.repo);
+    // With -z, a rename's count header has an empty path followed by two NUL-terminated names.
+    if (entry === m[0]) {
+      if (!stats[i + 1] || !stats[i + 2]) throw Error("Incomplete rename in " + row.repo);
+      i += 2;
+    }
     lines += Number(m[1]) + Number(m[2]);
   }
   return lines;

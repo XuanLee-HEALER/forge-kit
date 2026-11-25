@@ -1,4 +1,4 @@
-# Forge-kit v0.3 module map
+# Forge-kit v0.4 module map
 
 The four domain layers form an acyclic graph. Dependencies point from consumers toward their prerequisites. CLI entrypoints compose these layers.
 
@@ -16,10 +16,32 @@ shared    → core utilities and runtime
 | Ledger | ledger/types, transactions, schema, store, checkout | Persist and verify the per-task event chain, attachments, evidence and delivery readiness |
 | Ledger | ledger/spec, locked-tests, runbook | Bind frozen content to Git and SHA-256, check drift, manage session-scoped approvals |
 | Ledger | ledger/execution, delivery-tools, review-fallback, stats, fat-merge | Bind execution to clean revisions, verify remote PRs, conduct targeted reviews, report stats and tips, integrate FAT updates |
+| Ledger | ledger/handoff, pr, release, release-inspection | Capture handoff witnesses, verify live PR pins, assemble release runbooks and validate execution receipts before batch close |
+| Ledger | ledger/fast-track, review-range, cli | Bind and transition scope envelopes, check review coverage and dispatch ledger commands |
 | Guard | guard/evaluate, runbook-state, sql-http, infra, git-gh, tamper, spec-lock, ledger-gate | Apply a seven-second fail-closed budget, physical fuses, literal file locks and the ledger delivery gate |
 | Hooks | hooks/types, classify, runbook-prompt | Observe commits and remotely verified PR creation, restore session summaries and process whole-message human directives |
 
-The public facades are src/guard.ts, src/ledger.ts and src/ledger-hook.ts. The eleven build entrypoints in src/bin are cli, ledger, ledger-hook, guard, wb-git, dbcred, cmdfmt, lang-check, wb-verify, forge-review and forge-ship. The ship runner evaluates and redeems human-approved scopes through the ledger. PostToolUse has no package-manager, runner, manifest or review-output parser.
+SQLite schema v5 stores PR handoffs in `task_handoffs`, release batches and their pinned items in `releases` and `release_items`, and single-use authorities in `fast_track_envelopes`. The existing task event chain records approvals, state changes and delivery receipts.
+
+## CLI entrypoints
+
+Each row maps an installed `.workbench/bin` command to its build entrypoint under `src/bin/`.
+
+| Command | Entrypoint | Responsibility |
+|---|---|---|
+| forge | cli.ts | Initialize, sync, register repositories and run doctor |
+| ledger | ledger.ts | Manage tasks, evidence, handoffs, releases, runbooks and envelopes |
+| ledger-hook | ledger-hook.ts | Route lifecycle events into the ledger |
+| guard | guard.ts | Evaluate PreToolUse authorization |
+| wb-git | wb-git.ts | Inspect worktrees, integrate FAT branches and sweep |
+| dbcred | dbcred.ts | Resolve read-only or approved scoped database credentials |
+| cmdfmt | cmdfmt.ts | Format shell commands for inspection |
+| lang-check | lang-check.ts | Run repository language checks |
+| wb-verify | wb-verify.ts | Capture tool-backed checks at a clean revision |
+| forge-review | forge-review.ts | Run independent reviews and record their evidence |
+| forge-ship | forge-ship.ts | Dispatch to `src/forge-ship.ts` for scope evaluation and redemption |
+
+The v0.4 M3 graph has 68 TypeScript source files and 261 local dependency edges, zero cycles and zero layer violations. The public facades `src/guard.ts`, `src/ledger.ts` and `src/ledger-hook.ts` retain their 27, 30 and 4 exports respectively. Guard sources total 1,490 lines against a 1,500-line ceiling. The managed AGENTS template uses 7,405 of its strict 8,000-byte limit.
 
 ## Verification checklist
 

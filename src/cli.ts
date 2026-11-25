@@ -1,7 +1,9 @@
 import { loadShipPolicy } from "./config";
 import { Database } from "bun:sqlite";
 import {
+  accessSync,
   chmodSync,
+  constants,
   cpSync,
   existsSync,
   lstatSync,
@@ -80,6 +82,11 @@ export function findKitRoot(): string {
   if (existsSync(join(candidate, "kit.toml"))) {
     return realpathSync(candidate);
   }
+  const lockPath = join(candidate, "kit-lock.json");
+  if (existsSync(lockPath)) {
+    const { kit_root } = JSON.parse(readFileSync(lockPath, "utf8")) as KitLock;
+    if (kit_root && existsSync(join(kit_root, "kit.toml"))) return realpathSync(kit_root);
+  }
   throw new Error("Cannot locate forge-kit root (missing kit.toml)");
 }
 
@@ -129,6 +136,10 @@ function ensureKitBuilt(kitRoot: string, bundles: string[]): void {
   }
 }
 
+function bundleName(wrapper: string): string {
+  return (wrapper === "forge" ? "cli" : wrapper) + ".js";
+}
+
 function installManagedBins(kitRoot: string, targetRoot: string, manifest: KitManifest): void {
   ensureKitBuilt(kitRoot, manifest.managed.bin_bundles);
   const binDir = join(targetRoot, ".workbench", "bin");
@@ -143,7 +154,7 @@ function installManagedBins(kitRoot: string, targetRoot: string, manifest: KitMa
 set -euo pipefail
 DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 BUN="\${BUN_BIN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
-exec "$BUN" "$DIR/${wrapper}.js" "$@"
+exec "$BUN" "$DIR/${bundleName(wrapper)}" "$@"
 `;
     writeFileSync(wrapperPath, script, "utf8");
     chmodSync(wrapperPath, 0o755);
@@ -857,14 +868,16 @@ export function doctorWorkbench(targetDir?: string): {
   try { loadShipPolicy(root); } catch (err) { issues.push({level:"error",check:"ship-policy",message:String(err)}); }
 
   // 5. Binaries & review-agents launchers check
-  for (const binName of ["ledger", "guard", "ledger-hook", "wb-git", "dbcred", "cmdfmt", "lang-check", "wb-verify", "forge-review", "forge-ship"]) {
-    const p = join(root, ".workbench", "bin", binName);
-    if (!existsSync(p)) {
-      issues.push({
-        level: "error",
-        check: "bins",
-        message: `Missing workbench binary: .workbench/bin/${binName}`,
-      });
+  for (const binName of ["forge", "ledger", "guard", "ledger-hook", "wb-git", "dbcred", "cmdfmt", "lang-check", "wb-verify", "forge-review", "forge-ship"]) {
+    for (const [name, mode] of [[binName, constants.X_OK], [bundleName(binName), constants.R_OK]] as const) {
+      const path = join(root, ".workbench", "bin", name);
+      try {
+        if (!statSync(path).isFile()) throw Error("Expected a file");
+        accessSync(path, mode);
+      } catch {
+        const required = mode === constants.X_OK ? "executable wrapper" : "readable bundle";
+        issues.push({level: "error", check: "bins", message: "Expected " + required + ": .workbench/bin/" + name});
+      }
     }
   }
   const lockPath = join(root, ".workbench", "kit-lock.json");

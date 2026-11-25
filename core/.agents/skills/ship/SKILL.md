@@ -1,21 +1,51 @@
 ---
 name: ship
-description: >
-  按授权终点执行交付：测试环境（FAT）合并推送与验收、准备与创建 PR、生产发布核对与发布后分支清理。
-  触发词：合 fat、推 fat、上 fat、fat 验收、提 PR、进 main、上线流程、走发布流程、清理分支、ship。
+description: 交付已验证的功能至 FAT、PR 或生产，按授权选择单线程交付、PR 移交与批量发布，或使用预授权快轨。
 ---
 
 # 按授权终点交付
 
-| 阶段 | 进入条件 | 完成条件 |
-|---|---|---|
-| FAT | wrapup 通过且已授权测试环境 | 记录推送的 FAT SHA、部署结果和实际验收情况 |
-| PR | 已授权创建或更新 PR | PR 正文含账本见证，远端 HEAD 与验证 SHA 一致 |
-| Prod | 已明确授权生产且精确 Runbook 已获批 | 登记动作完成，部署、只读回查与回滚条件已核对 |
-| Cleanup | PR 已合并且部署成功 | 本次临时工作树与分支已清理，账本按终点关闭 |
+在工作台根目录执行 `export PATH="$PWD/.workbench/bin:$PATH"`。先核对任务、仓库卡、分支、终点和待交付的 SHA。
+每个挂载分支分别进入其干净功能工作树运行 `wb-verify` 和 `forge-review`；也可在根目录为两条命令都指定 `--task <task_id> --cwd <工作树绝对路径>`。
 
-1. 核对任务、仓库卡、目标分支和已验证 SHA。同任务升级终点用 ledger set-endpoint 或 reopen。
-2. **FAT**　运行 `.workbench/bin/wb-git fat-merge <repo> <branch> [--cherry-pick]`，依仓库卡选择策略。保存 feat_sha、fat_sha，跟踪部署。后端执行受影响的接口验收，按本轮运行 ID 逆序清理夹具并核验残留。真实业务记录引用夹具时保留真实记录，报告受阻的夹具 ID，验收记为失败，前端交由用户测试。实际验收通过后在功能 SHA 登记 fat 证据。
-3. **PR**　核对相对 origin/main 的差异与历史。用 `.workbench/bin/ledger tip <task_id>` 取得整行 `Ledger-Tip: <task_id>@<hash>`，附在 PR 正文末尾。标题用 type 加一句话描述，正文写改动内容、关键文件及历史影响。后续推送运行 `.workbench/bin/ledger pr-sync <task_id> --repo <repo>` 更新远端证据。授权终点为 PR 时交给用户合并。
-4. **Prod**　获取最新 origin/main，核对发布范围只含授权改动。发布 tag 前用 `git merge-base --is-ancestor <sha> origin/main` 确认目标已合入。列明仓库、解析后的目标 SHA、PR、annotated tag、SQL 文件及主机、准确的 kubectl 命令、回滚方案和新旧版本兼容性。通过 `.workbench/bin/ledger runbook create` 登记精确动作，向用户展示上述清单及生成的编号。用户须在主会话**单独发送整句** `批准 <runbook_id>` 或 `approve <runbook_id>`，不附说明或标点。仅在签发会话及有效期内执行登记操作。数据库默认用只读 `.workbench/bin/dbcred <env>`，批准迁移才用 `.workbench/bin/dbcred <env> --rw --runbook <id>`。监测部署、错误日志及只读核验结果，再执行 `ledger runbook complete <runbook_id>`。若关联 prod 任务，以部署回查的实际结果运行 `ledger record <task_id> --kind prod --status <pass|fail> --repo <repo> --branch <branch> --sha <sha> --summary "<验收结果>"`。
-5. **Cleanup**　用 wb-git sweep 或按范围删除已合入的本地临时分支和工作树，核对 git worktree list。解绑已废弃的临时挂载，运行 ledger close，汇报实际交付记录。
+| 当前情况 | 模式 | 谁负责收尾 |
+|---|---|---|
+| 一个线程负责本次功能的全部交付 | A 单线程 | 功能线程验收到授权终点并关账 |
+| 功能线程在 PR 停止，多个任务一起发版 | B 移交与发布列车 | 发布线程按批次核验并关账 |
+| 操作者愿意提前批准冻结规格内的有限改动 | C 预授权快轨 | 同一会话兑现一次性授权，按终点接续 |
+
+## A · 单线程交付
+
+1. 在干净工作树运行 `wb-verify` 和 `forge-review`，核对证据对应当前 SHA。
+2. FAT 用 `wb-git fat-merge <repo> <branch> --task <task_id>`。记录功能与 FAT SHA，跟踪部署，验收后在功能 SHA 登记 FAT 结果。
+3. PR 核对目标分支、推送并创建 PR，正文附 `ledger tip <task_id>` 的见证。对每个挂载分支运行 `ledger pr-sync <task_id> --repo <repo> --branch <branch>` 核对远端 HEAD。
+4. 生产用 `ledger runbook create` 登记精确 PR、tag/SHA、SQL 主机与文件或 kubectl 命令，向用户展示范围及回滚方案。用户在主会话单独发送 `批准 <rb-id>`。
+5. 执行已批准动作，跟踪部署并只读回查。完成运行手册，按功能 SHA 用 `ledger record` 登记实际验收结果。
+
+**完成条件**　授权终点的证据齐全，`ledger close <task_id>` 成功。
+
+## B · PR 移交与批量发布
+
+**功能线程**
+
+1. 运行 `wb-verify`、`forge-review`，推送并创建 PR。用 `ledger pr-sync <task_id> --repo <repo> --branch <branch>` 逐个同步挂载分支的 PR。
+2. 执行 `ledger handoff <task_id> [--sql <host>:<path>] [--rollback "<note>"]`，将输出的 `Forge-Task`、`Verified-Head`、`Ledger-Tip` 三条见证贴入对应 PR。
+3. 状态为 `HANDED_OFF` 后停止。若需按评审修改代码，先 `ledger resume <task_id>`，再验证新 HEAD 并重新移交。
+
+**发布线程**
+
+1. 用 `ledger release create --title "<title>" --from-handoffs` 选取全部尚未被发布批次占用的 `HANDED_OFF` 任务。要指定批次成员，将 `--from-handoffs` 换成 `--tasks <id1>,<id2>`。再运行 `ledger release verify <rel-id>`。复用已移交的验证证据，通过实时 `gh pr view` 核对 SHA；出现 `STALE_PR` 时停止发布。
+2. 用 `ledger release runbook <rel-id> [--tag <repo>:<tag>:<sha>]` 将 PR、移交的 SQL 和发布标签汇入同一运行手册。用户单独发送 `批准 <rb-id>`。
+3. 执行输出的固定 HEAD 合并命令及获批动作。对 SQL、tag、kubectl 在对应任务的移交 SHA 登记 prod 回执，元数据含 `runbook_id` 和 `execution_actions` 给出的 `action_id`；生产任务另记部署验收。
+4. PR 远端合并后，在每个相关仓库执行 `git fetch origin` 更新目标引用，再执行 `ledger runbook complete <rb-id>` 和 `ledger release complete <rel-id>`。批次关闭后用 `wb-git sweep` 预览清理范围。
+
+**完成条件**　功能线程止于有见证的移交；发布线程完成批次，所有子任务原子关闭。
+
+## C · 预授权快轨
+
+1. 执行 `ledger freeze <task_id>`，按只读策略 `.workbench/ship-policy.yaml` 选择终点和路径。运行 `ledger fast-track prepare <task_id> --to <pr|fat|prod> --paths '<globs>' [--ttl <min>]`。
+2. 用户在主会话单独发送 `快轨批准 <ft-id>` 或 `fast-track approve <ft-id>`。`快轨撤销 <ft-id>` 可撤销 `PENDING` 或 `ACTIVE` 信封。生产信封一旦 `REDEEMED`，用 `ledger runbook revoke <rb-id>` 撤销运行手册中尚未执行的生产动作。
+3. 编码后在干净工作树运行 `wb-verify` 和 `forge-review`。PR 或生产终点须先推送已验证的 HEAD，创建或更新对应 PR，让远端 HEAD 与本地一致；生产还须等待必需 CI 通过。
+4. 评估前在各相关功能工作树执行 `git fetch origin` 更新目标引用。在批准会话执行 `forge-ship evaluate --envelope <ft-id>`，得到 `ELIGIBLE` 后运行 `forge-ship run --envelope <ft-id>`。越界、禁区、改动量超限、规格漂移或生产 CI 失败会进入 `DEGRADED`，交由人工接管；过期状态为 `EXPIRED`。
+
+**完成条件**　信封为 `REDEEMED`。FAT 检查推送回执，PR 自动移交至模式 B，停止前将返回的 `trailers`（`Forge-Task`、`Verified-Head`、`Ledger-Tip`）贴入对应 PR 正文；生产生成精确 SHA 的已批准运行手册，按其执行并记录验收。

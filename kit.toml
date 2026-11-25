@@ -28,6 +28,7 @@ copied_files = [
 ]
 
 bin_bundles = [
+  "cli.js",
   "ledger.js",
   "guard.js",
   "ledger-hook.js",
@@ -41,6 +42,7 @@ bin_bundles = [
 ]
 
 bin_wrappers = [
+  "forge",
   "ledger",
   "guard",
   "ledger-hook",

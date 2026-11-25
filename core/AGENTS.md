@@ -23,7 +23,7 @@
 | investigation | 查证并汇报根因、结论或方案，等确认再实施 |
 | local | 完成实现、适用验证与收尾，汇报证据和缺口 |
 | fat | 本地通过后用 `wb-git fat-merge <repo> <branch>` 合入测试分支、推送并按授权验收 |
-| pr | 创建或更新目标 PR，后续推送用 `ledger pr-sync <task_id> --repo <仓>` 核验最新 HEAD，汇报后停止；main PR 由用户合并 |
+| pr | 创建或更新 PR，推送用 `ledger pr-sync <task_id> --repo <仓> --branch <branch>` 核验 HEAD，汇报后停止；main PR 由用户合并 |
 | prod | 核对目标 SHA、证据和依赖，按 ship 发布，不可逆操作经人工确认 |
 
 按实际风险选深度。边界清晰的局部小修或文档用 `targeted`，独立定向评审并运行受影响的构建、测试或生成核验。资金、权限、协议、迁移、事务并发、跨模块变更或风险未排除用 `full`，执行 `wrapup` 完整收尾。
@@ -41,7 +41,7 @@
 - [自律][凭据] 只查问题所在环境；测试问题不访问 prod，线上结论用 prod 事实。凭据只展示键名或脱敏摘要。dbcred 默认只读，生产写凭据用 `dbcred <env> --rw --runbook <id>`。
 - [平台] 数据库权限、Kubernetes RBAC（不给 secrets 读取权）、GitHub 分支和 tag 规则及必需状态检查由部署方落实。
 - [hook] PreToolUse 检查可识别的 prod 写操作、集群变更、secret、端口转发、受保护分支与 tag、PR 合并及账本直接修改。发版先用 `ledger runbook create` 登记精确 tag+SHA、PR、迁移 SQL 或 kubectl 命令。
-- [hook][自律] 用户在主会话**单独回复整句** `批准 <runbook_id>` 或 `approve <runbook_id>`，不附带其他文字或标点。多个编号用空格分隔。批准仅对登记项、会话和有效期生效。禁止批量推 tag、强推 main、读取 secret。
+- [hook][自律] 用户在主会话**单独回复整句** `批准 <rb-id>` 或 `approve <runbook_id>`，不附带其他文字或标点。多个编号用空格分隔。批准仅对登记项、会话和有效期生效。禁止批量推 tag、强推 main、读取 secret。
 
 ## 任务账本与冻结
 
@@ -49,6 +49,11 @@
 - full 周期的 ssot.md、tech-spec.md、test-spec.md 默认在 `.workbench/specs/<task_id>/`，用户主动要求才移入业务仓。定稿用 freeze 保存摘要和锁定测试，交付时核对工作树与 Git；变更须用户确认后 amend，按影响重跑下游并重新 freeze。
 - [hook] commit、push、PR 前校验账本绑定及适用证据。完整深度须静态检查、执行验证和核心评审通过，无失败角色；四层覆盖由 wrapup 推进，在 status 审计。极小文档、注释、typo 可用 exempt。新会话或压缩后 hook 回注摘要。新验证与评审由执行器写入 source=tool；hook 记录提交与经远端核验的 PR，手工验收注明来源。
 - 账本哈希链用于一致性检查。用 `ledger stats` 查看汇总，用 `ledger tip <task_id>` 生成 PR 正文的 Ledger-Tip 见证；同一系统用户的写权限仍由操作系统控制。
+
+## 交付方式
+
+- 单线程交付按授权终点验收并关账。分线程发布时，功能线程执行 `ledger handoff <task_id>`，将见证贴入 PR 后止于 `HANDED_OFF`；需改代码先 `ledger resume <task_id>`。发布线程用 `ledger release` 组批、核验远端 SHA、登记回执并批量关账。
+- 快轨由操作者维护写保护的 `.workbench/ship-policy.yaml`。冻结后用 `ledger fast-track prepare` 定范围，用户在主会话单独发送 `快轨批准 <ft-id>` 或 `快轨撤销 <ft-id>`。批准会话用 `forge-ship evaluate` 核验、用 `forge-ship run` 兑现；降级交给人工接管。操作顺序见 ship 技能。
 
 ## 调度与流程入口
 

@@ -1,6 +1,7 @@
 import { isolateHome } from "./helpers/hermetic";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -126,6 +127,82 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const doc = doctorWorkbench(res.root);
     expect(doc.ok).toBe(true);
     expect(doc.issues.length).toBe(0);
+  });
+
+  test("installed forge restores managed shipping files and diagnoses policy and wrapper failures", () => {
+    const kit = join(import.meta.dir, "..");
+    const root = join(target, "bench");
+    const bin = join(root, ".workbench/bin");
+    const run = (exe: string, args: string[], exitCode = 0) => {
+      const result = Bun.spawnSync([exe, ...args], {
+        cwd: target,
+        env: { ...process.env, BUN_BIN: process.execPath },
+      });
+      expect(result.exitCode, result.stderr.toString()).toBe(exitCode);
+      return JSON.parse(result.stdout.toString());
+    };
+    run(join(kit, "bin/forge"), ["init", root, "--skip-review-agents"]);
+    for (const name of [
+      "forge",
+      "ledger",
+      "ledger-hook",
+      "guard",
+      "wb-git",
+      "dbcred",
+      "cmdfmt",
+      "lang-check",
+      "wb-verify",
+      "forge-review",
+      "forge-ship",
+    ]) {
+      expect(lstatSync(join(bin, name)).mode & 0o111, name).toBeTruthy();
+    }
+    const forge = join(bin, "forge");
+    run(forge, ["init", join(target, "second"), "--skip-review-agents"]);
+    const policy = join(root, ".workbench/ship-policy.yaml");
+    const defaults = readFileSync(join(kit, "templates/ship-policy.yaml"), "utf8");
+    expect(readFileSync(policy, "utf8")).toBe(defaults);
+    const custom = defaults.replace("enabled: true", "enabled: false");
+    writeFileSync(policy, custom);
+    const agents = join(root, "AGENTS.md"),
+      skill = join(root, ".agents/skills/ship/SKILL.md"),
+      bundle = join(bin, "forge-ship.js");
+    const rendered = readFileSync(agents, "utf8");
+    expect(rendered).toContain("HANDED_OFF");
+    for (const path of [agents, skill, bundle]) writeFileSync(path, "stale");
+    run(forge, ["sync", root]);
+    expect(readFileSync(agents, "utf8")).toBe(rendered);
+    expect(readFileSync(skill, "utf8")).toBe(readFileSync(join(kit, "core/.agents/skills/ship/SKILL.md"), "utf8"));
+    expect(readFileSync(bundle).equals(readFileSync(join(kit, "dist/forge-ship.js")))).toBe(true);
+    expect(readFileSync(policy, "utf8")).toBe(custom);
+    expect(run(forge, ["doctor", root, "--json"]).ok).toBe(true);
+    writeFileSync(policy, "fast_track: {}");
+    expect(run(forge, ["doctor", root, "--json"], 1).issues).toContainEqual(
+      expect.objectContaining({ check: "ship-policy" }),
+    );
+    writeFileSync(policy, custom);
+    chmodSync(join(bin, "forge-ship"), 0o644);
+    expect(run(forge, ["doctor", root, "--json"], 1).issues).toContainEqual(
+      expect.objectContaining({
+        check: "bins",
+        message: expect.stringContaining("executable wrapper: .workbench/bin/forge-ship"),
+      }),
+    );
+    chmodSync(join(bin, "forge-ship"), 0o755);
+    rmSync(bundle);
+    expect(run(forge, ["doctor", root, "--json"], 1).issues).toContainEqual(
+      expect.objectContaining({
+        check: "bins",
+        message: expect.stringContaining("readable bundle: .workbench/bin/forge-ship.js"),
+      }),
+    );
+    rmSync(policy);
+    rmSync(join(bin, "forge-ship"));
+    const missing = run(forge, ["doctor", root, "--json"], 1).issues;
+    expect(missing).toContainEqual(expect.objectContaining({ check: "ship-policy" }));
+    expect(missing).toContainEqual(
+      expect.objectContaining({ check: "bins", message: expect.stringContaining("forge-ship") }),
+    );
   });
 
   test("doctor catches plaintext API keys and absolute symlinks", () => {
