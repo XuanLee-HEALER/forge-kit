@@ -35,20 +35,28 @@ export function runProcess(
   try {
     const remaining = (verificationDeadline.getStore() ?? Infinity) - Date.now();
     if (remaining <= 0) throw Error("Verification timed out");
-    const timeout = opts?.timeoutMs ?? 10000;
+    const requested = opts?.timeoutMs ?? 10000;
+    const timeout = Number.isFinite(remaining) ? Math.min(requested || remaining, remaining) : requested;
     const proc = Bun.spawnSync(argv, {
       cwd: opts?.cwd,
       env: opts?.env ?? process.env,
       stdout: "pipe",
       stderr: "pipe",
-      timeout: Number.isFinite(remaining) ? Math.min(timeout || remaining, remaining) : timeout,
+      timeout,
     });
     opts?.onOutput?.(proc.stdout, proc.stderr);
-    return {
-      code: proc.exitCode ?? 1,
-      stdout: proc.stdout.toString(),
-      stderr: proc.stderr.toString(),
-    };
+    const stderr = proc.stderr.toString();
+    if (proc.exitedDueToTimeout || proc.signalCode) {
+      const cause = proc.exitedDueToTimeout
+        ? "Process timed out after " + timeout + " ms"
+        : "Process terminated by " + proc.signalCode;
+      return {
+        code: proc.exitCode || 1,
+        stdout: proc.stdout.toString(),
+        stderr: stderr ? cause + ": " + stderr : cause,
+      };
+    }
+    return { code: proc.exitCode ?? 1, stdout: proc.stdout.toString(), stderr };
   } catch (err) {
     return {
       code: 1,

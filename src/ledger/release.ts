@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
 import {
   currentHandoff,
+  availableHandoffs,
   detail,
   aggregate,
   invalidate,
@@ -36,12 +37,17 @@ function create(ledger: Ledger, args: string[]) {
     [values["from-handoffs"], values.tasks, values.prs].filter(Boolean).length > 1
   )
     throw Error("Expected --title and at most one of --from-handoffs, --tasks, --prs");
-  const ids = ledger.db
-    .query<{ task_id: string }, []>("SELECT task_id FROM tasks WHERE status='HANDED_OFF' ORDER BY task_id")
-    .all()
-    .map((t) => t.task_id);
   const wanted = new Set(values.prs?.split(","));
-  const selected = values.tasks ? [...new Set(values.tasks.split(","))].sort() : ids;
+  const selected = values.tasks
+    ? [...new Set(values.tasks.split(","))].sort()
+    : values.prs
+      ? ledger.db
+          .query<{ task_id: string }, []>(
+            "SELECT task_id FROM tasks WHERE status='HANDED_OFF' ORDER BY task_id",
+          )
+          .all()
+          .map((t) => t.task_id)
+      : availableHandoffs(ledger);
   const snapshots = selected
     .map((id) => currentHandoff(ledger, id))
     .filter((s) => {
@@ -190,12 +196,13 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
       requireActionReceipts(ledger, id, rb);
       for (const item of prodItems) {
         const last = ledger.db
-          .query<{ status: string }, [string, string, string, string]>(
+          .query<{ status: string }, [string, string, string, string, string]>(
             `SELECT json_extract(payload_json,'$.status') AS status FROM events WHERE task_id=?
-           AND canonical_repo(repo)=canonical_repo(?) AND (branch=? OR branch IS NULL) AND sha=? AND event_type='EVIDENCE_CAPTURED'
+           AND canonical_repo(repo)=canonical_repo(?) AND branch=? AND sha=? AND event_type='EVIDENCE_CAPTURED'
+           AND json_extract(payload_json,'$.release_id')=?
            AND json_extract(payload_json,'$.kind')='prod' AND json_type(payload_json,'$.meta.action_id') IS NULL AND json_extract(payload_json,'$.status') IN ('pass','fail') ORDER BY seq DESC LIMIT 1`,
           )
-          .get(item.task_id, item.repo, item.branch, item.expected_head_sha);
+          .get(item.task_id, item.repo, item.branch, item.expected_head_sha, id);
         if (last?.status !== "pass")
           throw Error(
             "Missing SHA-bound production delivery evidence for " + item.repo + "@" + item.expected_head_sha,

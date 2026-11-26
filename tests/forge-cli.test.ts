@@ -2,6 +2,7 @@ import { isolateHome } from "./helpers/hermetic";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -203,6 +204,46 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     expect(missing).toContainEqual(
       expect.objectContaining({ check: "bins", message: expect.stringContaining("forge-ship") }),
     );
+  });
+
+  test("one source-checkout sync upgrades an older workbench even with a stale dist CLI", () => {
+    const kit = join(target, "kit"),
+      bench = join(target, "bench");
+    const source = join(import.meta.dir, "..");
+    mkdirSync(kit);
+    for (const item of ["bin", "src", "core", "templates", "kit.toml", "package.json", "dist"])
+      cpSync(join(source, item), join(kit, item), { recursive: true });
+    symlinkSync(join(source, "node_modules"), join(kit, "node_modules"));
+    initWorkbench({ targetDir: bench, kitRoot: kit, skipReviewAgents: true });
+    const wb = join(bench, ".workbench"),
+      lockPath = join(wb, "kit-lock.json");
+    const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+    lock.kit_version = "0.3.0";
+    writeFileSync(lockPath, JSON.stringify(lock));
+    writeFileSync(join(bench, "AGENTS.local.md"), "operator edits");
+    for (const file of ["ship-policy.yaml", "bin/forge", "bin/forge-ship", "bin/forge-ship.js"])
+      rmSync(join(wb, file));
+    // A v0.3 checkout has a built CLI and no forge-ship bundle. This sentinel makes accidental old-code dispatch observable.
+    writeFileSync(join(kit, "dist/cli.js"), 'throw Error("stale management CLI");');
+    rmSync(join(kit, "dist/forge-ship.js"));
+    const run = (exe: string, ...args: string[]) =>
+      Bun.spawnSync([exe, ...args], { cwd: kit, env: { ...process.env, BUN_BIN: process.execPath } });
+    const sync = run(join(kit, "bin/forge"), "sync", bench);
+    expect(sync.exitCode, sync.stderr.toString()).toBe(0);
+    expect(JSON.parse(readFileSync(lockPath, "utf8")).kit_version).toBe(
+      (Bun.TOML.parse(readFileSync(join(kit, "kit.toml"), "utf8")) as { kit: { version: string } }).kit
+        .version,
+    );
+    expect(readFileSync(join(bench, "AGENTS.local.md"), "utf8")).toBe("operator edits");
+    expect(readFileSync(join(wb, "ship-policy.yaml"), "utf8")).toBe(
+      readFileSync(join(kit, "templates/ship-policy.yaml"), "utf8"),
+    );
+    const doctor = run(join(wb, "bin/forge"), "doctor", bench, "--json");
+    expect(doctor.exitCode, doctor.stderr.toString()).toBe(0);
+    expect(JSON.parse(doctor.stdout.toString()).ok).toBe(true);
+    const ship = run(join(wb, "bin/forge-ship"), "unknown");
+    expect(ship.exitCode).toBe(1);
+    expect(ship.stderr.toString() + ship.stdout.toString()).toContain("Expected forge-ship");
   });
 
   test("doctor catches plaintext API keys and absolute symlinks", () => {

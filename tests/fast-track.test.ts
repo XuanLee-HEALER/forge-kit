@@ -69,19 +69,23 @@ function commitFile(f: Feature, path: string, content = "export const a=1;") {
   f.head = git(f.wt, "rev-parse", "HEAD");
   remote(f.n, { headRefOid: f.head });
 }
-function gh(f: Feature) {
+function gh(f: Feature, firstViewDelayMs = 0) {
   writeFileSync(join(root, "checks"), JSON.stringify([{ name: "CI", bucket: "pass" }]));
   writeFileSync(join(root, "target-" + f.repo), f.base);
   remote(f.n, { baseRefOid: f.base, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
-  writeFileSync(
-    join(root, "bin/gh"),
-    '#!/usr/bin/env bun\nif(process.argv[2]==="api") await Bun.write(' +
-      JSON.stringify(join(root, "api-call")) +
-      ', process.argv[5]);const key=process.argv[2]==="api"?"target-"+process.argv[5].split("/")[2]:process.argv[3]==="checks"?"checks":"pr-"+process.argv[4].split("/").pop();console.log(await Bun.file(' +
-      JSON.stringify(root) +
-      '+"/"+key).text());',
-    { mode: 0o755 },
-  );
+  const script = `#!/usr/bin/env bun
+const [group, command, selector, endpoint] = process.argv.slice(2);
+const root = ${JSON.stringify(root)};
+const marker = root + "/first-view";
+if (command === "view" && ${firstViewDelayMs} && !await Bun.file(marker).exists()) {
+  await Bun.write(marker, "");
+  await Bun.sleep(${firstViewDelayMs});
+}
+if (group === "api") await Bun.write(root + "/api-call", endpoint);
+const key = group === "api" ? "target-" + endpoint.split("/")[2] :
+  command === "checks" ? "checks" : "pr-" + selector.split("/").pop();
+console.log(await Bun.file(root + "/" + key).text());`;
+  writeFileSync(join(root, "bin/gh"), script, { mode: 0o755 });
 }
 test("v4 migrates additively with release history, FTS and valid FK/hash chains", () => {
   const path = join(root, "old.db"),
@@ -265,7 +269,7 @@ for (const endpoint of ["pr", "fat", "prod"] as const)
       freeze(f);
       commitFile(f, "src/new.ts");
       if (endpoint === "prod") commitFile(f, "src/second.ts");
-      gh(f);
+      gh(f, endpoint === "pr" ? 3500 : 0);
       if (endpoint === "prod")
         writeFileSync(
           policy(),

@@ -1,6 +1,6 @@
 import { appendEventInTx } from "../src/ledger/transactions";
 import { test, expect } from "bun:test";
-import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { evaluatePreToolUse } from "../src/guard";
 import { handleLedgerHook } from "../src/ledger-hook";
@@ -285,4 +285,143 @@ test("slow local Git fails approval within the hook budget", () => {
   expect(approve(book)).toContain("未生效");
   expect(Date.now() - start).toBeLessThan(6500);
   expect(ledger.getRunbook(book)?.status).toBe("PENDING");
+}, 30000);
+
+test("ordinary handoff requires passing executable evidence on each same-SHA branch", () => {
+  const a = feature("api", 1),
+    b = feature("api", 3);
+  writeFileSync(
+    join(a.wt, "receipt.test.ts"),
+    [
+      'import { expect, test } from "bun:test";',
+      'test("receipt", () => {',
+      '  expect(process.env.FORGE_REGRESSION_FAIL).not.toBe("yes");',
+      "});",
+    ].join("\n"),
+  );
+  git(a.wt, "add", ".");
+  git(a.wt, "commit", "-m", "shared feature");
+  a.head = git(a.wt, "rev-parse", "HEAD");
+  git(b.wt, "reset", "--hard", a.head);
+  b.head = a.head;
+  ledger.cancelTask({ task_id: b.task, reason: "combine attachments" });
+  b.task = a.task;
+  ledger.attachRepo({
+    task_id: a.task,
+    repo: b.repo,
+    branch: b.branch,
+    worktree: b.wt,
+    base_sha: b.base,
+    head_sha: b.head,
+  });
+  remote(a.n, { headRefOid: a.head });
+  remote(b.n, { headRefOid: b.head });
+  sync(a);
+  const failed = Bun.spawnSync(
+    [
+      process.execPath,
+      join(import.meta.dir, "../src/bin/wb-verify.ts"),
+      "--cwd",
+      a.wt,
+      "--task",
+      a.task,
+      "--kind",
+      "test",
+      "--",
+      process.execPath,
+      "test",
+    ],
+    { cwd: root, env: { ...process.env, FORGE_WORKBENCH_ROOT: root, FORGE_REGRESSION_FAIL: "yes" } },
+  );
+  expect(failed.exitCode).toBe(1);
+  sync(b);
+  expect(rejects("handoff", a.task)).toContain("latest test failed");
+  verifyFeature(a);
+  expect(cmd("handoff", a.task).items).toHaveLength(2);
+}, 30000);
+
+test("automatic batches and session hints select only unreserved handoffs", () => {
+  const a = feature("api", 1),
+    b = feature("web", 3);
+  const first = train(a);
+  sync(b);
+  cmd("handoff", b.task);
+  const context = () => handleLedgerHook(root, { hook_event_name: "SessionStart", cwd: root }).sessionContext;
+  expect(context()).toContain(
+    'Handoffs awaiting release: 1 (run ledger release create --from-handoffs --title "<title>")',
+  );
+  expect(rejects("release", "create", "--tasks", a.task, "--title", "dup")).toContain(first);
+  expect(rejects("release", "create", "--prs", "api#1", "--title", "dup")).toContain(first);
+  const second = cmd("release", "create", "--from-handoffs", "--title", "second");
+  expect(second.items.map((i: { task_id: string }) => i.task_id)).toEqual([b.task]);
+  expect(context() ?? "").not.toContain("Handoffs awaiting release");
+  expect(rejects("release", "create", "--from-handoffs", "--title", "empty")).toContain("No handoffs");
+  cmd("release", "cancel", first);
+  expect(cmd("release", "create", "--from-handoffs", "--title", "requeued").items[0].task_id).toBe(a.task);
+}, 30000);
+
+test("release merge authorization follows the pinned feature worktree origin", () => {
+  const f = feature("api", 1);
+  git(f.dir, "config", "extensions.worktreeConfig", "true");
+  git(f.dir, "config", "--unset-all", "remote.origin.url");
+  git(f.dir, "config", "--worktree", "remote.origin.url", "https://github.com/other/api.git");
+  git(f.wt, "config", "--worktree", "remote.origin.url", "https://github.com/acme/api.git");
+  const id = train(f);
+  const gh = join(root, "bin/gh");
+  renameSync(gh, gh + "-fixture");
+  writeFileSync(gh, '#!/bin/sh\nsleep 3.5\nexec "$0-fixture" "$@"\n', { mode: 0o755 });
+  expect(cmd("release", "verify", id).status).toBe("VERIFIED");
+  renameSync(gh + "-fixture", gh);
+  git(f.wt, "switch", "-c", "next-task");
+  const book = cmd("release", "runbook", id);
+  expect(approve(book.runbook_id)).toContain(book.runbook_id);
+  const command = book.merge_commands[0];
+  const gate = (cwd: string, cmd = command, sid = "fixture") =>
+    evaluatePreToolUse(root, {
+      hook_event_name: "PreToolUse",
+      cwd,
+      session_id: sid,
+      tool_name: "Bash",
+      tool_input: { command: cmd },
+    });
+  expect(gate(f.wt)).toBeNull();
+  expect(gate(root)).toBeNull();
+  expect(gate(f.dir)).toBeTruthy();
+  expect(gate(f.wt, command, "other")).toBeTruthy();
+  expect(gate(f.wt, command.replace(f.head, "a".repeat(40)))).toBeTruthy();
+  remote(f.n, { baseRefName: "retargeted" });
+  expect(gate(f.wt)).toBeTruthy();
+}, 30000);
+
+test("production acceptance from an older handoff or reservation cannot close a new release", () => {
+  const f = feature("web", 2),
+    old = train(f);
+  recordProd(f);
+  cmd("resume", f.task);
+  expect(cmd("release", "status", old).status).toBe("CANCELLED");
+  cmd("handoff", f.task);
+  const reserve = () => cmd("release", "create", "--from-handoffs", "--title", "deploy").release_id;
+  const cancelled = reserve();
+  recordProd(f);
+  cmd("release", "cancel", cancelled);
+  const next = reserve();
+  merge(f);
+  cmd("release", "verify", next);
+  const book = cmd("release", "runbook", next).runbook_id;
+  approve(book);
+  cmd("runbook", "complete", book);
+  // Candidate builds recorded a SHA but no release identity. Even a later timestamp is ambiguous.
+  appendEventInTx(ledger.db, {
+    task_id: f.task,
+    event_type: "EVIDENCE_CAPTURED",
+    actor: "agent",
+    repo: f.repo,
+    branch: f.branch,
+    sha: f.head,
+    ts: "2099-01-01T00:00:00.000Z",
+    payload: { kind: "prod", status: "pass", source: "manual" },
+  });
+  expect(rejects("release", "complete", next)).toContain("production delivery evidence");
+  recordProd(f);
+  expect(cmd("release", "complete", next).status).toBe("COMPLETED");
 }, 30000);

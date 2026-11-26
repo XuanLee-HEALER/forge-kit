@@ -2,7 +2,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUN="${BUN_BIN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
-if [[ -f "$ROOT/dist/cli.js" ]]; then
-  exec "$BUN" "$ROOT/dist/cli.js" "$@"
+# Source checkouts dispatch with the current sync rules even when dist predates a kit update.
+if [[ -f "$ROOT/src/bin/cli.ts" && ( "${1:-}" == sync || ! -f "$ROOT/dist/cli.js" ) ]]; then
+  exec "$BUN" "$ROOT/src/bin/cli.ts" "$@"
 fi
-exec "$BUN" "$ROOT/src/bin/cli.ts" "$@"
+exec "$BUN" "$ROOT/dist/cli.js" "$@"

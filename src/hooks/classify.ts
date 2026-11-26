@@ -1,7 +1,7 @@
 import { verifiedPr } from "../ledger/pr";
 import { redactSecrets } from "../cmdfmt";
 import { findWorkbenchRoot, loadWorkbenchConfig } from "../config";
-import { getHeadAndParents, locateRepo, runGit } from "../git";
+import { getHeadAndParents, locateRepo, runGit, withinProcessDeadline } from "../git";
 import {
   emitPostCompactMessage,
   emitSessionStartContext,
@@ -192,6 +192,7 @@ export function handleLedgerHook(
 
   // FAST PATH for PostToolUse: do NOT open SQLite for non-shell or non-dev commands!
   if (evName === "PostToolUse") {
+    const prDeadline = Date.now() + 2500;
     const cmd = extractShellCommand(input);
     if (!cmd) return { recorded: 0 };
     const registeredRepos = new Set(cfg.repos);
@@ -280,7 +281,12 @@ export function handleLedgerHook(
         if (item.kind === "pr" && item.status === "pass") {
           if (!item.prUrl || effectiveDetached || !effectiveSha) continue;
           try {
-            const pr = verifiedPr(loc.checkoutDir, effectiveBranch, effectiveSha, item.prUrl, { ...process.env, ...item.ghEnv });
+            const pr = withinProcessDeadline(prDeadline, () =>
+              verifiedPr(loc.checkoutDir, effectiveBranch, effectiveSha!, item.prUrl!, {
+                ...process.env,
+                ...item.ghEnv,
+              }),
+            );
             item.meta = { pr_url: pr.url, pr_head_oid: pr.headRefOid };
           }
           catch { continue; }

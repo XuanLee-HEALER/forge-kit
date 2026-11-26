@@ -3,7 +3,11 @@ import { runGit } from "../git";
 import { resolveTaskCheckout } from "./checkout";
 import type { TaskRepoRecord } from "./types";
 
-export function coversReviewBase(root: string, attachment: TaskRepoRecord, base: unknown): boolean {
+export function coversReviewBase(
+  root: string,
+  attachment: Pick<TaskRepoRecord, "repo" | "branch" | "worktree" | "base_sha">,
+  base: unknown,
+): boolean {
   if (!attachment.base_sha) return false;
   if (typeof base !== "string" || !/^[a-f0-9]{7,64}$/i.test(base)) return false;
   if (base === attachment.base_sha) return true;

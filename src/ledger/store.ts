@@ -1,4 +1,9 @@
-import { currentHandoff, productionActions, actionMatchesItem } from "./release-inspection";
+import {
+  availableHandoffs,
+  currentHandoff,
+  productionActions,
+  actionMatchesItem,
+} from "./release-inspection";
 import { canonicalRepoPath } from "../config";
 import { prRemoteRefs, reachableFromRefs, resolveTaskCheckout } from "./checkout";
 import { coversReviewBase, reviewMeetsFloor } from "./review-range";
@@ -587,6 +592,7 @@ export class Ledger {
       // Deployment can happen after PR handoff. Only the pinned production receipt
       // may extend this chain without resuming development.
       let prodReceipt = false;
+      let releaseId: string | undefined;
       if (task.status === "HANDED_OFF" && params.kind === "prod" && params.repo && params.branch && params.sha) {
         const repo = canonicalRepoPath(this.workbenchRoot,params.repo);
         const snapshot = currentHandoff(this,task.task_id);
@@ -601,7 +607,14 @@ export class Ledger {
           if (!item || !linked || book?.status !== "APPROVED" || !action || !actionMatchesItem(snapshot,item,action))
             throw Error("Production receipt must match an approved release action and handoff SHA");
           prodReceipt = true;
-        } else prodReceipt = !!item && task.endpoint === "prod";
+        } else if (item && task.endpoint === "prod") {
+          prodReceipt = true;
+          releaseId = this.db.query<{ release_id: string }, [string, string]>(
+            `SELECT r.release_id FROM releases r JOIN release_items i USING(release_id)
+             WHERE i.task_id=? AND i.ledger_tip=? AND r.status IN ('DRAFT','VERIFIED','APPROVED')
+             LIMIT 1`,
+          ).get(task.task_id, snapshot.ledger_tip)?.release_id;
+        }
       }
       if (task.status !== "OPEN" && !prodReceipt) {
         throw new Error(`Cannot record evidence on ${task.status} task`);
@@ -626,6 +639,7 @@ export class Ledger {
           status: params.status,
           source: params.source ?? "manual",
           summary: params.summary,
+          ...(releaseId && { release_id: releaseId }),
           ...(normalizedMeta ? { meta: normalizedMeta } : {}),
         },
       });
@@ -902,13 +916,14 @@ export class Ledger {
 
     const events = this.db
       .query(
-        `SELECT seq, actor, branch, payload_json FROM events
-         WHERE task_id = ? AND event_type = 'EVIDENCE_CAPTURED'
-           AND canonical_repo(repo) = canonical_repo(?) AND sha = ?
+        `SELECT seq, actor, branch, event_type, payload_json FROM events
+         WHERE task_id = ? AND canonical_repo(repo) = canonical_repo(?)
+           AND (event_type IN ('REPO_ATTACHED','REPO_DETACHED') OR (event_type='EVIDENCE_CAPTURED' AND sha=?))
          ORDER BY seq ASC`,
       )
       .all(params.task_id, params.repo, params.head_sha) as Array<{
       seq: number;
+      event_type: string;
       branch: string | null;
       actor: string;
       payload_json: string;
@@ -917,38 +932,78 @@ export class Ledger {
     const floors = specState.evidence_floor_seq;
     const reviewFloor = this.db.query("SELECT ts FROM events WHERE task_id = ? AND seq = ?")
       .get(params.task_id, floors.review) as { ts: string } | null;
-    const latestByKind = new Map<string, string>();
-    const attachments = this.getTaskRepos(params.task_id).filter(r => r.repo === params.repo && (!params.branch || r.branch === params.branch));
+    const repoAttachments = this.getTaskRepos(params.task_id).filter((r) => r.repo === params.repo);
+    const attachments = repoAttachments.filter((r) =>
+      params.branch
+        ? r.branch === params.branch
+        : repoAttachments.length === 1 || r.head_sha === params.head_sha,
+    );
+    const unresolved = !params.branch && repoAttachments.length > 1 && attachments.length !== 1;
+    if (unresolved) missing.push("Specify the attached branch to verify delivery evidence");
     if (task.verification_depth === "full" || (task.verification_depth === "targeted" && params.checkEndpoint)) {
       for (const r of attachments) if (!r.base_sha) {
         missing.push(`review baseline missing: ledger attach ${params.task_id} --repo ${r.repo} --branch ${r.branch} --base <original-start-sha>`);
       }
     }
-    const latestReviewByRole = new Map<string, string>();
-    let latestEndpointStatus: string | null = null;
-
+    type BranchEvidence = {
+      checks: Map<string, string>;
+      reviews: Map<string, string>;
+      endpoint?: string;
+    };
+    const byBranch = new Map<string | null, BranchEvidence>();
+    type ReviewAttachment = Pick<TaskRepoRecord, "repo" | "branch" | "worktree" | "base_sha">;
+    const attachedAtEvent = new Map<string, ReviewAttachment>();
     for (const ev of events) {
+      if (ev.event_type === "REPO_ATTACHED" || ev.event_type === "REPO_DETACHED") {
+        if (ev.branch) {
+          if (ev.event_type === "REPO_ATTACHED") {
+            const { base_sha, worktree } = JSON.parse(ev.payload_json);
+            attachedAtEvent.set(ev.branch, { repo: params.repo, branch: ev.branch, base_sha, worktree });
+          } else {
+            attachedAtEvent.delete(ev.branch);
+          }
+        }
+        continue;
+      }
+      const branch = ev.branch ?? (attachedAtEvent.size === 1 ? attachedAtEvent.keys().next().value ?? null : null);
+      if (params.branch && branch && branch !== params.branch) continue;
+      let evidence = byBranch.get(branch);
+      if (!evidence) {
+        evidence = { checks: new Map(), reviews: new Map() };
+        byBranch.set(branch, evidence);
+      }
       try {
         const p = JSON.parse(ev.payload_json) as {
           source?: EvidenceSource;
           kind?: string;
           status?: string;
-          meta?: { pr_head_oid?: string; pr_url?: string; role?: string; started_at?: string; review_floor_seq?: number; base?: string };
+          meta?: {
+            pr_head_oid?: string;
+            pr_url?: string;
+            role?: string;
+            started_at?: string;
+            review_floor_seq?: number;
+            base?: string;
+          };
         };
         if (!p.kind || !p.status) continue;
         if (EXECUTABLE_EVIDENCE.has(p.kind) && evidenceSource(p, ev.actor) === "manual") continue;
         if (p.kind === "lint") {
-          if (ev.seq >= floors.lint) latestByKind.set("lint", p.status);
+          if (ev.seq >= floors.lint) evidence.checks.set("lint", p.status);
         } else if (p.kind === "test" || p.kind === "build") {
-          if (ev.seq >= floors.test) latestByKind.set(p.kind, p.status);
+          if (ev.seq >= floors.test) evidence.checks.set(p.kind, p.status);
         } else if (p.kind === "hurl") {
-          if (ev.seq >= floors.test) latestByKind.set("hurl", p.status);
+          if (ev.seq >= floors.test) evidence.checks.set("hurl", p.status);
         }
         if (p.kind === "review") {
           if (ev.seq < floors.review || !reviewMeetsFloor(p.status, p.meta, params.task_id, floors.review, reviewFloor?.ts, evidenceSource(p, ev.actor))) continue;
-          if (p.status === "fail" || (attachments.length > 0 && attachments.every(r => coversReviewBase(this.workbenchRoot, r, p.meta?.base)))) {
+          const historical = branch ? [attachedAtEvent.get(branch)] : [...attachedAtEvent.values()];
+          const current = branch ? repoAttachments.filter((r) => r.branch === branch) : [];
+          const covered = (row: ReviewAttachment | undefined) =>
+            !!row && coversReviewBase(this.workbenchRoot, row, p.meta?.base);
+          if (p.status === "fail" || (historical.length > 0 && historical.every(covered) && current.every(covered))) {
             const roleKey = normalizeReviewRole(p.meta?.role);
-            latestReviewByRole.set(roleKey, p.status);
+            evidence.reviews.set(roleKey, p.status);
           }
         }
         if (
@@ -961,7 +1016,7 @@ export class Ledger {
               (p.meta?.pr_head_oid !== params.head_sha || !p.meta.pr_url)) continue;
           const endpointFloor = task.endpoint === "fat" ? floors.fat : 0;
           if (ev.seq >= endpointFloor && (p.status === "pass" || p.status === "fail")) {
-            latestEndpointStatus = p.status;
+            evidence.endpoint = p.status;
           }
         }
       } catch {
@@ -969,19 +1024,37 @@ export class Ledger {
       }
     }
 
-    const failedKinds = [...latestByKind.entries()]
-      .filter(([, st]) => st === "fail")
-      .map(([k]) => k);
+    // A detached merge must honor failures at its own SHA before trying a verified parent.
+    // Positive evidence is credited only to the selected attachment or its unambiguous legacy receipts.
+    const failedKinds = new Set<string>();
+    const failedRoles = new Set<string>();
+    const latestByKind = new Map<string, string>();
+    const passingRoles = new Set<string>();
+    let latestEndpointStatus: string | undefined;
+    for (const [branch, evidence] of byBranch) {
+      const eligible = attachments.length === 1 && branch === attachments[0].branch;
+      for (const [kind, status] of evidence.checks) {
+        if (status === "fail") failedKinds.add(kind);
+        if (eligible && status === "pass") latestByKind.set(kind, status);
+      }
+      for (const [role, status] of evidence.reviews) {
+        if (status === "fail") failedRoles.add(role);
+        if (eligible && (status === "pass" || status === "fallback")) passingRoles.add(role);
+      }
+      if (evidence.endpoint === "fail" || (eligible && latestEndpointStatus !== "fail" && evidence.endpoint)) {
+        latestEndpointStatus = evidence.endpoint;
+      }
+    }
     const hasPassingVerify = [...latestByKind.values()].some((st) => st === "pass");
     const hasPassingExecVerify =
       latestByKind.get("test") === "pass" ||
       latestByKind.get("build") === "pass" ||
       latestByKind.get("hurl") === "pass";
 
-    if (failedKinds.length > 0) {
+    if (failedKinds.size > 0) {
       hasExplicitFailure = true;
       missing.push(
-        `latest ${failedKinds.join("/")} failed for ${params.repo}@${params.head_sha.slice(0, 8)}`,
+        `latest ${[...failedKinds].join("/")} failed for ${params.repo}@${params.head_sha.slice(0, 8)}`,
       );
     } else if (task.verification_depth === "full") {
       if (latestByKind.get("lint") !== "pass") {
@@ -1000,27 +1073,20 @@ export class Ledger {
       );
     }
 
-    const failedRoles = [...latestReviewByRole.entries()]
-      .filter(([, st]) => st === "fail")
-      .map(([r]) => r);
-    const passingRoles = [...latestReviewByRole.entries()]
-      .filter(([, st]) => st === "pass" || st === "fallback")
-      .map(([r]) => r);
-
-    if (failedRoles.length > 0) {
+    if (failedRoles.size > 0) {
       hasExplicitFailure = true;
       missing.push(
-        `latest review failed (${failedRoles.join(", ")}) for ${params.repo}@${params.head_sha.slice(0, 8)}`,
+        `latest review failed (${[...failedRoles].join(", ")}) for ${params.repo}@${params.head_sha.slice(0, 8)}`,
       );
     } else if (task.verification_depth === "targeted") {
       // Targeted depth requires at least one independent review pass/fallback before delivery/close
-      if (params.checkEndpoint && passingRoles.length === 0) {
+      if (params.checkEndpoint && passingRoles.size === 0) {
         missing.push(
           `targeted verification requires independent review evidence for ${params.repo}@${params.head_sha.slice(0, 8)}`,
         );
       }
     } else if (task.verification_depth === "full") {
-      const hasQualityOrBusiness = passingRoles.some((r) =>
+      const hasQualityOrBusiness = [...passingRoles].some((r) =>
         ["codex-review", "quality", "business-review", "default"].includes(r),
       );
       if (!hasQualityOrBusiness) {
@@ -1051,7 +1117,7 @@ export class Ledger {
       ready: missing.length === 0,
       missing,
       hasExplicitFailure,
-      recordedReviewRoles: passingRoles,
+      recordedReviewRoles: [...passingRoles],
     };
   }
 
@@ -1346,8 +1412,12 @@ export class Ledger {
 
   formatCompactContext(maxTasks = 8): string {
     const open = this.listOpenTasks().slice(0, maxTasks);
-    const { count } = this.db.query("SELECT COUNT(*) AS count FROM tasks WHERE status='HANDED_OFF'").get() as { count: number };
-    const quiet = count ? "Handoffs awaiting release: " + count + " (run ledger release create --from-handoffs)" : "";
+    const count = availableHandoffs(this).length;
+    const quiet = count
+      ? "Handoffs awaiting release: " +
+        count +
+        ' (run ledger release create --from-handoffs --title "<title>")'
+      : "";
     if (!open.length) return quiet;
     const lines: string[] = ["[Workbench Active Task Ledgers]"];
     for (const t of open) {

@@ -40,6 +40,35 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
     expect(evidenceSource({ source: "manual" }, actor)).toBe("manual");
   });
 
+  test("unlabelled receipts follow the sole attachment at the time of recording", () => {
+    const ledger = new Ledger(dir);
+    const task_id = "legacy-branch";
+    const repo = "svc";
+    const sha = "abcdef00";
+    const record = (branch: string | null, status: "pass" | "fail") =>
+      ledger.recordEvidence({ task_id, repo, sha, branch, kind: "test", status, source: "hook", summary: "test" });
+    const ready = () => ledger.checkPushReadiness({ task_id, repo, branch: "feat", head_sha: sha }).ready;
+    try {
+      ledger.openTask({ task_id, title: task_id, endpoint: "local", depth: "targeted", repo, branch: "feat", head_sha: sha });
+      record(null, "fail");
+      expect(ready()).toBe(false);
+      record("feat", "pass");
+      expect(ready()).toBe(true);
+      record(null, "fail");
+      expect(ready()).toBe(false);
+      ledger.attachRepo({ task_id, repo, branch: "sibling", head_sha: sha });
+      record("sibling", "pass");
+      record(null, "pass");
+      expect(ready()).toBe(false);
+      ledger.detachRepo({ task_id, repo, branch: "sibling" });
+      expect(ready()).toBe(false);
+      record(null, "pass");
+      expect(ready()).toBe(true);
+    } finally {
+      ledger.closeDb();
+    }
+  });
+
   test("manual executable results cannot satisfy delivery even with a trusted-looking actor", () => {
     const ledger = new Ledger(dir);
     const task_id = "manual-only";
@@ -1113,23 +1142,31 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       });
       expect(upd.task.endpoint).toBe("fat");
 
-      // Record complete FAT evidence on featSha (= fatSha)
-      for (const [kind, role] of [
-        ["lint", undefined],
-        ["test", undefined],
-        ["review", "business"],
-        ["fat", undefined],
-      ] as const) {
-        ledger.recordEvidence({
-          source: "tool",
-          task_id: "20261124-retry",
-          kind,
-          status: "pass",
-          summary: `${kind} pass`,
-          repo: "web",
-          sha: featSha,
-          meta: role ? { role, base: baseSha } : undefined,
-        });
+      // The two branches point to the same SHA. An unlabelled receipt cannot identify either branch.
+      ledger.recordEvidence({
+        source: "tool", task_id: "20261124-retry", kind: "test", status: "pass",
+        summary: "unbound test", repo: "web", sha: featSha,
+      });
+      expect(() => ledger.closeTask({ task_id: "20261124-retry", archive: false })).toThrow("no passing");
+      for (const branch of ["feat/retry", "integrate/retry-fat"]) {
+        for (const [kind, role] of [
+          ["lint", undefined],
+          ["test", undefined],
+          ["review", "business"],
+          ["fat", undefined],
+        ] as const) {
+          ledger.recordEvidence({
+            source: "tool",
+            task_id: "20261124-retry",
+            kind,
+            status: "pass",
+            summary: `${kind} pass`,
+            repo: "web",
+            branch,
+            sha: featSha,
+            meta: role ? { role, base: baseSha } : undefined,
+          });
+        }
       }
 
       // Push delivered commit to origin/fat before deleting temporary FAT integration branch on disk
@@ -1255,6 +1292,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         status: "pass",
         summary: "fat integration test pass",
         repo: "web",
+        branch: "fat-diverged",
         sha: cherryFatSha,
       });
       ledger.recordEvidence({
@@ -1264,6 +1302,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         status: "pass",
         summary: "fat integration review pass",
         repo: "web",
+        branch: "fat-diverged",
         sha: cherryFatSha,
         meta: { role: "business", base: baseSha },
       });
@@ -1291,6 +1330,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
           status: "pass",
           summary: `${kind} pass (cherry-pick ${cherryFatSha.slice(0, 8)})`,
           repo: "web",
+          branch: "feat/retry",
           sha: featSha,
           meta: role ? { role, base: baseSha } : undefined,
         });

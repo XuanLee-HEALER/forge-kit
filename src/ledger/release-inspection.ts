@@ -36,6 +36,19 @@ export interface Snapshot {
   rollback_plan: string | null;
 }
 
+export function availableHandoffs(ledger: LedgerReader) {
+  return ledger.db
+    .query<{ task_id: string }, []>(
+      `SELECT h.task_id FROM task_handoffs h JOIN tasks t USING(task_id)
+    WHERE t.status='HANDED_OFF' AND NOT EXISTS (
+      SELECT 1 FROM release_items i JOIN releases r USING(release_id)
+      WHERE i.task_id=h.task_id AND i.ledger_tip=h.ledger_tip AND r.status IN ('DRAFT','VERIFIED','APPROVED')
+    ) ORDER BY h.task_id`,
+    )
+    .all()
+    .map((row) => row.task_id);
+}
+
 export function currentHandoff(ledger: ReleaseLedger, task: string) {
   const row = ledger.db
     .query<{ ledger_tip: string }, [string]>("SELECT ledger_tip FROM task_handoffs WHERE task_id=?")
@@ -120,7 +133,8 @@ export function observe(ledger: ReleaseLedger, release: ReturnType<typeof detail
       const { dir } = resolveTaskCheckout(ledger.workbenchRoot, row);
       const remaining = deadline - Date.now();
       if (remaining <= 0) throw new PrUnavailable("Release approval verification timed out");
-      const pr = inspectPr(dir, item.branch, item.pr_url, process.env, Math.min(2500, remaining));
+      const timeout = Number.isFinite(deadline) ? Math.min(2500, remaining) : undefined;
+      const pr = inspectPr(dir, item.branch, item.pr_url, process.env, timeout);
       results.set(item.pr_url, {
         dir,
         branch: item.branch,

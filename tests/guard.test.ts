@@ -468,22 +468,87 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
       runGit(repoDir, ["remote", "set-url", "origin", "https://ghe/acme/app-api.git"]);
       expect(evaluatePreToolUse(wb, shellInput("GH_HOST=ghe gh -R acme/app-api pr create -t t -b b", repoDir))).toBeNull();
 
+      // A second attached feature has no parent in this merge.
+      runGit(repoDir, ["switch", "-c", "feat/sibling"]);
+      runGit(repoDir, ["commit", "--allow-empty", "-m", "sibling"]);
+      const siblingHead = runGit(repoDir, ["rev-parse", "HEAD"]).stdout.trim();
+      runGit(repoDir, ["switch", "feat/demo"]);
+      const siblingLedger = new Ledger(wb);
+      try {
+        siblingLedger.attachRepo({
+          task_id: "20261121-fat-flow",
+          repo: "app-api",
+          branch: "feat/sibling",
+          base_sha: featSha,
+          head_sha: siblingHead,
+        });
+      } finally {
+        siblingLedger.closeDb();
+      }
+      expect(evaluatePreToolUse(wb, shellInput(`git -C ${tmpWt} push origin HEAD:fat`))).toBeNull();
+
       // Regression: if merged HEAD itself has a FAILED test recorded, NEVER fall back to parent feature SHA!
       const mergedHead = runGit(tmpWt, ["rev-parse", "HEAD"]).stdout.trim();
       const ledger3 = new Ledger(wb);
-      ledger3.recordEvidence({
-        source: "hook",
-        task_id: "20261121-fat-flow",
-        kind: "test",
-        status: "fail",
-        summary: "merge conflict broke test",
-        repo: "app-api",
-        sha: mergedHead,
-      });
-      ledger3.closeDb();
-      expect(
-        evaluatePreToolUse(wb, shellInput(`git -C ${tmpWt} push origin HEAD:fat`)),
-      ).toContain("latest test failed");
+      const mergedCheck = (branch: string | null, status: "pass" | "fail") =>
+        ledger3.recordEvidence({
+          source: "hook",
+          task_id: "20261121-fat-flow",
+          kind: "test",
+          status,
+          summary: "verify merged checkout",
+          repo: "app-api",
+          branch,
+          sha: mergedHead,
+        });
+      const push = () => evaluatePreToolUse(wb, shellInput(`git -C ${tmpWt} push origin HEAD:fat`));
+      const task_id = "20261121-fat-flow";
+      const repo = "app-api";
+      const bind = (branch: string, head_sha: string) =>
+        ledger3.attachRepo({ task_id, repo, branch, base_sha: featSha, head_sha });
+      const detach = (branch: string) => ledger3.detachRepo({ task_id, repo, branch });
+      const review = (status: "pass" | "fail", base: string) =>
+        ledger3.recordEvidence({
+          task_id, repo, branch: "feat/sibling", sha: mergedHead,
+          kind: "review", source: "tool", status, summary: "merged review",
+          meta: { role: "quality", base },
+        });
+      try {
+        // An attachment at HEAD is distinct from the unique verified parent.
+        bind("at-merge", mergedHead);
+        expect(push()).toBeNull();
+        bind("at-fat-parent", runGit(tmpWt, ["rev-parse", "HEAD^1"]).stdout.trim());
+        expect(push()).toContain("尚未满足交付前检查");
+        detach("at-fat-parent");
+        detach("at-merge");
+
+        review("fail", featSha);
+        review("pass", mergedHead);
+        detach("feat/sibling");
+        expect(push()).toContain("latest review failed");
+        bind("feat/sibling", siblingHead);
+        review("pass", featSha);
+        detach("feat/sibling");
+        expect(push()).toBeNull();
+        bind("feat/sibling", siblingHead);
+
+        mergedCheck(null, "fail");
+        expect(push()).toContain("latest test failed");
+        mergedCheck(null, "pass");
+        expect(push()).toBeNull();
+
+        mergedCheck("feat/sibling", "fail");
+        mergedCheck("feat/demo", "pass");
+        expect(push()).toContain("latest test failed");
+        mergedCheck("feat/sibling", "pass");
+        expect(push()).toBeNull();
+
+        mergedCheck("feat/sibling", "fail");
+        ledger3.detachRepo({ task_id: "20261121-fat-flow", repo: "app-api", branch: "feat/sibling" });
+        expect(push()).toContain("latest test failed");
+      } finally {
+        ledger3.closeDb();
+      }
     } finally {
       runGit(repoDir, ["worktree", "remove", "--force", tmpWt]);
     }

@@ -43,7 +43,8 @@ git clone <repo-url> ~/work/my-garage/backend
 # 4. Run health checks (AGENTS size, TOML/JSON validity, relative symlinks, secret scan, ledger chain)
 ./bin/forge doctor ~/work/my-garage
 
-# 5. Later: pull kit updates without touching instance-private files
+# 5. After updating the kit checkout, install its locked dependencies and sync the workbench
+bun install --frozen-lockfile
 ./bin/forge sync ~/work/my-garage
 ```
 

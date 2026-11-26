@@ -299,10 +299,11 @@ export function checkLedgerGate(
             checkoutDir: loc.isDetached ? loc.checkoutDir : undefined,
           });
           if (!readiness.ready && !readiness.hasExplicitFailure && deliveryDetached) {
-            const parents = new Set(getHeadAndParents(loc.checkoutDir));
-            const boundRepo = ledger
+            const parents = new Set(getHeadAndParents(loc.checkoutDir).slice(1));
+            const matches = ledger
               .getTaskRepos(task.task_id)
-              .find((r) => r.repo === loc.repo && r.head_sha && parents.has(r.head_sha));
+              .filter((r) => r.repo === loc.repo && r.head_sha && parents.has(r.head_sha));
+            const boundRepo = matches.length === 1 ? matches[0] : undefined;
             if (boundRepo?.head_sha) {
               readiness = ledger.checkPushReadiness({
                 task_id: task.task_id,

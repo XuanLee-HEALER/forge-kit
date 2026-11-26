@@ -166,7 +166,6 @@ export function checkGitPhysicalFuse(
     const toks = splitShellTokens(segments[i]);
     if (!toks || toks.length === 0) continue;
 
-    // gh pr merge fuse (allowed ONLY when exact repo + PR number is in an active approved Runbook)
     const { prefix, gh, git } = parseDeliverySegment(toks);
     if (prefix.bin === "gh" && prefix.args.includes("api")) {
       const api = parseGhApi(prefix.args.slice(prefix.args.indexOf("api") + 1));
@@ -210,7 +209,9 @@ export function checkGitPhysicalFuse(
           target &&
           approvedRunbooks.some((rb) =>
             rb.actions.prs.some((p) => {
-              if (p.number !== target.number || (p.pin && !(matchesPinnedMerge(gh.subArgs, p.pin) && matchesReleasePr(resolve(workbenchRoot, p.repo), p.pin)))) return false;
+              if (p.number !== target.number) return false;
+              if (p.pin) return matchesPinnedMerge(gh.subArgs, p.pin) &&
+                matchesReleasePr(workbenchRoot, rb.record, p.repo, p.pin);
               const local = loc?.repo.toLowerCase() === p.repo.toLowerCase();
               if (!target.owner) return local;
               const origin = repoOrigin(local && loc ? loc.checkoutDir : resolve(workbenchRoot, p.repo));

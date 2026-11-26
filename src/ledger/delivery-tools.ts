@@ -3,11 +3,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { canonicalRepoPath, loadModelsConfig } from "../config";
 import { checkoutEnvironment, runGit, runProcess } from "../git";
+import type { RunbookRecord } from "./types";
 import { inspectPr, verifiedPr } from "./pr";
 import { prRemoteRefs, reachableFromRefs, resolveTaskCheckout } from "./checkout";
 import { coversReviewBase } from "./review-range";
 import { getSpecState } from "./spec";
-import type { Ledger } from "./store";
+import { Ledger } from "./store";
 
 function attached(ledger: Ledger, task: string, repo: string, branch?: string) {
   const rows = ledger.getTaskRepos(task).filter(r => r.repo === canonicalRepoPath(ledger.workbenchRoot,repo) && (!branch || r.branch === branch));
@@ -110,9 +111,44 @@ export function syncPr(ledger: Ledger, task: string, repo: string, pr?: string, 
   }).immediate();
 }
 
-export function matchesReleasePr(dir: string, pin: { url:string; head:string; branch:string; base:string; base_oid?:string;merged_oid?:string }) {
+export function matchesReleasePr(
+  root: string,
+  book: RunbookRecord,
+  repo: string,
+  pin: { url: string; head: string; branch: string; base: string; base_oid?: string; merged_oid?: string },
+) {
   try {
-    const pr = inspectPr(dir, pin.branch, pin.url, process.env, 2500, {baseOid:!!pin.base_oid});
-    return !pin.merged_oid && pr.state === "OPEN" && pr.headRefOid === pin.head && pr.baseRefName === pin.base && (!pin.base_oid || pr.baseRefOid===pin.base_oid);
-  } catch { return false; }
+    const ledger = new Ledger(root);
+    let worktree: string | null = null;
+    try {
+      const release = ledger.db.query<{ release_id: string }, [string]>(
+        "SELECT release_id FROM releases WHERE runbook_id=?",
+      ).get(book.runbook_id);
+      const task = release
+        ? ledger.db.query<{ task_id: string }, [string, string, string, string, string]>(
+            `SELECT task_id FROM release_items
+             WHERE release_id=? AND repo=? AND branch=? AND expected_head_sha=? AND pr_url=?`,
+          ).get(release.release_id, repo, pin.branch, pin.head, pin.url)?.task_id
+        : book.task_id;
+      if (release && !task) return false;
+      if (task) {
+        const row = ledger.getTaskRepos(task).find((r) => r.repo === repo && r.branch === pin.branch);
+        if (!row) return false;
+        worktree = row.worktree;
+      }
+    } finally {
+      ledger.closeDb();
+    }
+    const { dir } = resolveTaskCheckout(root, { repo, branch: pin.branch, worktree });
+    const pr = inspectPr(dir, pin.branch, pin.url, process.env, 2500, { baseOid: !!pin.base_oid });
+    return (
+      !pin.merged_oid &&
+      pr.state === "OPEN" &&
+      pr.headRefOid === pin.head &&
+      pr.baseRefName === pin.base &&
+      (!pin.base_oid || pr.baseRefOid === pin.base_oid)
+    );
+  } catch {
+    return false;
+  }
 }

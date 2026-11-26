@@ -21,7 +21,11 @@ export function inspectPr(dir: string, branch: string, pr?: string, env = proces
   if (!selector || selector.startsWith("-")) throw new Error("Expected a PR number or URL in origin");
   const result = runProcess([options?.bin ?? "gh", "pr", "view", selector, "--repo", origin.host + "/" + slug, "--json",
     "url,state,baseRefName,headRefName,headRefOid,isCrossRepository,headRepository,headRepositoryOwner"+(options?.baseOid?",baseRefOid,mergeCommit":"")+(options?.mergeability?",mergeable,mergeStateStatus":"")], { cwd: dir, env: checkoutEnvironment(env), timeoutMs });
-  if (result.code) throw new PrUnavailable("Unable to verify pull request: " + result.stderr);
+  if (result.code)
+    throw new PrUnavailable(
+      "Unable to verify pull request: " +
+        (result.stderr.trim() || "gh pr view exited with code " + result.code),
+    );
   const data = JSON.parse(result.stdout);
   if (!prNumber(data.url) || (pr && prNumber(data.url) !== number) || data.isCrossRepository !== false ||
       data.headRepository?.name?.toLowerCase() !== origin.repo || data.headRepositoryOwner?.login?.toLowerCase() !== origin.owner ||

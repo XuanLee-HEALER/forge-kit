@@ -136,6 +136,21 @@ describe("Ledger Passive Hooks (PostToolUse / SessionStart / PostCompact)", () =
     expect(record("gh pr create -t demo -b b", 8443)).toBe(0);
   });
 
+  test("a stalled PR lookup leaves the post-tool hook within budget and records no receipt", () => {
+    runGit(repoDir, ["remote", "add", "origin", "https://github.com/acme/svc.git"]);
+    writeFileSync(join(wb, "bin/gh"), "#!/bin/sh\nexec sleep 15\n", { mode: 0o755 });
+    const start = Date.now();
+    const result = handleLedgerHook(wb, {
+      hook_event_name: "PostToolUse",
+      cwd: repoDir,
+      tool_name: "exec_command",
+      tool_input: { command: "gh pr create -t demo -b body", workdir: repoDir },
+      tool_response: { exit_code: 0, output: "https://github.com/acme/svc/pull/42" },
+    });
+    expect(result.recorded).toBe(0);
+    expect(Date.now() - start).toBeLessThan(5000);
+  }, 15000);
+
   test("injects compact active ledger summary on SessionStart and PostCompact", () => {
     const start = handleLedgerHook(wb, {
       hook_event_name: "SessionStart",

@@ -144,7 +144,7 @@ function diffScope(
 function deliveryPr(dir: string, branch: string, head: string, base: string, prod: boolean, ci: boolean) {
   const bin = (prod && process.env.FORGE_GH_BIN) || "gh";
   const view = (selector?: string) =>
-    inspectPr(dir, branch, selector, process.env, 3000, { bin, mergeability: prod, baseOid: true });
+    inspectPr(dir, branch, selector, process.env, undefined, { bin, mergeability: prod, baseOid: true });
   const pr = view();
   const verify = (data: typeof pr) => {
     if (data.headRefOid !== head || !data.baseRefName || data.baseRefName !== pr.baseRefName)
@@ -173,9 +173,12 @@ function deliveryPr(dir: string, branch: string, head: string, base: string, pro
     const checks = runProcess([bin, "pr", "checks", pr.url, "--required", "--json", "name,bucket"], {
       cwd: dir,
       env: checkoutEnvironment(),
-      timeoutMs: 3000,
     });
-    if (checks.code) throw Error("Required CI checks failed or unavailable: " + checks.stderr);
+    if (checks.code)
+      throw Error(
+        "Required CI checks failed or unavailable: " +
+          (checks.stderr.trim() || "gh pr checks exited with code " + checks.code),
+      );
     const rows = JSON.parse(checks.stdout);
     if (!Array.isArray(rows) || !rows.length || rows.some((r) => !r.name || r.bucket !== "pass"))
       throw Error("Required CI checks are missing, pending or failing");

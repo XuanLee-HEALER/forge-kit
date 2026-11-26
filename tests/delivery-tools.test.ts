@@ -6,7 +6,8 @@ import { handleLedgerHook } from "../src/ledger-hook";
 import { appendEventInTx } from "../src/ledger/transactions";
 import { Ledger } from "../src/ledger";
 import { resolveTaskCheckout } from "../src/ledger/checkout";
-import { runGit } from "../src/git";
+import { runGit, withinProcessDeadline } from "../src/git";
+import { inspectPr } from "../src/ledger/pr";
 import { isolateHome } from "./helpers/hermetic";
 
 isolateHome();
@@ -499,4 +500,17 @@ test("fetching a superseded base cannot reverse an audited repair", () => {
   expect(git("rev-parse", "--verify", wrong + "^{commit}")).toBe(wrong);
   ledger.attachRepo({ task_id: "fix", repo: "svc", branch });
   expect(ledger.getTaskRepos("fix").find(r => r.branch === branch)?.base_sha).toBe(base);
+});
+
+test("PR lookup reports silent failures and obeys the caller's remaining deadline", () => {
+  const env = { ...process.env, PATH: bin + ":" + process.env.PATH };
+  const view = () => inspectPr(repo, "feature", undefined, env);
+  tool("gh", "exit 23");
+  expect(view).toThrow("gh pr view exited with code 23");
+  tool("gh", "kill -TERM $$");
+  expect(view).toThrow(/terminated by SIGTERM/);
+  tool("gh", "exec sleep 15");
+  const start = Date.now();
+  expect(() => withinProcessDeadline(start + 400, view)).toThrow(/timed out/);
+  expect(Date.now() - start).toBeLessThan(2500);
 });
