@@ -40,9 +40,23 @@ function approve(book: string) {
   }).userPromptContext;
 }
 
-test("merged prod child requires a completed runbook and production scope pinned to its release", () => {
-  const f = feature("web", 2),
-    id = train(f);
+for (const version of ["0.4", "0.5"] as const) test(`v${version} merged prod child requires a completed runbook and production scope pinned to its release`, () => {
+  const f = feature("web", 2, version);
+  if (version === "0.4") {
+    const dir = join(root, ".workbench/specs", f.task);
+    mkdirSync(dir, {recursive: true});
+    for (const name of ["ssot.md", "tech-spec.md", "test-spec.md"]) writeFileSync(join(dir, name), "legacy release scope");
+    ledger.freezeSpec({task_id: f.task});
+    // A newer installation's observer policy does not reclassify a historical task.
+    writeFileSync(join(root, ".workbench/workbench.yaml"), [
+      "repos: [web]", "extensions:", "  actions:",
+      '    send: {purpose: deliver, argv: [bun, --version], inputs: []}',
+      '    lookup: {purpose: observe, argv: [bun, --help], inputs: []}',
+      "  stages: {publish: {action: send, observe: lookup}}",
+      "  delivery: {endpoint: prod, stages: [publish]}",
+    ].join("\n"));
+  }
+  const id = train(f);
   merge(f);
   expect(rejects("release", "complete", id)).toContain("COMPLETED runbook");
   const book = cmd("release", "runbook", id).runbook_id;
@@ -122,15 +136,32 @@ test("SQL release requires a runbook even for a PR child; stale approval cannot 
   expect(cmd("release", "complete", id).status).toBe("COMPLETED");
 }, 30000);
 
-test("local branch drift blocks approval, verification and close; deleted merged branch uses pinned non-default base", () => {
+test("release refuses previously handed-off v0.5 PRs pinned to staging", () => {
   const f = feature("api", 1);
+  sync(f);
+  const handoff = cmd("handoff", f.task);
+  // Reproduce the durable snapshot an earlier v0.5 installer accepted.
+  const items = handoff.items.map((item: object) => ({ ...item, base_branch: "staging" }));
+  const snapshot = {items, sql_files: [], sql_owners: [], rollback_plan: null};
+  const event = appendEventInTx(ledger.db, {task_id: f.task, event_type:"HANDOFF_RECORDED", actor:"agent", payload:snapshot});
+  ledger.db.query("UPDATE task_handoffs SET ledger_tip=?,items_json=? WHERE task_id=?")
+    .run(f.task + "@" + event.entry_hash, JSON.stringify(items), f.task);
+  remote(f.n, {baseRefName:"staging", state:"MERGED"});
+  git(f.dir, "update-ref", "refs/remotes/origin/staging", f.head);
+  const batch = cmd("release", "create", "--tasks", f.task, "--title", "historical staging handoff");
+  expect(rejects("release", "verify", batch.release_id)).toContain("targeting main");
+  expect(ledger.getTask(f.task)?.status).toBe("HANDED_OFF");
+}, 30_000);
+
+test("v0.4 local branch drift blocks approval, verification and close; deleted merged branch uses pinned non-default base", () => {
+  const f = feature("api", 1, "0.4");
   const file = join(f.wt, "example.test.ts");
   writeFileSync(file, 'import {test,expect} from "bun:test"; test("release contract",()=>expect(1).toBe(1))');
   git(f.wt, "commit", "-am", "release contract");
   f.head = git(f.wt, "rev-parse", "HEAD");
   const spec = join(root, ".workbench/specs", f.task);
   mkdirSync(spec, { recursive: true });
-  for (const name of ["scope.md"]) writeFileSync(join(spec, name), "spec");
+  for (const name of ["ssot.md", "tech-spec.md", "test-spec.md"]) writeFileSync(join(spec, name), "spec");
   const freeze = ledger.freezeSpec({ task_id: f.task, locked_test_globs: ["example.test.ts"] });
   const legacy = JSON.parse(freeze.event.payload_json);
   for (const k of [

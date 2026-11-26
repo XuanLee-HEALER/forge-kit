@@ -81,7 +81,7 @@ test("both adapters consume pinned instruction changes as data; only a trusted u
     const [reply, exitCode] = await Promise.all([new Response(child.stdout).json(), child.exited]);
     expect(exitCode).toBe(3);
     expect(reply.status).toBe("incomplete");
-    expect(reply.roles[0]).toMatchObject({ status: "incomplete", findings: [], attempts: [{ backend: "api", status: "incomplete" }] });
+    expect(reply.roles[0]).toMatchObject({ status: "incomplete", findings: [], limitations: ["API response incomplete: max_output_tokens"], attempts: [{ backend: "api", status: "incomplete" }] });
     expect(events).toHaveLength(3);
     const incomplete = await runReview({ ...opts, roles: "business" });
     expect(incomplete.roles[0].attempts).toEqual([]);

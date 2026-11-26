@@ -1,3 +1,4 @@
+import type { installedInstance } from "../workflow-config";
 import { canonicalRepoPath } from "../config";
 import { runGit } from "../git";
 import { sha256File } from "../shared/path";
@@ -6,6 +7,7 @@ import { inspectPr, PrUnavailable } from "./pr";
 import { getSpecState } from "./spec";
 import {
   nowIso,
+  usesV05,
   canonicalJson,
   sha256String,
   type LedgerReader,
@@ -47,6 +49,16 @@ export function availableHandoffs(ledger: LedgerReader) {
     )
     .all()
     .map((row) => row.task_id);
+}
+
+export function requireReleaseBase(ledger: LedgerReader, taskId: string, branch: string) {
+  if (branch !== "main" && ledger.getTask(taskId)?.endpoint === "pr" && usesV05(ledger, taskId))
+    throw Error("PR delivery requires a pull request targeting main; found " + branch);
+}
+
+export function deploymentStages(config: ReturnType<typeof installedInstance>, endpoint: string) {
+  if (config?.delivery.value.endpoint !== endpoint) return [];
+  return config.delivery.value.stages.filter(id => config.stages.get(id)?.source !== "core");
 }
 
 export function currentHandoff(ledger: ReleaseLedger, task: string) {
@@ -213,6 +225,7 @@ export function inspect(
           throw Error("Local branch drift: expected " + expected_head_sha + ", found " + local.stdout.trim());
         }
       } else if (exists.code !== 1 || pr.state !== "MERGED") throw Error("Cannot verify local branch " + branch);
+      requireReleaseBase(ledger, task_id, item.base_branch);
       if (pr.base !== item.base_branch)
         throw Error("PR base branch changed: expected " + item.base_branch + ", live " + pr.base);
       if (pr.state === "MERGED") {

@@ -209,11 +209,11 @@ forge instance run smoke
 | ledger | forge ledger |
 | guard | forge guard |
 | ledger-hook | forge ledger-hook |
-| dbcred | forge dbcred |
+| dbcred | 生产读用 `forge dbcred <env> --ro`。原先用 `dbcred --rw` 获取生产写凭据的脚本，改为登记精确 SQL 并由已获批准的 `forge ship` 执行。非生产环境继续使用 `forge dbcred <env> --ro` 或 `--rw`。 |
 | cmdfmt | forge cmdfmt |
 | lang-check | forge lang-check |
 
-迁移评审脚本时，将旧 `--roles perf` 或 `--roles performance` 改为 `--roles simplify`，该角色同时检查性能与简洁性。原先同时选择 performance、simplify 的脚本只传一次 simplify。需要锁定后端时，用 `--backend codex` 或 `--backend api` 替换 `--no-fallback`。默认 `auto` 先运行独立 Codex 会话，上游服务异常时尝试 API。自动化从报告的 `roles` 数组读取每个实际运行角色的结果，并区分退出码 0（通过）、1（阻断）、2（执行错误）和 3（未完成）。
+迁移评审脚本时，将旧 `--roles perf` 或 `--roles performance` 改为 `--roles simplify`，该角色同时检查性能与简洁性。原先同时选择 performance、simplify 的脚本只传一次 simplify。需要锁定后端时，用 `--backend codex` 或 `--backend api` 替换 `--no-fallback`。默认 `auto` 先运行独立 Codex 会话，上游服务异常时尝试 API。自动化从报告的 `roles` 数组读取每个已选角色的结果。`attempts` 为空表示该角色未启动，可查看 `missing_materials` 确认缺什么材料。整体退出码为 0（通过）、1（阻断）、2（执行错误）和 3（未完成）。
 
 默认技能为 ready、grill、feature、bugfix、review、verify、pr-triage 和 ship。原业务取舍方法并入 grill，收尾拆给 review、verify 和 ship，四个专项评审统一由 review 选角色。环境配方与专业技能由实例维护。代理按 scanner、analyst、implementer 和 reviewer 四种专长委派，后两者分别承接原 dev 与 spec-reviewer 的任务。独立引擎的四个评审维度由引擎参数选择。
 

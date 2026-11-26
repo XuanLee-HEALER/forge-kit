@@ -6,11 +6,16 @@ import { executorFixture } from "./helpers/executor";
 
 const f = executorFixture("0.5");
 
-test("custom and core stages execute in declaration order against one isolated revision", () => {
+function configureInstance() {
   const configDir = join(f.root, ".workbench");
   for (const file of ["models.toml", "ship-policy.yaml"]) {
     copyFileSync(join(import.meta.dir, "../templates", file), join(configDir, file));
   }
+  return configDir;
+}
+
+test("custom and core stages execute in declaration order against one isolated revision", () => {
+  const configDir = configureInstance();
   const trace = join(f.root, "trace");
   const step = (id: string) => "import {appendFileSync} from 'node:fs'; appendFileSync(" +
     JSON.stringify(trace) + ", JSON.stringify([" + JSON.stringify(id) + ",process.cwd(),process.env.FIXTURE_CREDENTIAL ?? null])+'\\n');console.log(" + JSON.stringify(id) + ")";
@@ -136,3 +141,54 @@ test("an isolated Bun install uses the designated cache after the private fixtur
   expect(empty.exitCode).not.toBe(0);
   expect(empty.stderr.toString()).toContain("Cannot install locked verification dependencies");
 });
+
+test("project verification resolves inputs and programs from the selected linked worktree commit", () => {
+  const configDir = configureInstance();
+  const configFile = join(configDir, "workbench.yaml");
+  const config = parse(readFileSync(configFile, "utf8"));
+  const output = join(f.root, "verification-output");
+  const action = { purpose: "verify", cwd: ".", argv: ["./checks/run"], inputs: ["checks/rules"] };
+  config.extensions = { actions: { project: action }, stages: { check: { action: "project" } },
+    verification: { stages: ["check"] } };
+  writeFileSync(configFile, stringify(config));
+  const docs = join(configDir, "specs/task");
+  mkdirSync(docs, { recursive: true });
+  writeFileSync(join(docs, "scope.md"), "Use files from the verified commit.");
+  f.ledger.freezeSpec({ task_id: "task" });
+  f.git("switch", "-c", "main");
+  const linked = join(f.root, "service.worktrees/topic");
+  f.git("worktree", "add", linked, "feature");
+  mkdirSync(join(linked, "checks"));
+  writeFileSync(join(linked, "checks/rules"), "selected commit");
+  writeFileSync(join(linked, "checks/run"),
+    '#!/usr/bin/env bun\nawait Bun.write(' + JSON.stringify(output) + ', await Bun.file(process.argv[2]).text());', { mode: 0o755 });
+  f.git("-C", linked, "add", "--", "checks/run", "checks/rules");
+  f.git("-C", linked, "commit", "-m", "add branch-local verifier");
+  expect(existsSync(join(f.repo, "checks/run"))).toBe(false);
+  for (const cwd of [".", "service/checks"]) {
+    Object.assign(action, cwd === "."
+      ? {cwd, argv: ["./checks/run", "checks/rules"], inputs: ["checks/rules"]}
+      : {cwd, argv: ["./run", "rules"], inputs: ["rules"]});
+    writeFileSync(configFile, stringify(config));
+    const diagnosis = f.cli("doctor", [f.root, "--json"]);
+    const issues = JSON.parse(diagnosis.stdout.toString()).issues;
+    expect(issues.filter((issue: {check:string}) => issue.check === "configuration")).toEqual([]);
+    expect(issues).toContainEqual(expect.objectContaining({check:"verification", message:expect.stringContaining("selected commit")}));
+    const result = f.cli("verify", ["--task", "task", "--cwd", linked]);
+    expect(result.exitCode, result.stderr.toString() + result.stdout.toString()).toBe(0);
+    expect(readFileSync(output, "utf8")).toBe("selected commit");
+    expect(f.ledger.getTaskEvents("task").filter(e => e.event_type === "EVIDENCE_CAPTURED").at(-1)?.sha).toBe(f.git("-C", linked, "rev-parse", "HEAD"));
+  }
+
+  action.inputs = ["missing"];
+  writeFileSync(configFile, stringify(config));
+  const missing = f.cli("verify", ["--task", "task", "--cwd", linked]);
+  expect(missing.exitCode).not.toBe(0);
+  expect(missing.stderr.toString() + missing.stdout.toString()).toContain("Missing verification file at selected commit");
+  action.inputs = [];
+  action.argv = ["./rules"];
+  writeFileSync(configFile, stringify(config));
+  const mode = f.cli("verify", ["--task", "task", "--cwd", linked]);
+  expect(mode.exitCode).not.toBe(0);
+  expect(mode.stderr.toString() + mode.stdout.toString()).toContain("not executable at selected commit");
+}, 30_000);

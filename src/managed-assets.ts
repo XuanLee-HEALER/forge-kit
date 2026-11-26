@@ -180,7 +180,7 @@ type Operation = { path: string; before: string | null; after: string | null; mo
 const journalRel = ".workbench/sync-journal";
 export function checkMigration(root: string) {
   if (existsSync(localPath(root, journalRel)))
-    throw Error("An interrupted migration is pending; run forge sync " + root);
+    throw Error("An interrupted migration is pending. From the forge-kit release directory, run ./bin/forge sync " + Bun.$.escape(root));
 }
 
 function resume(root: string) {
@@ -193,14 +193,15 @@ function resume(root: string) {
     const dest = managedPath(root, op.path),
       current = state(dest);
     if (current === op.after && (current === null || (lstatSync(dest).mode & 0o777) === op.mode)) continue;
-    if (current !== op.before)
-      throw Error(
-        "Migration conflict at " +
-          dest +
-          "; recover the pre-migration file from " +
-          journal +
-          " before retrying",
-      );
+    if (current !== op.before) {
+      const recovery = ["Migration conflict at " + dest + ". Preserve any conflicting path by moving it aside."];
+      if (op.before?.startsWith("link:"))
+        recovery.push("Restore the symlink at " + dest + " with its original target " + JSON.stringify(op.before.slice(5)) + ".");
+      else if (op.before !== null)
+        recovery.push("Copy the saved file " + join(journal, i + ".old") + " back to " + dest + ".");
+      recovery.push("From the forge-kit release directory, retry ./bin/forge sync " + Bun.$.escape(root));
+      throw Error(recovery.join(" "));
+    }
     if (op.after === null) {
       rmSync(dest);
       continue;

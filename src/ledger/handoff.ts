@@ -6,7 +6,7 @@ import { runGit } from "../git";
 import { canonicalizeOsPath } from "../shared/path";
 import { resolveTaskCheckout } from "./checkout";
 import { verifiedPr } from "./pr";
-import type { HandoffItem, Snapshot } from "./release-inspection";
+import { requireReleaseBase, type HandoffItem, type Snapshot } from "./release-inspection";
 import type { Ledger } from "./store";
 import { appendEventInTx, withImmediateTx } from "./transactions";
 import { evidenceSource, isRolloutEndpoint, nowIso, type RunbookSqlFileAction } from "./types";
@@ -73,6 +73,7 @@ export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback
       const pr = verifiedPr(dir, branch, verified_head, url, process.env, Boolean(callbacks));
       callbacks?.verifyTarget(repo,branch,pr.baseRefOid,pr.state);
       if (typeof pr.baseRefName !== "string" || !pr.baseRefName) throw Error("PR has no base branch");
+      requireReleaseBase(ledger, task_id, pr.baseRefName);
       return {
         repo,
         branch,

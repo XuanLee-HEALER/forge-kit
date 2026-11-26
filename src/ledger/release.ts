@@ -1,4 +1,4 @@
-import { canonicalJson, isRolloutEndpoint, sha256String, VALID_ENDPOINTS, type ReleaseObserver } from "./types";
+import { canonicalJson, isRolloutEndpoint, sha256String, usesV05, type ReleaseObserver } from "./types";
 import { stagePin } from "./ship-actions";
 import { observeStage } from "../stage-observation";
 import { installedInstance } from "../workflow-config";
@@ -7,6 +7,7 @@ import { randomBytes } from "node:crypto";
 import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
 import {
   currentHandoff,
+  deploymentStages,
   availableHandoffs,
   detail,
   aggregate,
@@ -123,11 +124,12 @@ function releaseObservers(ledger: Ledger, release: ReturnType<typeof detail>): R
   const observers: ReleaseObserver[] = [];
   for (const item of release.items) {
     const endpoint = ledger.getTask(item.task_id)!.endpoint;
-    if (VALID_ENDPOINTS.has(endpoint)) continue;
+    if (!isRolloutEndpoint(endpoint) || !usesV05(ledger, item.task_id)) continue;
     const cfg = installedInstance(ledger.workbenchRoot);
+    const stages = deploymentStages(cfg, endpoint);
+    if (endpoint === "prod" && !stages.length) continue;
     if (cfg?.delivery.value.endpoint !== endpoint)
       throw Error("Release endpoint changed for " + item.task_id);
-    const stages = cfg.delivery.value.stages.filter(id => cfg.stages.get(id)?.source !== "core");
     if (!stages.length) throw Error("Custom release endpoint requires a target observer: " + endpoint);
     const versions = [{repo: item.repo, head: item.expected_head_sha}];
     for (const id of stages) {
@@ -265,19 +267,22 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
       const rb = ledger.getRunbook(release.runbook_id);
       if (rb?.status !== "COMPLETED" || !rb.approved_at)
         throw Error("Linked runbook must be approved and COMPLETED");
-      checkedActions(checked, rb);
+      const approvedObservers = checkedActions(checked, rb).release_observers ?? [];
+      if (canonicalJson(approvedObservers) !== canonicalJson(releaseObservers(ledger, checked)))
+        throw Error("Release observer bindings changed; resume the handoff and approve the current deployment configuration");
       requireActionReceipts(ledger, id, rb);
       for (const item of prodItems) {
         const endpoint = ledger.getTask(item.task_id)!.endpoint;
+        const observed = approvedObservers.some(pin => pin.task_id === item.task_id && pin.repo === item.repo && pin.branch === item.branch);
         const last = ledger.db
-          .query<{ status: string }, [string, string, string, string, string, string, string, string]>(
+          .query<{ status: string }, [string, string, string, string, string, number, string, string]>(
             `SELECT json_extract(payload_json,'$.status') AS status FROM events WHERE task_id=?
            AND canonical_repo(repo)=canonical_repo(?) AND branch=? AND sha=? AND event_type='EVIDENCE_CAPTURED'
            AND json_extract(payload_json,'$.release_id')=?
-           AND (?='prod' OR (json_extract(payload_json,'$.source')='tool' AND json_extract(payload_json,'$.meta.delivery_endpoint')=? AND json_extract(payload_json,'$.meta.observed_runbook')=?))
+           AND (?=0 OR (json_extract(payload_json,'$.source')='tool' AND json_extract(payload_json,'$.meta.delivery_endpoint')=? AND json_extract(payload_json,'$.meta.observed_runbook')=?))
            AND json_extract(payload_json,'$.kind')='prod' AND json_type(payload_json,'$.meta.action_id') IS NULL AND json_extract(payload_json,'$.status') IN ('pass','fail') ORDER BY seq DESC LIMIT 1`,
           )
-          .get(item.task_id, item.repo, item.branch, item.expected_head_sha, id, endpoint, endpoint, rb.runbook_id);
+          .get(item.task_id, item.repo, item.branch, item.expected_head_sha, id, Number(observed), endpoint, rb.runbook_id);
         if (last?.status !== "pass")
           throw Error(
             "Missing SHA-bound production delivery evidence for " + item.repo + "@" + item.expected_head_sha,

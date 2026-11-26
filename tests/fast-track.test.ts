@@ -154,7 +154,7 @@ test("scope-bound runbook activation requires the exact root prompt", () => {
   writeFileSync(policy(), template);
   expect(human("快轨批准 " + id)).toContain("ACTIVE");
   expect(ledger.getRunbook(rb.runbook_id)?.approved_session_id).toBe("test-session");
-  expect(() => ledger.completeRunbook(rb.runbook_id)).toThrow("verified action receipts");
+  expect(() => ledger.completeRunbook(rb.runbook_id)).toThrow("forge ship run --envelope " + id);
   expect(() => fastTrackCommand(ledger, ["revoke", id])).toThrow("approving root session");
   expect(human("快轨撤销 " + id, { session_id: "different-session" })).toContain("refused");
   expect(ledger.getRunbook(rb.runbook_id)?.status).toBe("APPROVED");

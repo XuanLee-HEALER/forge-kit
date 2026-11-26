@@ -231,8 +231,8 @@ function checkAuthorization(ledger: Ledger, id: string) {
     throw Error("Task has an open blocker");
 }
 class WaitingForTarget extends Error {
-  constructor(readonly index: number) {
-    super("Awaiting target confirmation; retry forge ship run to observe the same action without resubmitting");
+  constructor(readonly index: number, envelopeId: string) {
+    super("Awaiting target confirmation. Retry forge ship run --envelope " + envelopeId + " to observe the same delivery.");
   }
 }
 function reconcileStage(
@@ -246,7 +246,7 @@ function reconcileStage(
   const actionId = e.envelope_id + "/" + index;
   function observe() {
     const fact = observeStage(ledger.workbenchRoot, a, actionId, plan.endpoint, versions);
-    if (!fact || fact.state === "pending") throw new WaitingForTarget(index);
+    if (!fact || fact.state === "pending") throw new WaitingForTarget(index, e.envelope_id);
     if (fact.state === "failed") throw Error("Target reports failed delivery for " + a.stage);
     return fact.state === "completed" ? canonicalJson(fact) : null;
   }
@@ -261,7 +261,7 @@ function reconcileStage(
         "SELECT 1 FROM events WHERE task_id=? AND event_type='SHIP_STAGE_SUBMISSION_INTENT' AND json_extract(payload_json,'$.envelope_id')=? AND json_extract(payload_json,'$.index')=? LIMIT 1",
       )
       .get(e.task_id, e.envelope_id, index);
-    if (submitted) throw new WaitingForTarget(index);
+    if (submitted) throw new WaitingForTarget(index, e.envelope_id);
     trackEvent(ledger, e, "SHIP_STAGE_SUBMISSION_INTENT", { index, action_id: actionId });
   });
   const env = { ...stageEnvironment(actionId, plan.endpoint, versions), FORGE_ACTIVE_STAGE: a.stage };
@@ -272,7 +272,7 @@ function reconcileStage(
     throw Error(
       `Stage ${a.stage} submission exited with code ${submission.code}; target reports action ${actionId} absent. Inspect the submitter and target before manual recovery.`,
     );
-  throw new WaitingForTarget(index);
+  throw new WaitingForTarget(index, e.envelope_id);
 }
 function perform(
   ledger: Ledger,

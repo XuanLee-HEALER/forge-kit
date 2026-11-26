@@ -1,3 +1,4 @@
+import { checkMigration } from "./managed-assets";
 import { verificationPolicy } from "./workflow-config";
 import { createHash } from "node:crypto";
 import { runVerificationProcess } from "./verification-process";
@@ -35,7 +36,9 @@ export function verifyCli(args: string[]) {
       (!argv.length || !kind || !["lint", "test", "build", "hurl"].includes(kind) || values.mode))
   )
     throw Error("Use --mode static|dynamic|all or --kind lint|test|build|hurl -- <command> [args...]");
-  const ledger = new Ledger(findWorkbenchRoot(values.cwd));
+  const root = findWorkbenchRoot(values.cwd);
+  checkMigration(root);
+  const ledger = new Ledger(root);
   let temporary: string | undefined;
   let recordAborted: (() => void) | undefined;
   try {

@@ -198,8 +198,8 @@ console.log(JSON.stringify(observation));
   writeFileSync(cfgPath, stringify(cfg));
 }
 
-function delivery(localRollout?: RolloutMode) {
-  const prepared = preparePullRequest("full", false, localRollout ? "prod" : "pr");
+function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "prod" : "pr") {
+  const prepared = preparePullRequest("full", false, taskEndpoint);
   const {ledger} = prepared;
   const receipt = join(s.work, "stage-effects");
   const stageFile = join(s.work, "release-stage.ts");
@@ -365,6 +365,7 @@ for (const mode of ["success", "failure"] as const) {
     expect(readFileSync(f.receipt, "utf8")).toBe(f.head + "\n");
     const after = JSON.parse(second.out || second.err);
     expect(after.receipts).toEqual(report.receipts);
+    if (mode === "success") f.ledger("close", "ship-task", "--no-archive");
   }, 90_000);
 }
 
@@ -464,6 +465,7 @@ for (const outcome of ["completed", "disappeared", "wrong-version"]) {
     expect(first.code, first.out + first.err).not.toBe(0);
     const submitted = JSON.parse(first.out || first.err);
     expect(submitted.ok).toBe(false);
+    if (outcome !== "wrong-version") expect(submitted.reason.message).toContain("forge ship run --envelope " + f.envelope);
     expect(submitted.receipts.filter((row: {status: string}) => row.status === "confirmed")).toHaveLength(1);
     expect(existsSync(f.targetState), first.out + first.err).toBe(true);
     const target = JSON.parse(readFileSync(f.targetState, "utf8"));
@@ -487,10 +489,39 @@ for (const outcome of ["completed", "disappeared", "wrong-version"]) {
   }, 90_000);
 }
 
-test("T13 delegated rollout observation belongs to the handed-off task, stage and revision", () => {
-  const f = preparePullRequest("full", false, "blue-rollout");
+test("v0.5 PR handoff and release require main even when staging contains the verified head", () => {
+  const f = preparePullRequest("targeted");
+  const pr = JSON.parse(readFileSync(f.state, "utf8"));
+  const staged = {...pr, baseRefName: "staging", state: "MERGED", mergeCommit: {oid:f.head}};
+  writeFileSync(f.state, JSON.stringify(staged));
+  s.git(f.repo, "update-ref", "refs/remotes/origin/staging", f.head);
+  const handoff = s.run([s.forge, "ledger", "handoff", "ship-task"]);
+  expect(handoff.code).not.toBe(0);
+  expect(handoff.err + handoff.out).toContain("targeting main");
+
+  writeFileSync(f.state, JSON.stringify(pr));
+  f.ledger("handoff", "ship-task");
+  const batch = JSON.parse(f.ledger("release", "create", "--title", "PR target", "--tasks", "ship-task"));
+  f.ledger("release", "verify", batch.release_id);
+  writeFileSync(f.state, JSON.stringify(staged));
+  const completion = s.run([s.forge, "ledger", "release", "complete", batch.release_id]);
+  expect(completion.code).not.toBe(0);
+  expect(completion.err + completion.out).toContain("PR base branch changed");
+  expect(JSON.parse(f.ledger("release", "status", batch.release_id)).status).not.toBe("COMPLETED");
+}, 90_000);
+
+for (const endpoint of ["blue-rollout", "prod"]) test(`T13 delegated ${endpoint} observation belongs to the handed-off task, stage and revision`, () => {
+  const f = preparePullRequest("full", false, endpoint);
   const ledger = f.ledger;
-  ledger("open", "--id", "sibling", "--title", "other rollout", "--repo", "app", "--branch", "sibling", "--endpoint", "blue-rollout", "--depth", "targeted");
+  if (endpoint === "prod") {
+    configureStage("success", f.head, f.base, endpoint, "publish");
+    ledger("record", "ship-task", "--kind", "prod", "--status", "pass", "--repo", "app",
+      "--branch", "feature-fixture", "--sha", f.head, "--summary", "manual claim");
+    const close = s.run([s.forge, "ledger", "close", "ship-task"]);
+    expect(close.code).not.toBe(0);
+    expect(close.err + close.out).toContain("delivery evidence");
+  }
+  ledger("open", "--id", "sibling", "--title", "other rollout", "--repo", "app", "--branch", "sibling", "--endpoint", endpoint, "--depth", "targeted");
   ledger("handoff", "ship-task");
   const batch = JSON.parse(ledger("release", "create", "--title", "isolated named deployment", "--tasks", "ship-task"));
   ledger("release", "verify", batch.release_id);
@@ -498,7 +529,7 @@ test("T13 delegated rollout observation belongs to the handed-off task, stage an
   const observers = book.actions.release_observers;
   expect(observers).toHaveLength(1);
   const observer = observers[0];
-  expect(observer.endpoint).toBe("blue-rollout");
+  expect(observer.endpoint).toBe(endpoint);
   expect(JSON.stringify(observer.stage)).toContain("publish");
   expect(observer.versions).toContainEqual({repo:"app",head:f.head});
   s.hook("UserPromptSubmit", {session_id:"operator", prompt:"批准 " + book.runbook_id});
@@ -507,7 +538,7 @@ test("T13 delegated rollout observation belongs to the handed-off task, stage an
   s.git(f.repo, "fetch", f.bare, "+refs/heads/main:refs/remotes/origin/main");
   const targetState = join(s.work, "deployment-target.json");
   const observe = [s.forge, "ledger", "release", "observe", batch.release_id];
-  const record = {action_id:observer.action_id, endpoint:"blue-rollout", state:"completed",versions:[{repo:"app",head:f.head}]};
+  const record = {action_id:observer.action_id, endpoint:endpoint, state:"completed",versions:[{repo:"app",head:f.head}]};
   for (const imported of [
     {...record, versions:[{repo:"app",head:f.base}]},
     {...record, action_id:"other-batch/publish"},
@@ -516,7 +547,22 @@ test("T13 delegated rollout observation belongs to the handed-off task, stage an
     const wrong = s.run(observe);
     expect(wrong.code, wrong.out + wrong.err).not.toBe(0);
   }
-  expect(s.run([s.forge, "ledger", "release", "complete", batch.release_id]).code).not.toBe(0);
+  ledger("runbook", "complete", book.runbook_id);
+  ledger("record", "ship-task", "--kind", "prod", "--status", "pass", "--repo", "app",
+    "--branch", "feature-fixture", "--sha", f.head, "--summary", "manual confirmation");
+  const unobserved = s.run([s.forge, "ledger", "release", "complete", batch.release_id]);
+  expect(unobserved.code).not.toBe(0);
+  expect(unobserved.err + unobserved.out).toContain("production delivery evidence");
+  if (endpoint === "prod") {
+    const path = join(s.work, ".workbench/workbench.yaml");
+    const original = readFileSync(path);
+    const doc = parse(original.toString());
+    doc.extensions.delivery.stages = ["ship"];
+    writeFileSync(path, stringify(doc));
+    const drift = s.run([s.forge, "ledger", "release", "complete", batch.release_id]);
+    expect(drift.err + drift.out).toContain("observer bindings changed");
+    writeFileSync(path, original);
+  }
   writeFileSync(targetState, JSON.stringify(record));
   s.ok(observe);
   const events = JSON.parse(ledger("query", "--q", "prod", "--repo", "app", "--json")).events;
@@ -529,9 +575,8 @@ test("T13 delegated rollout observation belongs to the handed-off task, stage an
   expect(evidence[0].payload_json).toContain(batch.release_id);
   expect(evidence[0].payload_json).toContain(book.runbook_id);
   const meta = JSON.parse(evidence[0].payload_json).meta;
-  expect(meta.delivery_endpoint).toBe("blue-rollout");
+  expect(meta.delivery_endpoint).toBe(endpoint);
   expect(meta.observation_ids).toEqual([observer.action_id]);
-  ledger("runbook", "complete", book.runbook_id);
   const accepted = JSON.parse(ledger("release", "complete", batch.release_id, "--summary", "local target reports deployed revision"));
   expect(accepted.task_ids).toEqual(["ship-task"]);
   const open = JSON.parse(ledger("query", "--status", "OPEN", "--json")).tasks;
@@ -562,4 +607,46 @@ test("T11 recheck a pinned rollout input after the preceding PR operation", asyn
     if (proc.exitCode === null) proc.kill();
     await proc.exited;
   }
+}, 90_000);
+
+test("T11 a PR envelope cannot authorize an instance delivery writer", () => {
+  const f = preparePullRequest();
+  localTransport(f.bare, f.calls);
+  configureStage("success", f.head, f.base, "pr", "rollout");
+  const path = join(s.work, ".workbench/workbench.yaml");
+  const cfg = parse(readFileSync(path, "utf8"));
+  for (const purpose of ["deploy", "prod-write"]) {
+    cfg.extensions.actions.rolloutAction.purpose = purpose;
+    writeFileSync(path, stringify(cfg));
+    const book = JSON.parse(f.ledger("runbook", "create", "--task", "ship-task", "--title", purpose,
+      "--pr", "app:1", "--stage", "rollout"));
+    const result = s.run([s.forge, "ledger", "fast-track", "prepare", "ship-task",
+      "--runbook", book.runbook_id, "--to", "pr", "--paths", "src/**"]);
+    expect(result.code).not.toBe(0);
+    expect(result.err + result.out).toContain("production delivery endpoint");
+  }
+  expect(existsSync(join(s.work, "stage-effects"))).toBe(false);
+  expect(s.git(f.bare, "rev-parse", "refs/heads/main").trim()).toBe(f.base);
+}, 90_000);
+
+test("T11 an approved rollout stops after the task endpoint is reduced", () => {
+  const f = delivery("success");
+  f.approve();
+  f.ledger("set-endpoint", "ship-task", "--endpoint", "local", "--reason", "operator narrowed delivery");
+  for (const endpoint of ["local", "prod"]) {
+    if (endpoint === "prod") f.ledger("set-endpoint", "ship-task", "--endpoint", endpoint);
+    const result = s.run(f.shipArgs);
+    expect(result.code, result.err + result.out).not.toBe(0);
+  }
+  expect(readFileSync(f.calls, "utf8")).toBe("");
+  expect(existsSync(f.receipt)).toBe(false);
+  expect(s.git(f.bare, "rev-parse", "refs/heads/main").trim()).toBe(f.base);
+}, 90_000);
+
+test("T11 a stable PR task may authorize an exact production rollout", () => {
+  const f = delivery("success", "pr");
+  f.approve();
+  const result = s.run(f.shipArgs);
+  expect(result.code, result.err + result.out).toBe(0);
+  expect(readFileSync(f.receipt, "utf8")).toBe(f.head + "\n");
 }, 90_000);

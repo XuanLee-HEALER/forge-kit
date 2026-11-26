@@ -2,6 +2,7 @@ import { usesV05, isRolloutEndpoint } from "./types";
 import { installedInstance, verificationPolicy } from "../workflow-config";
 import {
   availableHandoffs,
+  deploymentStages,
   currentHandoff,
   productionActions,
   actionMatchesItem,
@@ -908,6 +909,7 @@ export class Ledger {
     params = {...params, repo:canonicalRepoPath(this.workbenchRoot,params.repo)};
     const currentWorkflow = usesV05(this, params.task_id);
     const config = currentWorkflow ? installedInstance(this.workbenchRoot) : undefined;
+    const prodStages = currentWorkflow && task.endpoint === "prod" ? deploymentStages(config, task.endpoint) : [];
     const customVerification = config && (config.verification.source !== "core" ||
       config.verification.value.stages.some(id => config.stages.get(id)?.source !== "core"));
     const expectedPolicy = config ? verificationPolicy(this.workbenchRoot, params.repo, params.head_sha, config) : undefined;
@@ -992,6 +994,7 @@ export class Ledger {
           kind?: string;
           status?: string;
           meta?: {
+            stage_receipts?: { stage: string; state: string; endpoint: string; versions: { repo: string; head: string }[] }[];
             pr_head_oid?: string;
             state?: string; base_branch?: string; target_oid?: string;
             pr_url?: string;
@@ -1040,6 +1043,11 @@ export class Ledger {
           (isRolloutEndpoint(task.endpoint) && p.kind === "prod" && (task.endpoint === "prod" ||
             (evidenceSource(p, ev.actor) === "tool" && p.meta?.delivery_endpoint === task.endpoint)))
         ) {
+          if (p.kind === "prod" && p.status === "pass" && prodStages.length &&
+              (evidenceSource(p, ev.actor) !== "tool" || p.meta?.delivery_endpoint !== task.endpoint ||
+               !prodStages.every(id => p.meta?.stage_receipts?.some(receipt => receipt.stage === id &&
+                 receipt.state === "completed" && receipt.endpoint === task.endpoint &&
+                 receipt.versions.some(version => version.repo === params.repo && version.head === params.head_sha))))) continue;
           if (p.kind === "pr" && p.status === "pass" &&
               (p.meta?.pr_head_oid !== params.head_sha || !p.meta.pr_url)) continue;
           if (currentWorkflow && p.kind==="pr" && p.status==="pass") {

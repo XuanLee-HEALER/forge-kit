@@ -19,7 +19,7 @@ beforeEach(() => {
     'const args = process.argv.slice(2), data = JSON.parse(await Bun.stdin.text());',
     'if (!data.spec?.includes("Fixture requirements") || !args.includes("--ephemeral")) process.exit(2);',
     'if (process.env.MUTATE_REPO) await Bun.write(process.env.MUTATE_REPO + "/edit", "modified");',
-    'await Bun.write(args[args.indexOf("-o")+1], JSON.stringify({status:"pass",summary:"reviewed fixture",findings:[],checked:[],limitations:[]}));',
+    'await Bun.write(args[args.indexOf("-o")+1], JSON.stringify({status:"pass",summary:"reviewed fixture",findings:[],checked:[],limitations:["Runtime coverage unavailable"]}));',
   ].join("\n"));
   chmodSync(codex, 0o755);
 });
@@ -32,9 +32,15 @@ test("ordered review records only actual roles against the pinned task and versi
   expect(r.exitCode, r.stderr.toString() + r.stdout.toString()).toBe(0);
   const report = JSON.parse(r.stdout.toString());
   expect(report.roles.map((role: { role: string }) => role.role)).toEqual(["business", "quality"]);
+  expect(report.roles.map((role: { limitations: string[] }) => role.limitations)).toEqual([
+    ["Runtime coverage unavailable"], ["Runtime coverage unavailable"],
+  ]);
+  const history = f.cli("ledger", ["reviews", "task"]);
+  expect(JSON.parse(history.stdout.toString())[0].limitations).toEqual(["Runtime coverage unavailable"]);
   const records = f.evidence().filter(e => e.kind === "review");
   expect(records).toHaveLength(2);
   for (const record of records) {
+    expect(record.meta.limitations).toEqual(["Runtime coverage unavailable"]);
     expect(record.source).toBe("tool");
     expect(record.meta.head).toBe(f.git("rev-parse", "HEAD"));
     expect(record.meta.review_task_id).toBe("task");

@@ -28,7 +28,7 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 
 实例终点为 FAT 时，按每个挂载仓登记 `--fat <repo>:fat`，绑定远端现有的 `refs/heads/fat`、旧 SHA、来源 head 及预期更新 SHA。该 runbook 只允许指定测试引用的条件更新。
 
-规格冻结后，使用 `forge ledger fast-track prepare <task-id> --to <endpoint> --paths <globs> --runbook <rb-id>` 绑定终点、范围和精确 runbook。向用户展示逐项资源、动作、版本和时效。用户在主会话单独发送 `快轨批准 <ft-id>` 或 `快轨撤销 <ft-id>`。快轨可覆盖整个实例交付路径。
+规格冻结后，使用 `forge ledger fast-track prepare <task-id> --to <endpoint> --paths <globs> --runbook <rb-id>` 绑定终点、范围和精确 runbook。向用户展示逐项资源、动作、版本和时效。用户在主会话单独发送 `快轨批准 <ft-id>` 或 `快轨撤销 <ft-id>`。快轨可覆盖整个实例交付路径。实例交付动作可以运行部署程序，需要生产级终点和策略许可。准备后变更任务终点会使原授权失效，须按新范围重新准备并批准。
 
 在同一获批会话运行 `forge ship evaluate --envelope <ft-id>` 后用 `forge ship run --envelope <ft-id>` 兑现。每一步核对策略、时效、冻结范围、版本、CI、评审与外部状态。只执行已确定动作；超界、漂移、后来才确定的动作或异常均须在调用前停止。重试前读取逐项回执，外部结果不确定时交还人工核实。存量授权缺精确绑定时重新登记并批准。
 
@@ -53,4 +53,4 @@ delivery: {endpoint: rollout, stages: [ship, rollout]}
 {"state":"completed","action_id":"ft-123/1","endpoint":"rollout","versions":[{"repo":"api","head":"0123456789abcdef0123456789abcdef01234567"}]}
 ```
 
-观察程序使用 `absent` 表示目标不存在，`pending` 表示执行中，`failed` 表示失败。初次观察为 absent 时可以提交一次。已经发起提交且目标尚未确认时，在原批准会话重跑同一条 `forge ship run` 查询进度。只有目标返回 `completed` 且动作、终点及全部版本匹配时才记录成功。失败或版本不符时暂停并检查实际目标。
+观察程序使用 `absent` 表示目标不存在，`pending` 表示执行中，`failed` 表示失败。初次观察为 absent 时可以提交一次。已经发起提交且目标尚未确认时，在原批准会话使用本次授权编号重跑 `forge ship run --envelope <ft-id>` 查询进度。只有目标返回 `completed` 且动作、终点及全部版本匹配时才记录成功。失败或版本不符时暂停并检查实际目标。

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { Ledger } from "../src/ledger/store";
 import { kit, sandbox, type Sandbox } from "./v05-sandbox";
 
 const skillPath = ".agents/skills/ready/SKILL.md";
@@ -192,3 +193,58 @@ test("ledger reviews preserves selected roles that could not start and their mis
   expect(empty.err + empty.out).toContain("Empty review diff");
   expect(JSON.parse(s.ok([s.forge, "ledger", "reviews", "selection"]))).toEqual(reviews);
 });
+
+for (const version of ["0.4", "0.5"] as const) test(`v${version} performance retry preserves the original role and range`, () => {
+  s.fresh();
+  const app = join(s.work, "app");
+  s.git(s.work, "clone", "-q", repo, app);
+  const db = new Ledger(s.work);
+  try {
+    const task = "perf-recovery";
+    db.openTask({workflow_version:version, task_id:task, title:"Recover original review", endpoint:"local", depth:"full",
+      repo:"app", branch:"main", base_sha:base, head_sha:head});
+    for (const file of ["ssot", "tech-spec", "test-spec"]) s.privateFile(`.workbench/specs/${task}/${file}.md`, "Review the pinned revision.");
+    const floor = db.freezeSpec({task_id: task}).spec.evidence_floor_seq.review;
+    Object.assign(s.env, {FORGE_CODEX_BIN:codex, REQUESTS:log, PASS:JSON.stringify(modelReport("pass"))});
+    const review = (role: string, ...more: string[]) => s.run([s.forge, "review", "--task", task, "--repo", "app", "--roles", role, "--backend", "codex", ...more], app);
+    expect(review("performance").code).not.toBe(0);
+    const scope = { task_id:task, repo:"app", branch:"main", sha:head, source:"tool" as const, actor:"tool" };
+    const failure = db.recordEvidence({...scope, kind:"review", status:"fail", summary:"upstream transient failure",
+      meta:{ role:"performance", base, head, review_task_id:task, review_floor_seq:floor, report_status:"error", exit_code:2, error_code:"upstream_unavailable" }});
+    const standalone = s.run([join(kit,"review-agents/bin/review"), "--repo", app, "--base", base, "--head", head, "--roles", "performance"]);
+    expect(standalone.code).not.toBe(0);
+    expect(review("performance", "--base", head).code).not.toBe(0);
+    if (version === "0.5") {
+      expect(review("performance").code).not.toBe(0);
+      expect(readFileSync(log, "utf8")).toBe("");
+      return;
+    }
+
+    for (const kind of ["lint","test"] as const) db.recordEvidence({...scope, kind, status:"pass", summary: "fixture verification"});
+    s.env.QUALITY = JSON.stringify(modelReport("pass"));
+    const readiness = () => db.checkPushReadiness({task_id:task, repo:"app", branch:"main", head_sha:head});
+    expect(review("quality,simplify").code).toBe(0);
+    expect(readiness().hasExplicitFailure).toBe(true);
+    s.env.PASS = JSON.stringify(modelReport("blocked"));
+    expect(review("performance").code).toBe(1);
+    expect(readiness().hasExplicitFailure).toBe(true);
+    s.env.PASS = JSON.stringify(modelReport("pass"));
+    const retry = review("performance");
+    expect(retry.code, retry.out + retry.err).toBe(0);
+    expect(JSON.parse(retry.out).roles).toMatchObject([{ role:"performance", base, head, status:"pass", backend:"codex" }]);
+    expect(readiness().ready).toBe(true);
+    expect(db.getTaskEvents(task).find(e => e.seq === failure.seq)).toEqual(failure);
+    const records = db.getTaskEvents(task).filter(e => e.event_type === "EVIDENCE_CAPTURED")
+      .map(e => ({seq:e.seq, ...JSON.parse(e.payload_json)})).filter(e => e.meta?.role === "performance");
+    expect(records.map(r => r.status)).toEqual(["fail","fail","pass"]);
+    expect(records[1].meta.retry_of).toBe(failure.seq);
+    expect(records[2].meta.retry_of).toBe(records[1].seq);
+    const inputs = readFileSync(log,"utf8").trim().split("\n").map(line => JSON.parse(line));
+    const prompt = JSON.parse(inputs.at(-1).prompt);
+    expect(prompt).toMatchObject({role:"performance",base,head});
+    expect(prompt.instructions).toContain("# Simplicity and performance reviewer");
+    expect(prompt.instructions).not.toContain("# Code simplification reviewer");
+    expect(inputs.at(-1).args).toContain("read-only");
+    expect(review("performance").code).not.toBe(0);
+  } finally { db.closeDb(); }
+}, 30_000);

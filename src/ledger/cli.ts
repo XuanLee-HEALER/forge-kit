@@ -87,7 +87,7 @@ Commands:
         const meta = evidence.meta ?? {};
         return [{ seq: event.seq, repo: event.repo, branch: event.branch, base: meta.base,
           head: event.sha, role: meta.role, status: meta.report_status ?? evidence.status,
-          backend: meta.backend, attempts: meta.attempts, missing_materials: meta.missing_materials, source: evidenceSource(evidence, event.actor), summary: evidence.summary }];
+          backend: meta.backend, attempts: meta.attempts, limitations: meta.limitations, missing_materials: meta.missing_materials, source: evidenceSource(evidence, event.actor), summary: evidence.summary }];
       });
       console.log(JSON.stringify(records, null, 2));
       return;

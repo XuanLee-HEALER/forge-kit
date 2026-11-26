@@ -15,7 +15,7 @@ type Finding = ReturnType<typeof validateReport>["findings"][number];
 type Attempt = { backend: Backend; status: Status; reason?: string };
 type RoleReport = {
   role: Role; base: string; head: string; status: Status; backend: Backend | null;
-  missing_materials?: string[]; findings: Finding[]; summary: string; attempts: Attempt[];
+  missing_materials?: string[]; findings: Finding[]; limitations: string[]; summary: string; attempts: Attempt[];
 };
 
 export const reviewOptions = {
@@ -23,21 +23,21 @@ export const reviewOptions = {
   roles: { type: "string" }, order: { type: "string" }, mode: { type: "string" }, backend: { type: "string" },
 } as const;
 
-function selection(csv: string) {
+function selection(csv: string, available: readonly Role[]) {
   const list = csv.split(",") as Role[];
-  if (!list.every(role => roles.includes(role)) || new Set(list).size !== list.length)
-    throw Error("Expected nonempty unique roles from " + roles.join(","));
+  if (!list.every(role => available.includes(role)) || new Set(list).size !== list.length)
+    throw Error("Expected nonempty unique roles from " + available.join(","));
   return list;
 }
 
-function options(opts: Option) {
-  const requested = selection(opts.roles ?? roles.join(","));
+function options(opts: Option, available: readonly Role[]) {
+  const requested = selection(opts.roles ?? available.join(","), available);
   const mode = (opts.mode ?? "parallel") as Mode;
   if (!modes.includes(mode)) throw Error("Invalid mode");
-  let sequence = roles.filter(r => requested.includes(r));
+  let sequence = available.filter(r => requested.includes(r));
   if (mode === "ordered") {
     if (!opts.order) throw Error("ordered mode requires --order");
-    const order = selection(opts.order);
+    const order = selection(opts.order, available);
     if (order.length !== sequence.length || !order.every(r => sequence.includes(r))) throw Error("--order must cover the selected roles");
     sequence = order;
   } else if (opts.order !== undefined) throw Error("--order requires ordered mode");
@@ -70,8 +70,9 @@ function materials(repo: Repo) {
 export async function runReview(params: Option & {
   repo: string; base: string; head: string; spec?: string; specSha256?: string;
   models?: Partial<Record<Role, Model>>; model?: Model;
+  legacyPerformanceRetry?: boolean;
 }) {
-  const { mode, sequence, backend } = options(params);
+  const { mode, sequence, backend } = options(params, params.legacyPerformanceRetry ? ["performance"] : roles);
   const repo = new Repo(params.repo, params.base, params.head);
   const { base, head } = repo;
   repo.git(["merge-base", "--is-ancestor", base, head]);
@@ -94,7 +95,7 @@ export async function runReview(params: Option & {
     const common = { role, base, head };
     const missing = [...material.missing];
     if (role === "business" && !spec) missing.push("spec");
-    if (missing.length) return { ...common, backend: null, missing_materials: missing, findings: [], attempts: [], summary: "Missing review material: " + missing.join(", "), status: "incomplete" };
+    if (missing.length) return { ...common, backend: null, missing_materials: missing, limitations: [], findings: [], attempts: [], summary: "Missing review material: " + missing.join(", "), status: "incomplete" };
     const prompt = JSON.stringify({ role, base, head, instructions: instructions(role, repo.files), spec: spec ?? null, diff: material.diff, context });
     const model = params.models?.[role] ?? params.model ?? { model: process.env.REVIEW_MODEL || "gpt-6.2-sol", effort: "medium" };
     const attempts: Attempt[] = [];
@@ -104,12 +105,12 @@ export async function runReview(params: Option & {
         const report = validateReport(await invoke(active, prompt, model), repo.files, []);
         const status = report.status === "findings" ? "blocked" : report.status;
         attempts.push({ backend: active, status });
-        return { ...common, backend: active, attempts, findings: report.findings, summary: report.summary, status };
+        return { ...common, backend: active, attempts, limitations: report.limitations, findings: report.findings, summary: report.summary, status };
       } catch (error) {
         const summary = error instanceof BackendFailure ? error.message : "Unable to execute backend or validate report";
         attempts.push({ backend: active, status: "error", reason: summary });
         if (backend === "auto" && active === "codex" && error instanceof BackendFailure && error.upstream) continue;
-        return { ...common, backend: active, attempts, findings: [], summary, status: "error" };
+        return { ...common, backend: active, attempts, limitations: [], findings: [], summary, status: "error" };
       }
     }
     throw Error("No review backend selected");

@@ -9,7 +9,7 @@ import {
   type Asset,
   type InstallLock,
 } from "./managed-assets";
-import { localPath, readRequired, resolveInstance, runInstanceStage } from "./instance";
+import { localPath, readRequired, isProjectVerification, resolveInstance, runInstanceStage } from "./instance";
 import { Database } from "bun:sqlite";
 import {
   accessSync,
@@ -502,6 +502,14 @@ function inspectWorkbench(root: string) {
   try {
     checkMigration(root);
     const effective = resolveInstance(root, findKitRoot());
+    const projectChecks = [...effective.actions.values()].filter(({value}) =>
+      isProjectVerification(value, effective.repos) && (value.inputs?.length ||
+        (value.argv[0].includes("/") && !isAbsolute(value.argv[0]))));
+    if (projectChecks.length) issues.push({
+      level: "warn", check: "verification",
+      message: "forge verify checks repository-relative files at the selected commit for actions: " +
+        projectChecks.map(action => action.id).join(", "),
+    });
     for (const id of effective.delivery.value.stages) {
       const stage = effective.stages.get(id)!;
       if (stage.source==="core") continue;
@@ -534,12 +542,18 @@ function inspectWorkbench(root: string) {
     });
     return { ok: false, root, issues };
   }
+  const syncCommand = issues.some(issue => issue.check === "bins")
+    ? "./bin/forge sync " + Bun.$.escape(root) + " from the forge-kit release directory"
+    : "forge sync " + Bun.$.escape(root);
   const agentsPath = localPath(root, "AGENTS.md");
-  if (!existsSync(agentsPath) || readRequired(agentsPath).length >= 8000)
+  const agentsMissing = !existsSync(agentsPath);
+  if (agentsMissing || readRequired(agentsPath).length >= 8000)
     issues.push({
       level: "error",
       check: "agents-md",
-      message: agentsPath + " must exist and be under 8000 bytes; run forge sync",
+      message: agentsMissing
+        ? "Missing " + agentsPath + "; run " + syncCommand + " to recreate it"
+        : agentsPath + " must be under 8000 bytes; move the edited file aside, then run " + syncCommand + " to recreate it",
     });
 
   // 2. Codex config / hooks / agents parse + models.toml consistency checks
@@ -699,11 +713,14 @@ function inspectWorkbench(root: string) {
     const lock = JSON.parse(readRequired(lockPath).toString()) as KitLock;
     for (const [path, expected] of Object.entries(lock.managed_files ?? {})) {
       const dest = localPath(root, path);
-      if (!existsSync(dest) || hash(readRequired(dest)) !== expected)
+      const missing = !existsSync(dest);
+      if (missing || hash(readRequired(dest)) !== expected)
         issues.push({
           level: "error",
           check: "projection",
-          message: dest + " differs from the installed manifest; move the edited file aside, then run forge sync to recreate it",
+          message: missing
+            ? "Missing " + dest + "; run " + syncCommand + " to recreate it"
+            : dest + " differs from the installed manifest; move the edited file aside, then run " + syncCommand + " to recreate it",
         });
     }
   }

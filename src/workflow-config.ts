@@ -24,14 +24,19 @@ export function verificationPolicy(root: string, repo: string, head: string, con
     const directory = verificationDirectory(root, repo, action.cwd, config.repos);
     const paths = new Set<string>();
     const pinned: [string, string][] = [];
-    for (const input of action.inputs ?? []) {
-      if (directory.target === "instance") paths.add(localPath(directory.path, input));
-      else {
-        const path = join(directory.path, input);
+    if (directory.target === "instance") {
+      for (const input of action.inputs ?? []) paths.add(localPath(directory.path, input));
+    } else {
+      const executable = action.argv[0].includes("/") && !isAbsolute(action.argv[0]) ? action.argv[0] : undefined;
+      const files = new Set(action.inputs ?? []);
+      if (executable) files.add(executable);
+      for (const file of files) {
+        const path = join(directory.path, file);
         const entry = runGit(localPath(root, repo), ["ls-tree", "-z", head, "--", ":(literal)" + path]);
-        const match = /^100(?:644|755) blob ([0-9a-f]+)\t/.exec(entry.stdout);
-        if (entry.code || !match) throw Error("Missing verification input at selected commit: " + path);
-        pinned.push([path, match[1]]);
+        const match = /^(100644|100755) blob ([0-9a-f]+)\t/.exec(entry.stdout);
+        if (entry.code || !match) throw Error("Missing verification file at selected commit: " + path);
+        if (file === executable && match[1] !== "100755") throw Error("Verification program is not executable at selected commit: " + path);
+        pinned.push([path, match[2]]);
       }
     }
     // Relative repository files already belong to the verified commit. Instance

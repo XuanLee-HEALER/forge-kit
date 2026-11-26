@@ -1,6 +1,7 @@
 import { accessSync, constants, lstatSync, readFileSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, normalize, relative } from "node:path";
 import { parse } from "yaml";
+import { locateRepo } from "./git";
 import { loadShipPolicy, loadWorkbenchConfig } from "./config";
 
 export const CORE_SKILLS = [
@@ -26,9 +27,14 @@ const retired: Record<string, string> = {
   "work-communication": "an instance-installed skill",
 };
 
-export function localPath(root: string, rel: string): string {
+function relativePath(rel: string): string {
   if (!rel || isAbsolute(rel) || rel.split(/[\\/]/).includes("..") || rel.includes("\0"))
-    throw Error(`Expected a relative path inside ${root}: ${rel}`);
+    throw Error(`Expected a relative path: ${rel}`);
+  return normalize(rel);
+}
+
+export function localPath(root: string, rel: string): string {
+  relativePath(rel);
   let path = root;
   for (const segment of rel.split("/").filter((s) => s && s !== ".")) {
     path = join(path, segment);
@@ -155,22 +161,29 @@ export function resolveInstance(root: string, kitRoot: string) {
     known(a, ["argv", "cwd", "purpose", "inputs"], path);
     const argv = strings(a.argv, path + ".argv");
     const cwd = str(a.cwd ?? ".", path + ".cwd");
-    const dir = localPath(root, cwd);
-    if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory())
+    const purpose = str(a.purpose, path + ".purpose");
+    const project = isProjectVerification({ purpose, cwd }, repos);
+    const dir = project ? root : localPath(root, cwd);
+    if (!project && !statSync(dir, { throwIfNoEntry: false })?.isDirectory())
       throw Error(`${path}.cwd directory missing: ${cwd}`);
-    const executable = Bun.which(argv[0], { cwd: dir });
-    const mode = executable && statSync(executable, { throwIfNoEntry: false });
-    if (!mode || !mode.isFile() || !(mode.mode & 0o111))
-      throw Error(`${path}.argv[0] is not executable: ${argv[0]}; install the program or correct its path`);
+    if (project && argv[0].includes("/") && !isAbsolute(argv[0])) {
+      relativePath(argv[0]);
+    } else {
+      const executable = Bun.which(argv[0], { cwd: dir });
+      const mode = executable && statSync(executable, { throwIfNoEntry: false });
+      if (!mode || !mode.isFile() || !(mode.mode & 0o111))
+        throw Error(`${path}.argv[0] is not executable: ${argv[0]}; install the program or correct its path`);
+    }
     if (basename(argv[0]) === "forge" && ["instance", "verify", "ship"].includes(argv[1]))
       throw Error(`${path}.argv recursively invokes a workflow; configure the underlying program`);
-    const action: Action = { argv, cwd, purpose: str(a.purpose, path + ".purpose") };
+    const action: Action = { argv, cwd, purpose };
     if (a.inputs !== undefined) {
       if (!Array.isArray(a.inputs)) throw Error(path + ".inputs must be a list of relative files");
       action.inputs = a.inputs.map((value, index) => {
         const field = path + ".inputs[" + index + "]";
         const input = str(value, field);
         try {
+          if (project) return relativePath(input);
           const path = localPath(dir, input),
             st = statSync(path);
           if (!st.isFile() || !(st.mode & 0o444)) throw Error("Expected a readable regular file: " + path);
@@ -275,16 +288,26 @@ export function resolveInstance(root: string, kitRoot: string) {
 // Configured paths use the workbench namespace. Only paths belonging to the
 // target repository are projected into its isolated checkout.
 export function verificationDirectory(root: string, repo: string, cwd: string, repos: string[]) {
-  const configured = localPath(root, cwd);
-  if (configured === root) return { target: "checkout", path: "." } as const;
-  const path = relative(root, configured);
-  const owner = [repo, ...repos].map(r => relative(root, localPath(root, r)))
-    .filter(r => r && (path === r || path.startsWith(r + "/")))
+  const owner = projectDirectory(cwd, [repo, ...repos]);
+  if (owner === undefined) return { target: "instance", path: localPath(root, cwd) } as const;
+  if (owner && owner !== repo) throw Error("Verification cwd belongs to another repository: " + cwd);
+  return { target: "checkout", path: owner ? relative(owner, normalize(cwd)) || "." : "." } as const;
+}
+
+// A repository path can exist only on the attached branch. Global discovery and
+// sync must not inspect the instance checkout in place of the selected revision.
+function projectDirectory(cwd: string, repos: string[]): string | undefined {
+  const path = relativePath(cwd);
+  if (path === ".") return "";
+  const owner = repos.filter(r => r !== "." && (path === r || path.startsWith(r + "/")))
     .sort((a, b) => b.length - a.length)[0];
-  const target = relative(root, localPath(root, repo));
-  if (owner && owner !== target) throw Error("Verification cwd belongs to another repository: " + cwd);
-  if (!owner && (target || path === ".workbench" || path.startsWith(".workbench/"))) return { target: "instance", path: configured } as const;
-  return { target: "checkout", path: relative(localPath(root, repo), configured) || "." } as const;
+  if (owner) return owner;
+  if (repos.includes(".") && path !== ".workbench" && !path.startsWith(".workbench/")) return ".";
+  return undefined;
+}
+
+export function isProjectVerification(action: Pick<Action, "purpose" | "cwd">, repos: string[]) {
+  return action.purpose === "verify" && projectDirectory(action.cwd, repos) !== undefined;
 }
 
 export function verificationStageCwd(root: string, repo: string, checkout: string, cwd: string, repos: string[]) {
@@ -317,8 +340,19 @@ export function runInstanceStage(
   if (process.env.FORGE_ACTIVE_STAGE)
     throw Error(`Recursive stage invocation: ${process.env.FORGE_ACTIVE_STAGE} -> ${id}`);
   const { argv, cwd } = action.value;
+  let directory: string;
+  if (verification) {
+    directory = verificationStageCwd(root, verification.repo, verification.checkout, cwd, cfg.repos);
+  } else {
+    const owner = action.value.purpose === "verify" ? projectDirectory(cwd, cfg.repos) : undefined;
+    const current = owner !== undefined ? locateRepo(root, process.cwd()) : null;
+    const repo = owner || current?.repo;
+    directory = owner !== undefined && repo
+      ? verificationStageCwd(root, repo, current?.repo === repo ? current.checkoutDir : localPath(root, repo), cwd, cfg.repos)
+      : localPath(root, cwd);
+  }
   const proc = Bun.spawnSync([...argv, ...stage.value.options], {
-    cwd: verification ? verificationStageCwd(root, verification.repo, verification.checkout, cwd, cfg.repos) : localPath(root, cwd),
+    cwd: directory,
     stdin: "ignore",
     stdout: onOutput ? "pipe" : "inherit",
     stderr: onOutput ? "pipe" : "inherit",

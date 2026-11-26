@@ -160,11 +160,21 @@ function ceiling(policy: ShipPolicy, to: string) {
   )
     throw Error("Fast-track disabled or endpoint exceeds policy ceiling");
 }
+function validateActionCeiling(policy: ShipPolicy, endpoint: Endpoint, plan: ExactPlan) {
+  ceiling(policy, endpoint);
+  if (endpoint === "fat" && plan.actions.some(a => a.kind !== "fat"))
+    throw Error("FAT scope can only update the registered test branch");
+  // Instance stages run arbitrary delivery writers with an independent target observer.
+  if (endpoint !== "prod" && plan.actions.some(a => ["stage", "tag", "sql"].includes(a.kind)))
+    throw Error("Deployment, tag or database writes require a production delivery endpoint");
+  if (policy.forbid_db_rw && plan.actions.some(a => a.kind === "sql"))
+    throw Error("Policy forbids database writes");
+}
 export function validateScope(ledger: Ledger, e: Envelope) {
   const { policy, hash } = loadShipPolicy(ledger.workbenchRoot);
-  ceiling(policy, e.target_endpoint);
+  const { binding, plan } = exactRunbook(ledger, e);
+  validateActionCeiling(policy, e.target_endpoint, plan);
   const snapshot = taskSnapshot(ledger, e.task_id);
-  const { binding } = exactRunbook(ledger, e);
   if (
     hash !== e.policy_hash ||
     scopeHash(e, binding) !== e.scope_hash ||
@@ -188,9 +198,14 @@ export function validateScope(ledger: Ledger, e: Envelope) {
     anchor.base_shas_json !== e.base_shas_json ||
     anchor.ttl_minutes !== e.ttl_minutes ||
     events.some(
-      (ev) =>
-        ev.seq > prepared.seq &&
-        ["TASK_CLOSED", "TASK_CANCELLED", "HANDOFF_RECORDED", "TASK_RESUMED"].includes(ev.event_type),
+      (ev) => {
+        if (ev.seq <= prepared.seq) return false;
+        if (ev.event_type === "ENDPOINT_UPDATED") {
+          const change = JSON.parse(ev.payload_json);
+          return change.prev_endpoint !== change.endpoint;
+        }
+        return ["TASK_CLOSED", "TASK_CANCELLED", "HANDOFF_RECORDED", "TASK_RESUMED"].includes(ev.event_type);
+      },
     )
   )
     throw Error("Prepared scope is no longer current");
@@ -326,13 +341,8 @@ export function fastTrackCommand(ledger: Ledger, args: string[]) {
     const plan: ExactPlan = JSON.parse(rb.actions_json).exact;
     if (!plan?.actions.length || plan.endpoint !== v.to)
       throw Error("Runbook must bind the exact requested endpoint; create a new runbook");
-    if(v.to==="fat" && plan.actions.some(a=>a.kind!=="fat")) throw Error("FAT scope can only update the registered test branch");
     const target_endpoint: Endpoint = v.to === "pr" || v.to === "fat" ? v.to : "prod";
-    if (target_endpoint !== "prod" && plan.actions.some((a) => a.kind === "tag" || a.kind === "sql"))
-      throw Error("Tag or database writes exceed the approved endpoint; register a production delivery");
-    if (policy.forbid_db_rw && plan.actions.some((a) => a.kind === "sql"))
-      throw Error("Policy forbids database writes");
-    ceiling(policy, target_endpoint);
+    validateActionCeiling(policy, target_endpoint, plan);
     const snap = taskSnapshot(ledger, id);
     const repos =
       v.repos === undefined

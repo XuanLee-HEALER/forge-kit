@@ -12,7 +12,9 @@ async function main() {
   }
   const { findWorkbenchRoot } = await import("../config");
   const { checkMigration } = await import("../managed-assets");
-  try { checkMigration(findWorkbenchRoot()); }
+  try {
+    if (command !== "review" && command !== "verify") checkMigration(findWorkbenchRoot());
+  }
   catch (error) {
     if (command !== "guard") throw error;
     emitPreToolUseDeny("工作台迁移未完成，请恢复 forge sync。");

@@ -298,8 +298,11 @@ export function completeRunbook(ledger: ReleaseLedger, runbook_id: string): Runb
     const rb = ledger.getRunbook(id);
     if (!rb) throw new Error(`Runbook not found: ${id}`);
     if (rb.status === "COMPLETED") return rb;
-    if(ledger.db.query("SELECT 1 FROM exact_ship_envelopes WHERE runbook_id=?").get(id))
-      throw Error("Fast-track runbooks complete through verified action receipts. Use forge ship run --envelope <id>.");
+    const envelope = ledger.db.query<{ envelope_id: string }, [string]>(
+      "SELECT envelope_id FROM exact_ship_envelopes WHERE runbook_id=?",
+    ).get(id);
+    if (envelope)
+      throw Error("Fast-track runbooks complete through verified action receipts. Use forge ship run --envelope " + envelope.envelope_id);
     if (rb.status === "REVOKED") {
       throw new Error(`Cannot complete REVOKED runbook: ${id}`);
     }

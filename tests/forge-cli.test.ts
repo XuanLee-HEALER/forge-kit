@@ -23,6 +23,7 @@ import {
   initWorkbench,
   syncWorkbench,
 } from "../src/cli";
+import { recoverInstall } from "../src/managed-assets";
 import { loadWorkbenchConfig } from "../src/config";
 import { runGit } from "../src/git";
 import { Ledger } from "../src/ledger";
@@ -51,6 +52,24 @@ afterEach(() => {
 });
 
 describe("forge CLI: init / add-repo / sync / doctor", () => {
+  test("review and verification check the migration journal at the selected workbench", () => {
+    const first = join(target, "first"), second = join(target, "second");
+    for (const root of [first, second]) {
+      mkdirSync(join(root, ".workbench"), {recursive:true});
+      writeFileSync(join(root, ".workbench/workbench.yaml"), "repos: []\n");
+    }
+    mkdirSync(join(second, ".workbench/sync-journal"));
+    const env = {...process.env};
+    delete env.FORGE_WORKBENCH_ROOT;
+    for (const command of ["review", "verify"]) {
+      const run = (cwd:string, selected:string) => Bun.spawnSync([process.execPath,
+        join(import.meta.dir,"../src/bin/cli.ts"), command, "--cwd", selected, "--task", "absent"], {cwd, env});
+      expect(run(first,second).stderr.toString()).toContain("interrupted migration");
+      const healthy = run(second,first);
+      expect(healthy.exitCode).not.toBe(0);
+      expect(healthy.stderr.toString()).not.toContain("interrupted migration");
+    }
+  });
   test("init refuses to overwrite existing unmanaged AGENTS.md without --force", () => {
     writeFileSync(join(target, "AGENTS.md"), "# Legacy\n");
     expect(() =>
@@ -130,7 +149,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     for (const bin of ["review", "verify"]) {
       const check = Bun.spawnSync([join(res.root, ".workbench/bin/forge"), bin, "--task", "absent"],
         { cwd:res.root, env:{...process.env,BUN_BIN:process.execPath} });
-      expect(check.exitCode).toBe(1);
+      expect(check.exitCode).toBe(bin === "review" ? 2 : 1);
       expect(check.stdout.toString()+check.stderr.toString()).toMatch(/attached checkout/);
     }
     const doc = doctorWorkbench(res.root);
@@ -250,6 +269,11 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
       skill = join(root, ".agents/skills/ship/SKILL.md"),
       bundle = join(bin, "cli.js");
     const rendered = readFileSync(agents, "utf8");
+    writeFileSync(agents, "x".repeat(8000));
+    expect(doctorWorkbench(root).issues).toContainEqual(expect.objectContaining({
+      check: "agents-md", message: expect.stringContaining("move the edited file aside"),
+    }));
+    writeFileSync(agents, rendered);
     expect(rendered).toContain("移交");
     writeFileSync(skill,"private edit");
     expect(doctorWorkbench(root).issues).toContainEqual(expect.objectContaining({
@@ -577,4 +601,37 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     expect(fat.exitCode).toBe(0);
     expect(JSON.parse(JSON.parse(fat.stdout.toString()).payload_json).source).toBe("manual");
   });
+});
+
+
+test("interrupted migration recovery describes the original destination for absent files, links and regular files", () => {
+  const journal = join(target, ".workbench/sync-journal");
+  mkdirSync(journal, {recursive:true});
+  const dest = join(target, "AGENTS.md");
+  const original = "previous content";
+  const next = "managed replacement";
+  const hash = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("hex");
+  const digest = hash(original);
+  for (const before of [null, "link:original-link-target", digest]) {
+    writeFileSync(dest, "unexpected edit");
+    if (before === digest) writeFileSync(join(journal, "0.old"), original);
+    writeFileSync(join(journal, "0.new"), next);
+    writeFileSync(join(journal, "operations.json"), JSON.stringify([
+      {path:"AGENTS.md", before, after:hash(next), mode:0o644},
+      {path:".workbench/kit-lock.json", before:null, after:null},
+    ]));
+    const attempt = () => recoverInstall(target);
+    expect(attempt).toThrow("moving it aside");
+    if (before === null) expect(attempt).toThrow("retry ./bin/forge sync");
+    else if (before === digest) expect(attempt).toThrow("Copy the saved file " + join(journal,"0.old") + " back to " + dest);
+    else expect(attempt).toThrow('original target "original-link-target"');
+    expect(readFileSync(dest,"utf8")).toBe("unexpected edit");
+    rmSync(dest);
+    if (before === digest) cpSync(join(journal,"0.old"),dest);
+    else if (before) symlinkSync("original-link-target",dest);
+    attempt();
+    expect(readFileSync(dest, "utf8")).toBe(next);
+    expect(existsSync(journal)).toBe(false);
+    mkdirSync(journal);
+  }
 });

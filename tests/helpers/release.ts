@@ -74,7 +74,7 @@ export function remote(n: number, patch: Record<string, unknown>) {
     JSON.stringify({ ...(existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {}), ...patch }),
   );
 }
-export function feature(repo: string, n: number) {
+export function feature(repo: string, n: number, workflow_version: "0.4" | "0.5" = "0.5") {
   const dir = join(root, repo),
     bare = join(root, repo + ".git"),
     branch = "feature/" + n,
@@ -109,6 +109,7 @@ export function feature(repo: string, n: number) {
   const head = git(wt, "rev-parse", "HEAD"),
     url = "https://github.com/acme/" + basename(repo) + "/pull/" + n;
   ledger.openTask({
+    workflow_version,
     task_id: task,
     title: task,
     repo,
