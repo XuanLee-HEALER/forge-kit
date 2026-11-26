@@ -133,7 +133,7 @@ export function feature(repo: string, n: number, workflow_version: "0.4" | "0.5"
   return { repo, n, task, branch, wt, dir, head, base, url };
 }
 export type Feature = ReturnType<typeof feature>;
-export function verifyFeature(f: Feature) {
+export function verifyFeature(f: Feature, { review = true } = {}) {
   if (ledger.getSpecState(f.task).state!=="FROZEN") {
     const spec=join(root,".workbench/specs",f.task);
     mkdirSync(spec,{recursive:true});
@@ -143,7 +143,7 @@ export function verifyFeature(f: Feature) {
   const target = ["--task", f.task, "--cwd", f.wt];
   cli("verify",[...target,"--kind","lint","--","tsc","--noEmit","--allowJs","--checkJs","--skipLibCheck","value.js"]);
   cli("verify", [...target, "--kind", "test", "--", process.execPath, "test", "./example.test.ts"]);
-  cli("review", [...target, "--roles", "quality"]);
+  if (review) cli("review", [...target, "--roles", "quality"]);
 }
 export function merge(f: Feature) {
   git(f.dir, "merge", "--no-edit", f.branch);

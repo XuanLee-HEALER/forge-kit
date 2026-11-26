@@ -11,7 +11,7 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 
 1. 确认冻结摘要、锁定测试和干净工作树；核对静态、执行、集成验证及独立审查均属于当前冻结周期和目标 SHA。当前范围仍有 blocked、error、incomplete 的已执行角色或未关闭 blocker 时暂停。历史结果保持原始归属。
 2. 按实例阶段创建或更新 PR。通过 `forge ledger pr-sync <task-id> --repo <repo> --branch <branch>` 核对远端 HEAD，将 `forge ledger tip <task-id>` 的见证附入 PR。外部意见用 pr-triage。检查目标分支、固定 HEAD 及必需 CI。
-3. 需要受保护动作时，先用 `forge ledger runbook create` 登记精确动作。向用户展示仓、远端、资源、版本、内容摘要和适用时效。主会话单独发送 `批准 <rb-id>` 或 `approve <rb-id>` 后方可兑现。若由人工合并，等待远端结果并核对。
+3. 需要受保护动作时，先用 `forge ledger runbook create` 登记动作。普通发版单可以通过 `--task <id>` 关联任务；即使实例未启用快轨，也可按普通批准与回执流程完成。向用户展示仓、远端、资源、版本、内容摘要和适用时效。主会话单独发送 `批准 <rb-id>` 或 `approve <rb-id>` 后方可兑现。若由人工合并，等待远端结果并核对。
 4. 核验远端 main 包含待交付提交或相应受核验的合并结果，再登记回执。实例另有终点时按已授权的阶段、顺序和版本继续，记录实际外部状态。到达本次终点后执行 `forge ledger close <task-id>`。
 
 ## 功能线程移交与发布批次
@@ -24,7 +24,7 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 
 ## Fast-Track
 
-从实例交付配置中读取有序阶段。用 `forge ledger runbook create --task "$TASK" --title "$TITLE" --pr "$REPO:$PR"` 登记精确合并；有自定义上线步骤时按声明顺序重复传入 `--stage <stage-id>`。登记时解析目标版本、动作参数及脚本摘要。内建 ship 在实例阶段列表的位置决定精确 PR/tag/SQL 的执行顺序。同名实例实现也按其位置运行。只有受信托管端可原子核验全部获批条件时才自动合并。公有 GitHub 和未提供此能力的实例在写入前转人工，操作者通过托管端的受保护 PR 流程合并。把返回的具体目标和内容提供给批准人。
+从实例交付配置中读取有序阶段。用 `forge ledger runbook create --exact --task "$TASK" --title "$TITLE" --pr "$REPO:$PR"` 登记精确合并；有自定义上线步骤时按声明顺序重复传入 `--stage <stage-id>`。登记时解析目标版本、动作参数及脚本摘要。内建 ship 在实例阶段列表的位置决定精确 PR/tag/SQL 的执行顺序。同名实例实现也按其位置运行。只有受信托管端可原子核验全部获批条件时才自动合并。公有 GitHub 和未提供此能力的实例在写入前转人工，操作者通过托管端的受保护 PR 流程合并。把返回的具体目标和内容提供给批准人。
 
 实例终点为 FAT 时，按每个挂载仓登记 `--fat <repo>:fat`，绑定远端现有的 `refs/heads/fat`、旧 SHA、来源 head 及预期更新 SHA。该 runbook 只允许指定测试引用的条件更新。
 

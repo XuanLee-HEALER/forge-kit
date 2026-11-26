@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ledger } from "../src/ledger/store";
 import { kit, sandbox, type Sandbox } from "./v05-sandbox";
@@ -77,6 +77,42 @@ writeFileSync(args[index+1], result);
   chmodSync(codex, 0o755);
 });
 afterEach(() => s.cleanup());
+
+test("the clean standalone package runs a pinned review offline from its bundled entry point", () => {
+  const source = join(s.root, "source");
+  const workspace = join(kit, "review-agents");
+  mkdirSync(source);
+  for (const name of readdirSync(workspace)) {
+    if (["node_modules", "dist", ".git"].includes(name)) continue;
+    cpSync(join(workspace, name), join(source, name), {recursive: true});
+  }
+  // Only the source checkout used to build the tarball can resolve installed dependencies.
+  symlinkSync(existsSync(join(workspace, "node_modules")) ? join(workspace, "node_modules") : join(kit, "node_modules"), join(source, "node_modules"));
+  Object.assign(s.env, {FORGE_CODEX_BIN: codex, REQUESTS: log, QUALITY: JSON.stringify(modelReport("pass"))});
+  const args = ["--repo", repo, "--base", base, "--head", head, "--roles", "quality", "--backend", "codex"];
+  const run = (root: string) => {
+    const report = JSON.parse(s.ok([join(root, "bin/review"), ...args]));
+    expect(report).toMatchObject({status:"pass", roles:[{role:"quality", backend:"codex", status:"pass"}]});
+  };
+  run(source);
+  s.ok(["bun", "run", "build"], source);
+  const archive = join(s.root, "standalone.tgz");
+  s.ok(["bun", "pm", "pack", "--ignore-scripts", "--quiet", "--filename", archive], source);
+  const destination = join(s.root, "distribution");
+  mkdirSync(destination);
+  s.ok(["tar", "-xzf", archive], destination);
+  const release = join(destination, "package");
+  expect(existsSync(join(release, "node_modules"))).toBe(false);
+  const cache = join(s.home, "cold-bun-cache");
+  mkdirSync(cache);
+  s.env.BUN_INSTALL_CACHE_DIR = cache;
+  writeFileSync(join(s.home, ".bunfig.toml"), '[install]\nauto = "disable"\n');
+  run(release);
+  expect(readdirSync(cache)).toEqual([]);
+  const requests = readFileSync(log, "utf8").trim().split("\n").map(row => JSON.parse(row));
+  expect(requests).toHaveLength(2);
+  for (const request of requests) expect(request.prompt).toContain(marker);
+}, 60_000);
 
 async function exercise(backend: string, status: Status, options: {failure?: string; roles?: string; mode?: string; gate?: string} = {}) {
   const apiRequests: string[] = [];

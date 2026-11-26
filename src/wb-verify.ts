@@ -1,6 +1,6 @@
 import { copyVerificationFixtures } from "./verification-fixtures";
 import { checkMigration } from "./managed-assets";
-import { materializeGitlinks } from "./verification-gitlinks";
+import { checkoutLocalRevision, materializeGitlinks } from "./verification-gitlinks";
 import { verificationPolicy } from "./workflow-config";
 import { createHash } from "node:crypto";
 import { runVerificationProcess } from "./verification-process";
@@ -75,7 +75,7 @@ export function verifyCli(args: string[]) {
     function isolatedGit(cwd: string, args: string[]) {
       if (!baseEnv) throw Error("Missing isolated verification environment");
       return runProcess(["git", "-c", "core.hooksPath=/dev/null", ...args], {
-        cwd, env: { ...baseEnv, GIT_CONFIG_GLOBAL: "/dev/null", GIT_ALLOW_PROTOCOL: "file", GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" },
+        cwd, timeoutMs: 0, env: { ...baseEnv, GIT_CONFIG_GLOBAL: "/dev/null", GIT_ALLOW_PROTOCOL: "file", GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" },
       });
     }
     if (modern) {
@@ -86,10 +86,8 @@ export function verifyCli(args: string[]) {
       mkdirSync(home, { mode: 0o700 });
       baseEnv = { PATH: process.env.PATH, LANG: process.env.LANG, HOME: home, TMPDIR: temporary,
         FORGE_VERIFY_ACTIVE_SHA: snap.head, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" };
-      const clone = isolatedGit(temporary, ["clone", "--template=", "--no-local", "--no-checkout", "--", snap.dir, dir]);
-      if (clone.code) throw Error("Cannot isolate verification checkout: " + clone.stderr);
-      const checkout = isolatedGit(dir, ["-c", "advice.detachedHead=false", "checkout", "--detach", snap.head]);
-      if (checkout.code) throw Error("Cannot select verification version: " + checkout.stderr);
+      mkdirSync(dir);
+      checkoutLocalRevision(snap.dir, dir, snap.head, isolatedGit);
       phase = "gitlink preparation";
       materializeGitlinks(snap.dir, dir, snap.head, isolatedGit);
       phase = "dependency installation";
@@ -131,7 +129,7 @@ export function verifyCli(args: string[]) {
       phase = "instance configuration";
       const config = modern ? resolveInstance(ledger.workbenchRoot) : undefined;
       environment = config?.verification.value.environment;
-      if (config) policyDigest = verificationPolicy(ledger.workbenchRoot, snap.repo, snap.head, config);
+      if (config) policyDigest = verificationPolicy(ledger.workbenchRoot, snap.repo, snap.head, config, dir);
       const stages = config?.verification.value.stages ?? ["verify"];
       if (config) {
         for (const id of stages) {
@@ -191,7 +189,7 @@ export function verifyCli(args: string[]) {
     }
     if (policyDigest) {
       const current = resolveInstance(ledger.workbenchRoot);
-      if (verificationPolicy(ledger.workbenchRoot, snap.repo, snap.head, current) !== policyDigest)
+      if (verificationPolicy(ledger.workbenchRoot, snap.repo, snap.head, current, dir) !== policyDigest)
         throw Error("Configured verification inputs changed during this run");
     }
     recordAborted = undefined;

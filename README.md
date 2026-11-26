@@ -221,6 +221,8 @@ forge instance run smoke
 
 从新的发行目录运行 `./bin/forge sync <实例目录>`，再执行 `./bin/forge doctor <实例目录> --json`。对比迁移报告中的路径，遇到已改动的受管文件或归属不明的同名文件时，先保留内容，按实际归属迁入私有位置后再重试。账本、旧见证与私有脚本原位保留。旧实例的 `review-agents/` 可含私有修改，升级后使用新发行附带的引擎。
 
+普通任务发版单继续使用 `forge ledger runbook create --task <id>`。需要快轨兑现的脚本显式传 `--exact --task <id>`（包括使用 `--stage` 或 `--fat` 的脚本）。已有精确计划保留其专属执行器与审批范围。
+
 实例自己的脚本按下表迁移。受管命令统一通过 `.workbench/bin/forge` 提供。
 
 | v0.4 入口 | v0.5 调用 |
@@ -232,7 +234,7 @@ forge instance run smoke
 | ledger | forge ledger |
 | guard | forge guard |
 | ledger-hook | forge ledger-hook |
-| dbcred | 生产读用 `forge dbcred <env> --ro`。内建生产写入支持 PostgreSQL。按唯一主机登记精确 SQL，配置 database 和 rw.user，并在执行环境安装 psql，由获批的 `forge ship` 执行。其他数据库沿用实例提供的受控交付路径。非生产环境继续使用 `forge dbcred <env> --ro` 或 `--rw`。 |
+| dbcred | 生产读用 `forge dbcred <env> --ro`。内建生产写入支持 PostgreSQL。数据库环境条目须设置 `engine: postgres`、唯一的 `host`、`database` 和 `rw.user`，登记时 `psql` 须在 PATH 中。生产快轨须配置部署阶段及独立的 observe 动作，两者声明 inputs。创建精确任务 runbook 时传 `--exact --task <id>`，按配置顺序传 `--stage <id>`，用 `--sql <host>:<path>` 登记内容，获批后由 `forge ship` 执行。其他数据库沿用实例提供的受控交付路径。非生产环境继续使用 `forge dbcred <env> --ro` 或 `--rw`。 |
 | cmdfmt | forge cmdfmt |
 | lang-check | forge lang-check |
 

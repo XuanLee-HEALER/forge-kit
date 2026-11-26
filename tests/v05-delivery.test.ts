@@ -195,7 +195,7 @@ function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "pro
   cfg.extensions.delivery ??= {stages:["ship"], endpoint:"pr"};
   if(useAtomicHost) cfg.extensions.delivery.atomic_pr_hosts=[typeof useAtomicHost==="string" ? useAtomicHost : "forge.example.test:8443"];
   writeFileSync(cfgPath,stringify(cfg));
-  const book = JSON.parse(ledger("runbook", "create", "--task", "ship-task", "--title", "local target", ...(includeMerge ? ["--pr", "app:1"] : []),
+  const book = JSON.parse(ledger("runbook", "create", "--exact", "--task", "ship-task", "--title", "local target", ...(includeMerge ? ["--pr", "app:1"] : []),
     ...(localRollout ? ["--stage", "rollout"] : [])));
   const envelope = JSON.parse(ledger("fast-track", "prepare", "ship-task", "--to", localRollout ? "prod" : "pr", "--paths", "src/**", "--runbook", book.runbook_id)).envelope_id;
   const transport = localTransport(prepared.bare, prepared.calls);
@@ -519,7 +519,7 @@ test("T11 a completed hosted transaction still needs an independently observed P
 test("T11 a FAT-only envelope cannot merge main", () => {
   const f = preparePullRequest();
   localTransport(f.bare, f.calls);
-  const book = JSON.parse(f.ledger("runbook", "create", "--task", "ship-task", "--title", "PR target", "--pr", "app:1"));
+  const book = JSON.parse(f.ledger("runbook", "create", "--exact", "--task", "ship-task", "--title", "PR target", "--pr", "app:1"));
   const prepare = s.run([s.forge, "ledger", "fast-track", "prepare", "ship-task", "--to", "fat", "--paths", "src/**", "--runbook", book.runbook_id]);
   if (prepare.code === 0) {
     const envelope = JSON.parse(prepare.out).envelope_id;
@@ -737,7 +737,7 @@ test("T11 a PR envelope cannot authorize an instance delivery writer", () => {
   for (const purpose of ["deploy", "prod-write"]) {
     cfg.extensions.actions.rolloutAction.purpose = purpose;
     writeFileSync(path, stringify(cfg));
-    const book = JSON.parse(f.ledger("runbook", "create", "--task", "ship-task", "--title", purpose,
+    const book = JSON.parse(f.ledger("runbook", "create", "--exact", "--task", "ship-task", "--title", purpose,
       "--pr", "app:1", "--stage", "rollout"));
     const result = s.run([s.forge, "ledger", "fast-track", "prepare", "ship-task",
       "--runbook", book.runbook_id, "--to", "pr", "--paths", "src/**"]);
@@ -841,7 +841,7 @@ test("T11 approving an exact runbook before preparing an envelope cannot authori
   }}));
   writeFileSync(join(s.bin,"psql"),"#!/bin/sh\nexit 20\n",{mode:0o755});
   const args=["--tag","app:"+tag+":"+f.head,"--sql","db.example.invalid:"+sql];
-  const book=JSON.parse(f.ledger("runbook","create","--task","ship-task","--title","exact tag","--pr","app:1",...args));
+  const book=JSON.parse(f.ledger("runbook","create","--exact","--task","ship-task","--title","exact tag","--pr","app:1",...args));
   const approve=(id:string)=>s.hook("UserPromptSubmit",{session_id:"operator",prompt:"批准 "+id});
   expect(JSON.stringify(approve(book.runbook_id))).toContain("fast-track prepare");
   const decision=(command:string)=>s.hook("PreToolUse",{cwd:f.repo,tool_name:"Bash",session_id:"operator",tool_input:{command}});
@@ -851,10 +851,18 @@ test("T11 approving an exact runbook before preparing an envelope cannot authori
   expect(JSON.stringify(decision(sqlCall))).toContain("连接 prod 数据库");
   expect(s.run([s.forge,"ledger","runbook","complete",book.runbook_id]).code).not.toBe(0);
   expect(JSON.parse(f.ledger("runbook","show",book.runbook_id)).status).toBe("APPROVED");
-  const ordinary=JSON.parse(f.ledger("runbook","create","--title","ordinary tag",...args));
+  const policy = join(s.work, ".workbench/ship-policy.yaml");
+  const doc = parse(readFileSync(policy, "utf8"));
+  doc.fast_track.enabled = false;
+  writeFileSync(policy, stringify(doc));
+  const ordinary=JSON.parse(f.ledger("runbook","create","--task","ship-task","--title","ordinary tag",...args));
+  expect(ordinary.task_id).toBe("ship-task");
+  expect(ordinary.actions.exact).toBeUndefined();
   approve(ordinary.runbook_id);
   for (const command of [tagPush,sqlCall]) {
     const replies=decision(command);
     expect(replies.some(r => r.code===2 || /"permissionDecision"\s*:\s*"deny"/.test(r.text)), JSON.stringify(replies)).toBe(false);
   }
+  expect(JSON.parse(f.ledger("runbook","complete",ordinary.runbook_id)).status).toBe("COMPLETED");
+  expect(JSON.stringify(decision(tagPush))).toContain("禁止未批准推送生产发布 tag");
 },90_000);

@@ -340,7 +340,7 @@ export function fastTrackCommand(ledger: Ledger, args: string[]) {
       throw Error("Expected --runbook with exact pending or approved actions for this task");
     const plan: ExactPlan = JSON.parse(rb.actions_json).exact;
     if (!plan?.actions.length || plan.endpoint !== v.to)
-      throw Error("Runbook must bind the exact requested endpoint; create a new runbook");
+      throw Error(`Runbook must bind the exact requested endpoint; use forge ledger runbook create --exact --task ${id} and approve the new plan`);
     const target_endpoint: Endpoint = v.to === "pr" || v.to === "fat" ? v.to : "prod";
     validateActionCeiling(policy, target_endpoint, plan);
     const snap = taskSnapshot(ledger, id);

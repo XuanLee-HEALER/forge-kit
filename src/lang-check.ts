@@ -282,12 +282,12 @@ function runTsChecks(targetDir: string, mode: CheckMode, execCheck: ReturnType<t
 
   if (mode === "static" || mode === "all") {
     const scripts = pkg?.scripts ?? {};
-    const declared = ["check", "typecheck", "lint"].find(name => scripts[name]?.trim());
+    const declared = ["check", "typecheck", "lint"].filter(name => scripts[name]?.trim());
     const hasProject = existsSync(join(targetDir, "tsconfig.json"));
     const localTsc = join(targetDir, "node_modules", ".bin", "tsc");
     const hasLocalTsc = hasProject && existsSync(localTsc);
-    if (declared) {
-      const body = scripts[declared].trim();
+    for (const name of declared) {
+      const body = scripts[name].trim();
       // Execute the native compiler ourselves. A lifecycle hook, package script
       // shadowing tsc, or any extra shell command is separate project behavior.
       const direct = body === "tsc --noEmit";
@@ -296,10 +296,10 @@ function runTsChecks(targetDir: string, mode: CheckMode, execCheck: ReturnType<t
       const bunAlias = unshadowedBun && body === "bun --bun run tsc --noEmit" &&
         !["tsc", "pretsc", "posttsc"].some(name => Object.hasOwn(scripts, name)) &&
         !readdirSync(targetDir).some(name => name === "tsc" || name.startsWith("tsc."));
-      const equivalent = hasLocalTsc && !scripts["pre" + declared] && !scripts["post" + declared] &&
+      const equivalent = hasLocalTsc && !scripts["pre" + name] && !scripts["post" + name] &&
         (direct || directBun || bunAlias);
       if (!equivalent) {
-        items.push(execCheck("ts", "static", declared, [process.execPath, "--bun", "run", declared], targetDir));
+        items.push(execCheck("ts", "static", name, [process.execPath, "--bun", "run", name], targetDir));
       }
     }
     if (hasProject) {

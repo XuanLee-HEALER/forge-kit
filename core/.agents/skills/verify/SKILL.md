@@ -22,3 +22,5 @@ description: 对待交付版本执行静态、动态与集成验收，记录隔�
 若目标提交包含 Git 子模块，先在所选本机工作树准备各层子模块。验证器从这些本地仓库按 gitlink 固定的提交重建隔离检出；缺少工作树或对象时报告准备失败。
 
 通过 `--fixture-env NAME=/absolute/file` 显式为本次隔离验证提供普通文件，可以重复指定不同名称。名称以 `FORGE_FIXTURE_` 开头，或带有 `_TEST_FILE`、`_TEST_ARCHIVE`、`_FIXTURE_FILE`、`_FIXTURE_ARCHIVE` 后缀。验证程序从该环境变量读取私有临时目录中的只读副本。账本记录名称与 SHA-256；涉及版本的夹具由测试核对预期摘要。进程结束后清理副本。
+
+隔离检出只包含待验提交及其目录树，各层子模块按父提交固定的版本取材。需要旧版本数据的测试通过 `--fixture-env 名称=文件` 提供经过校验的本地夹具。TypeScript 静态检查执行项目声明的 check、typecheck 和 lint；存在 tsconfig 与编译器时也核验实际类型检查结果。

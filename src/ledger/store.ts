@@ -878,6 +878,8 @@ export class Ledger {
     branch?: string;
     checkoutDir?: string;
     checkEndpoint?: boolean;
+    /** Apply the v0.4 fast-track policy to this exact branch, SHA and freeze. */
+    requireFrozenToolReview?: boolean;
   }): {
     ready: boolean;
     missing: string[];
@@ -887,7 +889,7 @@ export class Ledger {
     return this.checkReadiness(params, false);
   }
 
-  private checkReadiness(params: { task_id: string; repo: string; head_sha: string; branch?: string; checkoutDir?: string; checkEndpoint?: boolean }, closing: boolean) {
+  private checkReadiness(params: { task_id: string; repo: string; head_sha: string; branch?: string; checkoutDir?: string; checkEndpoint?: boolean; requireFrozenToolReview?: boolean }, closing: boolean) {
     const task = this.getTask(params.task_id);
     if (!task) {
       return {
@@ -911,11 +913,20 @@ export class Ledger {
 
     params = {...params, repo:canonicalRepoPath(this.workbenchRoot,params.repo)};
     const currentWorkflow = usesV05(this, params.task_id);
+    const strictLegacyReview = !currentWorkflow && params.requireFrozenToolReview === true;
     const config = currentWorkflow ? installedInstance(this.workbenchRoot) : undefined;
     const prodStages = currentWorkflow && task.endpoint === "prod" ? deploymentStages(config, task.endpoint) : [];
     const customVerification = config && (config.verification.source !== "core" ||
       config.verification.value.stages.some(id => config.stages.get(id)?.source !== "core"));
-    const expectedPolicy = config ? verificationPolicy(this.workbenchRoot, params.repo, params.head_sha, config) : undefined;
+    const repoAttachments = this.getTaskRepos(params.task_id).filter((r) => r.repo === params.repo);
+    const attachments = repoAttachments.filter((r) =>
+      params.branch
+        ? r.branch === params.branch
+        : repoAttachments.length === 1 || r.head_sha === params.head_sha,
+    );
+    const registeredTree = attachments.length === 1 ? attachments[0].worktree : undefined;
+    const policyCheckout = params.checkoutDir ?? (registeredTree && existsSync(registeredTree) ? registeredTree : undefined);
+    const expectedPolicy = config ? verificationPolicy(this.workbenchRoot, params.repo, params.head_sha, config, policyCheckout) : undefined;
     const specState = getSpecState(this, params.task_id, { delivery: params, closing });
     if (currentWorkflow && specState.state === "NONE") missing.push("A confirmed frozen specification is required for delivery");
     if (specState.drifted_locked_tests.length) {
@@ -951,12 +962,6 @@ export class Ledger {
     const floors = specState.evidence_floor_seq;
     const reviewFloor = this.db.query("SELECT ts FROM events WHERE task_id = ? AND seq = ?")
       .get(params.task_id, floors.review) as { ts: string } | null;
-    const repoAttachments = this.getTaskRepos(params.task_id).filter((r) => r.repo === params.repo);
-    const attachments = repoAttachments.filter((r) =>
-      params.branch
-        ? r.branch === params.branch
-        : repoAttachments.length === 1 || r.head_sha === params.head_sha,
-    );
     const unresolved = !params.branch && repoAttachments.length > 1 && attachments.length !== 1;
     if (unresolved) missing.push("Specify the attached branch to verify delivery evidence");
     if (task.verification_depth === "full" || (task.verification_depth === "targeted" && params.checkEndpoint)) {
@@ -1029,6 +1034,12 @@ export class Ledger {
         }
         const fact = reviewFactKind(p);
         if (fact) {
+          // Old receipts may omit freeze_seq. Their event must still follow this freeze and satisfy its review floor.
+          if (strictLegacyReview && fact === "review" && p.status !== "fail" && (
+            p.source !== "tool" || p.status !== "pass" || ev.branch !== params.branch ||
+            !specState.freeze_seq || ev.seq <= specState.freeze_seq ||
+            (p.meta?.freeze_seq !== undefined && p.meta.freeze_seq !== specState.freeze_seq)
+          )) continue;
           if (currentWorkflow && (evidenceSource(p, ev.actor) !== "tool" ||
               p.meta?.review_task_id !== params.task_id || p.meta.freeze_seq !== specState.freeze_seq || p.meta.review_floor_seq !== floors.review)) continue;
           if (ev.seq < floors.review || !reviewMeetsFloor(p.status, p.meta, params.task_id, floors.review, reviewFloor?.ts, evidenceSource(p, ev.actor))) continue;
@@ -1155,7 +1166,7 @@ export class Ledger {
         missing.push("Independent review evidence required for the nonempty task baseline-to-HEAD diff at the current freeze");
     } else if (task.verification_depth === "targeted") {
       // Targeted depth requires at least one independent review pass/fallback before delivery/close
-      if (params.checkEndpoint && passingRoles.size === 0) {
+      if ((params.checkEndpoint || strictLegacyReview) && passingRoles.size === 0) {
         missing.push(
           `targeted verification requires independent review evidence for ${params.repo}@${params.head_sha.slice(0, 8)}`,
         );

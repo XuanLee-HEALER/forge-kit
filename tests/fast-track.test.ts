@@ -283,13 +283,17 @@ extensions:
   expect(order(true)).toEqual(["precheck", "ship", "pr", "postcheck"]);
 }, 30_000);
 
-for (const outcome of ["success", "drift"]) {
+for (const outcome of ["success", "drift", "legacy-reviewed", "legacy-no-review", "legacy-stale-review", "legacy-policy-off"]) {
   test(
     "FAT-only conditional delivery to a local bare remote: " + outcome,
     () => {
       initWorkbench({ targetDir: root, kitRoot: join(import.meta.dir, "..") });
-      const f = feature("api", 1),
+      const f = feature("api", 1, outcome.startsWith("legacy") ? "0.4" : "0.5"),
         bare = join(root, "api.git");
+      const missingReview = outcome === "legacy-no-review" || outcome === "legacy-stale-review";
+      if (outcome === "legacy-policy-off") {
+        writeFileSync(policy(), template.replace("require_independent_review: true", "require_independent_review: false"));
+      }
       git(f.dir, "remote", "set-url", "origin", bare);
       git(f.dir, "push", "origin", f.base + ":refs/heads/fat");
       writeFileSync(
@@ -297,7 +301,18 @@ for (const outcome of ["success", "drift"]) {
         "name: fixture\nrepos: [api]\nextensions:\n  delivery: {endpoint: fat, stages: [ship]}\n",
       );
       ledger.updateEndpoint({ task_id: f.task, endpoint: "fat", reason: "Isolated test branch only" });
-      verifyFeature(f);
+      if (outcome.startsWith("legacy")) {
+        const spec = join(root, ".workbench/specs", f.task);
+        mkdirSync(spec, {recursive: true});
+        for (const file of ["ssot.md", "tech-spec.md", "test-spec.md"]) {
+          writeFileSync(join(spec, file), "Deliver the feature commit only to the FAT ref.");
+        }
+      }
+      if (outcome === "legacy-stale-review") {
+        verifyFeature(f);
+        ledger.amendSpec({ task_id: f.task, scope: "requirement", reason: "Operator changed the approved scope" });
+      }
+      verifyFeature(f, { review: !missingReview && outcome !== "legacy-policy-off" });
       const rb = ledger.createRunbook({
         task_id: f.task,
         title: "Update the exact test branch",
@@ -316,12 +331,13 @@ for (const outcome of ["success", "drift"]) {
         "src/**",
       ]) as { envelope_id: string };
       expect(human("快轨批准 " + id)).toContain("ACTIVE");
-      let expected = f.head;
+      let expected = missingReview ? f.base : f.head;
       if (outcome === "drift") {
         git(f.dir, "commit", "--allow-empty", "-m", "external target change");
         expected = git(f.dir, "rev-parse", "HEAD");
         git(f.dir, "push", "origin", expected + ":refs/heads/fat");
       }
+      const trace = join(root, "ship-git.trace");
       const cli = () =>
         Bun.spawnSync(
           [process.execPath, join(import.meta.dir, "../src/bin/cli.ts"), "ship", "run", "--envelope", id],
@@ -329,6 +345,7 @@ for (const outcome of ["success", "drift"]) {
             cwd: root,
             env: {
               ...process.env,
+              GIT_TRACE: trace,
               FORGE_WORKBENCH_ROOT: root,
               FORGE_SESSION_ID: "test-session",
               CODEX_SESSION_ID: "test-session",
@@ -337,10 +354,17 @@ for (const outcome of ["success", "drift"]) {
         );
       const result = cli(),
         json = JSON.parse(result.stdout.toString());
-      expect(json.ok, result.stderr.toString() + result.stdout.toString()).toBe(outcome === "success");
+      expect(json.ok, result.stderr.toString() + result.stdout.toString()).toBe(outcome !== "drift" && !missingReview);
       expect(git(bare, "rev-parse", "main")).toBe(f.base);
       expect(git(bare, "rev-parse", "fat")).toBe(expected);
-      if (outcome === "success") {
+      const remoteCall = /built-in: git (?:ls-remote|fetch|push) /;
+      const calls = readFileSync(trace, "utf8");
+      if (missingReview) {
+        expect(calls).not.toMatch(remoteCall);
+        expect(json.reason.message).toContain("independent review");
+        expect(json.receipts).toHaveLength(0);
+      } else if (outcome !== "drift") {
+        expect(calls).toMatch(remoteCall);
         expect(json.receipts).toHaveLength(1);
         expect(JSON.parse(cli().stdout.toString()).receipts).toEqual(json.receipts);
         const receipts = ledger

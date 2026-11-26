@@ -42,13 +42,14 @@ function live(e: Envelope) {
   if (!sid || sid !== e.approved_session_id) throw Error("Session does not match human approval");
   if (!e.expires_at || !(Date.parse(e.expires_at) >= Date.now())) throw Error("Envelope expired");
 }
-function checkEvidence(ledger: Ledger, e: Envelope, row: TaskRepoRecord, dir: string, head: string) {
+function checkEvidence(ledger: Ledger, e: Envelope, row: TaskRepoRecord, dir: string, head: string, requireFrozenToolReview: boolean) {
   const check = ledger.checkPushReadiness({
     task_id: e.task_id,
     repo: row.repo,
     branch: row.branch,
     checkoutDir: dir,
     head_sha: head,
+    requireFrozenToolReview,
   });
   if (!check.ready) throw Error(check.missing.join(", "));
 }
@@ -139,17 +140,25 @@ function preflight(ledger: Ledger, e: Envelope) {
     dirs = new Map<string, string>(),
     check = deliveryDiff(policy, paths);
   let lines = 0;
-  for (const row of ledger.getTaskRepos(e.task_id)) {
-    const pin = plan.pins.find((p) => p.repo === row.repo && p.branch === row.branch)!;
-    const { dir } = resolveTaskCheckout(ledger.workbenchRoot, row);
+  const checkouts = ledger.getTaskRepos(e.task_id).map(row => ({
+    row,
+    pin: plan.pins.find(p => p.repo === row.repo && p.branch === row.branch)!,
+    dir: resolveTaskCheckout(ledger.workbenchRoot, row).dir,
+  }));
+  const reviewRequired = policy.require_independent_review || e.target_endpoint === "pr" ||
+    ledger.getTask(e.task_id)?.verification_depth === "full";
+  // Check every local review gate before observing even the first remote repository.
+  for (const {row, pin, dir} of checkouts) {
+    dirs.set(row.repo, dir);
+    checkEvidence(ledger, e, row, dir, pin.head, reviewRequired);
+  }
+  for (const {row, pin, dir} of checkouts) {
     if (
       git(dir, ["status", "--porcelain", "-z", "--untracked-files=all"]) ||
       runGit(dir, ["merge-base", "--is-ancestor", row.base_sha!, pin.head]).code
     )
       throw Error("Expected clean approved version in " + row.repo);
     if (!repos.includes(row.repo)) throw Error("Repository outside approval");
-    dirs.set(row.repo, dir);
-    checkEvidence(ledger, e, row, dir, pin.head);
     lines += diffScope(dir, row, pin.head, true, paths, policy, files);
     if (lines > policy.max_lines_changed || files.size > policy.max_files_changed)
       throw Error("Diff exceeds policy limits");

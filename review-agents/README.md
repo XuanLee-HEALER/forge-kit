@@ -1,6 +1,6 @@
 # review-agents
 
-Run a fixed-commit review from a Bun workspace or its standalone distribution.
+Run a fixed-commit review from a Bun workspace or its standalone distribution. The launcher runs the built bundle when present. In a source checkout, use `bun src/review.ts` to run changes directly or `bun run build` to refresh the bundle.
 
 ```sh
 review-agents/bin/review --repo ./project --base "$BASE" --head "$HEAD" --spec ./requirements.md --roles business,quality --mode ordered --order quality,business

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, unlinkSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, unlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { bootstrap, kit, legacyRevision, sandbox, type Sandbox } from "./v05-sandbox";
 
@@ -40,7 +40,7 @@ function oldInstance() {
   expect(init.lock.kit_version).toBe("0.4.1");
   expect(s.read(".codex/config.toml")).toContain('model = "previous-standard"');
   // The private change has not gone through v0.4 sync yet.
-  s.privateFile(".workbench/models.toml", '[tiers.standard]\nmodel = "fixture-standard"\neffort = "high"\n');
+  s.privateFile(".workbench/models.toml", '[tiers.standard]\nmodel = "fixture-standard"\neffort = "high"\n[tiers.mechanical]\nmodel = "private-scanner"\neffort = "low"\n');
   const ledger = (...args: string[]) => s.ok([join(s.work, ".workbench/bin/ledger"), ...args]);
   s.privateFile("app/tests/example.test.ts", 'import {expect,test} from "bun:test"; test("fixture", ()=>expect(2+2).toBe(4));\n');
   s.git(join(s.work, "app"), "init", "-b", "active");
@@ -170,6 +170,17 @@ for (const invalid of [false, true]) {
         expect(readFileSync(join(s.work, ".workbench/kit-lock.json"))).toEqual(oldLock);
       }
       writeFileSync(config, original);
+      const scanner = join(s.work, ".codex/agents/scanner.toml");
+      const stock = readFileSync(scanner, "utf8");
+      const editedScanner = stock.replace("gpt-6.1-terra", "hand-edited-scanner");
+      expect(editedScanner).not.toBe(stock);
+      writeFileSync(scanner, editedScanner);
+      const conflict = s.run([bootstrap, "sync", s.work]);
+      expect(conflict.code).not.toBe(0);
+      expect(conflict.err + conflict.out).toContain("Ownership conflict at " + realpathSync(scanner));
+      expect(readFileSync(scanner, "utf8")).toBe(editedScanner);
+      expect(readFileSync(join(s.work, ".workbench/kit-lock.json"))).toEqual(oldLock);
+      writeFileSync(scanner, stock);
       writeFileSync(file, "extensions: [\n");
       const broken = privateState([file]);
       const result = s.run([bootstrap, "sync", s.work]);
@@ -194,7 +205,7 @@ for (const invalid of [false, true]) {
       expect(Bun.TOML.parse(s.read(".codex/config.toml"))).toMatchObject({model: "fixture-standard", model_reasoning_effort: "high"});
       for (const [agent, model, effort] of [
         ["implementer", "fixture-standard", "high"],
-        ["scanner", "gpt-6.1-terra", "medium"],
+        ["scanner", "private-scanner", "low"],
         ["analyst", "gpt-6.2-astra", "high"],
         ["reviewer", "gpt-6.2-astra", "high"],
       ]) {

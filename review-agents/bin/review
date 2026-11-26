@@ -1,2 +1,5 @@
 #!/usr/bin/env bun
-import "../src/review.ts";
+import { existsSync } from "node:fs";
+
+const bundle = new URL("../dist/review.js", import.meta.url);
+await import(existsSync(bundle) ? bundle.href : new URL("../src/review.ts", import.meta.url).href);

@@ -87,4 +87,15 @@ test("the compiler checks the project independently of package script names", ()
   writeFileSync(join(dir, "tsc.ts"), 'console.log("project check")');
   const shadowed = runLangChecks({targetDir: dir, mode: "static"});
   expect(shadowed.checks.map(item => [item.name, item.status])).toEqual([["check", "pass"], ["tsc-noEmit", "fail"]]);
+
+  writeFileSync(join(dir, "example.ts"), "const count: number = 1;");
+  writeFileSync(join(dir, "lint.js"), 'console.error("fixture lint violation"); process.exit(1)');
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: {
+    check: "bun -e 'console.log(1)'", typecheck: "tsc --noEmit", lint: "bun lint.js",
+  } }));
+  const lintFailure = runLangChecks({targetDir: dir, mode: "static"});
+  expect(lintFailure.ok).toBe(false);
+  expect(lintFailure.checks.map(item => [item.name, item.status])).toEqual([
+    ["check","pass"], ["lint","fail"], ["tsc-noEmit","pass"],
+  ]);
 }, 30_000);

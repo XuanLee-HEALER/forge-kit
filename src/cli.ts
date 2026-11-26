@@ -259,6 +259,13 @@ export function initWorkbench(opts: {
   });
 }
 
+function missingLockRecovery(root: string, path: string): string {
+  const recovery = existsSync(localPath(root, ".workbench/sync-journal"))
+    ? "Resume the interrupted sync from the release directory."
+    : "For an existing installation, restore its matching kit-lock.json from backup and rerun sync from the release directory. For a new workbench, run forge init.";
+  return "Missing " + path + ". " + recovery;
+}
+
 export function syncWorkbench(opts?: { targetDir?: string; kitRoot?: string }): {
   root: string;
   lock: KitLock;
@@ -268,7 +275,7 @@ export function syncWorkbench(opts?: { targetDir?: string; kitRoot?: string }): 
   const kitRoot = opts?.kitRoot ?? findKitRoot();
   const path = localPath(root, ".workbench/kit-lock.json");
   if (!existsSync(path) && !existsSync(localPath(root,".workbench/sync-journal")))
-    throw Error("Not an initialized workbench: missing "+path+"; use forge init");
+    throw Error(missingLockRecovery(root, path));
   return withConfigWriteLock(localPath(root, ".workbench/workbench.yaml"), () => {
     loadDbEnvironments(root, { strict: true, validateShadowed: true });
     recoverInstall(root);
@@ -523,7 +530,7 @@ function inspectWorkbench(root: string, issues: DoctorIssue[]) {
     issues.push({
       level: "error",
       check: "lock",
-      message: "Missing " + lockPath + "; initialize the workbench",
+      message: missingLockRecovery(root, lockPath),
     });
   if (existsSync(lockPath)) {
     const lock = JSON.parse(readRequired(lockPath).toString()) as KitLock;

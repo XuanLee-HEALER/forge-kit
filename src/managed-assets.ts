@@ -18,7 +18,7 @@ import { localPath, readRequired } from "./instance";
 export type Asset = { bytes: Buffer; mode: number };
 export const hash = (data: Buffer | string) => createHash("sha256").update(data).digest("hex");
 // These SHA-256 values come from the core/pack blobs and frozen-lockfile Bun builds of the
-// releases below. A release archive need not contain Git history or the previous installer.
+// releases below, including scanner.toml rendered with its release defaults. A release archive need not contain Git history or the previous installer.
 const legacy: Record<string, Record<string, string[]>> = legacyDigests;
 const reviewLinks = [
   "implementation-review",
@@ -89,7 +89,7 @@ function managedPath(root: string, path: string) {
     path !== "AGENTS.md" &&
     path !== ".workbench/kit-lock.json" &&
     !/^\.codex\/(?:config\.toml|hooks\.json|agents\/[\w-]+\.toml)$/.test(path) &&
-    !/^\.agents\/skills\/[\w-]+(?:\/[\w. -]+)*$/.test(path) &&
+    !/^\.agents\/skills\/[\w-]+(?:\/(?:[\w. -]|[^\x00-\x7f\p{C}])+)*$/u.test(path) &&
     !/^\.workbench\/bin\/[\w.-]+$/.test(path)
   )
     throw Error("Unexpected managed path: " + path);

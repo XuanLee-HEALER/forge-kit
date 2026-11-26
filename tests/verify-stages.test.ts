@@ -238,7 +238,15 @@ test("verification materializes nested fixed gitlinks locally and stops before s
     f.git("-C", source, "config", "user.email", "fixture@example.invalid");
   }
   writeFileSync(join(leaf, "value"), "nested content");
-  f.git("-C", leaf, "add", "--", "value");
+  const log = join(f.root, "stage-runs");
+  const script = [
+    'import {appendFileSync} from "node:fs";',
+    'const git = cwd => Bun.spawnSync(["git","-C",cwd,"rev-parse","HEAD"]).stdout.toString().trim();',
+    'const path = Bun.file("vendor/leaf/value");',
+    'appendFileSync(' + JSON.stringify(log) + ', JSON.stringify([git("vendor"),git("vendor/leaf"),await path.exists() ? await path.text() : null])+"\\n");',
+  ].join("\n");
+  writeFileSync(join(leaf, "probe.ts"), script);
+  f.git("-C", leaf, "add", "--", "value", "probe.ts");
   f.git("-C", leaf, "commit", "-m", "leaf content");
   f.git("-C", library, "-c", "protocol.file.allow=always", "submodule", "add", leaf, "leaf");
   f.git("-C", library, "commit", "-m", "pin nested module");
@@ -250,16 +258,9 @@ test("verification materializes nested fixed gitlinks locally and stops before s
   renameSync(leaf, leaf + ".unavailable");
   renameSync(library, library + ".unavailable");
   f.git("commit", "-m", "pin supplied module");
-  const log = join(f.root, "stage-runs");
-  const script = [
-    'import {appendFileSync} from "node:fs";',
-    'const git = cwd => Bun.spawnSync(["git","-C",cwd,"rev-parse","HEAD"]).stdout.toString().trim();',
-    'const path = Bun.file("vendor/leaf/value");',
-    'appendFileSync(' + JSON.stringify(log) + ', JSON.stringify([git("vendor"),git("vendor/leaf"),await path.exists() ? await path.text() : null])+"\\n");',
-  ].join("\n");
   const cfgFile = join(configDir, "workbench.yaml");
   const cfg = parse(readFileSync(cfgFile, "utf8"));
-  cfg.extensions = { actions: { probe: {purpose: "verify", argv:["bun","-e",script]} },
+  cfg.extensions = { actions: { probe: {purpose: "verify", argv:["bun","vendor/leaf/probe.ts"], inputs:["vendor/leaf/value"]} },
     stages: { probe: {action:"probe"} }, verification: {stages:["probe"]} };
   writeFileSync(cfgFile, stringify(cfg));
   mkdirSync(join(configDir, "specs/task"), {recursive:true});
@@ -285,11 +286,24 @@ test("forge verify passes only declared read-only fixture copies into a pinned t
   const source=join(f.root,"input.tar");
   const trace=join(f.root,"fixture-location");
   writeFileSync(source,"pinned bytes\n");
+  f.git("switch", "-c", "unrelated");
+  writeFileSync(join(f.repo, "branch-only"), "unrelated branch object");
+  f.git("add", "--", "branch-only");
+  f.git("commit", "-m", "other branch");
+  const unrelated = f.git("rev-parse", "HEAD:branch-only");
+  f.git("switch", "feature");
+  const parent = f.git("rev-parse", "HEAD");
   writeFileSync(join(f.repo,"fixture.test.ts"),`
 import {expect,test} from "bun:test";
 import {statSync,readFileSync,writeFileSync} from "node:fs";
 import {join} from "node:path";
 test("check fixture contract",()=>{
+  const git=(...args) => Bun.spawnSync(["git",...args]);
+  expect(git("rev-parse","--is-shallow-repository").stdout.toString().trim()).toBe("true");
+  expect(git("rev-list","--count","HEAD").stdout.toString().trim()).toBe("1");
+  expect(git("for-each-ref").stdout.toString()).toBe("");
+  expect(git("cat-file","-e",${JSON.stringify(unrelated)}).exitCode).not.toBe(0);
+  expect(git("cat-file","-e",${JSON.stringify(parent)}).exitCode).not.toBe(0);
   const path=process.env.EXAMPLE_TEST_ARCHIVE;
   expect(path).toBe(join(process.env.TMPDIR,"fixtures","EXAMPLE_TEST_ARCHIVE"));
   expect(readFileSync(path,"utf8")).toBe("pinned bytes\\n");

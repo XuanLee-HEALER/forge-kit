@@ -9,8 +9,10 @@ import type { LedgerReader, LockedGitlinks, LockedTreeEntry } from "./types";
 const excluded = new Set([".git", "node_modules", ".venv"]);
 
 // Expand gitlinks at the exact revision pinned by the parent. All reads stay local.
-function* treeEntries(dir: string, rev: string, globs: string[], repo: string, capture?: LockedGitlinks, archivedCache?: LockedGitlinks, uninitialized?: Set<string>, prefix = ""): Generator<LockedTreeEntry> {
-  const tree = runGit(dir, ["ls-tree", "-rz", "--full-tree", rev]);
+function* treeEntries(dir: string, rev: string, globs: string[], repo: string, capture?: LockedGitlinks, archivedCache?: LockedGitlinks, uninitialized?: Set<string>, prefix = "", literalPaths?: Set<string>): Generator<LockedTreeEntry> {
+  const roots = literalPaths && [...new Set([...literalPaths].filter(path => path.startsWith(prefix))
+    .map(path => path.slice(prefix.length).split("/")[0]))];
+  const tree = runGit(dir, ["--literal-pathspecs", "ls-tree", "-rz", "--full-tree", rev, ...(roots ? ["--", ...roots] : [])]);
   if (tree.code) throw new Error("Cannot inspect locked tests at " + rev);
   for (const row of tree.stdout.split("\0")) {
     if (!row) continue;
@@ -19,7 +21,7 @@ function* treeEntries(dir: string, rev: string, globs: string[], repo: string, c
     const [mode, , oid] = row.slice(0, tab).split(" ");
     const path = prefix + rel;
     if (mode === "160000") {
-      const reachable = globs.some(glob => {
+      const reachable = literalPaths ? [...literalPaths].some(file => file.startsWith(path + "/")) : globs.some(glob => {
         const pattern = glob.replace(/\\/g, "/").replace(/^\.\//, "").split("/");
         if (pattern.length === 1) return true;
         const parts = path.split("/");
@@ -46,14 +48,24 @@ function* treeEntries(dir: string, rev: string, globs: string[], repo: string, c
         }
         objects = stored.stdout.replace(/\n$/, "");
       }
-      const entries = treeEntries(objects, oid, globs, repo, capture, archivedCache, uninitialized, path + "/");
+      const entries = treeEntries(objects, oid, globs, repo, capture, archivedCache, uninitialized, path + "/", literalPaths);
       if (capture) capture[key] = [];
       for (const entry of entries) {
         if (capture && globs.some(glob => matchesGlob(entry.path, glob))) capture[key].push(entry);
         yield entry;
       }
-    } else yield { path, mode, oid };
+    } else if (!literalPaths || literalPaths.has(path)) yield { path, mode, oid };
   }
+}
+
+// Exact paths use the same parent-pinned object traversal as frozen test globs.
+export function pinnedTreeFiles(dir: string, revision: string, paths: string[]) {
+  const files = new Map<string, LockedTreeEntry>();
+  if (paths.length) {
+    for (const entry of treeEntries(dir, revision, [], "", undefined, undefined, undefined, "", new Set(paths)))
+      files.set(entry.path, entry);
+  }
+  return files;
 }
 
 type Hashes = Record<string, string>;

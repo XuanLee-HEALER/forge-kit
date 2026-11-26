@@ -86,6 +86,42 @@ test("T02 discovery, invocation and repeated sync preserve one effective skill",
   expect(decision.some(reply => reply.code === 2 || /"permissionDecision"\s*:\s*"deny"/.test(reply.text))).toBe(true);
 }, 90_000);
 
+test("sync projects referenced Unicode resources while enforcing the skill directory boundary", () => {
+  s.fresh();
+  const dir = ".workbench/overrides/ready";
+  const resource = "references/验收（草案）.md";
+  const header = "---\nname: ready\ndescription: 本地技能\n---\n";
+  const skill = s.privateFile(dir + "/SKILL.md", header + "[验收](" + resource + ")");
+  const source = s.privateFile(dir + "/" + resource, "验收内容");
+  configure({skills:{ready:dir}});
+  const sync = [s.forge, "sync", s.work];
+  const projected = ".agents/skills/ready/" + resource;
+  s.ok(sync);
+  expect(s.read(projected)).toBe("验收内容");
+  s.ok([s.forge, "doctor", s.work, "--json"]);
+  writeFileSync(source, "修订");
+  s.ok(sync);
+  expect(s.read(projected)).toBe("修订");
+  const external = s.privateFile(".workbench/验收.md", "private");
+  const linked = join(s.work, dir, "references/链接.md");
+  symlinkSync(external, linked);
+  for (const [reference, reason] of [
+    ["references/链接.md", "Symlink in managed path"],
+    ["../../验收.md", "Expected a relative path"],
+    ["references", "Unreadable file"],
+  ]) {
+    writeFileSync(skill, header + "[验收](" + reference + ")");
+    const result = s.run(sync);
+    expect(result.code).not.toBe(0);
+    expect(result.err + result.out).toContain(reason);
+    expect(s.read(projected)).toBe("修订");
+  }
+  configure({});
+  s.ok(sync);
+  expect(existsSync(join(s.work, projected))).toBe(false);
+  expect(readFileSync(source, "utf8")).toBe("修订");
+}, 60_000);
+
 for (const error of ["yaml", "reference", "permissions"]) {
   test(`T03 doctor and sync diagnose ${error} and recover after repair`, () => {
     s.fresh();

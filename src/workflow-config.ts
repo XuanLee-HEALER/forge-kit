@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { localPath, readRequired, resolveInstance, verificationDirectory } from "./instance";
-import { runGit } from "./git";
+import { pinnedTreeFiles } from "./ledger/locked-tests";
 import { parseYamlFile } from "./config";
 import { interpreterScript } from "./shared/action-program";
 
@@ -14,7 +14,7 @@ export function installedInstance(root: string) {
   return resolveInstance(root);
 }
 
-export function verificationPolicy(root: string, repo: string, head: string, config: ReturnType<typeof resolveInstance>) {
+export function verificationPolicy(root: string, repo: string, head: string, config: ReturnType<typeof resolveInstance>, checkout = localPath(root, repo)) {
   const { environment, stages } = config.verification.value;
   const digests = new Map<string, string>();
   const sequence = stages.map(id => {
@@ -34,13 +34,13 @@ export function verificationPolicy(root: string, repo: string, head: string, con
       const files = new Set(action.inputs ?? []);
       if (executable) files.add(executable);
       if (script && !isAbsolute(script)) files.add(script);
+      const entries = pinnedTreeFiles(checkout, head, [...files].map(file => join(directory.path, file)));
       for (const file of files) {
         const path = join(directory.path, file);
-        const entry = runGit(localPath(root, repo), ["ls-tree", "-z", head, "--", ":(literal)" + path]);
-        const match = /^(100644|100755) blob ([0-9a-f]+)\t/.exec(entry.stdout);
-        if (entry.code || !match) throw Error("Missing verification file at selected commit: " + path);
-        if (file === executable && match[1] !== "100755") throw Error("Verification program is not executable at selected commit: " + path);
-        pinned.push([path, match[2]]);
+        const entry = entries.get(path);
+        if (!entry || !["100644", "100755"].includes(entry.mode)) throw Error("Missing verification file at selected commit: " + path);
+        if (file === executable && entry.mode !== "100755") throw Error("Verification program is not executable at selected commit: " + path);
+        pinned.push([path, entry.oid]);
       }
     }
     // Keep mutable arguments (including output paths) bound as argv values only.

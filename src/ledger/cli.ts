@@ -565,14 +565,14 @@ Commands:
       if (!sub || sub === "--help" || sub === "-h" || (sub === "create" && ["--help","-h"].includes(rest[1]))) {
         console.log(`Usage: forge ledger runbook <create|show|list|complete|revoke>
   create --title <text> [--id rb-xxxx] <actions>
-    Standalone: register at least one --pr <repo>:<num>, --tag <repo>:<tag>:<sha>,
+    Ordinary runbook: optionally associate --task <id>. Register at least one --pr <repo>:<num>, --tag <repo>:<tag>:<sha>,
                 --sql <host>:<path>, or --kubectl "<command>". Flags may repeat.
-    Task delivery: add --task <id>. Register a --pr for each attached repo when merging to main.
+    Fast-track plan: add --exact --task <id>. Register a --pr for each attached repo when merging to main.
                    Pass each custom delivery stage as --stage <id> in declared order.
                    Register Kubernetes operations as versioned instance stages.
                    Production endpoints may also register an exact --tag or --sql.
-    FAT task: use --task <id> --fat <repo>:fat for each attached repository. The only destination is refs/heads/fat.
-    Example: forge ledger runbook create --task fix-1 --title "Merge reviewed change" --pr api:42
+    FAT task: use --exact --task <id> --fat <repo>:fat for each attached repository. The only destination is refs/heads/fat.
+    Example: forge ledger runbook create --exact --task fix-1 --title "Merge reviewed change" --pr api:42
   show     <runbook_id>
   list     [--status <PENDING|APPROVED|COMPLETED|REVOKED>]
   complete <runbook_id>
@@ -591,6 +591,7 @@ Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <ru
             pr: { type: "string", multiple: true },
             sql: { type: "string", multiple: true },
             kubectl: { type: "string", multiple: true },
+            exact: { type: "boolean" },
             stage: { type: "string", multiple: true },
             fat: { type: "string", multiple: true },
           },
@@ -617,13 +618,13 @@ Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <ru
           }
           return { host: spec.slice(0, idx), path: spec.slice(idx + 1), sha256: "" };
         });
-        if(values.task && values.kubectl?.length) throw Error("--task deliveries register Kubernetes operations via --stage <id>");
-        if(values.fat?.length && !values.task) throw Error("--fat requires --task");
-        if (values.stage?.length && !values.task) throw Error("--stage requires --task");
+        if (values.exact && !values.task) throw Error("--exact requires --task <id>");
+        if ((values.stage || values.fat) && !values.exact) throw Error("--stage and --fat require --exact --task <id>");
+        if (values.exact && values.kubectl?.length) throw Error("Register exact Kubernetes operations via --stage <id>");
         const rec = ledger.createRunbook({
           runbook_id: values.id,
           task_id: values.task,
-          ...(values.task && {exact_stages: values.stage ?? [],exact_fat:values.fat ?? []}),
+          ...(values.exact && {exact_stages: values.stage ?? [],exact_fat:values.fat ?? []}),
           title: values.title,
           actions: {
             tags,
