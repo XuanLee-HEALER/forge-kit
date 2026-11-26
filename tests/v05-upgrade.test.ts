@@ -23,6 +23,7 @@ function oldInstance() {
     writeFileSync(join(dir, "SKILL.md"), "legacy review material " + id);
   }
   writeFileSync(join(legacy, "review-agents/package.json"), JSON.stringify({name: "local-review-fixture", private: true, scripts: {build: "true"}}));
+  s.privateFile(".workbench/models.toml", '[tiers.standard]\nmodel = "fixture-standard"\neffort = "high"\n');
   const init = JSON.parse(s.ok([join(legacy, "bin/forge"), "init", s.work, "--packs", "dbop,comm-lark"]));
   expect(init.lock.kit_version).toBe("0.4.1");
   const ledger = (...args: string[]) => s.ok([join(s.work, ".workbench/bin/ledger"), ...args]);
@@ -128,6 +129,7 @@ for (const invalid of [false, true]) {
     unlinkSync(changedLink);
     symlinkSync(privateLinkText, changedLink);
     const privateFiles = [originalTarget, privateTarget,
+      join(s.work, ".workbench/models.toml"),
       s.privateFile("AGENTS.local.md", "local instance instruction\n"),
       s.privateFile(".workbench/env/synthetic.key", "TEST-CREDENTIAL-MARKER\n"),
       s.privateFile(".agents/skills/form-ux/SKILL.md", "user-modified retired skill\n"),
@@ -162,6 +164,15 @@ for (const invalid of [false, true]) {
       expect(snapshot(old.schema)).toEqual(old);
       expect(privateState(privateFiles)).toEqual(preserved);
       expect(readFileSync(file)).toEqual(good);
+      for (const [agent, model, effort] of [
+        ["implementer", "fixture-standard", "high"],
+        ["scanner", "gpt-6.1-terra", "medium"],
+        ["analyst", "gpt-6.2-astra", "high"],
+        ["reviewer", "gpt-6.2-astra", "high"],
+      ]) {
+        const rendered = readFileSync(join(s.work, `.codex/agents/${agent}.toml`), "utf8");
+        expect(Bun.TOML.parse(rendered)).toMatchObject({ model, model_reasoning_effort: effort });
+      }
       s.ok([s.forge, "doctor", s.work, "--json"]);
       for (const tip of tips) s.ok([s.forge, "ledger", "verify-tip", tip]);
       expect(JSON.parse(s.ok([s.forge, "ledger", "query", "--q", "rehearsal", "--json"]))).toEqual(search);

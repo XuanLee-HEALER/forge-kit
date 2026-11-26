@@ -329,6 +329,86 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     expect(ship.stderr.toString() + ship.stdout.toString()).toMatch(/ship/i);
   });
 
+  test("stage resolution diagnoses incompatible verification, delivery and observer references before sync", () => {
+    const { root } = initWorkbench({ targetDir: target });
+    const cfg = join(root, ".workbench/workbench.yaml"),
+      original = readFileSync(cfg, "utf8");
+    const lock = join(root, ".workbench/kit-lock.json"),
+      initial = readFileSync(lock);
+    const marker = join(root, "stage-ran");
+    const actions = {
+      check: { purpose: "verify", argv: ["bun", "-e", "console.log('verified')"] },
+      write: {
+        purpose: "deliver",
+        argv: ["bun", "-e", "await Bun.write(" + JSON.stringify(marker) + ", 'ran')"],
+        inputs: [],
+      },
+      probe: { purpose: "observe", argv: ["bun", "-e", "console.log('observed')"], inputs: [] },
+    };
+    const stages = {
+      check: { action: "check" },
+      roll: { action: "write", observe: "probe" },
+      read: { action: "probe" },
+    };
+    const legal = {
+      actions,
+      stages,
+      verification: { stages: ["verify", "check"] },
+      delivery: { stages: ["ship", "roll"] },
+    };
+    function configure(extensions: object) {
+      writeFileSync(cfg, original + "\nextensions: " + JSON.stringify(extensions) + "\n");
+    }
+    function invalid(extensions: object, field: string) {
+      configure(extensions);
+      const diagnosis = doctorWorkbench(root);
+      expect(diagnosis.ok).toBe(false);
+      expect(JSON.stringify(diagnosis.issues)).toContain(field);
+      expect(() => syncWorkbench({ targetDir: root })).toThrow(field);
+      expect(readFileSync(lock)).toEqual(initial);
+      expect(existsSync(marker)).toBe(false);
+    }
+    for (const stage of ["ship", "roll", "read"])
+      invalid({ ...legal, verification: { stages: [stage] } }, "verification.stages");
+    for (const stage of ["verify", "check", "read"])
+      invalid({ ...legal, delivery: { stages: [stage] } }, "delivery.stages");
+    for (const observe of ["missing", "write", "check"])
+      invalid({ ...legal, stages: { ...stages, roll: { action: "write", observe } } }, "roll.observe");
+    invalid(
+      { ...legal, actions: { ...actions, missing: { purpose: "verify", argv: ["./absent"] } } },
+      "missing.argv[0]",
+    );
+    writeFileSync(join(root, "input.json"), "{}");
+    symlinkSync(join(root, "input.json"), join(root, "link.json"));
+    for (const inputs of [
+      ["../external"],
+      ["."],
+      ["missing.json"],
+      ["link.json"],
+      ["input.json", "./input.json"],
+    ]) {
+      invalid({ ...legal, actions: { ...actions, write: { ...actions.write, inputs } } }, "write.inputs");
+    }
+    configure({ ...legal, stages: { ...stages, roll: { action: "write" } } });
+    expect(doctorWorkbench(root).issues).toContainEqual(
+      expect.objectContaining({ level: "warn", message: expect.stringContaining("roll.observe") }),
+    );
+    configure(legal);
+    expect(doctorWorkbench(root).issues).toEqual([]);
+    syncWorkbench({ targetDir: root });
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("sync and doctor reject a malformed declared model tier before writing", () => {
+    const { root } = initWorkbench({ targetDir: join(target, "instance") });
+    const lock = join(root, ".workbench/kit-lock.json");
+    const before = readFileSync(lock);
+    writeFileSync(join(root, ".workbench/models.toml"), '[tiers.standard]\nmodel = "fixture-standard"\n');
+    expect(JSON.stringify(doctorWorkbench(root).issues)).toContain("tiers.standard.effort");
+    expect(() => syncWorkbench({ targetDir: root })).toThrow("tiers.standard.effort");
+    expect(readFileSync(lock)).toEqual(before);
+  });
+
   test("sync and doctor validate both private environment files before changing projections", () => {
     const instance = join(target, "instance");
     initWorkbench({ targetDir: instance });

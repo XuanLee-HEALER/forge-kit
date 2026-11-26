@@ -161,7 +161,18 @@ export interface RunbookSqlFileAction {
   sha256: string;
 }
 
+export interface ReleaseObserver {
+  task_id: string;
+  repo: string;
+  branch: string;
+  endpoint: string;
+  action_id: string;
+  versions: {repo: string; head: string}[];
+  stage: Extract<import("./ship-actions").ShipAction, {kind:"stage"}>;
+}
+
 export interface RunbookActions {
+  release_observers?: ReleaseObserver[];
   tags: RunbookTagAction[];
   prs: RunbookPrAction[];
   sql_files: RunbookSqlFileAction[];

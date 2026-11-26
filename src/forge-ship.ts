@@ -1,3 +1,4 @@
+import { checkStagePin, observeStage, stageEnvironment } from "./stage-observation";
 import { mergePinnedHead } from "./conditional-merge";
 import { diffScope, inspectMerge, deliveryDiff, git } from "./ship-diff";
 import { parseArgs } from "node:util";
@@ -9,7 +10,6 @@ import {
   checkFatProtection,
   checkDeliveryDefinition,
   pinCheckouts,
-  stagePin,
   databaseTarget,
   isOid,
   type ShipAction,
@@ -183,8 +183,7 @@ function preflight(ledger: Ledger, e: Envelope) {
     else inspectMerge(row.repo, dir, pr.baseOid, pin.head, check);
   }
   for (const a of plan.actions) {
-    if (a.kind === "stage" && canonicalJson(stagePin(ledger.workbenchRoot, a.stage)) !== canonicalJson(a))
-      throw Error("Stage script, target or arguments changed: " + a.stage);
+    if (a.kind === "stage") checkStagePin(ledger.workbenchRoot, a);
     if (
       a.kind === "sql" &&
       (policy.forbid_db_rw ||
@@ -230,6 +229,46 @@ function checkAuthorization(ledger: Ledger, id: string) {
     throw Error("Authorization expired, revoked or changed");
   if (ledger.getTaskBlockers(current.task_id).some((blocker) => blocker.status === "OPEN"))
     throw Error("Task has an open blocker");
+}
+class WaitingForTarget extends Error {
+  constructor(readonly index: number) {
+    super("Awaiting target confirmation; retry forge ship run to observe the same action without resubmitting");
+  }
+}
+function reconcileStage(
+  ledger: Ledger,
+  e: Envelope,
+  a: Extract<ShipAction, { kind: "stage" }>,
+  plan: ExactPlan,
+  index: number,
+): string {
+  const versions = plan.pins.map(({ repo, head }) => ({ repo, head }));
+  const actionId = e.envelope_id + "/" + index;
+  function observe() {
+    const fact = observeStage(ledger.workbenchRoot, a, actionId, plan.endpoint, versions);
+    if (!fact || fact.state === "pending") throw new WaitingForTarget(index);
+    if (fact.state === "failed") throw Error("Target reports failed delivery for " + a.stage);
+    return fact.state === "completed" ? canonicalJson(fact) : null;
+  }
+  const alreadyDone = observe();
+  if (alreadyDone) return alreadyDone;
+  checkStagePin(ledger.workbenchRoot, a);
+  // Persist intent before invoking the writer, so a crash or asynchronous submission cannot replay it.
+  withImmediateTx(ledger.db, () => {
+    checkAuthorization(ledger, e.envelope_id);
+    const submitted = ledger.db
+      .query(
+        "SELECT 1 FROM events WHERE task_id=? AND event_type='SHIP_STAGE_SUBMISSION_INTENT' AND json_extract(payload_json,'$.envelope_id')=? AND json_extract(payload_json,'$.index')=? LIMIT 1",
+      )
+      .get(e.task_id, e.envelope_id, index);
+    if (submitted) throw new WaitingForTarget(index);
+    trackEvent(ledger, e, "SHIP_STAGE_SUBMISSION_INTENT", { index, action_id: actionId });
+  });
+  const env = { ...stageEnvironment(actionId, plan.endpoint, versions), FORGE_ACTIVE_STAGE: a.stage };
+  runProcess(a.execute.argv, { cwd: a.execute.cwd, env, timeoutMs: 60_000 });
+  const receipt = observe();
+  if (receipt) return receipt;
+  throw new WaitingForTarget(index);
 }
 function perform(
   ledger: Ledger,
@@ -288,26 +327,12 @@ function perform(
     if (!confirmed) throw Error("Uncertain remote outcome; inspect remote before retrying");
     return confirmed;
   }
-  const env: Record<string, string | undefined> = {
-    PATH: process.env.PATH,
-    LANG: process.env.LANG,
-    FORGE_ACTION_ID: e.envelope_id + "/" + index,
-    FORGE_ENDPOINT: plan.endpoint,
-    FORGE_APPROVED_HEADS: JSON.stringify(plan.pins.map(({ repo, head }) => ({ repo, head }))),
-  };
-  if (a.kind === "stage") {
-    if (canonicalJson(stagePin(ledger.workbenchRoot, a.stage)) !== canonicalJson(a))
-      throw Error("Stage changed");
-    checkAuthorization(ledger, e.envelope_id);
-    const r = runProcess(a.argv, {
-      cwd: a.cwd,
-      env: { ...env, FORGE_ACTIVE_STAGE: a.stage },
-      timeoutMs: 60_000,
-    });
-    if (r.code)
-      throw Error("Unconfirmed stage " + a.stage + " (exit " + r.code + "); inspect target before retrying");
-    return "exit=0 stdout_sha256=" + sha256String(r.stdout);
-  }
+  const env = stageEnvironment(
+    e.envelope_id + "/" + index,
+    plan.endpoint,
+    plan.pins.map(({ repo, head }) => ({ repo, head })),
+  );
+  if (a.kind === "stage") return reconcileStage(ledger, e, a, plan, index);
   const sql = readFileSync(a.path);
   if (
     createHash("sha256").update(sql).digest("hex") !== a.sha256 ||
@@ -349,6 +374,7 @@ function state(ledger: Ledger, id: string, reason?: string) {
   };
 }
 function validOwner(pid: number) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -437,7 +463,10 @@ export function shipCli(argv: string[]) {
             if (validOwner(claim.owner_pid) || envelope(ledger, id).status !== "ACTIVE")
               return state(ledger, id, "Action claimed; inspect receipts");
           }
-          observation = observed(ledger, current, action, dirs);
+          observation =
+            action.kind === "stage"
+              ? reconcileStage(ledger, current, action, plan, index)
+              : observed(ledger, current, action, dirs);
           if (!observation)
             throw Error(
               "Uncertain outcome for a claimed item; inspect target and receipts before manual recovery",
@@ -470,6 +499,16 @@ export function shipCli(argv: string[]) {
         const { rb } = exactRunbook(ledger, current);
         if (rb.status !== "APPROVED" || !rb.expires_at || Date.parse(rb.expires_at) <= Date.now())
           throw Error("Approval expired or revoked");
+        const allReceipts = receipts(ledger, id);
+        const versions = plan.pins.map(({ repo, head }) => ({ repo, head }));
+        const stageReceipts = plan.actions.flatMap((action, index) => {
+          if (action.kind !== "stage") return [];
+          const fact = { state: "completed", action_id: id + "/" + index, endpoint: plan.endpoint, versions };
+          const receipt = allReceipts.find((row) => row.action_index === index && row.status === "confirmed");
+          if (receipt?.observation !== canonicalJson(fact))
+            throw Error("Missing completed target receipt for " + action.stage);
+          return [{ stage: action.stage, ...fact }];
+        });
         const now = nowIso();
         ledger.db
           .query(
@@ -546,7 +585,7 @@ export function shipCli(argv: string[]) {
               source: "tool",
               actor: "tool",
               summary: "Confirmed exact delivery steps",
-              meta,
+              meta: { ...meta, stage_receipts: stageReceipts },
             });
         }
         trackEvent(ledger, current, "FAST_TRACK_REDEEMED", {
@@ -558,6 +597,19 @@ export function shipCli(argv: string[]) {
       });
     } catch (err) {
       return withImmediateTx(ledger.db, () => {
+        if (err instanceof WaitingForTarget) {
+          ledger.db
+            .query(
+              "UPDATE ship_action_receipts SET owner_pid=0 WHERE envelope_id=? AND action_index=? AND status='claimed'",
+            )
+            .run(id, err.index);
+          ledger.db
+            .query(
+              "UPDATE fast_track_envelopes SET run_token=NULL WHERE envelope_id=? AND status='ACTIVE' AND run_token=?",
+            )
+            .run(id, String(process.pid));
+          return state(ledger, id, err.message);
+        }
         const reason = err instanceof Error ? err.message : String(err);
         const status = Date.parse(initial.expires_at!) <= Date.now() ? "EXPIRED" : "DEGRADED";
         if (

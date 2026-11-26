@@ -910,7 +910,7 @@ export class Ledger {
     const config = currentWorkflow ? installedInstance(this.workbenchRoot) : undefined;
     const customVerification = config && (config.verification.source !== "core" ||
       config.verification.value.stages.some(id => config.stages.get(id)?.source !== "core"));
-    const expectedPolicy = customVerification ? verificationPolicy(config) : undefined;
+    const expectedPolicy = config ? verificationPolicy(config) : undefined;
     const specState = getSpecState(this, params.task_id, { delivery: params, closing });
     if (currentWorkflow && specState.state === "NONE") missing.push("A confirmed frozen specification is required for delivery");
     if (specState.drifted_locked_tests.length) {
@@ -996,7 +996,7 @@ export class Ledger {
             state?: string; base_branch?: string; target_oid?: string;
             pr_url?: string;
             role?: string;
-            policy_sha256?: string; delivery_endpoint?: string;
+            policy_sha256?: string; startup_failure?: boolean; delivery_endpoint?: string;
             mode?: string; freeze_seq?: number; review_task_id?: string;
             started_at?: string;
             review_floor_seq?: number;
@@ -1007,7 +1007,8 @@ export class Ledger {
         if (EXECUTABLE_EVIDENCE.has(p.kind) && evidenceSource(p, ev.actor) === "manual") continue;
         if (currentWorkflow && p.kind === "verify" && p.meta?.mode === "all" &&
             p.meta.review_task_id === params.task_id && p.meta.freeze_seq === specState.freeze_seq &&
-            (!expectedPolicy || expectedPolicy === p.meta.policy_sha256) &&
+            ((p.status === "fail" && p.meta.startup_failure === true) ||
+             (expectedPolicy !== undefined && expectedPolicy === p.meta.policy_sha256)) &&
             evidenceSource(p, ev.actor) === "tool" && ev.seq >= Math.max(floors.lint, floors.test)) {
           evidence.checks.set("verify", p.status);
         }
@@ -1431,7 +1432,7 @@ export class Ledger {
     const cutoff = new Date(
       Date.now() - params.beforeDays * 86400_000,
     ).toISOString();
-    const eligible = "status IN ('CLOSED', 'CANCELLED') AND COALESCE(closed_at, updated_at) < ? AND NOT EXISTS (SELECT 1 FROM release_items r WHERE r.task_id=tasks.task_id)";
+    const eligible = "status IN ('CLOSED', 'CANCELLED') AND COALESCE(closed_at, updated_at) < ? AND NOT EXISTS (SELECT 1 FROM release_items r WHERE r.task_id=tasks.task_id) AND NOT EXISTS (SELECT 1 FROM fast_track_envelopes f JOIN exact_ship_envelopes e ON e.envelope_id=f.envelope_id WHERE f.task_id=tasks.task_id)";
     const selectCandidates = () => {
       const rows = this.db.query(`SELECT task_id FROM tasks WHERE ${eligible} ORDER BY created_at ASC`)
         .all(cutoff) as Array<{ task_id: string }>;

@@ -76,6 +76,11 @@ export async function runReview(params: Option & {
   const { base, head } = repo;
   repo.git(["merge-base", "--is-ancestor", base, head]);
   const material = materials(repo);
+  let context: ReturnType<Repo["context"]> | undefined;
+  if (!material.missing.length) {
+    try { context = repo.context(material.diff); }
+    catch { material.missing.push("pinned source context"); }
+  }
   let spec: string | undefined;
   if (params.spec) {
     try {
@@ -89,7 +94,7 @@ export async function runReview(params: Option & {
     const missing = [...material.missing];
     if (role === "business" && !spec) missing.push("spec");
     if (missing.length) return { ...common, backend: null, findings: [], attempts: [], summary: "Missing review material: " + missing.join(", "), status: "incomplete" };
-    const prompt = JSON.stringify({ role, base, head, instructions: instructions(role, repo.files), spec: spec ?? null, diff: material.diff });
+    const prompt = JSON.stringify({ role, base, head, instructions: instructions(role, repo.files), spec: spec ?? null, diff: material.diff, context });
     const model = params.models?.[role] ?? params.model ?? { model: process.env.REVIEW_MODEL || "gpt-6.2-sol", effort: "medium" };
     const attempts: Attempt[] = [];
     const backends: Backend[] = backend === "auto" ? ["codex", "api"] : [backend];

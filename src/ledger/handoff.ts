@@ -9,13 +9,13 @@ import { verifiedPr } from "./pr";
 import type { HandoffItem, Snapshot } from "./release-inspection";
 import type { Ledger } from "./store";
 import { appendEventInTx, withImmediateTx } from "./transactions";
-import { evidenceSource, nowIso, type RunbookSqlFileAction } from "./types";
+import { evidenceSource, isRolloutEndpoint, nowIso, type RunbookSqlFileAction } from "./types";
 
 export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback?: string, callbacks?:{verifyTarget:(repo:string,branch:string,oid:string,state:string)=>void; beforeRecord:(items:HandoffItem[])=>void; afterRecord:()=>void}) {
   function candidates() {
     const task = ledger.getTask(task_id);
-    if (task?.status !== "OPEN" || !["pr", "prod"].includes(task.endpoint))
-      throw Error("Expected an OPEN pr or prod task");
+    if (task?.status !== "OPEN" || (task.endpoint !== "pr" && !isRolloutEndpoint(task.endpoint)))
+      throw Error("Expected an OPEN PR or rollout task");
     const repos = ledger.getTaskRepos(task_id);
     if (!repos.length || task.open_blockers || !ledger.verify(task_id).ok)
       throw Error("Check task attachments, blockers and ledger integrity");

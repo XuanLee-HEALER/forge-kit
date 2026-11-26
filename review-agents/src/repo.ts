@@ -1,4 +1,5 @@
 import { realpathSync } from "node:fs";
+import { posix } from "node:path";
 
 export function snapshotGitEnv() {
   const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat" } as NodeJS.ProcessEnv;
@@ -138,53 +139,93 @@ export class Repo {
     this.readFiles.add(`${revision}:${path}`);
     return result;
   }
+  trackedPaths() {
+    return this.git(["ls-tree", "-r", "--name-only", "-z", this.head]).split("\0")
+      .filter(p => p && !isInstructionFile(p) && !isPrivatePath(p));
+  }
+
+  private searchHits(terms: string[], globs: string[], maxPerFile?: number) {
+    // Zero-delimited path and line fields keep literal colons in names unambiguous.
+    const raw = this.git(["grep", "-n", "-z", "-I", "-F", ...(maxPerFile ? ["-m", String(maxPerFile)] : []),
+      ...terms.flatMap(term => ["-e", term]), this.head, "--", ...globs,
+      ":(exclude).workbench/**", ":(exclude).agents/**", ":(exclude).codex/**",
+      ":(exclude)**/.env*", ":(exclude).env*", ":(exclude)**/config.toml", ":(exclude)config.toml",
+      ":(exclude)*.pem", ":(exclude)*.key"], true);
+    const hits: {path: string; line: number; text: string}[] = [];
+    for (const row of raw.split("\n")) {
+      const [name, line, text] = row.split("\0");
+      if (!name?.startsWith(this.head + ":") || text === undefined) continue;
+      const path = name.slice(this.head.length + 1);
+      if (!isPrivatePath(path) && !isInstructionFile(path)) hits.push({path, line: Number(line), text});
+    }
+    return hits;
+  }
+
   search(query: string, glob: string, offset: number) {
-    if (
-      typeof query !== "string" ||
-      typeof glob !== "string" ||
-      query.length > 200 ||
-      glob.length > 200
-    )
+    if (typeof query !== "string" || typeof glob !== "string" || query.length > 200 || glob.length > 200)
       throw new Error("Invalid search");
     this.searches++;
     if (!query) {
       const matcher = new Bun.Glob(glob || "**");
-      const paths = this.git(["ls-tree", "-r", "--name-only", "-z", this.head])
-        .split("\0")
-        .filter((p) => p && !isInstructionFile(p) && matcher.match(p));
-      return this.page(paths, offset);
+      return this.page(this.trackedPaths().filter(p => matcher.match(p)), offset);
     }
-    const lines = this.git(
-      [
-        "grep",
-        "-n",
-        "-I",
-        "-F",
-        "-e",
-        query,
-        this.head,
-        "--",
-        glob || "*",
-        ":(exclude)**/.env*",
-        ":(exclude).env*",
-        ":(exclude)**/config.toml",
-        ":(exclude)config.toml",
-        ":(exclude)*.pem",
-        ":(exclude)*.key",
-        ":(exclude,icase)**/CLAUDE.md",
-        ":(exclude,icase)CLAUDE.md",
-        ":(exclude,icase)**/AGENTS.md",
-        ":(exclude,icase)AGENTS.md",
-        ":(exclude,icase)**/SKILL.md",
-        ":(exclude,icase)SKILL.md",
-        ":(exclude,icase)**/WORKBENCH.md",
-        ":(exclude,icase)WORKBENCH.md",
-      ],
-      true,
-    )
-      .split("\n")
-      .filter(Boolean);
-    return this.page(lines, offset);
+    return this.page(this.searchHits([query], [glob || "*"]).map(h => h.path + ":" + h.line + ":" + h.text), offset);
+  }
+
+  context(diff: Record<string, string>) {
+    const extensions = ["ts","tsx","js","jsx","mts","cts","mjs","cjs","go","py","rs","java","kt","swift","rb","c","cc","cpp","h","hpp"];
+    const publicSource = (p: string) => extensions.includes(posix.extname(p).slice(1)) &&
+      !/(^|\/)(?:\.workbench|\.agents|\.codex|\.ssh|node_modules|vendor)\//.test(p);
+    const changedPaths = new Set(this.files);
+    const changed = this.files.filter(publicSource).slice(0, 8);
+    const files: { path: string; text: string }[] = [];
+    const omitted: string[] = [];
+    if (!changed.length) return { revision: this.head, files, omitted };
+    const paths = new Set(this.trackedPaths().filter(publicSource));
+    const candidates = new Map<string, number>();
+    const names = new Set<string>();
+    for (const file of changed) {
+      const patch = diff[file] ?? "";
+      for (const m of patch.matchAll(/\b(?:function|class|interface|const|def|fn|func)\s+([A-Za-z_]\w{2,})/g))
+        if (names.size < 24) names.add(m[1]);
+      const stem = posix.parse(file).name;
+      if (/^[a-zA-Z_]\w{2,}$/.test(stem) && !["index","main","mod"].includes(stem)) names.add(stem);
+      if (!paths.has(file)) continue;
+      const header = this.read(file, "head", 0).text;
+      for (const m of (header + "\n" + patch).matchAll(/["'](\.\.?\/[^"'\s]+)["']/g)) {
+        const target = posix.join(posix.dirname(file), m[1]);
+        // TS sources commonly refer to a .js module in their emitted imports.
+        const stem = target.replace(/\.[cm]?js$/, "");
+        const dep = [target, ...["ts","tsx","js","jsx","mts","cts","mjs","cjs","py","rs"].flatMap(
+          ext => [stem + "." + ext, posix.join(stem, "index." + ext)])].find(p => paths.has(p));
+        if (dep && !changedPaths.has(dep) && candidates.size < 6) candidates.set(dep, 0);
+      }
+    }
+    const hits = names.size ? this.searchHits([...names], extensions.map(ext => "*." + ext), 4) : [];
+    const importLine = (text: string) => /^\s*(?:import\b|from\b.*\bimport\b|(?:const|let|var)\b.*\brequire\s*\()/.test(text);
+    // Prefer the call site to its import when the two are far apart.
+    hits.sort((a, b) => Number(importLine(a.text)) - Number(importLine(b.text)));
+    for (const hit of hits) {
+      if (!paths.has(hit.path) || changedPaths.has(hit.path) || candidates.has(hit.path)) continue;
+      candidates.set(hit.path, Math.max(0, hit.line - 10));
+      if (candidates.size >= 12) break;
+    }
+    for (const [path, offset] of candidates) {
+      // Up to 4 KiB per excerpt, 12 files total. Keep complete numbered lines.
+      let text: string;
+      try { text = this.read(path, "head", offset).text; }
+      catch { omitted.push(path); continue; }
+      const lines: string[] = [];
+      let bytes = 0;
+      for (const line of text.split("\n")) {
+        bytes += Buffer.byteLength(line) + 1;
+        if (bytes > 4096) break;
+        lines.push(line);
+      }
+      if (lines.length) files.push({path, text: lines.join("\n")});
+      else omitted.push(path);
+    }
+    return { revision: this.head, files, omitted };
   }
   missing() {
     return this.files.filter(

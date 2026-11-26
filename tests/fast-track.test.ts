@@ -260,11 +260,12 @@ test("runbook manifest positions the merge at the declared ship slot and retains
 extensions:
   delivery: {endpoint: rollout, stages: [precheck, ship, postcheck]}
   stages:
-    precheck: {action: inspect}
-    postcheck: {action: inspect}
-    ${override ? "ship: {action: inspect}" : ""}
+    precheck: {action: inspect, observe: readback}
+    postcheck: {action: inspect, observe: readback}
+    ${override ? "ship: {action: inspect, observe: readback}" : ""}
   actions:
-    inspect: {argv: ["bun", "-e", "console.log('test')"], cwd: ".", purpose: deliver}
+    inspect: {argv: ["bun", "-e", "console.log('test')"], cwd: ".", purpose: deliver, inputs: []}
+    readback: {argv: ["bun", "-e", "console.log(1)"], purpose: observe, inputs: []}
 `,
     );
     const stages = override ? ["precheck", "ship", "postcheck"] : ["precheck", "postcheck"];
@@ -361,3 +362,25 @@ for (const outcome of ["success", "drift"]) {
     60_000,
   );
 }
+
+test("prune previews and removes ordinary closed tasks while retaining exact authorizations and audit history", () => {
+  const { f, prep } = exactFixture();
+  const { envelope_id } = prep();
+  const ordinary = "prune-ordinary";
+  ledger.openTask({ task_id: ordinary, title: "old work", depth: "targeted", endpoint: "local" });
+  for (const id of [ordinary, f.task]) ledger.cancelTask({ task_id: id, reason: "completed fixture" });
+  ledger.db
+    .query("UPDATE tasks SET closed_at=? WHERE task_id IN (?,?)")
+    .run("2000-01-01T00:00:00.000Z", ordinary, f.task);
+  const before = ledger.getTaskEvents(f.task);
+  for (const apply of [false, true]) {
+    const result = ledger.prune({ beforeDays: 90, apply });
+    expect(result.candidates).toEqual([ordinary]);
+    expect(result.deleted).toEqual(apply ? [ordinary] : []);
+  }
+  expect(ledger.getTaskEvents(f.task)).toEqual(before);
+  expect(
+    ledger.db.query("SELECT envelope_id FROM exact_ship_envelopes WHERE envelope_id=?").get(envelope_id),
+  ).toEqual({ envelope_id });
+  expect(ledger.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+}, 30_000);

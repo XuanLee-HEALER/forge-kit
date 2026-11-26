@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
 import { executorFixture } from "./helpers/executor";
@@ -50,9 +50,9 @@ test("custom and core stages execute in declaration order against one isolated r
   mkdirSync(adapters);
   const output = join(f.root, "adapter-result.json");
   writeFileSync(join(adapters, "check.ts"),
-    "await Bun.write(" + JSON.stringify(output) + ", JSON.stringify({cwd:process.cwd(), checkout:process.env.FORGE_VERIFY_CHECKOUT, environment:process.env.FORGE_VERIFY_ENVIRONMENT}));");
+    "#!/usr/bin/env bun\nawait Bun.write(" + JSON.stringify(output) + ", JSON.stringify({cwd:process.cwd(), checkout:process.env.FORGE_VERIFY_CHECKOUT, environment:process.env.FORGE_VERIFY_ENVIRONMENT}));", {mode:0o755});
   config.extensions.actions.first.cwd = "service";
-  config.extensions.actions.last = { cwd: ".workbench/actions", argv: ["bun", "check.ts"], purpose: "verify" };
+  config.extensions.actions.last = { cwd: ".workbench/actions", argv: ["./check.ts"], purpose: "verify" };
   config.extensions.verification.environment = "fixture-lab";
   writeFileSync(file, stringify(config));
   const custom = f.cli("verify", []);
@@ -64,6 +64,20 @@ test("custom and core stages execute in declaration order against one isolated r
   const lastFirst = readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(row => row[0] === "first").at(-1);
   expect(lastFirst[1]).toBe(adapter.checkout);
   expect(existsSync(adapter.checkout)).toBe(false);
+
+  const before = f.evidence().at(-1);
+  const executable = join(adapters, "check.ts");
+  renameSync(executable, executable + ".saved");
+  const unavailable = f.cli("verify", []);
+  expect(unavailable.exitCode).not.toBe(0);
+  expect(f.evidence().at(-1)).toMatchObject({ kind: "verify", status: "fail", source: "tool", meta: {
+    startup_failure: true, failed_phase: "instance configuration", freeze_seq: before.meta.freeze_seq,
+  } });
+  renameSync(executable + ".saved", executable);
+  const readiness = () => f.ledger.checkPushReadiness({ task_id: "task", repo: "service", branch: "feature", head_sha: f.git("rev-parse", "HEAD") }).missing;
+  expect(readiness().join(" ")).toContain("latest verify failed");
+  expect(f.cli("verify", []).exitCode).toBe(0);
+  expect(readiness().join(" ")).not.toContain("latest verify failed");
 
   config.extensions.actions.first.argv = ["bun", "-e", "process.exit(9)"];
   writeFileSync(file, stringify(config));

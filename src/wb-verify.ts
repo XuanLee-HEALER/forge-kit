@@ -37,12 +37,33 @@ export function verifyCli(args: string[]) {
     throw Error("Use --mode static|dynamic|all or --kind lint|test|build|hurl -- <command> [args...]");
   const ledger = new Ledger(findWorkbenchRoot(values.cwd));
   let temporary: string | undefined;
+  let recordAborted: (() => void) | undefined;
   try {
     const snap = executionSnapshot(ledger, values);
     const modern = usesV05(ledger, snap.task_id);
     let dir = snap.dir;
     let baseEnv: NodeJS.ProcessEnv | undefined;
     if (process.env.FORGE_VERIFY_ACTIVE_SHA === snap.head) throw Error("Recursive verification of the same commit");
+    const started = Date.now();
+    const results: { kind: Kind | "verify"; stage?: string; action?: string; options_sha256?: string; command: string[]; exit_code: number; output_sha256: string }[] = [];
+    let environment: string | undefined;
+    let policyDigest: string | undefined;
+    const fullRun = modern && !kind && mode === "all";
+    let phase = "checkout preparation";
+    const recordRun = (passed: boolean, aborted = false) => ledger.recordEvidence({
+      task_id: snap.task_id, repo: snap.repo, branch: snap.branch, sha: snap.head, kind: "verify",
+      source: "tool", actor: "tool", status: passed ? "pass" : "fail",
+      summary: aborted ? "Verification failed during " + phase : "Configured verification stages",
+      meta: { mode, ...(environment && {environment}), ...(policyDigest && {policy_sha256:policyDigest}), stages: results, review_task_id: snap.task_id,
+        freeze_seq: snap.freeze_seq, started_at: new Date(started).toISOString(), duration_ms: Date.now() - started,
+        ...(aborted && { startup_failure: true, failed_phase: phase }) },
+    });
+    if (fullRun && snap.freeze_seq) {
+      recordAborted = () => ledger.db.transaction(() => {
+        recheckExecution(ledger, snap);
+        recordRun(false, true);
+      }).immediate();
+    }
     if (modern) {
       if (!snap.freeze_seq) throw Error("Freeze the confirmed specification before verification");
       temporary = realpathSync(mkdtempSync(join(tmpdir(), "forge-verify-")));
@@ -60,10 +81,6 @@ export function verifyCli(args: string[]) {
         if (install.code) throw Error("Cannot install locked verification dependencies: " + install.stderr);
       }
     }
-    const started = Date.now();
-    const results: { kind: Kind | "verify"; stage?: string; action?: string; options_sha256?: string; command: string[]; exit_code: number; output_sha256: string }[] = [];
-    let environment: string | undefined;
-    let policyDigest: string | undefined;
     let skipped = false;
     function result(k: Kind, command: string[], code: number, output_sha256: string) {
       results.push({ kind: k, command, exit_code: code, output_sha256 });
@@ -84,6 +101,7 @@ export function verifyCli(args: string[]) {
         skipped = true;
       else result(kind, argv, child.code, hash.digest("hex"));
     } else {
+      phase = "instance configuration";
       const config = modern ? resolveInstance(ledger.workbenchRoot, findKitRoot()) : undefined;
       environment = config?.verification.value.environment;
       if (config) policyDigest = verificationPolicy(config);
@@ -91,11 +109,12 @@ export function verifyCli(args: string[]) {
       if (config) {
         for (const id of stages) {
           const stage = config.stages.get(id);
-          const action = stage && config.actions.get(stage.value.action);
+          const action = stage && stage.source !== "core" && config.actions.get(stage.value.action);
           if (action) verificationStageCwd(ledger.workbenchRoot, snap.repo, dir, action.value.cwd, config.repos);
         }
       }
       for (const stage of stages) {
+        phase = "stage " + stage;
         const custom = config?.stages.get(stage);
         if (custom?.source !== "core" && config && custom) {
           const action = config.actions.get(custom.value.action);
@@ -142,6 +161,7 @@ export function verifyCli(args: string[]) {
       if (current.code || current.stdout.trim() !== snap.head || changes.code || changes.stdout)
         throw Error("Verification changed the isolated checkout revision or tracked inputs");
     }
+    recordAborted = undefined;
     const ok = !skipped && results.length > 0 && results.every(r => !r.exit_code);
     ledger.db
       .transaction(() => {
@@ -165,14 +185,7 @@ export function verifyCli(args: string[]) {
               review_floor_seq: snap.floors.review,
             },
           });
-        if (modern && !kind && mode === "all") {
-          ledger.recordEvidence({
-            task_id: snap.task_id, repo: snap.repo, branch: snap.branch, sha: snap.head, kind: "verify",
-            source: "tool", actor: "tool", status: ok ? "pass" : "fail", summary: "Configured verification stages",
-            meta: { mode, environment, policy_sha256: policyDigest, stages: results, review_task_id: snap.task_id, freeze_seq: snap.freeze_seq,
-              started_at: new Date(started).toISOString(), duration_ms: Date.now() - started },
-          });
-        }
+        if (fullRun) recordRun(ok);
       })
       .immediate();
     return {
@@ -182,6 +195,9 @@ export function verifyCli(args: string[]) {
       results,
       ...(skipped ? { error: "No applicable checks executed for a requested phase" } : {}),
     };
+  } catch (error) {
+    recordAborted?.();
+    throw error;
   } finally {
     ledger.closeDb();
     if (temporary) rmSync(temporary, { recursive: true, force: true });

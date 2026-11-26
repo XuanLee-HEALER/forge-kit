@@ -4,7 +4,7 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { prospectiveMerge } from "../conditional-merge";
 import { loadDbEnvironments, loadWorkbenchConfig } from "../config";
-import { localPath, resolveInstance } from "../instance";
+import { localPath, readRequired, resolveInstance } from "../instance";
 import { runGit } from "../git";
 import { sha256File } from "../shared/path";
 import { resolveTaskCheckout } from "./checkout";
@@ -42,6 +42,11 @@ export function checkFatProtection(root: string) {
   const caps = loadWorkbenchConfig(root).guard.protected_branches;
   if (caps.includes("fat") || caps.includes("refs/heads/fat")) throw Error("The FAT branch is protected");
 }
+interface PinnedCommand {
+  cwd: string;
+  argv: string[];
+  files: Record<string, string>;
+}
 export type ShipAction =
   | {
       kind: "fat";
@@ -55,7 +60,7 @@ export type ShipAction =
     }
   | { kind: "pr"; repo: string; number: number; url: string; head: string; base: string; baseOid: string }
   | { kind: "tag"; repo: string; tag: string; head: string }
-  | { kind: "stage"; stage: string; target: string; cwd: string; argv: string[]; files: Record<string, string> }
+  | { kind: "stage"; stage: string; target: string; execute: PinnedCommand; observe: PinnedCommand }
   | { kind: "sql"; target: DbTarget; path: string; sha256: string };
 export interface ExactPlan {
   endpoint: string;
@@ -103,8 +108,13 @@ function deliveryStages(cfg: ReturnType<typeof resolveInstance>) {
     core: cfg.stages.get(id)?.source === "core" && id === "ship",
   }));
 }
+function requireTargetObservation(endpoint: string, actions: ShipAction[]) {
+  if (endpoint !== "fat" && endpoint !== "pr" && !actions.some((action) => action.kind === "stage"))
+    throw Error("A protected delivery endpoint requires a configured stage and independent target observer");
+}
 export function checkDeliveryDefinition(root: string, plan: ExactPlan) {
   const cfg = instanceFor(root);
+  requireTargetObservation(plan.endpoint, plan.actions);
   if (
     cfg.delivery.value.endpoint !== plan.endpoint ||
     canonicalJson(deliveryStages(cfg)) !== canonicalJson(plan.stages)
@@ -117,22 +127,51 @@ export function stagePin(root: string, id: string): Extract<ShipAction, { kind: 
   const action = stage && cfg.actions.get(stage.value.action);
   if (!action || !stage || !cfg.delivery.value.stages.includes(id))
     throw Error("Expected configured delivery stage " + id);
-  const cwd = localPath(root, action.value.cwd);
-  const argv = [...action.value.argv, ...stage.value.options];
-  const executable = argv[0].includes("/") ? resolve(cwd, argv[0]) : Bun.which(argv[0]);
-  if (!executable) throw Error("Missing stage executable: " + id);
-  const resolved = realpathSync(executable),
-    files: Record<string, string> = {};
-  argv[0] = resolved;
-  for (const arg of argv) {
-    const path = isAbsolute(arg) ? arg : resolve(cwd, arg);
-    if (statSync(path, { throwIfNoEntry: false })?.isFile()) {
-      const digest = sha256File(path);
-      if (!digest) throw Error("Unreadable stage input: " + path);
+  const observer = stage.value.observe && cfg.actions.get(stage.value.observe);
+  if (!observer || observer.value.purpose !== "observe" || stage.value.observe === stage.value.action)
+    throw Error(
+      "Protected stage " +
+        id +
+        " needs a distinct read-only observe action in extensions.stages." +
+        id +
+        ".observe",
+    );
+  const cache = new Map<string, string>();
+  function pin(actionId: string, args: string[], cwdName: string, inputs?: string[]): PinnedCommand {
+    if (!inputs)
+      throw Error(
+        "Declare every deployment input in extensions.actions." +
+          actionId +
+          ".inputs (use [] for no extra files)",
+      );
+    const cwd = localPath(root, cwdName),
+      argv = [...args];
+    const executable = argv[0].includes("/") ? resolve(cwd, argv[0]) : Bun.which(argv[0]);
+    if (!executable) throw Error("Missing executable for " + actionId);
+    argv[0] = realpathSync(executable);
+    const files: Record<string, string> = {};
+    const paths = new Set(inputs.map((path) => localPath(cwd, path)));
+    for (const arg of argv) {
+      const path = isAbsolute(arg) ? arg : resolve(cwd, arg);
+      if (statSync(path, { throwIfNoEntry: false })?.isFile()) paths.add(path);
+    }
+    for (const path of paths) {
+      const digest = cache.get(path) ?? new Bun.CryptoHasher("sha256").update(readRequired(path)).digest("hex");
+      cache.set(path, digest);
       files[path] = digest;
     }
+    return { cwd, argv, files };
   }
-  return { kind: "stage", stage: id, target: cfg.delivery.value.endpoint, cwd, argv, files };
+  const execute = pin(
+    action.id,
+    [...action.value.argv, ...stage.value.options],
+    action.value.cwd,
+    action.value.inputs,
+  );
+  const observe = pin(observer.id, observer.value.argv, observer.value.cwd, observer.value.inputs);
+  if (canonicalJson([execute.cwd, execute.argv]) === canonicalJson([observe.cwd, observe.argv]))
+    throw Error("Use a separate read-only target observation for " + id);
+  return { kind: "stage", stage: id, target: cfg.delivery.value.endpoint, execute, observe };
 }
 export function databaseTarget(root: string, host: string): DbTarget {
   const entries = Object.entries(loadDbEnvironments(root, { strict: true })).filter(
@@ -292,5 +331,6 @@ export function buildPlan(
         throw Error("Cannot verify tag destination when fetch and push remotes differ");
     }
   }
+  requireTargetObservation(cfg.delivery.value.endpoint, items);
   return { endpoint: cfg.delivery.value.endpoint, pins, actions: items, ci, stages: sequence };
 }

@@ -1,4 +1,7 @@
-import { isRolloutEndpoint } from "./types";
+import { canonicalJson, isRolloutEndpoint, sha256String, VALID_ENDPOINTS, type ReleaseObserver } from "./types";
+import { stagePin } from "./ship-actions";
+import { observeStage } from "../stage-observation";
+import { installedInstance } from "../workflow-config";
 import { canonicalRepoPath } from "../config";
 import { randomBytes } from "node:crypto";
 import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
@@ -116,8 +119,76 @@ function create(ledger: Ledger, args: string[]) {
   return detail(ledger, id);
 }
 
+function releaseObservers(ledger: Ledger, release: ReturnType<typeof detail>): ReleaseObserver[] {
+  const observers: ReleaseObserver[] = [];
+  for (const item of release.items) {
+    const endpoint = ledger.getTask(item.task_id)!.endpoint;
+    if (VALID_ENDPOINTS.has(endpoint)) continue;
+    const cfg = installedInstance(ledger.workbenchRoot);
+    if (cfg?.delivery.value.endpoint !== endpoint)
+      throw Error("Release endpoint changed for " + item.task_id);
+    const stages = cfg.delivery.value.stages.filter(id => cfg.stages.get(id)?.source !== "core");
+    if (!stages.length) throw Error("Custom release endpoint requires a target observer: " + endpoint);
+    const versions = [{repo: item.repo, head: item.expected_head_sha}];
+    for (const id of stages) {
+      const stage = stagePin(ledger.workbenchRoot, id);
+      const action_id = sha256String(canonicalJson([release.release_id, item.task_id, item.branch, item.ledger_tip, versions, endpoint, stage]));
+      observers.push({task_id: item.task_id, repo: item.repo, branch: item.branch, action_id, endpoint, stage, versions});
+    }
+  }
+  return observers;
+}
+
+function observeRelease(ledger: Ledger, id: string) {
+  function approved() {
+    const release = detail(ledger, id);
+    const rb = release.runbook_id && ledger.getRunbook(release.runbook_id);
+    if (release.status !== "APPROVED" || !rb || !rb.approved_at || !["APPROVED", "COMPLETED"].includes(rb.status))
+      throw Error("Release observation needs its approved runbook");
+    const pins = checkedActions(release, rb).release_observers ?? [];
+    if (!pins.length || canonicalJson(pins) !== canonicalJson(releaseObservers(ledger, release)))
+      throw Error("Missing or changed release observer bindings");
+    return {pins, runbook_id: rb.runbook_id};
+  }
+  const {pins, runbook_id} = approved();
+  for (const pin of pins) {
+    const observation = observeStage(ledger.workbenchRoot, pin.stage, pin.action_id, pin.endpoint, pin.versions);
+    if (observation?.state !== "completed")
+      throw Error("Target has not confirmed delivery for " + pin.action_id);
+  }
+  return withImmediateTx(ledger.db, () => {
+    if (approved().runbook_id !== runbook_id) throw Error("Release runbook changed during observation");
+    for (const item of detail(ledger, id).items) {
+      const targets = pins.filter(p => p.task_id === item.task_id && p.repo === item.repo && p.branch === item.branch);
+      if (!targets.length) continue;
+      ledger.recordEvidence({
+        task_id: item.task_id,
+        repo: item.repo,
+        branch: item.branch,
+        sha: item.expected_head_sha,
+        kind: "prod",
+        source: "tool",
+        actor: "tool",
+        status: "pass",
+        summary: "Target confirmed release delivery",
+        tool_use_id: "release-observe/" + runbook_id + "/" + targets[0].action_id,
+        meta: {
+          delivery_endpoint: targets[0].endpoint,
+          observed_runbook: runbook_id,
+          observation_ids: targets.map(p => p.action_id),
+        },
+      });
+    }
+    return {ok:true, release_id:id, runbook_id, observations:pins.length};
+  });
+}
+
 export function releaseCommand(ledger: Ledger, argv: string[]) {
   const [cmd, ...rest] = argv;
+  if (cmd === "observe") {
+    if (rest.length !== 1) throw Error("Expected one release ID");
+    return observeRelease(ledger, rest[0]);
+  }
   if (cmd === "status") {
     if (rest.length > 1) throw Error("Expected at most one release ID");
     if (!ledger.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='releases'").get()) {
@@ -172,6 +243,7 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
         title: release.title,
         actions: {
           tags,
+          release_observers: releaseObservers(ledger, checked),
           kubectl_commands: (values.kubectl ?? []) as string[],
           prs: releasePrActions(checked.items),
           sql_files: checked.sql_files,
@@ -198,14 +270,14 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
       for (const item of prodItems) {
         const endpoint = ledger.getTask(item.task_id)!.endpoint;
         const last = ledger.db
-          .query<{ status: string }, [string, string, string, string, string, string, string]>(
+          .query<{ status: string }, [string, string, string, string, string, string, string, string]>(
             `SELECT json_extract(payload_json,'$.status') AS status FROM events WHERE task_id=?
            AND canonical_repo(repo)=canonical_repo(?) AND branch=? AND sha=? AND event_type='EVIDENCE_CAPTURED'
            AND json_extract(payload_json,'$.release_id')=?
-           AND (?='prod' OR (json_extract(payload_json,'$.source')='tool' AND json_extract(payload_json,'$.meta.delivery_endpoint')=?))
+           AND (?='prod' OR (json_extract(payload_json,'$.source')='tool' AND json_extract(payload_json,'$.meta.delivery_endpoint')=? AND json_extract(payload_json,'$.meta.observed_runbook')=?))
            AND json_extract(payload_json,'$.kind')='prod' AND json_type(payload_json,'$.meta.action_id') IS NULL AND json_extract(payload_json,'$.status') IN ('pass','fail') ORDER BY seq DESC LIMIT 1`,
           )
-          .get(item.task_id, item.repo, item.branch, item.expected_head_sha, id, endpoint, endpoint);
+          .get(item.task_id, item.repo, item.branch, item.expected_head_sha, id, endpoint, endpoint, rb.runbook_id);
         if (last?.status !== "pass")
           throw Error(
             "Missing SHA-bound production delivery evidence for " + item.repo + "@" + item.expected_head_sha,

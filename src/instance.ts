@@ -1,5 +1,5 @@
-import { lstatSync, readFileSync, statSync } from "node:fs";
-import { basename, isAbsolute, join, relative } from "node:path";
+import { accessSync, constants, lstatSync, readFileSync, statSync } from "node:fs";
+import { basename, isAbsolute, join, normalize, relative } from "node:path";
 import { parse } from "yaml";
 import { loadShipPolicy, loadWorkbenchConfig } from "./config";
 
@@ -75,11 +75,14 @@ interface Action {
   argv: string[];
   cwd: string;
   purpose: string;
+  inputs?: string[];
 }
 interface Stage {
   action: string;
   options: string[];
+  observe?: string;
 }
+const deliveryPurposes = new Set(["deliver", "delivery", "deploy", "deployment", "ship", "release", "prod-write"]);
 interface Skill {
   description: string;
   body: string;
@@ -122,6 +125,8 @@ export function resolveInstance(root: string, kitRoot: string) {
   load(modelFile, (bytes) => {
     const tiers = record(record(Bun.TOML.parse(bytes.toString()), "models").tiers, "tiers");
     for (const name of ["mechanical", "standard", "deep"]) {
+      // v0.4 instances may override individual tiers and inherit defaults for the rest.
+      if (!Object.hasOwn(tiers, name)) continue;
       const tier = record(tiers[name], `tiers.${name}`);
       str(tier.model, `tiers.${name}.model`);
       if (!["low", "medium", "high", "xhigh"].includes(String(tier.effort)))
@@ -147,19 +152,42 @@ export function resolveInstance(root: string, kitRoot: string) {
   const actions = values<Action>("actions", (v, id) => {
     const path = `${loc}.actions.${id}`,
       a = record(v, path);
-    known(a, ["argv", "cwd", "purpose"], path);
+    known(a, ["argv", "cwd", "purpose", "inputs"], path);
     const argv = strings(a.argv, path + ".argv");
     const cwd = str(a.cwd ?? ".", path + ".cwd");
-    if (!statSync(localPath(root, cwd), { throwIfNoEntry: false })?.isDirectory())
+    const dir = localPath(root, cwd);
+    if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory())
       throw Error(`${path}.cwd directory missing: ${cwd}`);
+    const executable = Bun.which(argv[0], { cwd: dir });
+    const mode = executable && statSync(executable, { throwIfNoEntry: false });
+    if (!mode || !mode.isFile() || !(mode.mode & 0o111))
+      throw Error(`${path}.argv[0] is not executable: ${argv[0]}; install the program or correct its path`);
     if (basename(argv[0]) === "forge" && ["instance", "verify", "ship"].includes(argv[1]))
       throw Error(`${path}.argv recursively invokes a workflow; configure the underlying program`);
-    return { argv, cwd, purpose: str(a.purpose, path + ".purpose") };
+    const action: Action = { argv, cwd, purpose: str(a.purpose, path + ".purpose") };
+    if (a.inputs !== undefined) {
+      if (!Array.isArray(a.inputs)) throw Error(path + ".inputs must be a list of relative files");
+      action.inputs = a.inputs.map((value, index) => {
+        const field = path + ".inputs[" + index + "]";
+        const input = str(value, field);
+        try {
+          const path = localPath(dir, input),
+            st = statSync(path);
+          if (!st.isFile() || !(st.mode & 0o444)) throw Error("Expected a readable regular file: " + path);
+          accessSync(path, constants.R_OK);
+        } catch (error) {
+          throw Error(field + ": " + String(error));
+        }
+        return normalize(input);
+      });
+      if (new Set(action.inputs).size !== action.inputs.length) throw Error(path + ".inputs repeats a file");
+    }
+    return action;
   });
   const stages = values<Stage>("stages", (v, id) => {
     const path = `${loc}.stages.${id}`,
       s = record(v, path);
-    known(s, ["action", "options"], path);
+    known(s, ["action", "options", "observe"], path);
     const action = str(s.action, path + ".action");
     if (!actions.has(action))
       throw Error(`${path}.action references unknown action ${action}; define it under actions`);
@@ -167,16 +195,34 @@ export function resolveInstance(root: string, kitRoot: string) {
       s.options === undefined || (Array.isArray(s.options) && !s.options.length)
         ? []
         : strings(s.options, path + ".options");
-    return { action, options };
+    if (s.observe === undefined) return { action, options };
+    const observe = str(s.observe, path + ".observe");
+    const observer = actions.get(observe)?.value;
+    if (observe === action || observer?.purpose !== "observe")
+      throw Error(path + ".observe must name a distinct read-only action with purpose observe");
+    const write = actions.get(action)!.value;
+    if (!deliveryPurposes.has(write.purpose))
+      throw Error(path + ".observe is only valid for a delivery action");
+    if (
+      normalize(observer.cwd) === normalize(write.cwd) &&
+      JSON.stringify(observer.argv) === JSON.stringify([...write.argv, ...options])
+    )
+      throw Error(path + ".observe must use a different command from the delivery action");
+    return { action, options, observe };
   });
   for (const id of ["verify", "ship"])
     if (!stages.has(id))
       stages.set(id, { kind: "stage", id, source: "core", value: { action: id, options: [] } });
   function stageRefs(v: unknown, fallback: string[], name: string) {
     const refs = v === undefined ? fallback : strings(v, loc + "." + name + ".stages");
-    for (const id of refs)
-      if (!stages.has(id))
-        throw Error(`${loc}.${name}.stages references unknown stage ${id}; define it under stages`);
+    for (const id of refs) {
+      const stage = stages.get(id);
+      if (!stage) throw Error(`${loc}.${name}.stages references unknown stage ${id}; define it under stages`);
+      const purpose = stage.source === "core" ? id : actions.get(stage.value.action)!.value.purpose;
+      const compatible = name === "verification" ? purpose === "verify" : deliveryPurposes.has(purpose);
+      if (!compatible)
+        throw Error(`${loc}.${name}.stages: stage ${id} has purpose ${purpose}; select a ${name} stage`);
+    }
     return refs;
   }
   const v = section("verification"),
@@ -257,9 +303,9 @@ export function runInstanceStage(
   if (!stage) throw Error(`Unknown stage ${id}`);
   const action = cfg.actions.get(stage.value.action);
   if (
-    id === "ship" ||
-    cfg.delivery.value.stages.some(key => cfg.stages.get(key)?.value.action === stage.value.action) ||
-    (action && /ship|deploy|deliver|release|prod.write/i.test(action.value.purpose))
+    (stage.source === "core" && id === "ship") ||
+    cfg.delivery.value.stages.includes(id) ||
+    (action && (deliveryPurposes.has(action.value.purpose) || /ship|deploy|deliver|release|prod.write/i.test(action.value.purpose)))
   )
     throw Error(`Stage ${id} requires the authorized forge ship executor`);
   if (!action) throw Error(`Use forge verify --task <task-id> to run the isolated core verification stage`);

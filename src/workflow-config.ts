@@ -17,7 +17,7 @@ export function verificationPolicy(config: ReturnType<typeof resolveInstance>) {
   const { environment, stages } = config.verification.value;
   const sequence = stages.map(id => {
     const stage = config.stages.get(id)!;
-    return [id, stage.value, config.actions.get(stage.value.action)?.value ?? null];
+    return [id, stage.value, stage.source === "core" ? null : config.actions.get(stage.value.action)?.value ?? null];
   });
   return createHash("sha256").update(JSON.stringify([environment, sequence])).digest("hex");
 }

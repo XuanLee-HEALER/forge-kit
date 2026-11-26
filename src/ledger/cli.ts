@@ -48,7 +48,7 @@ Commands:
   handoff   <task_id> [--sql host:path ...] [--rollback note]
   resume    <task_id> [--reason note]
   release   create --title text [--from-handoffs | --tasks ids | --prs repo#num,...] [--order repos]\n            PR selectors include every attachment of the selected handoff.
-  release   verify|runbook|complete|cancel <release_id> | status [release_id]
+  release   verify|runbook|observe|complete|cancel <release_id> | status [release_id]
             For each executed SQL/tag/kubectl action, record its result on a release item:
             record <task> --kind prod --repo <repo> --branch <branch> --sha <handoff-sha> --status pass --summary <result> --meta '{"runbook_id":"<rb-id>","action_id":"<execution_actions ID>"}'
             For each prod item, record delivery at its handoff SHA with the same command, omitting --meta.

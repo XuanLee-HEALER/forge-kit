@@ -134,6 +134,7 @@ export function createRunbook(ledger: LedgerReader, params: {
   }
 
   const normalized: RunbookActions = { tags, prs, sql_files, kubectl_commands };
+  if (params.actions.release_observers?.length) normalized.release_observers = params.actions.release_observers;
   const exact = params.exact_stages && params.task_id ? buildPlan(ledger,params.task_id,normalized,params.exact_stages,params.exact_fat) : undefined;
   for(const action of exact?.actions ?? []) {
     if(action.kind==="pr") {

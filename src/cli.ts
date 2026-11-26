@@ -500,6 +500,20 @@ function inspectWorkbench(root: string) {
   try {
     checkMigration(root);
     const effective = resolveInstance(root, findKitRoot());
+    for (const id of effective.delivery.value.stages) {
+      const stage = effective.stages.get(id)!;
+      if (stage.source==="core") continue;
+      const missing: string[] = [];
+      const action = effective.actions.get(stage.value.action)!;
+      if (!action.value.inputs) missing.push("extensions.actions."+action.id+".inputs");
+      const observe = stage.value.observe;
+      if (!observe) missing.push("extensions.stages."+id+".observe");
+      else if (!effective.actions.get(observe)!.value.inputs) missing.push("extensions.actions."+observe+".inputs");
+      if (missing.length) issues.push({
+        level:"warn", check:"delivery",
+        message:stage.source+" stage "+id+" requires "+missing.join(", ")+" before a protected run can be registered",
+      });
+    }
     visitSkillFiles(effective, (path, src) => {
       const dest = localPath(root, path);
       if (!existsSync(dest) || !readRequired(dest).equals(readRequired(src))) {

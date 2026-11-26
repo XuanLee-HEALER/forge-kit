@@ -61,6 +61,18 @@ test("custom delivery and verification keep the configured receipts and each rev
       yaml.extensions.verification.environment = "second-environment";
       writeFileSync(file, stringify(yaml));
       expect(check().ready).toBe(false);
+      git("commit", "--allow-empty", "-m", "second revision");
+      const next = git("rev-parse", "HEAD");
+      const secondCheck = () => db.checkPushReadiness({ ...bind, branch: "feature", head_sha: next });
+      db.recordEvidence({ ...bind, sha: next, kind: "review", status: "pass", meta: {
+        role: "quality", base, review_task_id: task.task_id, review_floor_seq: spec.freeze_seq } });
+      db.recordEvidence({ ...bind, sha: next, kind: "verify", status: "pass", meta: {
+        mode: "all", policy_sha256: verificationPolicy(installedInstance(s.work)!),
+        freeze_seq: spec.freeze_seq, review_task_id: task.task_id } });
+      expect(secondCheck().ready).toBe(true);
+      delete yaml.extensions.verification;
+      writeFileSync(file, stringify(yaml));
+      expect(secondCheck().ready).toBe(false);
     } finally { db.closeDb(); }
   } finally { s.cleanup(); }
 });

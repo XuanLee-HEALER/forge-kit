@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
 import { sandbox, type Sandbox } from "./v05-sandbox";
@@ -92,6 +92,7 @@ function preparePullRequest(track: "full" | "targeted" = "full", defect = false,
   const config = join(s.work, ".workbench/workbench.yaml");
   const doc = parse(readFileSync(config, "utf8"));
   writeFileSync(config, stringify({...doc, repos: ["app"]}));
+  if (endpoint === "blue-rollout") configureStage("success", base, base, endpoint, "publish");
   const ledger = (...args: string[]) => s.ok([s.forge, "ledger", ...args]);
   ledger("open", "--id", "ship-task", "--title", "isolated local merge", "--endpoint", endpoint, "--depth", track,
     "--repo", "app", "--branch", "feature-fixture", "--worktree", repo, "--base", base, "--head", base);
@@ -108,6 +109,7 @@ function preparePullRequest(track: "full" | "targeted" = "full", defect = false,
   }
   const head = commit("src/feature.ts", 'export const message = "ready";\n');
   git("push", bare, "feature-fixture");
+  if (endpoint === "blue-rollout") configureStage("success", head, base, endpoint, "publish");
   const pr = { url: "https://github.com/fixture/app/pull/1", number: 1, state: "OPEN", baseRefName: "main",
     headRefName: "feature-fixture", headRefOid: head, baseRefOid: base, isCrossRepository: false,
     headRepository: {name: "app"}, headRepositoryOwner: {login: "fixture"}, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" };
@@ -163,23 +165,53 @@ await Bun.write(args[args.indexOf("-o")+1],JSON.stringify({status:"pass",summary
   return {ledger, repo, head, base, bare, state, ci, calls};
 }
 
-function delivery(localRollout?: "success" | "failure") {
+type RolloutMode = "success" | "failure" | "pending" | "wrong-version";
+
+function configureStage(localRollout: RolloutMode, head: string, base: string, endpoint: string, stage: string) {
+  const cfgPath = join(s.work, ".workbench/workbench.yaml");
+  const cfg = parse(readFileSync(cfgPath, "utf8"));
+  writeFileSync(join(s.work, "release-plan.json"), JSON.stringify({repo:"app", head:head, target:"worker-a"}));
+  writeFileSync(join(s.work, "release-stage.ts"), `import {appendFileSync} from "node:fs";
+const plan = await Bun.file("release-plan.json").json();
+const mode = process.argv[3];
+appendFileSync("stage-effects", plan.head+"\\n");
+const ticket = {action_id:process.env.FORGE_ACTION_ID, endpoint:process.env.FORGE_ENDPOINT,
+  state:mode==="pending"?"pending":mode==="failure"?"failed":"completed",
+  versions:[{repo:plan.repo,head:mode==="wrong-version"?process.argv[4]:plan.head}]};
+await Bun.write("deployment-target.json", JSON.stringify(ticket));
+// The submitter can acknowledge the request before the target has applied the revision.
+console.log(JSON.stringify({state:"completed",action_id:ticket.action_id,endpoint:ticket.endpoint,versions:JSON.parse(process.env.FORGE_APPROVED_HEADS)}));
+if(mode==="failure") process.exit(3);
+`);
+  writeFileSync(join(s.work, "observe-target.ts"), `import {appendFileSync} from "node:fs";
+const target = Bun.file("deployment-target.json");
+const observation = await target.exists() ? await target.json() : {state:"absent",action_id:process.env.FORGE_ACTION_ID,
+  endpoint:process.env.FORGE_ENDPOINT,versions:JSON.parse(process.env.FORGE_APPROVED_HEADS)};
+appendFileSync("target-reads", JSON.stringify(observation)+"\\n");
+console.log(JSON.stringify(observation));
+`);
+  cfg.extensions = {actions: {
+    rolloutAction: {purpose: "deliver", cwd: ".", argv: ["bun", "release-stage.ts", head, localRollout, base], inputs:["release-plan.json"]},
+    actualState: {purpose:"observe",cwd:".",argv:["bun","observe-target.ts"],inputs:[]}},
+    stages: {[stage]: {action: "rolloutAction", observe:"actualState"}}, delivery: {endpoint, stages: [stage]}};
+  writeFileSync(cfgPath, stringify(cfg));
+}
+
+function delivery(localRollout?: RolloutMode) {
   const prepared = preparePullRequest("full", false, localRollout ? "prod" : "pr");
   const {ledger} = prepared;
   const receipt = join(s.work, "stage-effects");
   const stageFile = join(s.work, "release-stage.ts");
+  const manifest = join(s.work, "release-plan.json");
+  const targetState = join(s.work, "deployment-target.json");
+  const observations = join(s.work, "target-reads");
   if (localRollout) {
     // The operator policy here belongs to the disposable instance created by sandbox().
     const policy = join(s.work, ".workbench/ship-policy.yaml");
     const policyDoc = parse(readFileSync(policy, "utf8"));
     Object.assign(policyDoc.fast_track, {allow_prod: true, max_endpoint: "prod"});
     writeFileSync(policy, stringify(policyDoc));
-    const cfgPath = join(s.work, ".workbench/workbench.yaml");
-    const cfg = parse(readFileSync(cfgPath, "utf8"));
-    writeFileSync(stageFile, 'import {appendFileSync} from "node:fs";\nappendFileSync("stage-effects", process.argv[2]+"\\n");\nif (process.argv[3]==="failure") process.exit(3);\n');
-    cfg.extensions = {actions: {rolloutAction: {purpose: "deliver", cwd: ".", argv: ["bun", "release-stage.ts", prepared.head, localRollout]}},
-      stages: {rollout: {action: "rolloutAction"}}, delivery: {endpoint: "prod", stages: ["rollout"]}};
-    writeFileSync(cfgPath, stringify(cfg));
+    configureStage(localRollout, prepared.head, prepared.base, "prod", "rollout");
   }
   const book = JSON.parse(ledger("runbook", "create", "--task", "ship-task", "--title", "local target", "--pr", "app:1",
     ...(localRollout ? ["--stage", "rollout"] : [])));
@@ -189,7 +221,7 @@ function delivery(localRollout?: "success" | "failure") {
     const approval = s.hook("UserPromptSubmit", {session_id: "operator", prompt: "快轨批准 " + envelope});
     expect(JSON.parse(ledger("fast-track", "status", envelope))[0].status, JSON.stringify(approval)).toBe("ACTIVE");
   };
-  return {...prepared, ...transport, approve, envelope, receipt, stageFile, shipArgs: [s.forge, "ship", "run", "--envelope", envelope]};
+  return {...prepared, ...transport, approve, envelope, receipt, stageFile, manifest, targetState, observations, shipArgs: [s.forge, "ship", "run", "--envelope", envelope]};
 }
 
 for (const fault of ["unapproved", "session", "ci", "remote-head", "success"]) {
@@ -335,11 +367,15 @@ for (const mode of ["success", "failure"] as const) {
   }, 90_000);
 }
 
-for (const change of ["script", "arguments", "later-stage"]) {
+for (const change of ["script", "arguments", "later-stage", "declared-input"]) {
   test(`T11 exact stage preflight stops all effects after ${change} changes`, () => {
     const f = delivery("success");
     f.approve();
     if (change === "script") writeFileSync(f.stageFile, "console.log('different content')\n");
+    else if (change === "declared-input") {
+      const changedPlan = {...JSON.parse(readFileSync(f.manifest, "utf8")), target:"worker-b"};
+      writeFileSync(f.manifest, JSON.stringify(changedPlan));
+    }
     else {
       const path = join(s.work, ".workbench/workbench.yaml");
       const doc = parse(readFileSync(path, "utf8"));
@@ -401,4 +437,112 @@ test("T11 a FAT-only envelope cannot merge main", () => {
   } else expect(prepare.out + prepare.err).toMatch(/fat|scope|endpoint/i);
   expect(s.git(f.bare, "rev-parse", "refs/heads/main").trim()).toBe(f.base);
   expect(readFileSync(f.calls, "utf8")).toBe("");
+}, 90_000);
+
+for (const outcome of ["completed", "disappeared", "wrong-version"]) {
+  test(`T11 read back the deployment target after accepting a job: ${outcome}`, () => {
+    const f = delivery(outcome === "wrong-version" ? "wrong-version" : "pending");
+    f.approve();
+    const first = s.run(f.shipArgs);
+    expect(first.code, first.out + first.err).not.toBe(0);
+    const submitted = JSON.parse(first.out || first.err);
+    expect(submitted.ok).toBe(false);
+    expect(submitted.receipts.filter((row: {status: string}) => row.status === "confirmed")).toHaveLength(1);
+    expect(existsSync(f.targetState), first.out + first.err).toBe(true);
+    const target = JSON.parse(readFileSync(f.targetState, "utf8"));
+    expect(target.action_id).toBeTruthy();
+    expect(target.endpoint).toBeTruthy();
+    expect(target.versions).toEqual([{repo:"app", head:outcome === "wrong-version" ? f.base : f.head}]);
+    expect(readFileSync(f.receipt, "utf8")).toBe(f.head + "\n");
+    const reads = () => readFileSync(f.observations, "utf8").trim().split("\n").map(row => JSON.parse(row));
+    expect(reads()[0].state).toBe("absent");
+    expect(reads()).toContainEqual(target);
+
+    if (outcome === "completed") writeFileSync(f.targetState, JSON.stringify({...target, state:"completed"}));
+    if (outcome === "disappeared") unlinkSync(f.targetState);
+    const resumed = s.run(f.shipArgs);
+    expect(resumed.code === 0, resumed.out + resumed.err).toBe(outcome === "completed");
+    const final = JSON.parse(resumed.out || resumed.err);
+    expect(final.receipts.filter((row: {status: string}) => row.status === "confirmed")).toHaveLength(outcome === "completed" ? 2 : 1);
+    if (outcome === "completed") expect(reads()).toContainEqual({...target, state:"completed"});
+    expect(readFileSync(f.receipt, "utf8")).toBe(f.head + "\n");
+    expect(readFileSync(f.calls, "utf8")).toBe("merge " + f.head + "\n");
+  }, 90_000);
+}
+
+test("T13 delegated rollout observation belongs to the handed-off task, stage and revision", () => {
+  const f = preparePullRequest("full", false, "blue-rollout");
+  const ledger = f.ledger;
+  ledger("open", "--id", "sibling", "--title", "other rollout", "--repo", "app", "--branch", "sibling", "--endpoint", "blue-rollout", "--depth", "targeted");
+  ledger("handoff", "ship-task");
+  const batch = JSON.parse(ledger("release", "create", "--title", "isolated named deployment", "--tasks", "ship-task"));
+  ledger("release", "verify", batch.release_id);
+  const book = JSON.parse(ledger("release", "runbook", batch.release_id));
+  const observers = book.actions.release_observers;
+  expect(observers).toHaveLength(1);
+  const observer = observers[0];
+  expect(observer.endpoint).toBe("blue-rollout");
+  expect(JSON.stringify(observer.stage)).toContain("publish");
+  expect(observer.versions).toContainEqual({repo:"app",head:f.head});
+  s.hook("UserPromptSubmit", {session_id:"operator", prompt:"批准 " + book.runbook_id});
+  s.env.FIXTURE_HUMAN_MERGE = "1";
+  s.ok(["gh", "pr", "merge", "1", "--merge", "--match-head-commit", f.head]);
+  s.git(f.repo, "fetch", f.bare, "+refs/heads/main:refs/remotes/origin/main");
+  const targetState = join(s.work, "deployment-target.json");
+  const observe = [s.forge, "ledger", "release", "observe", batch.release_id];
+  const record = {action_id:observer.action_id, endpoint:"blue-rollout", state:"completed",versions:[{repo:"app",head:f.head}]};
+  for (const imported of [
+    {...record, versions:[{repo:"app",head:f.base}]},
+    {...record, action_id:"other-batch/publish"},
+  ]) {
+    writeFileSync(targetState, JSON.stringify(imported));
+    const wrong = s.run(observe);
+    expect(wrong.code, wrong.out + wrong.err).not.toBe(0);
+  }
+  expect(s.run([s.forge, "ledger", "release", "complete", batch.release_id]).code).not.toBe(0);
+  writeFileSync(targetState, JSON.stringify(record));
+  s.ok(observe);
+  const events = JSON.parse(ledger("query", "--q", "prod", "--repo", "app", "--json")).events;
+  const evidence = events.filter((row: {payload_json:string}) => {
+    const payload = JSON.parse(row.payload_json);
+    return payload.kind === "prod" && payload.source === "tool";
+  });
+  expect(evidence).toHaveLength(1);
+  expect(evidence[0]).toMatchObject({task_id:"ship-task", repo:"app", branch:"feature-fixture", sha:f.head});
+  expect(evidence[0].payload_json).toContain(batch.release_id);
+  expect(evidence[0].payload_json).toContain(book.runbook_id);
+  const meta = JSON.parse(evidence[0].payload_json).meta;
+  expect(meta.delivery_endpoint).toBe("blue-rollout");
+  expect(meta.observation_ids).toEqual([observer.action_id]);
+  ledger("runbook", "complete", book.runbook_id);
+  const accepted = JSON.parse(ledger("release", "complete", batch.release_id, "--summary", "local target reports deployed revision"));
+  expect(accepted.task_ids).toEqual(["ship-task"]);
+  const open = JSON.parse(ledger("query", "--status", "OPEN", "--json")).tasks;
+  expect(open.map((task: {task_id:string}) => task.task_id)).toEqual(["sibling"]);
+}, 90_000);
+
+test("T11 recheck a pinned rollout input after the preceding PR operation", async () => {
+  const f = delivery("success");
+  f.approve();
+  writeFileSync(f.gate + ".armed", "1");
+  const proc = Bun.spawn(f.shipArgs, {cwd: s.work, env: s.env, stdout:"pipe", stderr:"pipe", timeout:45_000});
+  try {
+    const deadline = Date.now() + 15_000;
+    while (!existsSync(f.gate + ".entered") && Date.now() < deadline) await Bun.sleep(20);
+    expect(existsSync(f.gate + ".entered")).toBe(true);
+    const changed = {...JSON.parse(readFileSync(f.manifest, "utf8")), target:"another-worker"};
+    writeFileSync(f.manifest, JSON.stringify(changed));
+    writeFileSync(f.gate, "1");
+    const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    expect(code, out + err).not.toBe(0);
+    const report = JSON.parse(out || err);
+    expect(report.receipts.filter((row: {status: string}) => row.status === "confirmed")).toHaveLength(1);
+    expect(readFileSync(f.calls, "utf8")).toBe("merge " + f.head + "\n");
+    expect(existsSync(f.receipt)).toBe(false);
+    expect(existsSync(f.targetState)).toBe(false);
+  } finally {
+    writeFileSync(f.gate, "1");
+    if (proc.exitCode === null) proc.kill();
+    await proc.exited;
+  }
 }, 90_000);

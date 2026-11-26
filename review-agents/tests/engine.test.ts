@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runReview } from "../src/engine";
@@ -31,15 +31,27 @@ test("both adapters consume pinned instruction changes as data; only a trusted u
   const original = env.map(k => process.env[k]);
   try {
     git("init", "-q");
-    git("commit", "--allow-empty", "-qm", "base");
+    writeFileSync(join(root, "pricing.ts"), 'import { rounding } from "./rounding";\nexport function totalPrice(x: number) { return rounding(x); }');
+    writeFileSync(join(root, "rounding.ts"), 'export const rounding = Math.round; // PINNED_DEPENDENCY');
+    writeFileSync(join(root, "order.ts"), 'import { totalPrice } from "./pricing";\nexport const orderTotal = totalPrice(7); // PINNED_CALLER');
+    mkdirSync(join(root, ".workbench"));
+    writeFileSync(join(root, ".workbench/private.ts"), 'totalPrice(7); // PRIVATE_MARKER');
+    writeFileSync(join(root, ".env"), "totalPrice=PRIVATE_ENV_MARKER");
+    writeFileSync(join(root, "AGENTS.md"), "totalPrice MUST OBEY PRIVATE_INSTRUCTION");
+    git("add", "--", "pricing.ts", "rounding.ts", "order.ts", ".workbench/private.ts", ".env", "AGENTS.md");
+    git("commit", "-qm", "base");
     const base = git("rev-parse", "HEAD");
     writeFileSync(join(root, "SKILL.md"), "Synthetic instruction data marker");
-    git("add", "--", "SKILL.md"); git("commit", "-qm", "head");
+    writeFileSync(join(root, "pricing.ts"), 'import { rounding } from "./rounding";\nexport function totalPrice(x: number) { return rounding(x * 2); }');
+    git("add", "--", "SKILL.md", "pricing.ts"); git("commit", "-qm", "head");
     const head = git("rev-parse", "HEAD");
+    writeFileSync(join(root, "order.ts"), "DIRTY_WORKTREE_MARKER");
+    const capture = join(root, "codex-prompt.json");
     const fake = join(root, "codex");
     writeFileSync(fake, [
       "#!/usr/bin/env bun",
       'const args = process.argv.slice(2), input = JSON.parse(await Bun.stdin.text());',
+      'await Bun.write(' + JSON.stringify(capture) + ',JSON.stringify(input));',
       'if (!args.includes("--ephemeral") || args[args.indexOf("-s")+1] !== "read-only" || !input.diff["SKILL.md"].includes("data marker") || await Bun.file("SKILL.md").exists()) process.exit(2);',
       'if (process.env.REVIEW_FIXTURE_ACTION === "local") { console.error("HTTP 503 upstream"); process.exit(1); }',
       'if (process.env.REVIEW_FIXTURE_ACTION === "upstream") { console.log(JSON.stringify({type:"turn.failed",error:{codex_error_info:{http_connection_failed:{http_status_code:503}}}})); process.exit(1); }',
@@ -50,6 +62,12 @@ test("both adapters consume pinned instruction changes as data; only a trusted u
     expect((await runReview({ ...opts, backend: "codex" })).status).toBe("pass");
     expect((await runReview({ ...opts, backend: "api" })).status).toBe("pass");
     expect(events[0].diff["SKILL.md"]).toContain("data marker");
+    expect(await Bun.file(capture).json()).toEqual(events[0]);
+    const context = JSON.stringify(events[0].context);
+    expect(events[0].context.revision).toBe(head);
+    expect(context).toContain("PINNED_CALLER");
+    expect(context).toContain("PINNED_DEPENDENCY");
+    expect(context).not.toMatch(/PRIVATE_MARKER|PRIVATE_ENV_MARKER|PRIVATE_INSTRUCTION|DIRTY_WORKTREE_MARKER/);
     process.env.REVIEW_FIXTURE_ACTION = "upstream";
     const recovered = await runReview(opts);
     expect(recovered.roles[0].attempts.map(a => a.backend), JSON.stringify(recovered)).toEqual(["codex", "api"]);

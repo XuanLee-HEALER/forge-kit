@@ -20,6 +20,8 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 
 发布线程用 `forge ledger release create --title "<title>" --from-handoffs` 或显式任务列表建批，`forge ledger release verify <rel-id>` 核验实时 PR。出现版本漂移时暂停相应批次并退回功能线程。使用 `forge ledger release runbook <rel-id>` 汇集确定的动作，在主会话取得精确批准。逐项兑现并记录回执，核验远端目标引用，再完成 runbook 及 release。
 
+命名交付终点会在批次 runbook 的 `actions.release_observers` 中列出各阶段的动作 ID、目标和版本。发布后执行 `forge ledger release observe <rel-id>` 读取目标侧状态。所有观察器确认对应版本已完成后，账本记录工具回执，再执行 `forge ledger release complete <rel-id>`。
+
 ## Fast-Track
 
 从实例交付配置中读取有序阶段。用 `forge ledger runbook create --task "$TASK" --title "$TITLE" --pr "$REPO:$PR"` 登记精确合并；有自定义上线步骤时按声明顺序重复传入 `--stage <stage-id>`。登记时解析目标版本、动作参数及脚本摘要。内建 ship 在实例阶段列表的位置决定精确 PR/tag/SQL 的执行顺序。同名实例实现也按其位置运行。对于精确 PR，执行器只向批准的目标引用提交基于固定 base/head 的快进更新，并核验托管服务的合入回执。目标仓的推送策略若拒绝，交由操作者使用受保护的常规 PR 合并流程。把返回的具体目标和内容提供给批准人。
@@ -31,3 +33,24 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 在同一获批会话运行 `forge ship evaluate --envelope <ft-id>` 后用 `forge ship run --envelope <ft-id>` 兑现。每一步核对策略、时效、冻结范围、版本、CI、评审与外部状态。只执行已确定动作；超界、漂移、后来才确定的动作或异常均须在调用前停止。重试前读取逐项回执，外部结果不确定时交还人工核实。存量授权缺精确绑定时重新登记并批准。
 
 **输出与完成条件**为每仓版本、终点、远端观测结果、回执和账本状态。移交要有可核验的见证；中断保留已完成项与待人工处理的具体条件。
+
+### 自定义上线阶段的回执
+
+在实例的 `extensions` 下分别登记提交动作和只读观察动作。两者都要列出相对各自工作目录的输入文件，包括脚本隐式读取的部署清单、配置及模块。没有额外输入时显式填写 `inputs: []`。登记时将程序、参数与文件内容绑定到 runbook，调用前重新校验。
+
+```yaml
+actions:
+  submit: {purpose: deliver, cwd: ".", argv: ["bun", "ops/submit.ts"], inputs: ["ops/manifest.json"]}
+  status: {purpose: observe, cwd: ".", argv: ["bun", "ops/status.ts"], inputs: []}
+stages:
+  rollout: {action: submit, observe: status}
+delivery: {endpoint: rollout, stages: [ship, rollout]}
+```
+
+两个程序接收相同的 `FORGE_ACTION_ID`、`FORGE_ENDPOINT`、`FORGE_ACTIVE_STAGE` 与 `FORGE_APPROVED_HEADS`。最后一项是按仓排列的 `[{repo,head}]`。提交程序使用动作 ID 标记目标作业。观察程序通过只读凭据查询目标端的实际作业、部署版本与终点，在标准输出返回 JSON。例如：
+
+```json
+{"state":"completed","action_id":"ft-123/1","endpoint":"rollout","versions":[{"repo":"api","head":"0123456789abcdef0123456789abcdef01234567"}]}
+```
+
+观察程序使用 `absent` 表示目标不存在，`pending` 表示执行中，`failed` 表示失败。初次观察为 absent 时可以提交一次。已经发起提交且目标尚未确认时，在原批准会话重跑同一条 `forge ship run` 查询进度。只有目标返回 `completed` 且动作、终点及全部版本匹配时才记录成功。失败或版本不符时暂停并检查实际目标。
