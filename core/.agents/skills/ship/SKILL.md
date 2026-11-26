@@ -20,7 +20,7 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 
 发布线程用 `forge ledger release create --title "<title>" --from-handoffs` 或显式任务列表建批，`forge ledger release verify <rel-id>` 核验实时 PR。出现版本漂移时暂停相应批次并退回功能线程。使用 `forge ledger release runbook <rel-id>` 汇集确定的动作，在主会话取得精确批准。将返回的 human_merges 清单交给操作者在托管平台核对目标分支、HEAD 和必需检查后合并。发布线程运行 `forge ledger release verify <rel-id>` 核验远端结果，记录其余已批准动作的回执，再完成 runbook 及 release。
 
-命名交付终点会在批次 runbook 的 `actions.release_observers` 中列出各阶段的动作 ID、目标和版本。发布后执行 `forge ledger release observe <rel-id>` 读取目标侧状态。所有观察器确认对应版本已完成后，账本记录工具回执，再执行 `forge ledger release complete <rel-id>`。重复观察会记录目标状态的变化；若目标回报失败，须等同一批次、动作和版本重新确认完成后方可关账。
+命名交付终点会在批次 runbook 的 `actions.release_observers` 中列出各阶段的动作 ID、目标和版本。发布后执行 `forge ledger release observe <rel-id>` 读取目标侧状态。所有观察器确认对应版本已完成后，账本记录工具回执，再执行 `forge ledger release complete <rel-id>`。重复观察会记录目标状态的变化；若观察器执行失败、返回未知状态或目标回报的动作及版本不符，本次观察会使先前的通过回执失效。须等同一批次、动作和版本重新确认完成后方可关账。
 
 ## Fast-Track
 
@@ -28,7 +28,7 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 
 实例终点为 FAT 时，按每个挂载仓登记 `--fat <repo>:fat`，绑定远端现有的 `refs/heads/fat`、旧 SHA、来源 head 及预期更新 SHA。该 runbook 只允许指定测试引用的条件更新。
 
-规格冻结后，使用 `forge ledger fast-track prepare <task-id> --to <endpoint> --paths <globs> --runbook <rb-id>` 绑定终点、范围和精确 runbook。向用户展示逐项资源、动作、版本和时效。用户在主会话单独发送 `快轨批准 <ft-id>` 或 `快轨撤销 <ft-id>`。快轨可覆盖整个实例交付路径。实例交付动作可以运行部署程序，需要生产级终点和策略许可。准备后变更任务终点会使原授权失效，须按新范围重新准备并批准。
+规格冻结后，使用 `forge ledger fast-track prepare <task-id> --to <endpoint> --paths <globs> --runbook <rb-id>` 绑定终点、范围和精确 runbook。向用户展示逐项资源、动作、版本和时效。用户在主会话单独发送 `快轨批准 <ft-id>`。撤销 ACTIVE 授权时，须回到原批准主会话单独发送 `快轨撤销 <ft-id>`；若已有 claimed 项，核对其回执与目标状态。PENDING 授权可用 `forge ledger fast-track revoke <ft-id>` 撤销。快轨可覆盖整个实例交付路径。实例交付动作可以运行部署程序，需要生产级终点和策略许可。准备后变更任务终点会使原授权失效，须按新范围重新准备并批准。
 
 在同一获批会话运行 `forge ship evaluate --envelope <ft-id>` 后用 `forge ship run --envelope <ft-id>` 兑现。每一步核对策略、时效、冻结范围、版本、CI、评审与外部状态。只执行已确定动作；超界、漂移、后来才确定的动作或异常均须在调用前停止。重试前读取逐项回执，外部结果不确定时交还人工核实。存量授权缺精确绑定时重新登记并批准。
 

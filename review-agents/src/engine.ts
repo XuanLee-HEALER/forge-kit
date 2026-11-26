@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
-import { Repo } from "./repo";
+import { DIFF_BYTE_LIMIT, Repo } from "./repo";
 import { validateReport } from "./report";
 import { roles, instructions, type Role } from "./roles";
 import { BackendFailure, invoke, type Backend, type Model } from "./backend";
@@ -51,18 +51,22 @@ function materials(repo: Repo) {
   const missing = [...repo.excludedFiles];
   let bytes = 0;
   for (const file of repo.files) {
+    if (bytes >= DIFF_BYTE_LIMIT) break;
     try {
       let next = 0;
       const chunks = [];
       do {
-        const page = repo.diff(file, next);
-        bytes += Buffer.byteLength(page.text);
-        if (bytes > 1_500_000) throw Error("material limit");
+        const page = repo.diff(file, next, DIFF_BYTE_LIMIT - bytes);
+        bytes += Buffer.byteLength(page.text) + (next ? 1 : 0);
+        if (bytes > DIFF_BYTE_LIMIT) throw Error("material limit");
         chunks.push(page.text);
         next = page.truncated ? page.nextOffset : 0;
       } while (next);
       diff[file] = chunks.join("\n");
-    } catch { missing.push(file); }
+    } catch {
+      missing.push(file);
+      break; // repo.missing() also lists the unread suffix, without opening its diffs.
+    }
   }
   return { diff, missing: [...new Set([...missing, ...repo.missing()])] };
 }

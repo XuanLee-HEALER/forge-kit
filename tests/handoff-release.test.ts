@@ -416,6 +416,10 @@ test("release provides a human merge handoff for the pinned feature worktree ori
   expect(book.merge_commands).toBeUndefined();
   expect(book.human_merges).toEqual([{ pr_url: f.url, base_branch: "main", expected_head_sha: f.head }]);
   expect(book.merge_instructions).toContain("托管平台");
+  for (const message of [approval, book.merge_instructions]) {
+    expect(message).toContain("HEAD 在目标分支上保持可达");
+    expect(message).toContain("刷新各仓固定目标分支的 origin 跟踪引用");
+  }
   const command = "gh pr merge " + f.url + " --merge --match-head-commit " + f.head;
   const gate = (cwd: string, cmd = command, sid = "fixture") =>
     evaluatePreToolUse(root, {

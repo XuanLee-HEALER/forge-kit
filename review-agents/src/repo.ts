@@ -9,6 +9,8 @@ export function snapshotGitEnv() {
   return env;
 }
 
+export const DIFF_BYTE_LIMIT = 1_500_000;
+
 export class Repo {
   root: string;
   base: string;
@@ -47,7 +49,7 @@ export class Repo {
     this.excludedFiles = this.files.filter(isPrivatePath);
     this.files = this.files.filter((p) => !isPrivatePath(p));
   }
-  git(args: string[], allowNoMatch = false) {
+  git(args: string[], allowNoMatch = false, maxBytes = 32 * 1024 * 1024) {
     const p = Bun.spawnSync(
       ["git", "-c", "core.quotePath=false", "-C", this.root, ...args],
       {
@@ -55,9 +57,10 @@ export class Repo {
         stderr: "pipe",
         env: snapshotGitEnv(),
         timeout: 20000,
-        maxBuffer: 32 * 1024 * 1024,
+        maxBuffer: maxBytes + 1,
       },
     );
+    if (p.stdout.byteLength > maxBytes) throw Error("Git output exceeds review material limit");
     if (p.exitCode !== 0 && !(allowNoMatch && p.exitCode === 1))
       throw new Error("Git read failed; verify repository, revision and path");
     return p.stdout.toString();
@@ -75,12 +78,19 @@ export class Repo {
     
     return path;
   }
-  diff(path: string, offset = 0) {
+  diff(path: string, offset = 0, remainingBytes = DIFF_BYTE_LIMIT) {
     this.path(path);
     if (!this.files.includes(path))
       throw new Error("Path outside changed files");
     let lines = this.diffs.get(path);
     if (!lines) {
+      // Cap Git's blob inputs as well as its output. A tiny textual change in a
+      // very large blob can otherwise allocate much more than the prompt budget.
+      for (const rev of [this.base, this.head]) {
+        const entry = this.git(["--literal-pathspecs", "ls-tree", "-l", "-z", rev, "--", path]);
+        const blobSize = /^\d+ blob [0-9a-f]+ +([0-9]+)\t/.exec(entry);
+        if (blobSize && Number(blobSize[1]) > DIFF_BYTE_LIMIT) throw Error("Changed blob exceeds review material limit");
+      }
       lines = this.git([
         "--literal-pathspecs", "diff",
         "--no-ext-diff",
@@ -91,7 +101,7 @@ export class Repo {
         this.head,
         "--",
         path,
-      ]).split("\n");
+      ], false, remainingBytes).split("\n");
       this.diffs.set(path, lines);
     }
     const page = this.page(lines, offset);

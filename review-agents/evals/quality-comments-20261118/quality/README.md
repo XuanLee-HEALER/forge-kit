@@ -1,5 +1,7 @@
 # Quality 真实回放
 
+复跑本文的历史实验，请在 v0.4 的 `review-agents` 子模块检出 `08996d4b498f0a1bd2320911a3d445f36e98d5ce`，从该子模块根目录执行。当前版本的成对评测在 v0.5 的 `review-agents` 目录运行 `bun run eval`。
+
 [预期清单](expectations.json) 在真实审查启动前固定根因、严重度和提交范围。Catalog 原始及两个独立修复控制用于验证诊断遗漏与重复请求。Butlers 取自真实 PR 分支，包含最初引入缺陷的提交及紧邻的修复提交。这段提交范围没有进入先前 pilot。Directory 样本复用既有合成数据和 Performance 结果，分别检验可复现的限额故障与正常的有界路径。
 
 ## 复跑

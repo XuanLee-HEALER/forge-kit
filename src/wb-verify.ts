@@ -1,4 +1,6 @@
+import { copyVerificationFixtures } from "./verification-fixtures";
 import { checkMigration } from "./managed-assets";
+import { materializeGitlinks } from "./verification-gitlinks";
 import { verificationPolicy } from "./workflow-config";
 import { createHash } from "node:crypto";
 import { runVerificationProcess } from "./verification-process";
@@ -25,6 +27,7 @@ export function verifyCli(args: string[]) {
       ...targetOptions,
       mode: { type: "string" },
       offline: { type: "boolean" },
+      "fixture-env": { type: "string", multiple: true },
       kind: { type: "string" },
     },
   });
@@ -50,6 +53,8 @@ export function verifyCli(args: string[]) {
     const started = Date.now();
     const results: { kind: Kind | "verify"; stage?: string; action?: string; options_sha256?: string; command: string[]; exit_code: number; output_sha256: string }[] = [];
     let environment: string | undefined;
+    let fixtures: ReturnType<typeof copyVerificationFixtures> | undefined;
+    const fixtureMetadata = () => fixtures ? { fixture_sha256: fixtures.digests } : {};
     let policyDigest: string | undefined;
     const fullRun = modern && !kind && mode === "all";
     let phase = "checkout preparation";
@@ -57,7 +62,7 @@ export function verifyCli(args: string[]) {
       task_id: snap.task_id, repo: snap.repo, branch: snap.branch, sha: snap.head, kind: "verify",
       source: "tool", actor: "tool", status: passed ? "pass" : "fail",
       summary: aborted ? "Verification failed during " + phase : "Configured verification stages",
-      meta: { mode, ...(environment && {environment}), ...(policyDigest && {policy_sha256:policyDigest}), stages: results, review_task_id: snap.task_id,
+      meta: { mode, ...fixtureMetadata(), ...(environment && {environment}), ...(policyDigest && {policy_sha256:policyDigest}), stages: results, review_task_id: snap.task_id,
         freeze_seq: snap.freeze_seq, started_at: new Date(started).toISOString(), duration_ms: Date.now() - started,
         ...(aborted && { startup_failure: true, failed_phase: phase }) },
     });
@@ -70,7 +75,7 @@ export function verifyCli(args: string[]) {
     function isolatedGit(cwd: string, args: string[]) {
       if (!baseEnv) throw Error("Missing isolated verification environment");
       return runProcess(["git", "-c", "core.hooksPath=/dev/null", ...args], {
-        cwd, env: { ...baseEnv, GIT_CONFIG_GLOBAL: "/dev/null" },
+        cwd, env: { ...baseEnv, GIT_CONFIG_GLOBAL: "/dev/null", GIT_ALLOW_PROTOCOL: "file", GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" },
       });
     }
     if (modern) {
@@ -85,6 +90,9 @@ export function verifyCli(args: string[]) {
       if (clone.code) throw Error("Cannot isolate verification checkout: " + clone.stderr);
       const checkout = isolatedGit(dir, ["-c", "advice.detachedHead=false", "checkout", "--detach", snap.head]);
       if (checkout.code) throw Error("Cannot select verification version: " + checkout.stderr);
+      phase = "gitlink preparation";
+      materializeGitlinks(snap.dir, dir, snap.head, isolatedGit);
+      phase = "dependency installation";
       if (existsSync(join(dir, "bun.lock")) || existsSync(join(dir, "bun.lockb"))) {
         const cache = process.env.BUN_INSTALL_CACHE_DIR;
         const installArgs = [process.execPath, "install", "--frozen-lockfile", "--ignore-scripts"];
@@ -93,6 +101,12 @@ export function verifyCli(args: string[]) {
         const install = runProcess(installArgs, { cwd: dir, env: baseEnv, timeoutMs: 120_000 });
         if (install.code) throw Error("Cannot install locked verification dependencies: " + install.stderr);
       }
+    }
+    if (values["fixture-env"]?.length) {
+      if (!temporary || !baseEnv) throw Error("--fixture-env requires an isolated v0.5 verification checkout");
+      phase = "fixture preparation";
+      fixtures = copyVerificationFixtures(temporary, values["fixture-env"]);
+      Object.assign(baseEnv, fixtures.env);
     }
     let skipped = false;
     function result(k: Kind, command: string[], code: number, output_sha256: string) {
@@ -168,9 +182,10 @@ export function verifyCli(args: string[]) {
         if (skipped || results.some(item => item.exit_code)) break;
       }
     }
+    fixtures?.verify();
     if (modern) {
       const current = isolatedGit(dir, ["rev-parse", "HEAD"]);
-      const changes = isolatedGit(dir, ["status", "--porcelain", "--untracked-files=no"]);
+      const changes = isolatedGit(dir, ["status", "--porcelain", "--untracked-files=no", "--ignore-submodules=untracked"]);
       if (current.code || current.stdout.trim() !== snap.head || changes.code || changes.stdout)
         throw Error("Verification changed the isolated checkout revision or tracked inputs");
     }
@@ -197,6 +212,7 @@ export function verifyCli(args: string[]) {
             summary: kind + " verification",
             meta: {
               ...meta,
+              ...fixtureMetadata(),
               duration_ms: Date.now() - started,
               started_at: new Date(started).toISOString(),
               review_task_id: snap.task_id,

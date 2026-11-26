@@ -1177,7 +1177,7 @@ export class Ledger {
     ) {
       const syncPr = `forge ledger pr-sync ${params.task_id} --repo ${params.repo}`;
       const prHint = task.endpoint !== "pr" ? "" : currentWorkflow
-        ? `; after the PR is merged into remote main, run ${syncPr} to verify the merged revision`
+        ? `; after the PR is merged into remote main, run ${syncPr} --branch ${attachments.length === 1 ? Bun.$.escape(attachments[0].branch) : "<attached-branch>"} --pr <number-or-url> to verify the merged revision. After local branch deletion, the recorded head must remain reachable from the origin feature or default-branch tracking ref`
         : `; run ${syncPr} to verify the remote PR head`;
       if (latestEndpointStatus === "fail") {
         hasExplicitFailure = true;

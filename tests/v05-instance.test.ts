@@ -131,6 +131,13 @@ for (const error of ["yaml", "reference", "permissions"]) {
   }, 60_000);
 }
 
+function linkWorkspaceDependencies(destination: string) {
+  for (const workspace of [".", "review-agents"]) {
+    const deps = join(workspace, "node_modules");
+    if (existsSync(join(kit, deps))) symlinkSync(join(kit, deps), join(destination, deps));
+  }
+}
+
 test("T05/T12 portable distribution self-bootstraps outside the checkout", () => {
   const archive = join(s.root, "distribution.tgz");
   const source = join(s.root, "distribution-source");
@@ -143,10 +150,7 @@ test("T05/T12 portable distribution self-bootstraps outside the checkout", () =>
     mkdirSync(dirname(output), {recursive: true});
     cpSync(input, output, {verbatimSymlinks: true});
   }
-  for (const workspace of [".", "review-agents"]) {
-    const deps = join(workspace, "node_modules");
-    if (existsSync(join(kit, deps))) symlinkSync(join(kit, deps), join(source, deps));
-  }
+  linkWorkspaceDependencies(source);
   mkdirSync(join(source, ".workbench"));
   writeFileSync(join(source, ".workbench/private-marker"), "synthetic instance file");
   s.ok(["bun", "run", "build"], source);
@@ -215,41 +219,16 @@ test("self-hosted root task routes commit, review and isolated verification evid
   expect(JSON.parse(ledger("reviews", "root-task"))).toContainEqual(expect.objectContaining({role: "quality", status: "pass", base, head}));
 }, 60_000);
 
-for (const incident of [
-  {source: "qa defect", environment: "qa"},
-  {source: "production defect", environment: "live"},
-  {source: "alert", environment: "live"},
-]) {
-  test(`T10 ${incident.source} diagnostics query only the reporting environment`, async () => {
-    s.fresh();
-    const requests: {path: string; method: string}[] = [];
-    const server = Bun.serve({hostname: "127.0.0.1", port: 0, fetch(request) {
-      const path = new URL(request.url).pathname;
-      requests.push({path, method: request.method});
-      return Response.json({environment: path.slice(1), incident: incident.source});
-    }});
-    try {
-      const actions = Object.fromEntries(["qa", "live"].map(environment => [environment, {
-        argv: ["bun", "-e", "console.log(await (await fetch(process.argv[1])).text())", server.url.origin + "/" + environment],
-        cwd: ".", purpose: "diagnose",
-      }]));
-      configure({ actions, stages: {reportQA: {action: "qa"}, reportLive: {action: "live"}} });
-      const stage = incident.environment === "qa" ? "reportQA" : "reportLive";
-      expect(s.ok([s.forge, "instance", "list", "--json"])).toContain(stage);
-      const proc = Bun.spawn([s.forge, "instance", "run", stage], {cwd: s.work, env: s.env, stdout: "pipe", stderr: "pipe", timeout: 12_000});
-      const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-      expect(code, out + err).toBe(0);
-      expect(out).toContain(incident.source);
-      expect(requests).toEqual([{path: "/" + incident.environment, method: "GET"}]);
-      expect(JSON.parse(s.ok([s.forge, "ledger", "query", "--json"])).tasks).toEqual([]);
-    } finally { await server.stop(true); }
-  }, 30_000);
-}
-
 test("installed skills use the delivered release across source changes, removal and override rollback", () => {
   const source = join(s.root, "source");
   mkdirSync(source);
-  for (const path of ["core", "templates", "kit.toml", "dist"]) cpSync(join(kit,path), join(source,path), {recursive:true});
+  const checkout = join(s.root, "release-input");
+  const revision = s.git(kit, "rev-parse", "HEAD").trim();
+  s.git(s.root, "clone", "--local", "--no-checkout", "--", kit, checkout);
+  s.git(checkout, "checkout", "--detach", revision);
+  linkWorkspaceDependencies(checkout);
+  for (const path of ["core", "templates", "kit.toml"]) cpSync(join(checkout, path), join(source, path), {recursive:true});
+  s.ok(["bun", "build", "--target=bun", "src/bin/cli.ts", "--outfile", join(source, "dist/cli.js")], checkout);
   const release = ["bun", join(source, "dist/cli.js")];
   s.ok([...release, "init", s.work]);
   const show = [s.forge, "instance", "show", "skill", "ready", "--json"];

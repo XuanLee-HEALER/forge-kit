@@ -123,25 +123,6 @@ export function resolveInstance(root: string, kitRoot?: string) {
   if ("git_org" in cfg && typeof cfg.git_org !== "string") throw Error(file + " git_org must be a string");
   if ("repos" in cfg && (!Array.isArray(cfg.repos) || !cfg.repos.every((r) => typeof r === "string")))
     throw Error(`${file} repos must be a string list`);
-  for (const section of ["guard", "ledger"]) {
-    if (!(section in cfg)) continue;
-    const fields = record(cfg[section], `${file} ${section}`);
-    for (const [key, value] of Object.entries(fields)) {
-      const label = `${file} ${section}.${key}`;
-      if (["enabled","require_prod_db_hosts","block_shared_worktree_ops","block_ledger_direct_edits"].includes(key) && typeof value !== "boolean") throw Error(label+" must be a boolean");
-      if (["retention_days","exempt_max_files","exempt_max_lines"].includes(key) && (!Number.isSafeInteger(value) || Number(value)<0)) throw Error(label+" must be a nonnegative integer");
-      if (["prod_db_hosts","protected_branches","prod_tag_patterns","custom_block_patterns","exempt_allowed_globs","protected_code_globs"].includes(key)) {
-        if (!Array.isArray(value) || !value.every(s=>typeof s==="string")) throw Error(label+" must be a string list");
-        if (["prod_tag_patterns","custom_block_patterns"].includes(key)) for (const pattern of value) {
-          try { new RegExp(pattern); } catch { throw Error(label+" contains an invalid regular expression"); }
-        }
-      }
-      if (key==="prod_db_targets") {
-        if (!Array.isArray(value)) throw Error(label+" must be a list of database targets");
-        for (const target of value) str(record(target,label).host,label+".host");
-      }
-    }
-  }
   const modelFile = process.env.FORGE_MODELS_TOML || localPath(root, ".workbench/models.toml");
   load(modelFile, (bytes) => {
     const tiers = record(record(Bun.TOML.parse(bytes.toString()), "models").tiers, "tiers");

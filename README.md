@@ -107,7 +107,7 @@ flowchart TD
 #### 4. 集成验证与交付
 - 集成验证在实例覆写指定的验证环境中运行集成测试、冒烟测试（按需含性能测试），修复直至 bug-free。
 - 默认交付终点为 PR 合并至主分支（`main`）；支持功能 thread 止于带见证的 PR 移交、由发布 thread 批量合并收口。
-- 多环境部署、发版标签、数据迁移等 CI/CD 流程由实例层挂载。PR 自动合并要求托管端在同一事务核验获批的 PR 状态、版本、合并内容与分支保护。公有 GitHub 的标准合并接口无法同时锁定目标分支 SHA，执行器在写入前转人工。[GitHub 合并接口参数](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
+- 多环境部署、发版标签、数据迁移等 CI/CD 流程由实例层挂载。PR 自动合并要求托管端在同一事务核验获批的 PR 状态、版本、合并内容与分支保护。公有 GitHub 的标准合并接口无法同时锁定目标分支 SHA，执行器在写入前转人工。操作者在托管平台选择保留获批 HEAD 祖先关系的合并方式，例如创建合并提交。发布线程刷新固定目标分支的 origin 跟踪引用后，再核验合入结果。[GitHub 合并接口参数](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
 
 ---
 
@@ -150,9 +150,15 @@ git -C /path/to/full-forge-kit --no-replace-objects -c core.attributesFile=/dev/
   --format=tar --output=/path/to/fixtures/forge-kit-v0.4.1.tar eb139c117be733173648abce723b6eaaf975f7bc
 export FORGE_V04_TEST_ARCHIVE=/path/to/fixtures/forge-kit-v0.4.1.tar
 bun test tests/v05-upgrade.test.ts
+# 在已建账并冻结的浅克隆工作台中，通过隔离入口执行同一验收
+forge verify --task "$TASK" --cwd "$CHECKOUT" --offline \
+  --fixture-env "FORGE_V04_TEST_ARCHIVE=$FORGE_V04_TEST_ARCHIVE" \
+  --kind test -- bun test ./tests/v05-upgrade.test.ts
 ```
 
 离线机器还需预供 Bun、Git、tar 和本仓锁定的 Bun 依赖。夹具在临时目录构建原版安装器，并用本地评审替身生成历史见证，无需旧评审子模块或远端服务。
+
+T10 使用三个独立 Codex CLI 会话读取安装后的 bugfix 说明，为 QA 缺陷、生产缺陷和报警选择诊断命令。运行 `FORGE_LIVE_T10=1 bun test tests/v05-incident-workflow.test.ts` 需可用的 Codex CLI 与模型访问权限。诊断目标均为本机临时 HTTP 服务；测试输出展示会话、选择的命令及服务端收到的请求。
 
 ### 在本仓库自举
 

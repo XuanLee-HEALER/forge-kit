@@ -1,5 +1,7 @@
 # Advisory review pilot
 
+Historical pilot and replay commands in this guide run from the v0.4 `review-agents` submodule directory at `08996d4b498f0a1bd2320911a3d445f36e98d5ce`. For the current paired evaluation, run `bun run eval` from the v0.5 `review-agents` directory.
+
 This evaluates useful, supported suggestions, not autonomous release approval. Initial source is [ReviewBench](https://github.com/review-bench/ReviewBench), revision recorded in reviewbench-pilot.json. Its MIT notice is retained in ReviewBench-LICENSE.txt. Target repositories keep their own licenses. Raw labels and cloned repositories remain under .local/ and are never reviewer inputs.
 
 ## Frozen subset
@@ -27,7 +29,7 @@ ReviewBench has reference findings from both generated reviews and human reviews
 
 ## Reproduction
 
-Run from the project root (model runs use the CLI's configured provider and incur usage):
+Run the archived commands below from the review-agents checkout specified above. Model runs use the configured provider and incur usage.
 
 ```sh
 python3 scripts/prepare-pilot.py

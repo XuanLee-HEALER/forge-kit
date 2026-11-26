@@ -116,3 +116,44 @@ test("custom delivery and verification keep the configured receipts and each rev
     } finally { db.closeDb(); }
   } finally { s.cleanup(); }
 });
+
+test("a targeted scope stays frozen through test-only and technical amendments", () => {
+  const s = sandbox();
+  try {
+    s.fresh();
+    const repo = join(s.work, "app");
+    mkdirSync(repo);
+    s.git(repo, "init", "-b", "feature");
+    s.git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+      "commit", "--allow-empty", "-m", "base");
+    const ledger = (...args: string[]) => s.ok([s.forge, "ledger", ...args]);
+    ledger("open", "--id", "scope", "--title", "Scope lock", "--repo", "app", "--branch", "feature", "--depth", "targeted");
+    const original = "Deliver the approved scope.";
+    const file = s.privateFile(".workbench/specs/scope/scope.md", original);
+    const freeze = () => JSON.parse(ledger("freeze", "scope")).spec.hashes.scope;
+    const amend = (scope: string) => ledger("amend", "scope", "--scope", scope, "--reason", "Exercise " + scope);
+    const locked = () => s.hook("PreToolUse", {tool_name: "Bash", tool_input: {
+      command: "echo changed >> .workbench/specs/scope/scope.md",
+    }}).some(reply => reply.text.includes("冻结 Spec 保护"));
+    let digest = freeze();
+    for (const scope of ["test_spec", "tech_spec"]) {
+      amend(scope);
+      expect(locked()).toBe(true);
+      writeFileSync(file, "Replace entire task.");
+      const failed = s.run([s.forge, "ledger", "freeze", "scope"]);
+      expect(failed.code).not.toBe(0);
+      expect(failed.err + failed.out).toContain("out-of-scope spec document(s) changed (.workbench/specs/scope/scope.md)");
+      writeFileSync(file, original);
+      expect(freeze()).toBe(digest);
+    }
+    for (const scope of ["requirement", "invariant"]) {
+      amend(scope);
+      expect(locked()).toBe(false);
+      writeFileSync(file, "Authorized " + scope);
+      const next = freeze();
+      expect(next).not.toBe(digest);
+      digest = next;
+      expect(locked()).toBe(true);
+    }
+  } finally { s.cleanup(); }
+});

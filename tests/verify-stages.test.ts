@@ -226,3 +226,94 @@ test("project verification resolves inputs and programs from the selected linked
   expect(mode.exitCode).not.toBe(0);
   expect(mode.stderr.toString() + mode.stdout.toString()).toContain("not executable at selected commit");
 }, 30_000);
+
+test("verification materializes nested fixed gitlinks locally and stops before stages if an object source is absent", () => {
+  const configDir = configureInstance();
+  const leaf = join(f.root, "leaf-origin");
+  const library = join(f.root, "library-origin");
+  for (const source of [leaf, library]) {
+    mkdirSync(source);
+    f.git("-C", source, "init", "-b", "main");
+    f.git("-C", source, "config", "user.name", "Fixture");
+    f.git("-C", source, "config", "user.email", "fixture@example.invalid");
+  }
+  writeFileSync(join(leaf, "value"), "nested content");
+  f.git("-C", leaf, "add", "--", "value");
+  f.git("-C", leaf, "commit", "-m", "leaf content");
+  f.git("-C", library, "-c", "protocol.file.allow=always", "submodule", "add", leaf, "leaf");
+  f.git("-C", library, "commit", "-m", "pin nested module");
+  f.git("-c", "protocol.file.allow=always", "submodule", "add", library, "vendor");
+  f.git("-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive");
+  const base = f.git("-C", "vendor", "rev-parse", "HEAD");
+  const nested = f.git("-C", "vendor/leaf", "rev-parse", "HEAD");
+  // The selected checkout is the only available object source for this verification.
+  renameSync(leaf, leaf + ".unavailable");
+  renameSync(library, library + ".unavailable");
+  f.git("commit", "-m", "pin supplied module");
+  const log = join(f.root, "stage-runs");
+  const script = [
+    'import {appendFileSync} from "node:fs";',
+    'const git = cwd => Bun.spawnSync(["git","-C",cwd,"rev-parse","HEAD"]).stdout.toString().trim();',
+    'const path = Bun.file("vendor/leaf/value");',
+    'appendFileSync(' + JSON.stringify(log) + ', JSON.stringify([git("vendor"),git("vendor/leaf"),await path.exists() ? await path.text() : null])+"\\n");',
+  ].join("\n");
+  const cfgFile = join(configDir, "workbench.yaml");
+  const cfg = parse(readFileSync(cfgFile, "utf8"));
+  cfg.extensions = { actions: { probe: {purpose: "verify", argv:["bun","-e",script]} },
+    stages: { probe: {action:"probe"} }, verification: {stages:["probe"]} };
+  writeFileSync(cfgFile, stringify(cfg));
+  mkdirSync(join(configDir, "specs/task"), {recursive:true});
+  writeFileSync(join(configDir, "specs/task/scope.md"), "Read pinned submodule revisions.");
+  f.ledger.freezeSpec({task_id:"task"});
+  const pass = f.cli("verify", []);
+  expect(pass.exitCode, pass.stderr.toString() + pass.stdout.toString()).toBe(0);
+  const first = readFileSync(log, "utf8");
+  expect(JSON.parse(first)).toEqual([base, nested, "nested content"]);
+  f.git("-C", "vendor", "submodule", "deinit", "--force", "--", "leaf");
+  const missing = f.cli("verify", []);
+  expect(missing.exitCode).not.toBe(0);
+  expect(missing.stderr.toString() + missing.stdout.toString()).toContain("Missing local gitlink checkout");
+  expect(readFileSync(log, "utf8")).toBe(first);
+  expect(f.evidence().at(-1)).toMatchObject({kind:"verify",status:"fail",meta:{failed_phase:"gitlink preparation"}});
+}, 30_000);
+
+test("forge verify passes only declared read-only fixture copies into a pinned test checkout", () => {
+  const configDir=configureInstance();
+  const specs=join(configDir,"specs/task");
+  mkdirSync(specs,{recursive:true});
+  writeFileSync(join(specs,"scope.md"), "Use the authenticated test archive.");
+  const source=join(f.root,"input.tar");
+  const trace=join(f.root,"fixture-location");
+  writeFileSync(source,"pinned bytes\n");
+  writeFileSync(join(f.repo,"fixture.test.ts"),`
+import {expect,test} from "bun:test";
+import {statSync,readFileSync,writeFileSync} from "node:fs";
+import {join} from "node:path";
+test("check fixture contract",()=>{
+  const path=process.env.EXAMPLE_TEST_ARCHIVE;
+  expect(path).toBe(join(process.env.TMPDIR,"fixtures","EXAMPLE_TEST_ARCHIVE"));
+  expect(readFileSync(path,"utf8")).toBe("pinned bytes\\n");
+  expect(statSync(path).mode & 0o222).toBe(0);
+  expect(process.env.UNRELATED_TEST_FILE).toBeUndefined();
+  expect(process.env.OPERATOR_CREDENTIAL).toBeUndefined();
+  writeFileSync(${JSON.stringify(trace)},path);
+});
+`);
+  f.git("add","--","fixture.test.ts");
+  f.git("commit","-m","Add pinned verification contract");
+  f.ledger.freezeSpec({task_id:"task"});
+  const testArgs=["--kind","test","--","bun","test","./fixture.test.ts"];
+  const entry="EXAMPLE_TEST_ARCHIVE="+source;
+  const result=f.cli("verify",["--fixture-env",entry,...testArgs],{
+    EXAMPLE_TEST_ARCHIVE:"untrusted inherited value",UNRELATED_TEST_FILE:source,OPERATOR_CREDENTIAL:"private",
+  });
+  expect(result.exitCode,result.stderr.toString()+result.stdout.toString()).toBe(0);
+  const copy=readFileSync(trace,"utf8");
+  expect(copy).not.toBe(source);
+  expect(existsSync(copy)).toBe(false);
+  expect(f.evidence().at(-1).meta.fixture_sha256).toEqual({EXAMPLE_TEST_ARCHIVE:new Bun.CryptoHasher("sha256").update("pinned bytes\n").digest("hex")});
+  for(const arg of ["GIT_CONFIG_GLOBAL="+source,"EXAMPLE_TEST_ARCHIVE="+configDir]){
+    const refused=f.cli("verify",["--fixture-env",arg,...testArgs]);
+    expect(refused.exitCode).not.toBe(0);
+  }
+});

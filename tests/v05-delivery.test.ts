@@ -269,11 +269,16 @@ for (const track of ["full", "targeted"] as const) {
     const f = preparePullRequest(track, track === "targeted");
     const open = s.run([s.forge, "ledger", "close", "ship-task", "--summary", "open PR"]);
     expect(open.code).not.toBe(0);
-    expect(open.err + open.out).toContain("after the PR is merged into remote main, run forge ledger pr-sync ship-task --repo app");
+    expect(open.err + open.out).toContain("after the PR is merged into remote main, run forge ledger pr-sync ship-task --repo app --branch feature-fixture --pr <number-or-url>");
     expect(s.ok(["bun", "-e", "import {message} from './src/feature'; console.log(message)"], f.repo).trim()).toBe("ready");
     s.env.FIXTURE_HUMAN_MERGE = "1";
     s.ok(["gh", "pr", "merge", "1", "--merge", "--match-head-commit", f.head]);
     expect(s.git(f.bare, "rev-parse", "refs/heads/main").trim()).toBe(f.head);
+    if (track === "targeted") {
+      s.git(f.repo, "fetch", f.bare, "refs/heads/main:refs/remotes/origin/main");
+      s.git(f.repo, "switch", "--detach", f.head);
+      s.git(f.repo, "branch", "-d", "feature-fixture");
+    }
     f.ledger("pr-sync", "ship-task", "--repo", "app", "--branch", "feature-fixture", "--pr", "1");
     const closed = JSON.parse(f.ledger("close", "ship-task", "--summary", "isolated host confirms main", "--no-archive"));
     expect(closed.task.status).toBe("CLOSED");
@@ -565,7 +570,7 @@ for (const endpoint of ["blue-rollout", "prod"]) test(`T13 delegated ${endpoint}
     const payload = JSON.parse(row.payload_json);
     return payload.kind === "prod" && payload.source === "tool";
   });
-  expect(evidence).toHaveLength(1);
+  expect(evidence).toHaveLength(2);
   expect(evidence[0]).toMatchObject({task_id:"ship-task", repo:"app", branch:"feature-fixture", sha:f.head});
   expect(evidence[0].payload_json).toContain(batch.release_id);
   expect(evidence[0].payload_json).toContain(book.runbook_id);
@@ -585,14 +590,30 @@ for (const endpoint of ["blue-rollout", "prod"]) test(`T13 delegated ${endpoint}
   writeFileSync(targetState, JSON.stringify(record));
   s.ok(observe);
   s.ok(observe);
+  const expectedStates = ["unconfirmed", "completed", "failed", "completed"];
+  for (const target of [
+    JSON.stringify({...record, versions:[{repo:"app",head:f.base}]}),
+    JSON.stringify({...record, action_id:"different/action"}),
+    JSON.stringify({...record, state:"unknown"}),
+    "unreadable target response", // The target adapter exits unsuccessfully parsing its input.
+  ]) {
+    writeFileSync(targetState, target);
+    for (let i = 0; i < 2; i++) expect(s.run(observe).code).not.toBe(0);
+    const close = s.run([s.forge, "ledger", "release", "complete", batch.release_id]);
+    expect(close.code).not.toBe(0);
+    expect(close.err + close.out).toContain("production delivery evidence");
+    writeFileSync(targetState, JSON.stringify(record));
+    s.ok(observe);
+    expectedStates.push("unconfirmed", "completed");
+  }
   const transitions = JSON.parse(ledger("query", "--q", "prod", "--repo", "app", "--json")).events
     .map((row: {seq:number; sha:string; payload_json:string}) => ({...row, payload:JSON.parse(row.payload_json)}))
     .filter((row: {payload:{meta?:{observed_runbook?:string}}}) => row.payload.meta?.observed_runbook === book.runbook_id)
     .sort((a: {seq:number}, b: {seq:number}) => a.seq - b.seq);
-  expect(transitions).toHaveLength(3);
-  for (const [index, state] of ["completed", "failed", "completed"].entries()) {
+  expect(transitions).toHaveLength(expectedStates.length);
+  for (const [index, state] of expectedStates.entries()) {
     expect(transitions[index]).toMatchObject({sha:f.head, payload:{release_id:batch.release_id, source:"tool",
-      status:state === "failed" ? "fail" : "pass", meta:{observations:[{action_id:observer.action_id, state}]}}});
+      status:state === "completed" ? "pass" : "fail", meta:{observations:[{action_id:observer.action_id, state}]}}});
   }
   const accepted = JSON.parse(ledger("release", "complete", batch.release_id, "--summary", "local target reports deployed revision"));
   expect(accepted.task_ids).toEqual(["ship-task"]);

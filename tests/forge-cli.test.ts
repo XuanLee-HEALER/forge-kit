@@ -714,3 +714,40 @@ test("a partially published install can replay a restored file after a later con
   expect(readFileSync(lock, "utf8")).toBe("new lock");
   expect(existsSync(journal)).toBe(false);
 });
+
+test("guard and ledger fields keep their v0.4 sections in sync, doctor and policy reads", () => {
+  const {root} = initWorkbench({targetDir: target});
+  const path = join(root, ".workbench/workbench.yaml");
+  const lock = join(root, ".workbench/kit-lock.json");
+  const config = Bun.YAML.parse(readFileSync(path,"utf8")) as {guard: Record<string,unknown>; ledger: Record<string,unknown>};
+  config.guard.custom_block_patterns = ["^blocked-command$"];
+  config.guard.prod_db_targets = [{host:"db-a"}, {name:"reporting", engine:"custom-engine", host:"db-b"}];
+  config.guard.protected_branches = ["release"];
+  config.ledger.exempt_max_lines = 0;
+  writeFileSync(path, JSON.stringify(config));
+  syncWorkbench({targetDir:root});
+  expect(doctorWorkbench(root).issues.filter(i=>i.check==="configuration")).toEqual([]);
+  expect(loadWorkbenchConfig(root)).toMatchObject({
+    guard:{custom_block_patterns:["^blocked-command$"],protected_branches:["release"],
+      prod_db_targets:[{name:"db-a",host:"db-a"},{name:"reporting",engine:"custom-engine",host:"db-b"}]},
+    ledger:{exempt_max_lines:0},
+  });
+  const before = readFileSync(lock);
+  for (const [section,key,value,expected] of [
+    ["ledger","protected_branches",["release"],"move it to guard.protected_branches"],
+    ["guard","exempt_max_lines",0,"move it to ledger.exempt_max_lines"],
+    ["guard","prod_db_host",["db-a"],"guard.prod_db_host"],
+    ["ledger","enabled_tasks",true,"ledger.enabled_tasks"],
+    ["guard","prod_db_targets",[{host:"db-a",engnie:"postgres"}],"guard.prod_db_targets[0].engnie"],
+  ] as const) {
+    writeFileSync(path,JSON.stringify({...config,[section]:{...config[section],[key]:value}}));
+    expect(()=>loadWorkbenchConfig(root)).toThrow(expected);
+    expect(()=>syncWorkbench({targetDir:root})).toThrow(expected);
+    const doctor = doctorWorkbench(root);
+    expect(doctor.ok).toBe(false);
+    const diagnosis=doctor.issues.map(i=>i.message).join("\n");
+    expect(diagnosis).toContain(section+"."+key);
+    expect(diagnosis).toContain(expected);
+    expect(readFileSync(lock)).toEqual(before);
+  }
+});

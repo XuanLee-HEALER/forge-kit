@@ -67,7 +67,7 @@ export function checkSpecAndTestLocks(
 
       const lockedSpecFiles: ResolvedLock["lockedSpecFiles"] = [];
       for (const kind of ["ssot", "tech_spec", "test_spec", "scope"] as const) {
-        if (!st.files?.[kind] || { ssot: unlockedSsot, tech_spec: unlockedTech, test_spec: unlockedTest, scope: scopes.size > 0 }[kind]) continue;
+        if (!st.files?.[kind] || { ssot: unlockedSsot, tech_spec: unlockedTech, test_spec: unlockedTest, scope: unlockedSsot }[kind]) continue;
         const rel = st.files[kind];
         lockedSpecFiles.push({ kind, rel, abs: canonicalizeMaybePath(resolve(wbReal, rel)) });
       }

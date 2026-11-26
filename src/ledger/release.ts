@@ -176,17 +176,15 @@ function observeRelease(ledger: Ledger, id: string) {
         const fact = observeStage(ledger.workbenchRoot, pin.stage, pin.action_id, pin.endpoint, pin.versions);
         return {action_id:pin.action_id, state:fact.state};
       } catch (error) {
-        return {action_id:pin.action_id, state:null, error:String(error)};
+        return {action_id:pin.action_id, state:"unconfirmed", error:String(error)};
       }
     });
-    const status: "pass" | "fail" | null = states.some(row => row.state !== null && row.state !== "completed") ? "fail" :
-      states.every(row => row.state === "completed") ? "pass" : null;
+    const status: "pass" | "fail" = states.every(row => row.state === "completed") ? "pass" : "fail";
     return [{item, targets, latest, before, states, status}];
   });
   withImmediateTx(ledger.db, () => {
     if (approved().runbook_id !== runbook_id) throw Error("Release runbook changed during observation");
     for (const {item, targets, latest, before, states, status} of reports) {
-      if (!status) continue;
       const prior = latest();
       const observations = states.map(({action_id, state}) => ({action_id, state}));
       if (prior?.status === status && (status === "pass" || prior.observations === canonicalJson(observations))) continue;
@@ -200,7 +198,7 @@ function observeRelease(ledger: Ledger, id: string) {
         source: "tool",
         actor: "tool",
         status,
-        summary: status === "pass" ? "Target confirmed release delivery" : "Target reported delivery incomplete",
+        summary: status === "pass" ? "Target confirmed release delivery" : "Target did not confirm release delivery",
         meta: {
           delivery_endpoint: targets[0].endpoint,
           observed_runbook: runbook_id,
@@ -293,7 +291,7 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
       }));
       return { ...rb, actions, release_id: id, execution_actions: productionActions(actions), human_merges,
         ...(human_merges.length && { merge_instructions:
-          "审批后请操作者在托管平台打开所列 PR，核对目标分支、HEAD 及必需检查后手动合并。发布线程随后运行 forge ledger release verify " + id + " 核验远端结果。" }) };
+          "审批后请操作者在托管平台打开所列 PR，核对目标分支、HEAD 及必需检查后手动合并，使获批 HEAD 在目标分支上保持可达（例如创建合并提交）。发布线程随后刷新各仓固定目标分支的 origin 跟踪引用，再运行 forge ledger release verify " + id + " 核验远端结果。" }) };
     }
     const prodItems = checked.items.filter((i) => isRolloutEndpoint(ledger.getTask(i.task_id)!.endpoint));
     if ((prodItems.length || checked.sql_files.length) && !release.runbook_id)

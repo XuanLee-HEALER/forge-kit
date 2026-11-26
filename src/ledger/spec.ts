@@ -71,7 +71,8 @@ export function freezeSpec(ledger: LedgerReader, params: {
     }
 
     const wbReal = realpathSync(ledger.workbenchRoot);
-    const rawDir = params.spec_dir?.trim() || join(".workbench", "specs", params.task_id);
+    const previous = ledger.getSpecState(params.task_id);
+    const rawDir = params.spec_dir?.trim() || previous.spec_dir || join(".workbench", "specs", params.task_id);
     const absDir = resolve(wbReal, rawDir);
     if (!existsSync(absDir)) {
       throw new Error(`Spec directory does not exist: ${rawDir}`);
@@ -85,7 +86,6 @@ export function freezeSpec(ledger: LedgerReader, params: {
       throw new Error(`Spec directory must reside inside workbench root: ${rawDir}`);
     }
 
-    const previous = ledger.getSpecState(params.task_id);
     const lightweight = previous.files ? Object.hasOwn(previous.files, "scope")
       : task.verification_depth === "targeted" && usesV05(ledger, params.task_id);
     const fileNames: Record<string, string> = lightweight ? { scope: "scope.md" }
@@ -161,8 +161,9 @@ export function freezeSpec(ledger: LedgerReader, params: {
         );
       }
       const unauthorizedDocs: string[] = [];
-      if (!allowSsot && prevSpec.hashes && hashes.ssot !== prevSpec.hashes.ssot) {
-        unauthorizedDocs.push(files.ssot);
+      const scopeDoc = lightweight ? "scope" : "ssot";
+      if (!allowSsot && prevSpec.hashes && hashes[scopeDoc] !== prevSpec.hashes[scopeDoc]) {
+        unauthorizedDocs.push(files[scopeDoc]);
       }
       if (!allowTech && prevSpec.hashes && hashes.tech_spec !== prevSpec.hashes.tech_spec) {
         unauthorizedDocs.push(files.tech_spec);

@@ -229,7 +229,7 @@ export function shipReceipts(ledger: Ledger, id: string) {
 }
 function revoke(ledger: Ledger, e: Envelope, reason: string, session?: string) {
   if (!["PENDING", "ACTIVE"].includes(e.status)) throw Error("Envelope is " + e.status);
-  if(e.status==="ACTIVE" && (!session || session!==e.approved_session_id)) throw Error("Active authorization requires revocation from the approving root session");
+  if(e.status==="ACTIVE" && (!session || session!==e.approved_session_id)) throw Error(`Active authorization requires revocation from the approving root session: send the entire message "快轨撤销 ${e.envelope_id}". Inspect any claimed receipt and its target.`);
   ledger.db
     .query(
       "UPDATE fast_track_envelopes SET status='REVOKED',updated_at=?,degraded_reason=? WHERE envelope_id=?",

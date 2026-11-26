@@ -44,7 +44,10 @@ Commands:
   status    [--task <id>] [--repo <r> --branch <b>] [--json]
   query     [--q <fts>] [--repo <r>] [--status <OPEN|HANDED_OFF|CLOSED|CANCELLED>] [--since <iso>] [--json]
   fast-track prepare <task_id> --to <endpoint> --paths <globs> --runbook <rb-id> [--repos <repos>] [--ttl <minutes>]
-  fast-track status [<id>] [--task <task_id>] | revoke <id> [--reason <reason>]
+  fast-track status [<id>] [--task <task_id>]
+  fast-track revoke <id> [--reason <reason>] (PENDING)
+  ACTIVE: send "快轨撤销 <id>" as the entire message in the approving root session.
+          Inspect the receipt and target for any claimed action.
   handoff   <task_id> [--sql host:path ...] [--rollback note]
   resume    <task_id> [--reason note]
   release   create --title text [--from-handoffs | --tasks ids | --prs repo#num,...] [--order repos]\n            PR selectors include every attachment of the selected handoff.

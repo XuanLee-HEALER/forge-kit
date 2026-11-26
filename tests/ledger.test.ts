@@ -906,7 +906,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
     const ledger = new Ledger(dir);
     try {
       const { writeFileSync, symlinkSync, unlinkSync } = require("node:fs") as typeof import("node:fs");
-      const specDir = join(dir, ".workbench", "specs", "20261123-hard");
+      const specDir = join(dir, "docs", "custom specs");
       Bun.spawnSync(["mkdir", "-p", specDir]);
       writeFileSync(join(dir, "AGENTS.md"), "# Workbench Agents\n");
 
@@ -962,14 +962,14 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       symlinkSync(join(dir, "AGENTS.md"), join(specDir, "ssot.md"));
       writeFileSync(join(specDir, "tech-spec.md"), "# Tech\nok\n");
       writeFileSync(join(specDir, "test-spec.md"), "# Test\nok\n");
-      expect(() => ledger.freezeSpec({ task_id: "20261123-hard" })).toThrow(
+      expect(() => ledger.freezeSpec({ task_id: "20261123-hard", spec_dir: specDir })).toThrow(
         "resolves outside selected spec directory",
       );
 
       // Replace symlink with real file and perform first freeze -> MUST invalidate pre-freeze evidence!
       unlinkSync(join(specDir, "ssot.md"));
       writeFileSync(join(specDir, "ssot.md"), "# SSOT\nINV-1: server decides\n");
-      const f1 = ledger.freezeSpec({ task_id: "20261123-hard" });
+      const f1 = ledger.freezeSpec({ task_id: "20261123-hard", spec_dir: specDir });
       expect(f1.spec.evidence_floor_seq.lint).toBe(f1.event.seq);
       expect(f1.spec.evidence_floor_seq.test).toBe(f1.event.seq);
       expect(f1.spec.evidence_floor_seq.review).toBe(f1.event.seq);
@@ -1013,6 +1013,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         task_id: "20261123-hard",
         locked_test_globs: ["tests/**/*.hurl"],
       });
+      expect(fLock.spec.spec_dir).toBe(f1.spec.spec_dir);
       expect(fLock.spec.locked_test_globs).toEqual(["tests/**/*.hurl"]);
       expect(
         ledger.checkPushReadiness({

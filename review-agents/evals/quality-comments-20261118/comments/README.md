@@ -1,5 +1,7 @@
 # Comments 真实回放
 
+复跑本文的历史实验，请在 v0.4 的 `review-agents` 子模块检出 `08996d4b498f0a1bd2320911a3d445f36e98d5ce`，从该子模块根目录执行。当前版本的成对评测在 v0.5 的 `review-agents` 目录运行 `bun run eval`。
+
 2026-11-18。本地定向验证。五次均为独立的 `review-comments` 新任务，报告和任务状态均确认实际模型 `gpt-6.2-sol`、`high`，固定范围的 diff 已读完。评审从各自的中性目录启动，工作区只包含本次固定 head。冻结判定、脱敏报告和调用方执行证据见 [expectations.md](expectations.md)、[reports.json](reports.json)、[verification.json](verification.json)。
 
 | 样本 | 退出码 | 阻断 / 建议 | 轮数 | 累计 token | 外部读取错误 |

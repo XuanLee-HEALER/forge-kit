@@ -90,3 +90,42 @@ test("detectDiffPitfallLanguages selects only matching Go/TS/Python pitfall chec
     expect(readFileSync(p, "utf8").trim().length).toBeGreaterThan(100);
   }
 });
+
+test("the review budget stops Git before unread diffs and oversized input blobs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "review-limit-"));
+  const git = (...args: string[]) => {
+    const result = Bun.spawnSync(["git", "-C", dir, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", ...args]);
+    expect(result.exitCode, result.stderr.toString()).toBe(0);
+    return result.stdout.toString().trim();
+  };
+  function review(base: string, head: string, missing: string[], opened: string[]) {
+    const trace = join(dir, ".git", head + ".jsonl");
+    const result = Bun.spawnSync([process.execPath, join(import.meta.dir, "../src/review.ts"),
+      "--base", base, "--head", head, "--repo", dir, "--roles", "quality", "--backend", "codex"], {
+      env: {...process.env, GIT_TRACE2_EVENT: trace, FORGE_CODEX_BIN: join(dir, "unused-provider")},
+    });
+    expect(result.exitCode, result.stderr.toString()).toBe(3);
+    expect(JSON.parse(result.stdout.toString()).roles[0]).toMatchObject({
+      status:"incomplete", missing_materials:missing, attempts:[],
+    });
+    const events = readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const diffs = events.filter(e => e.event === "start" && e.argv.includes("--unified=5"));
+    expect(diffs.map(e => e.argv.at(-1))).toEqual(opened);
+  }
+  try {
+    git("init", "-q");
+    git("commit", "--allow-empty", "-qm", "base");
+    const base = git("rev-parse", "HEAD");
+    const line = "x".repeat(299) + "\n";
+    for (const file of ["a.ts", "b.ts"]) writeFileSync(join(dir, file), line.repeat(2600));
+    writeFileSync(join(dir, "c.ts"), "small final change\n");
+    git("add", "--", "a.ts", "b.ts", "c.ts");
+    git("commit", "-qm", "combined changes");
+    const first = git("rev-parse", "HEAD");
+    review(base, first, ["b.ts", "c.ts"], ["a.ts", "b.ts"]);
+    writeFileSync(join(dir, "a.ts"), line.repeat(6000));
+    writeFileSync(join(dir, "c.ts"), "later change\n");
+    git("commit", "-qam", "large input blob");
+    review(first, git("rev-parse", "HEAD"), ["a.ts","c.ts"], []);
+  } finally { rmSync(dir, {recursive:true, force:true}); }
+}, 30_000);

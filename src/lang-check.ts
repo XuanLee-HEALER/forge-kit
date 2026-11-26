@@ -465,7 +465,7 @@ export function runLangCheckCli(): void {
   const rawArgs = process.argv.slice(2);
   if (rawArgs.includes("--help") || rawArgs.includes("-h")) {
     console.log(
-      `Usage: lang-check [target-dir] [--mode static|dynamic|all] [--lang auto|go|ts|python] [--json]
+      `Usage: forge lang-check [target-dir] [--mode static|dynamic|all] [--lang auto|go|ts|python] [--json]
 Runs language-specific static & dynamic checks (Go, TypeScript, Python).
 Exit 0: >=1 check executed and all passed; 1: check failed; 2: no applicable checks executed (fail-closed).`,
     );

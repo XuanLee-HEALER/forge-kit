@@ -101,6 +101,7 @@ const DEFAULT_LEDGER: LedgerConfig = {
 };
 
 const DEFAULT_GUARD: GuardConfig = {
+  custom_block_patterns: [],
   prod_db_hosts: [],
   prod_db_targets: [],
   require_prod_db_hosts: false,
@@ -175,70 +176,67 @@ export function canonicalRepoPath(root: string, repo: string): string {
   return existsSync(path) ? relative(realpathSync(root),realpathSync(path)) || "." : relative(resolve(root),path) || ".";
 }
 
-export function loadWorkbenchConfig(root: string): WorkbenchConfig {
-  const raw = parseYamlFile<Partial<WorkbenchConfig>>(
-    join(root, ".workbench", "workbench.yaml"),
-  );
-  const ledgerRaw = (raw?.ledger ?? {}) as Partial<LedgerConfig>;
-  const guardRaw = (raw?.guard ?? {}) as Partial<GuardConfig>;
-  if (guardRaw.custom_block_patterns !== undefined && (!Array.isArray(guardRaw.custom_block_patterns) ||
-      !guardRaw.custom_block_patterns.every(pattern => typeof pattern === "string"))) {
-    throw new Error("guard.custom_block_patterns must be an array of regex strings");
+function validatePolicySection(file: string, section: "guard" | "ledger", fields: unknown) {
+  if (fields === undefined) return;
+  const location = file + " " + section;
+  if (!fields || typeof fields !== "object" || Array.isArray(fields)) throw Error(location + " must be a mapping");
+  const defaults = section === "guard" ? DEFAULT_GUARD : DEFAULT_LEDGER;
+  const other = section === "guard" ? "ledger" : "guard";
+  const otherDefaults = section === "guard" ? DEFAULT_LEDGER : DEFAULT_GUARD;
+  for (const [key, value] of Object.entries(fields)) {
+    const label = location + "." + key;
+    if (!Object.hasOwn(defaults, key)) {
+      const hint = Object.hasOwn(otherDefaults, key) ? "move it to " + other + "." + key : "supported fields: " + Object.keys(defaults).join(", ");
+      throw Error("Unknown field " + label + "; " + hint);
+    }
+    if (key === "prod_db_targets") {
+      if (!Array.isArray(value)) throw Error(label + " must be a list of database targets");
+      for (const [index, target] of value.entries()) {
+        const path = label + "[" + index + "]";
+        if (!target || typeof target !== "object" || Array.isArray(target)) throw Error(path + " must be a mapping");
+        if (typeof target.host !== "string" || !target.host.trim()) throw Error(path + ".host must be a nonempty string");
+        for (const [field, setting] of Object.entries(target)) {
+          if (!["host", "name", "engine"].includes(field)) throw Error("Unknown field " + path + "." + field);
+          if (typeof setting !== "string") throw Error(path + "." + field + " must be a string");
+        }
+      }
+      continue;
+    }
+    const defaultValue: unknown = Reflect.get(defaults, key);
+    if (typeof defaultValue === "boolean" && typeof value !== "boolean") throw Error(label + " must be a boolean");
+    if (typeof defaultValue === "number" && (!Number.isSafeInteger(value) || Number(value) < 0))
+      throw Error(label + " must be a nonnegative integer");
+    if (!Array.isArray(defaultValue)) continue;
+    if (!Array.isArray(value) || !value.every(entry => typeof entry === "string")) throw Error(label + " must be a string list");
+    if (key === "prod_tag_patterns" || key === "custom_block_patterns") {
+      for (const [index, pattern] of value.entries()) {
+        try { new RegExp(pattern); }
+        catch { throw Error(label + "[" + index + "] contains an invalid regular expression"); }
+      }
+    }
   }
+}
 
+export function loadWorkbenchConfig(root: string): WorkbenchConfig {
+  const file = join(root, ".workbench", "workbench.yaml");
+  const raw = parseYamlFile<Partial<WorkbenchConfig>>(file);
+  validatePolicySection(file, "guard", raw?.guard);
+  validatePolicySection(file, "ledger", raw?.ledger);
+  const ledgerRaw: Partial<LedgerConfig> = raw?.ledger ?? {};
+  const guardRaw: Partial<GuardConfig> = raw?.guard ?? {};
   return {
     name: raw?.name || "workbench",
     git_org: raw?.git_org,
     repos: Array.isArray(raw?.repos) ? raw.repos.map(repo => canonicalRepoPath(root,String(repo))) : [],
-    ledger: {
-      enabled: ledgerRaw.enabled ?? DEFAULT_LEDGER.enabled,
-      retention_days:
-        typeof ledgerRaw.retention_days === "number"
-          ? ledgerRaw.retention_days
-          : DEFAULT_LEDGER.retention_days,
-      exempt_max_files:
-        typeof ledgerRaw.exempt_max_files === "number"
-          ? ledgerRaw.exempt_max_files
-          : DEFAULT_LEDGER.exempt_max_files,
-      exempt_max_lines:
-        typeof ledgerRaw.exempt_max_lines === "number"
-          ? ledgerRaw.exempt_max_lines
-          : DEFAULT_LEDGER.exempt_max_lines,
-      exempt_allowed_globs: Array.isArray(ledgerRaw.exempt_allowed_globs)
-        ? ledgerRaw.exempt_allowed_globs.map(String)
-        : DEFAULT_LEDGER.exempt_allowed_globs,
-      protected_code_globs: Array.isArray(ledgerRaw.protected_code_globs)
-        ? ledgerRaw.protected_code_globs.map(String)
-        : DEFAULT_LEDGER.protected_code_globs,
-    },
+    ledger: { ...DEFAULT_LEDGER, ...ledgerRaw },
     guard: {
-      prod_db_hosts: Array.isArray(guardRaw.prod_db_hosts)
-        ? guardRaw.prod_db_hosts.map(String)
-        : DEFAULT_GUARD.prod_db_hosts,
-      prod_db_targets: Array.isArray(guardRaw.prod_db_targets)
-        ? guardRaw.prod_db_targets
-            .filter((t) => t && typeof t.host === "string" && t.host.trim())
-            .map((t) => ({
-              name: String(t.name || t.host),
-              engine: t.engine ? String(t.engine) : undefined,
-              host: String(t.host),
-            }))
-        : DEFAULT_GUARD.prod_db_targets,
-      require_prod_db_hosts:
-        guardRaw.require_prod_db_hosts ?? DEFAULT_GUARD.require_prod_db_hosts,
-      custom_block_patterns: guardRaw.custom_block_patterns ?? [],
-      protected_branches: Array.isArray(guardRaw.protected_branches)
-        ? guardRaw.protected_branches.map(String)
-        : DEFAULT_GUARD.protected_branches,
-      prod_tag_patterns: Array.isArray(guardRaw.prod_tag_patterns)
-        ? guardRaw.prod_tag_patterns.map(String)
-        : DEFAULT_GUARD.prod_tag_patterns,
-      block_shared_worktree_ops:
-        guardRaw.block_shared_worktree_ops ??
-        DEFAULT_GUARD.block_shared_worktree_ops,
-      block_ledger_direct_edits:
-        guardRaw.block_ledger_direct_edits ??
-        DEFAULT_GUARD.block_ledger_direct_edits,
+      ...DEFAULT_GUARD,
+      ...guardRaw,
+      prod_db_targets: (guardRaw.prod_db_targets ?? []).map(target => ({
+        name: target.name || target.host,
+        engine: target.engine || undefined,
+        host: target.host,
+      })),
     },
   };
 }

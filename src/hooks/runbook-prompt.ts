@@ -91,8 +91,8 @@ export function handleUserPromptRunbookDirectives(
         notes.push(
           `[Forge Runbook] 用户已在主会话批准发版单 ${record.runbook_id}（有效至 ${record.expires_at}，绑定当前 session）。` +
             `登记范围：${formatRunbookScopeSummary(actions)}。` +
-            (actions.prs?.length ? "请操作者在托管平台核对目标分支、固定 HEAD 和必需检查，手动合并所列 PR。" : "") +
-            (releaseId ? `发布线程随后运行 forge ledger release verify ${releaseId} 核验远端结果。` : "") +
+            (actions.prs?.length ? "请操作者在托管平台核对目标分支、固定 HEAD 和必需检查，手动合并所列 PR，使获批 HEAD 在目标分支上保持可达（例如创建合并提交）。" : "") +
+            (releaseId ? `发布线程随后刷新各仓固定目标分支的 origin 跟踪引用，再运行 forge ledger release verify ${releaseId} 核验远端结果。` : "") +
             `完成登记项后运行 forge ledger runbook complete ${record.runbook_id}。`,
         );
       } catch (err) {
