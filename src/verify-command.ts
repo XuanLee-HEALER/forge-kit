@@ -87,7 +87,7 @@ function hurlInputs(args: string[], dir: string, head: string) {
   return files > 0;
 }
 
-export function isVerificationCommand(kind: VerificationKind, argv: string[], dir: string, head: string) {
+export function isVerificationCommand(kind: VerificationKind, argv: string[], dir: string, head: string, env = process.env) {
   const bin = basename(argv[0]),
     args = argv.slice(1),
     [cmd] = args;
@@ -130,7 +130,7 @@ export function isVerificationCommand(kind: VerificationKind, argv: string[], di
   if (bin === "go")
     return (
       cmd === { lint: "vet", test: "test", build: "build" }[kind] &&
-      !hasNonExecutingGoFlags(argv[0], dir, args)
+      !hasNonExecutingGoFlags(argv[0], dir, args, env)
     );
   if (bin === "cargo")
     return (kind === "lint" ? ["clippy", "check"].includes(cmd) : cmd === kind && !args.includes("--no-run")) &&

@@ -331,3 +331,50 @@ test("check fixture contract",()=>{
     expect(refused.exitCode).not.toBe(0);
   }
 });
+
+test("direct and delegated Go verification resolve flags inside the isolated checkout environment", () => {
+  const configDir = configureInstance();
+  const specs = join(configDir, "specs/task");
+  const operator = join(f.root, "operator");
+  const settings = join(operator, "go.env");
+  const calls = join(f.root, "go-calls");
+  mkdirSync(specs, {recursive:true});
+  mkdirSync(operator);
+  writeFileSync(settings, "-tags=operator_saved");
+  writeFileSync(join(specs, "scope.md"), "Verify the committed Go checks in isolation.");
+  writeFileSync(join(f.root, "go"), `#!/usr/bin/env bun
+import {appendFileSync} from "node:fs";
+const [op] = process.argv.slice(2);
+const {HOME, GOENV, GOFLAGS} = process.env;
+appendFileSync(${JSON.stringify(calls)}, JSON.stringify({op, HOME, GOENV, GOFLAGS})+"\\n");
+if (op === "env") {
+  const file = Bun.file(GOENV || HOME + "/go.env");
+  if (await file.exists()) console.log(await file.text());
+} else if (op === "test") console.log("ok  example/service  0.01s");
+else process.exit(2);
+`, {mode:0o755});
+  writeFileSync(join(f.repo, "delegate.test.ts"), `import {expect,test} from "bun:test";
+test("execute Go project checks", () => expect(Bun.spawnSync(["go","test","./..."]).exitCode).toBe(0));
+`);
+  f.git("add", "--", "delegate.test.ts");
+  f.git("commit", "-m", "delegated test");
+  f.ledger.freezeSpec({task_id:"task"});
+  for (const [flags, command] of [
+    ["-tags=operator_direct", ["bun", "test", "./delegate.test.ts"]],
+    ["", ["bun", "test", "./delegate.test.ts"]],
+    ["-n", ["go", "test", "./..."]],
+  ] as const) {
+    writeFileSync(calls, "");
+    const result = f.cli("verify", ["--kind", "test", "--", ...command],
+      {HOME:operator, GOENV:settings, GOFLAGS:flags, PATH:f.root + ":" + process.env.PATH});
+    expect(result.exitCode, result.stderr.toString() + result.stdout.toString()).toBe(0);
+    const log = readFileSync(calls, "utf8").trim().split("\n").map(row => JSON.parse(row));
+    expect(log.map(call => call.op)).toEqual(["env", "test"]);
+    for (const call of log) {
+      expect(call.HOME).not.toBe(operator);
+      expect(call.HOME).toBe(log[0].HOME);
+      expect(call.GOENV).toBeUndefined();
+      expect((call.GOFLAGS ?? "").trim()).toBe("");
+    }
+  }
+});

@@ -9,6 +9,8 @@ export function snapshotGitEnv() {
   return env;
 }
 
+const privateDirectories = new Set([".workbench", ".codex", ".agents", ".ssh"]);
+
 export const DIFF_BYTE_LIMIT = 1_500_000;
 
 export class Repo {
@@ -20,6 +22,7 @@ export class Repo {
   diffs = new Map<string, string[]>();
   excludedFiles: string[];
   readFiles = new Set<string>();
+  private lineCounts = new Map<string, number>();
   searches = 0;
   constructor(root: string, base: string, head: string) {
     this.root = realpathSync(root);
@@ -77,6 +80,21 @@ export class Repo {
     if (isPrivatePath(path)) throw new Error("Private file excluded");
     
     return path;
+  }
+  lineCount(path: string) {
+    const cached = this.lineCounts.get(path);
+    if (cached !== undefined) return cached;
+    this.path(path);
+    const headEntry = this.git(["--literal-pathspecs", "ls-tree", "-z", this.head, "--", path]);
+    // A file can be replaced by a directory. Its deleted lines belong to base.
+    const entry = !headEntry || /^040000 tree /.test(headEntry)
+      ? this.git(["--literal-pathspecs", "ls-tree", "-z", this.base, "--", path]) : headEntry;
+    const blob = /^\d+ blob ([0-9a-f]+)\t/.exec(entry);
+    const content = blob ? this.git(["cat-file", "blob", blob[1]], false, DIFF_BYTE_LIMIT) : "";
+    let lines = content.length && !content.endsWith("\n") ? 1 : 0;
+    for (let i = 0; i < content.length; i++) if (content.charCodeAt(i) === 10) lines++;
+    this.lineCounts.set(path, lines);
+    return lines;
   }
   diff(path: string, offset = 0, remainingBytes = DIFF_BYTE_LIMIT) {
     this.path(path);
@@ -158,7 +176,7 @@ export class Repo {
     // Zero-delimited path and line fields keep literal colons in names unambiguous.
     const raw = this.git(["grep", "-n", "-z", "-I", "-F", ...(maxPerFile ? ["-m", String(maxPerFile)] : []),
       ...terms.flatMap(term => ["-e", term]), this.head, "--", ...globs,
-      ":(exclude).workbench/**", ":(exclude).agents/**", ":(exclude).codex/**",
+      ...Array.from(privateDirectories, dir => ":(exclude,glob)**/" + dir + "/**"),
       ":(exclude)**/.env*", ":(exclude).env*", ":(exclude)**/config.toml", ":(exclude)config.toml",
       ":(exclude)*.pem", ":(exclude)*.key"], true);
     const hits: {path: string; line: number; text: string}[] = [];
@@ -252,6 +270,12 @@ function isInstructionFile(path: string) {
 }
 
 function isPrivatePath(path: string) {
-  if (/^\.agents\/skills\/[^/]+\/SKILL\.md$/.test(path)) return false;
-  return /^(?:\.workbench|\.codex|\.agents)\//.test(path) || /(^|\/)(?:AGENTS.local\.md|\.env(?:$|\.)|config\.toml$)|\.(?:pem|key)$/.test(path);
+  if (/(^|\/)(?:AGENTS\.local\.md(?:$|\/)|\.env(?:$|[./])|config\.toml$)|\.(?:pem|key)$/.test(path)) return true;
+  const parts = path.split("/");
+  const privateIndex = parts.findIndex(part => privateDirectories.has(part));
+  if (privateIndex === -1) return false;
+  // Only the public skill document itself may cross a private directory boundary.
+  const [marker, container, id, file, ...rest] = parts.slice(privateIndex);
+  return !(marker === ".agents" && container === "skills" && id && !privateDirectories.has(id) &&
+    file === "SKILL.md" && rest.length === 0);
 }

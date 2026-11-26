@@ -915,7 +915,7 @@ export class Ledger {
     const currentWorkflow = usesV05(this, params.task_id);
     const strictLegacyReview = !currentWorkflow && params.requireFrozenToolReview === true;
     const config = currentWorkflow ? installedInstance(this.workbenchRoot) : undefined;
-    const prodStages = currentWorkflow && task.endpoint === "prod" ? deploymentStages(config, task.endpoint) : [];
+    const rolloutStages = currentWorkflow && isRolloutEndpoint(task.endpoint) ? deploymentStages(config, task.endpoint) : [];
     const customVerification = config && (config.verification.source !== "core" ||
       config.verification.value.stages.some(id => config.stages.get(id)?.source !== "core"));
     const repoAttachments = this.getTaskRepos(params.task_id).filter((r) => r.repo === params.repo);
@@ -1066,9 +1066,11 @@ export class Ledger {
           (isRolloutEndpoint(task.endpoint) && p.kind === "prod" && (task.endpoint === "prod" ||
             (evidenceSource(p, ev.actor) === "tool" && p.meta?.delivery_endpoint === task.endpoint)))
         ) {
-          if (p.kind === "prod" && p.status === "pass" && prodStages.length &&
+          if (currentWorkflow && p.kind === "prod" && p.status === "pass" && task.endpoint !== "prod" &&
+              config?.delivery.value.endpoint !== task.endpoint) continue;
+          if (p.kind === "prod" && p.status === "pass" && rolloutStages.length &&
               (evidenceSource(p, ev.actor) !== "tool" || p.meta?.delivery_endpoint !== task.endpoint ||
-               !prodStages.every(id => p.meta?.stage_receipts?.some(receipt => receipt.stage === id &&
+               !rolloutStages.every(id => p.meta?.stage_receipts?.some(receipt => receipt.stage === id &&
                  receipt.state === "completed" && receipt.endpoint === task.endpoint &&
                  receipt.versions.some(version => version.repo === params.repo && version.head === params.head_sha))))) continue;
           if (p.kind === "pr" && p.status === "pass" &&

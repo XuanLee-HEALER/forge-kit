@@ -42,6 +42,13 @@ test("pinned reads, complete pagination and no worktree contamination", () => {
     expect(() => r.diff("a.ts", -1)).toThrow();
     expect(r.search("line399", "*.ts", 0).text).toContain("line399");
     expect(r.search("", "**", 0).text).toBe("1: a.ts");
+    const deletedBase = git("rev-parse","HEAD");
+    rmSync(join(dir,"a.ts"));
+    git("add", "-u", "--", "a.ts");
+    git("commit", "-qm", "delete file");
+    writeFileSync(join(dir,"a.ts"), "working tree replacement");
+    const deletion = new Repo(dir, deletedBase, git("rev-parse","HEAD"));
+    expect(deletion.lineCount("a.ts")).toBe(400);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -54,7 +61,7 @@ test("unread diffs never pass and blocking findings determine exit state", () =>
     checked: [],
     limitations: [],
   };
-  expect(validateReport(raw, ["a"], ["a"]).status).toBe("incomplete");
+  expect(validateReport(raw, ["a"], ["a"], () => 1).status).toBe("incomplete");
   expect(
     validateReport(
       {
@@ -72,6 +79,7 @@ test("unread diffs never pass and blocking findings determine exit state", () =>
       },
       ["a"],
       [],
+      () => 1,
     ).status,
   ).toBe("findings");
 });

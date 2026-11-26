@@ -1,8 +1,8 @@
 import { checkoutEnvironment, runProcess } from "../git";
 
-function effectiveFlags(bin: string, cwd: string): string | null {
-  if (process.env.GOFLAGS) return process.env.GOFLAGS;
-  const result = runProcess([bin, "env", "GOFLAGS"], { cwd, env: checkoutEnvironment() });
+function effectiveFlags(bin: string, cwd: string, env: NodeJS.ProcessEnv): string | null {
+  if (env.GOFLAGS) return env.GOFLAGS;
+  const result = runProcess([bin, "env", "GOFLAGS"], { cwd, env: checkoutEnvironment(env) });
   return result.code === 0 ? result.stdout.trim() : null;
 }
 
@@ -43,15 +43,15 @@ function preventsExecution(flags: string[], subcommand: string): boolean {
   return active.size > 0;
 }
 
-export function hasNonExecutingGoFlags(bin: string, cwd: string, args: string[]): boolean {
-  const effective = effectiveFlags(bin, cwd);
+export function hasNonExecutingGoFlags(bin: string, cwd: string, args: string[], env = process.env): boolean {
+  const effective = effectiveFlags(bin, cwd, env);
   const flags = effective === null ? null : parseGoFlags(effective);
   return !flags || preventsExecution([...flags, ...args.slice(1)], args[0]);
 }
 
-export function delegatedGoEnvironment(bin: string, cwd: string): Record<string, string> {
+export function delegatedGoEnvironment(bin: string, cwd: string, env: NodeJS.ProcessEnv): Record<string, string> {
   if (!["bun", "make"].includes(bin)) return {};
-  const effective = effectiveFlags("go", cwd);
+  const effective = effectiveFlags("go", cwd, env);
   // A nonempty whitespace value means zero flags and overrides saved Go settings.
   const flags = effective === null ? null : parseGoFlags(effective);
   return { GOFLAGS: effective && flags && !preventsExecution(flags, "test") ? effective : " " };

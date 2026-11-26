@@ -33,6 +33,22 @@ function upstreamCode(events: string): string | undefined {
   }
 }
 
+// Provider authentication and transport are independent of workbench, cloud
+// and deployment credentials present in the invoking agent's process.
+function codexEnvironment(cwd: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { PWD: cwd };
+  for (const name of [
+    "PATH", "HOME", "CODEX_HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
+    "SYSTEMROOT", "USERPROFILE", "LOCALAPPDATA", "APPDATA",
+    "CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL",
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY",
+    "https_proxy", "http_proxy", "no_proxy", "all_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR",
+  ]) {
+    if (process.env[name] !== undefined) env[name] = process.env[name];
+  }
+  return env;
+}
+
 async function codex(prompt: string, model: Model) {
   const tmp = mkdtempSync(join(tmpdir(), "forge-model-"));
   try {
@@ -49,7 +65,7 @@ async function codex(prompt: string, model: Model) {
       "-m", model.model, "-c", "model_reasoning_effort=" + JSON.stringify(model.effort),
       "--output-schema", schemaPath, "-o", result, "-",
     ];
-    const proc = Bun.spawn(args, { cwd: tmp, env: { ...process.env, PWD: tmp, FORGE_WORKBENCH_ROOT: undefined }, stdin: new Blob([prompt]), stdout: "pipe", stderr: "ignore", timeout: 300_000 });
+    const proc = Bun.spawn(args, { cwd: tmp, env: codexEnvironment(tmp), stdin: new Blob([prompt]), stdout: "pipe", stderr: "ignore", timeout: 300_000 });
     const [events, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
     if (code !== 0) {
       const upstream = !proc.signalCode && upstreamCode(events);
@@ -78,7 +94,10 @@ export async function invoke(backend: Backend, prompt: string, model: Model) {
         ? "API response incomplete: " + reason : "API response incomplete";
       return { status: "incomplete", summary, findings: [], checked: [], limitations: [summary] };
     }
-    if (response.status && response.status !== "completed") throw new BackendFailure("API response was " + response.status);
+    if (response.status && response.status !== "completed") {
+      const known = ["queued", "in_progress", "failed", "cancelled"].includes(response.status);
+      throw new BackendFailure(known ? "API response was " + response.status : "API returned an unexpected response status");
+    }
     return JSON.parse(response.output_text);
   } catch (err) {
     if (err instanceof BackendFailure) throw err;

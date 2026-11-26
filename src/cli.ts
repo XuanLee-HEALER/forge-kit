@@ -115,13 +115,22 @@ function visitSkillFiles(
     visit(dest + "SKILL.md", source);
     // Skill authors explicitly reference supporting files; adjacent private materials are never projected.
     const resources = new Set<string>();
-    for (const m of skill.value.body.matchAll(
-      /\]\(([^)# ]+)(?:#[^) ]*)?\)|`((?:references|assets|scripts)\/[^\s`]+)`/g,
-    )) {
-      const path = m[1] ?? m[2];
-      if (/^[a-z]+:/i.test(path) || path.startsWith("#")) continue;
-      resources.add(path.replace(/^\.\//, ""));
+    function link(href: string) {
+      const path = href.split("#", 1)[0];
+      if (path && !/^[a-z][a-z0-9+.-]*:/i.test(path)) {
+        const unescaped = path.replace(/\\([!-/:-@\[-`{-~])/g, "$1");
+        resources.add(decodeURIComponent(unescaped).replace(/^\.\//, ""));
+      }
+      return "";
     }
+    Bun.markdown.render(skill.value.body, {
+      link: (_, {href}) => link(href),
+      image: (_, {src}) => link(src),
+      codespan: path => {
+        if (/^(references|assets|scripts)\/\S+$/.test(path)) resources.add(path);
+        return "";
+      },
+    });
     for (const rel of resources) {
       const src = localPath(base, rel);
       visit(dest + rel, src);
@@ -867,8 +876,9 @@ Usage:
     checkMigration(root);
     const c = resolveInstance(root);
     if (verb === "run" && args.length === 1) {
-      const id=args[0];
-      if (id==="verify" && c.stages.get(id)?.source==="core" && !c.delivery.value.stages.includes(id)) {
+      const id = args[0];
+      const stage = c.stages.get(id);
+      if (stage?.source === "core" && stage.id === "verify") {
         const {verifyCli}=await import("./wb-verify");
         const result=verifyCli([]);
         console.log(JSON.stringify(result));

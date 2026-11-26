@@ -335,14 +335,16 @@ export function runInstanceStage(
   const cfg = verification?.config ?? resolveInstance(root),
     stage = cfg.stages.get(id);
   if (!stage) throw Error(`Unknown stage ${id}`);
-  const action = cfg.actions.get(stage.value.action);
+  if (stage.source === "core") {
+    if (id === "ship") throw Error("Stage ship requires the authorized forge ship executor");
+    throw Error("Use forge verify --task <task-id> to run the isolated core verification stage");
+  }
+  const action = cfg.actions.get(stage.value.action)!;
   if (
-    (stage.source === "core" && id === "ship") ||
     cfg.delivery.value.stages.includes(id) ||
-    (action && (deliveryPurposes.has(action.value.purpose) || /ship|deploy|deliver|release|prod.write/i.test(action.value.purpose)))
+    deliveryPurposes.has(action.value.purpose) || /ship|deploy|deliver|release|prod.write/i.test(action.value.purpose)
   )
     throw Error(`Stage ${id} requires the authorized forge ship executor`);
-  if (!action) throw Error(`Use forge verify --task <task-id> to run the isolated core verification stage`);
   if (process.env.FORGE_ACTIVE_STAGE)
     throw Error(`Recursive stage invocation: ${process.env.FORGE_ACTIVE_STAGE} -> ${id}`);
   const { argv, cwd } = action.value;

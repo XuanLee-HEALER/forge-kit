@@ -195,7 +195,7 @@ function executeCheck(
   timeoutMs = 120_000,
 ): LangCheckItem {
   const bin = basename(argv[0]);
-  const blocked = (bin === "go" && hasNonExecutingGoFlags(argv[0], cwd, argv.slice(1)));
+  const blocked = (bin === "go" && hasNonExecutingGoFlags(argv[0], cwd, argv.slice(1), baseEnv));
   if (blocked) {
     return {
       language, phase, name, command: argv.join(" "), status: "fail", exit_code: null,

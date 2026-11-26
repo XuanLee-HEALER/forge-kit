@@ -18,8 +18,9 @@ beforeEach(() => {
     "#!/usr/bin/env bun",
     'const args = process.argv.slice(2), data = JSON.parse(await Bun.stdin.text());',
     'if (!data.spec?.includes("Fixture requirements") || !args.includes("--ephemeral")) process.exit(2);',
-    'if (process.env.MUTATE_REPO) await Bun.write(process.env.MUTATE_REPO + "/edit", "modified");',
-    'await Bun.write(args[args.indexOf("-o")+1], JSON.stringify({status:"pass",summary:"reviewed fixture",findings:[],checked:[],limitations:["Runtime coverage unavailable"]}));',
+    'if (await Bun.file(import.meta.path + ".mutate").exists()) await Bun.write(' + JSON.stringify(join(f.repo, "edit")) + ', "modified");',
+    'const preset = Bun.file(import.meta.path + ".report");',
+    'await Bun.write(args[args.indexOf("-o")+1], await preset.exists() ? await preset.text() : JSON.stringify({status:"pass",summary:"reviewed fixture",findings:[],checked:[],limitations:["Runtime coverage unavailable"]}));',
   ].join("\n"));
   chmodSync(codex, 0o755);
 });
@@ -49,11 +50,21 @@ test("ordered review records only actual roles against the pinned task and versi
   }
 });
 test("a dirty checkout during review produces no trusted evidence", () => {
-  const r = run(["--roles", "quality"], { MUTATE_REPO: f.repo });
+  writeFileSync(codex + ".mutate", "change checkout during review");
+  const r = run(["--roles", "quality"]);
   expect(r.exitCode).toBe(2);
   expect(f.evidence().filter(e => e.kind === "review")).toHaveLength(0);
 });
 test("an invalid explicit version cannot start a review", () => {
   expect(run(["--head", "deadbee", "--roles", "quality"]).exitCode).not.toBe(0);
   expect(f.evidence().filter(e => e.kind === "review")).toHaveLength(0);
+});
+
+test("a nonexistent finding line records a real provider error instead of a blocker", () => {
+  writeFileSync(codex + ".report", JSON.stringify({status:"findings",summary:"fixture",checked:["code.txt"],limitations:[],
+    findings:[{severity:"blocking",path:"code.txt",line:900,title:"Fixture",evidence:"Fixture",recommendation:"Fixture"}]}));
+  const result = run(["--roles", "quality"]);
+  expect(result.exitCode).toBe(2);
+  expect(f.evidence().at(-1)).toMatchObject({source:"tool", meta:{backend:"codex",report_status:"error",
+    findings:[],attempts:[{backend:"codex",status:"error",reason:"Finding line exceeds the pinned file length"}]}});
 });

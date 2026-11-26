@@ -215,7 +215,7 @@ forge instance show skill ready --json
 forge instance run smoke
 ```
 
-技能查询读取实例上次成功同步的受管副本。修改或撤销私有技能覆写后，先运行同步再查询。原发行目录移动后，实例仍可查询和使用已交付的技能；下次同步从所需发行目录运行。
+技能正文可用 Markdown 行内链接、引用式链接或图片引用同目录下的资源，链接可带标题。同步时只投影引用的本地文件。技能查询读取实例上次成功同步的受管副本。修改或撤销私有技能覆写后，先运行同步再查询。原发行目录移动后，实例仍可查询和使用已交付的技能；下次同步从所需发行目录运行。
 
 ## 升级到 v0.5
 
@@ -234,9 +234,18 @@ forge instance run smoke
 | ledger | forge ledger |
 | guard | forge guard |
 | ledger-hook | forge ledger-hook |
-| dbcred | 生产读用 `forge dbcred <env> --ro`。内建生产写入支持 PostgreSQL。数据库环境条目须设置 `engine: postgres`、唯一的 `host`、`database` 和 `rw.user`，登记时 `psql` 须在 PATH 中。生产快轨须配置部署阶段及独立的 observe 动作，两者声明 inputs。创建精确任务 runbook 时传 `--exact --task <id>`，按配置顺序传 `--stage <id>`，用 `--sql <host>:<path>` 登记内容，获批后由 `forge ship` 执行。其他数据库沿用实例提供的受控交付路径。非生产环境继续使用 `forge dbcred <env> --ro` 或 `--rw`。 |
+| dbcred | 生产读取使用 `forge dbcred <env> --ro`。生产写入交给实例已有的受控交付流程。使用内建 PostgreSQL 快轨的实例见下方条件。非生产环境继续使用 `forge dbcred <env> --ro` 或 `--rw`。 |
 | cmdfmt | forge cmdfmt |
 | lang-check | forge lang-check |
+
+**使用内建 PostgreSQL 生产快轨的条件**
+
+升级会保留实例原有的交付策略。仅当操作者已经启用生产 SQL 快轨时才走以下流程。保留 v0.4 默认策略的实例继续使用各自已有的受控生产写入流程。
+
+1. 核对实例策略。快轨须启用，`max_endpoint` 为 `prod`，`allow_prod` 与 `require_ci_green_for_prod` 为 true，`forbid_db_rw` 为 false。
+2. 数据库条目须设置 `engine: postgres`、唯一的 `host`、`database` 与 `rw.user`。登记时 `psql` 须在 PATH 中。
+3. 每个挂载仓须有可核验的同仓 PR，来源分支与任务 HEAD 对应，目标为 main。只执行 SQL 和实例阶段时，也须能按来源分支查到该 PR。交付链使用内建 ship 合并时，每仓显式传 `--pr <repo>:<number>` 并遵守托管端原子合并条件。
+4. 实例须配置部署阶段及独立 observe 动作，两者均声明输入文件。用 `forge ledger runbook create --exact --task <id>` 登记精确计划，按实例顺序传 `--stage <id>`，用 `--sql <host>:<path>` 登记 SQL。按 ship 技能批准、兑现并核验目标端回执。
 
 迁移评审脚本时，将旧 `--roles perf` 或 `--roles performance` 改为 `--roles simplify`，该角色同时检查性能与简洁性。若升级时 v0.4 任务仍有未解决的 performance 失败，可在原基线、HEAD 和评审周期显式单选 `--roles performance`，复核结果会关联这条旧记录。其他情况下，原先同时选择两个角色的脚本只传一次 simplify。需要锁定后端时，用 `--backend codex` 或 `--backend api` 替换 `--no-fallback`。默认 `auto` 先运行独立 Codex 会话，上游服务异常时尝试 API。自动化从报告的 `roles` 数组读取每个已选角色的结果。`attempts` 为空表示该角色未启动，可查看 `missing_materials` 确认缺什么材料。整体退出码为 0（通过）、1（阻断）、2（执行错误）和 3（未完成）。
 

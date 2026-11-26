@@ -89,7 +89,7 @@ function managedPath(root: string, path: string) {
     path !== "AGENTS.md" &&
     path !== ".workbench/kit-lock.json" &&
     !/^\.codex\/(?:config\.toml|hooks\.json|agents\/[\w-]+\.toml)$/.test(path) &&
-    !/^\.agents\/skills\/[\w-]+(?:\/(?:[\w. -]|[^\x00-\x7f\p{C}])+)*$/u.test(path) &&
+    !/^\.agents\/skills\/[\w-]+(?:\/(?:[\w. ()-]|[^\x00-\x7f\p{C}])+)*$/u.test(path) &&
     !/^\.workbench\/bin\/[\w.-]+$/.test(path)
   )
     throw Error("Unexpected managed path: " + path);

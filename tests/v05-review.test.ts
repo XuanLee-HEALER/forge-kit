@@ -29,6 +29,12 @@ function modelReport(status: Status) {
   };
 }
 
+function configureCodex(settings: Record<string, string>) {
+  const path = codex + ".json";
+  const previous = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
+  writeFileSync(path, JSON.stringify({...previous, ...settings}));
+}
+
 beforeEach(() => {
   s = sandbox();
   repo = join(s.root, "materials");
@@ -48,21 +54,23 @@ beforeEach(() => {
   codex = join(s.bin, "codex");
   log = join(s.root, "requests.jsonl");
   writeFileSync(log, "");
+  configureCodex({ REQUESTS: log, QUALITY: JSON.stringify(modelReport("pass")), PASS: JSON.stringify(modelReport("pass")) });
   writeFileSync(codex, `#!/usr/bin/env bun
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const prompt = await Bun.stdin.text();
 const request = JSON.parse(prompt);
-appendFileSync(process.env.REQUESTS, JSON.stringify({args, prompt, role: request.role}) + "\\n");
-const trace = process.env.REQUESTS + ".trace";
+const settings = JSON.parse(readFileSync(import.meta.path + ".json", "utf8"));
+appendFileSync(settings.REQUESTS, JSON.stringify({args, prompt, role: request.role}) + "\\n");
+const trace = settings.REQUESTS + ".trace";
 appendFileSync(trace, "start " + request.role + "\\n");
-if (process.env.RENDEZVOUS === "parallel") {
+if (settings.RENDEZVOUS === "parallel") {
   const end = Date.now()+5000;
   while(readFileSync(trace, "utf8").split("start ").length < 3 && Date.now()<end) await Bun.sleep(15);
   if (readFileSync(trace, "utf8").split("start ").length < 3) process.exit(4);
 }
 appendFileSync(trace, "end " + request.role + "\\n");
-switch (process.env.CLI_FAILURE) {
+switch (settings.CLI_FAILURE) {
   case "upstream":
     console.log(JSON.stringify({type:"turn.failed",error:{codex_error_info:{http_connection_failed:{http_status_code:503}}}}));
     process.exit(1);
@@ -71,7 +79,7 @@ switch (process.env.CLI_FAILURE) {
 }
 const index = args.indexOf("-o");
 if (index < 0) process.exit(2);
-const result = request.role === "quality" ? process.env.QUALITY : process.env.PASS;
+const result = request.role === "quality" ? settings.QUALITY : settings.PASS;
 writeFileSync(args[index+1], result);
 `);
   chmodSync(codex, 0o755);
@@ -88,7 +96,7 @@ test("the clean standalone package runs a pinned review offline from its bundled
   }
   // Only the source checkout used to build the tarball can resolve installed dependencies.
   symlinkSync(existsSync(join(workspace, "node_modules")) ? join(workspace, "node_modules") : join(kit, "node_modules"), join(source, "node_modules"));
-  Object.assign(s.env, {FORGE_CODEX_BIN: codex, REQUESTS: log, QUALITY: JSON.stringify(modelReport("pass"))});
+  s.env.FORGE_CODEX_BIN = codex;
   const args = ["--repo", repo, "--base", base, "--head", head, "--roles", "quality", "--backend", "codex"];
   const run = (root: string) => {
     const report = JSON.parse(s.ok([join(root, "bin/review"), ...args]));
@@ -114,8 +122,10 @@ test("the clean standalone package runs a pinned review offline from its bundled
   for (const request of requests) expect(request.prompt).toContain(marker);
 }, 60_000);
 
-async function exercise(backend: string, status: Status, options: {failure?: string; roles?: string; mode?: string; gate?: string} = {}) {
+async function exercise(backend: string, status: Status, options: {failure?: string; roles?: string; mode?: string; gate?: string; findingLine?: number} = {}) {
   const apiRequests: string[] = [];
+  const quality = modelReport(status);
+  if (options.findingLine !== undefined && quality.findings[0]) quality.findings[0].line = options.findingLine;
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
     async fetch(req) {
@@ -123,7 +133,7 @@ async function exercise(backend: string, status: Status, options: {failure?: str
       const body = await req.text();
       apiRequests.push(body);
       const role = /"role"\s*:\s*"quality"/.test(body.replaceAll('\\"', '"'));
-      const report = role ? modelReport(status) : modelReport("pass");
+      const report = role ? quality : modelReport("pass");
       return Response.json({ id: "resp_fixture", object: "response", status: "completed",
         output: [{ type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: JSON.stringify(report) }] }] });
     },
@@ -133,10 +143,11 @@ async function exercise(backend: string, status: Status, options: {failure?: str
     "--backend", backend];
   if (!options.mode) args.push("--order", "comments,quality");
   try {
+    configureCodex({ QUALITY: JSON.stringify(quality), PASS: JSON.stringify(modelReport("pass")),
+      CLI_FAILURE: options.failure ?? "", RENDEZVOUS: options.gate ?? "" });
     const proc = Bun.spawn(args, {
       cwd: s.root, env: { ...s.env, FORGE_CODEX_BIN: codex, OPENAI_BASE_URL: server.url.href + "v1",
-        OPENAI_API_KEY: "fixture-loopback-only", REQUESTS: log, QUALITY: JSON.stringify(modelReport(status)),
-        PASS: JSON.stringify(modelReport("pass")), CLI_FAILURE: options.failure ?? "", RENDEZVOUS: options.gate ?? "" },
+        OPENAI_API_KEY: "fixture-loopback-only" },
       stdout: "pipe", stderr: "pipe", timeout: 25_000,
     });
     const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
@@ -213,7 +224,7 @@ test("ledger reviews preserves selected roles that could not start and their mis
   s.git(s.work, "clone", "-q", repo, app);
   s.ok([s.forge, "ledger", "open", "--id", "selection", "--title", "Check review coverage", "--repo", "app",
     "--branch", "main", "--base", base, "--depth", "targeted"]);
-  Object.assign(s.env, { FORGE_CODEX_BIN: codex, REQUESTS: log, QUALITY: JSON.stringify(modelReport("pass")) });
+  s.env.FORGE_CODEX_BIN = codex;
   const args = [s.forge, "review", "--task", "selection", "--repo", "app", "--roles", "business,quality", "--backend", "codex"];
   const prior = s.run([s.forge, "review", "--task", "selection", "--repo", "app", "--roles", "quality", "--backend", "codex"], app);
   expect(prior.code, prior.out + prior.err).toBe(0);
@@ -241,7 +252,7 @@ test("ledger reviews preserves selected roles that could not start and their mis
   expect(empty.err + empty.out).toContain("Empty review diff");
   expect(JSON.parse(s.ok([s.forge, "ledger", "reviews", "selection"]))).toEqual(reviews);
 
-  s.env.QUALITY = JSON.stringify(modelReport("incomplete"));
+  configureCodex({QUALITY: JSON.stringify(modelReport("incomplete"))});
   expect(s.run(args, app).code).toBe(3);
   const attempted = JSON.parse(s.ok([s.forge, "ledger", "reviews", "selection"])).at(-1);
   expect(attempted).toMatchObject({ kind: "review", role: "quality", status: "incomplete", backend: "codex",
@@ -259,7 +270,7 @@ for (const version of ["0.4", "0.5"] as const) test(`v${version} performance ret
       repo:"app", branch:"main", base_sha:base, head_sha:head});
     for (const file of ["ssot", "tech-spec", "test-spec"]) s.privateFile(`.workbench/specs/${task}/${file}.md`, "Review the pinned revision.");
     const floor = db.freezeSpec({task_id: task}).spec.evidence_floor_seq.review;
-    Object.assign(s.env, {FORGE_CODEX_BIN:codex, REQUESTS:log, PASS:JSON.stringify(modelReport("pass"))});
+    s.env.FORGE_CODEX_BIN = codex;
     const review = (role: string, ...more: string[]) => s.run([s.forge, "review", "--task", task, "--repo", "app", "--roles", role, "--backend", "codex", ...more], app);
     expect(review("performance").code).not.toBe(0);
     const scope = { task_id:task, repo:"app", branch:"main", sha:head, source:"tool" as const, actor:"tool" };
@@ -275,14 +286,14 @@ for (const version of ["0.4", "0.5"] as const) test(`v${version} performance ret
     }
 
     for (const kind of ["lint","test"] as const) db.recordEvidence({...scope, kind, status:"pass", summary: "fixture verification"});
-    s.env.QUALITY = JSON.stringify(modelReport("pass"));
+    configureCodex({QUALITY: JSON.stringify(modelReport("pass"))});
     const readiness = () => db.checkPushReadiness({task_id:task, repo:"app", branch:"main", head_sha:head});
     expect(review("quality,simplify").code).toBe(0);
     expect(readiness().hasExplicitFailure).toBe(true);
-    s.env.PASS = JSON.stringify(modelReport("blocked"));
+    configureCodex({PASS: JSON.stringify(modelReport("blocked"))});
     expect(review("performance").code).toBe(1);
     expect(readiness().hasExplicitFailure).toBe(true);
-    s.env.PASS = JSON.stringify(modelReport("pass"));
+    configureCodex({PASS: JSON.stringify(modelReport("pass"))});
     const retry = review("performance");
     expect(retry.code, retry.out + retry.err).toBe(0);
     expect(JSON.parse(retry.out).roles).toMatchObject([{ role:"performance", base, head, status:"pass", backend:"codex" }]);
@@ -302,3 +313,11 @@ for (const version of ["0.4", "0.5"] as const) test(`v${version} performance ret
     expect(review("performance").code).not.toBe(0);
   } finally { db.closeDb(); }
 }, 30_000);
+
+
+for (const backend of ["codex", "api"]) test("invalid pinned finding line is a provider error via " + backend, async () => {
+  const result = await exercise(backend, "blocked", {roles: "quality", mode: "serial", findingLine: 900});
+  expect(result.code, result.err).toBe(2);
+  expect(JSON.parse(result.out).roles[0]).toMatchObject({backend, status:"error", findings:[],
+    attempts:[{backend,status:"error",reason:"Finding line exceeds the pinned file length"}]});
+});

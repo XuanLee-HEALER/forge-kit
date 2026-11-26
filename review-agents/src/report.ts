@@ -87,15 +87,19 @@ export function cleanReport(raw: unknown, paths: string[] = []) {
   return r;
 }
 
+export class FindingLocationError extends Error {}
+
 export function validateReport(
   raw: unknown,
   files: string[],
   missing: string[],
+  lineCount: (path: string) => number,
 ) {
   const r = cleanReport(raw, files);
-  for (const f of r.findings)
-    if (!files.includes(f.path))
-      throw new Error("Finding must anchor to a changed file");
+  for (const f of r.findings) {
+    if (!files.includes(f.path)) throw new FindingLocationError("Finding must anchor to a changed file");
+    if (f.line > lineCount(f.path)) throw new FindingLocationError("Finding line exceeds the pinned file length");
+  }
   if (missing.length) {
     r.status = "incomplete";
     r.limitations.push(`Unread diff: ${missing.join(", ")}`);

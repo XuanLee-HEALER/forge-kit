@@ -111,7 +111,7 @@ export function verifyCli(args: string[]) {
       results.push({ kind: k, command, exit_code: code, output_sha256 });
     }
     if (kind) {
-      if (!isVerificationCommand(kind, argv, dir, snap.head))
+      if (!isVerificationCommand(kind, argv, dir, snap.head, baseEnv))
         throw Error("Expected an executable verification runner for " + kind);
       const hash = createHash("sha256");
       const child = runVerificationProcess(argv, kind === "test", {

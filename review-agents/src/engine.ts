@@ -2,8 +2,9 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { DIFF_BYTE_LIMIT, Repo } from "./repo";
-import { validateReport } from "./report";
+import { FindingLocationError, ReportTextError, validateReport } from "./report";
 import { roles, instructions, type Role } from "./roles";
+import { CredentialConfigError } from "./config";
 import { BackendFailure, invoke, type Backend, type Model } from "./backend";
 
 export type Status = "pass" | "blocked" | "incomplete" | "error";
@@ -106,12 +107,12 @@ export async function runReview(params: Option & {
     const backends: Backend[] = backend === "auto" ? ["codex", "api"] : [backend];
     for (const active of backends) {
       try {
-        const report = validateReport(await invoke(active, prompt, model), repo.files, []);
+        const report = validateReport(await invoke(active, prompt, model), repo.files, [], path => repo.lineCount(path));
         const status = report.status === "findings" ? "blocked" : report.status;
         attempts.push({ backend: active, status });
         return { ...common, backend: active, attempts, limitations: report.limitations, findings: report.findings, summary: report.summary, status };
       } catch (error) {
-        const summary = error instanceof BackendFailure ? error.message : "Unable to execute backend or validate report";
+        const summary = (error instanceof BackendFailure || error instanceof CredentialConfigError || error instanceof FindingLocationError || error instanceof ReportTextError) ? error.message : "Unable to execute backend or validate report";
         attempts.push({ backend: active, status: "error", reason: summary });
         if (backend === "auto" && active === "codex" && error instanceof BackendFailure && error.upstream) continue;
         return { ...common, backend: active, attempts, limitations: [], findings: [], summary, status: "error" };

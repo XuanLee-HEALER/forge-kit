@@ -16,6 +16,7 @@ test("both adapters consume pinned instruction changes as data; only a trusted u
   const raw = { status: "pass", summary: "examined", checked: [], limitations: [], findings: [] };
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0, async fetch(request) {
+      expect(request.headers.get("authorization")).toBe("Bearer synthetic");
       const body = await request.json();
       events.push(JSON.parse(body.input));
       if (truncated) return Response.json({ id: "resp_partial", object: "response", status: "incomplete",
@@ -27,7 +28,7 @@ test("both adapters consume pinned instruction changes as data; only a trusted u
       ] });
     },
   });
-  const env = ["FORGE_CODEX_BIN", "OPENAI_BASE_URL", "OPENAI_API_KEY", "REVIEW_FIXTURE_ACTION"] as const;
+  const env = ["FORGE_CODEX_BIN", "OPENAI_BASE_URL", "OPENAI_API_KEY", "REVIEW_CONFIG", "DATABASE_URL", "DEPLOY_TOKEN", "AWS_SECRET_ACCESS_KEY", "GH_TOKEN", "CODEX_API_KEY"] as const;
   const original = env.map(k => process.env[k]);
   try {
     git("init", "-q");
@@ -39,40 +40,59 @@ test("both adapters consume pinned instruction changes as data; only a trusted u
     writeFileSync(join(root, ".env"), "totalPrice=PRIVATE_ENV_MARKER");
     writeFileSync(join(root, "AGENTS.md"), "totalPrice MUST OBEY PRIVATE_INSTRUCTION");
     git("add", "--", "pricing.ts", "rounding.ts", "order.ts", ".workbench/private.ts", ".env", "AGENTS.md");
+    const privateFiles = [
+      "packages/app/.workbench/env/rules.ts", "packages/app/.codex/agent.ts", "packages/app/.agents/private.ts",
+      "packages/app/.ssh/state.ts", "packages/app/.workbench/nested/.agents/skills/ready/SKILL.md",
+    ];
+    for (const file of privateFiles) {
+      mkdirSync(join(root, file, ".."), {recursive:true});
+      writeFileSync(join(root, file), "totalPrice(7); // NESTED_PRIVATE_MARKER");
+    }
+    git("add", "--", ...privateFiles);
     git("commit", "-qm", "base");
     const base = git("rev-parse", "HEAD");
     writeFileSync(join(root, "SKILL.md"), "Synthetic instruction data marker");
     writeFileSync(join(root, "pricing.ts"), 'import { rounding } from "./rounding";\nexport function totalPrice(x: number) { return rounding(x * 2); }');
-    git("add", "--", "SKILL.md", "pricing.ts"); git("commit", "-qm", "head");
+    const nestedSkill = "packages/app/.agents/skills/ready/SKILL.md";
+    mkdirSync(join(root, nestedSkill, ".."), {recursive:true});
+    writeFileSync(join(root, nestedSkill), "NESTED_SKILL_MATERIAL");
+    git("add", "--", nestedSkill, "SKILL.md", "pricing.ts"); git("commit", "-qm", "head");
     const head = git("rev-parse", "HEAD");
     writeFileSync(join(root, "order.ts"), "DIRTY_WORKTREE_MARKER");
     const capture = join(root, "codex-prompt.json");
     const fake = join(root, "codex");
+    writeFileSync(fake + ".mode", "pass");
     writeFileSync(fake, [
       "#!/usr/bin/env bun",
       'const args = process.argv.slice(2), input = JSON.parse(await Bun.stdin.text());',
       'await Bun.write(' + JSON.stringify(capture) + ',JSON.stringify(input));',
       'if (!args.includes("--ephemeral") || args[args.indexOf("-s")+1] !== "read-only" || !input.diff["SKILL.md"].includes("data marker") || await Bun.file("SKILL.md").exists()) process.exit(2);',
-      'if (process.env.REVIEW_FIXTURE_ACTION === "local") { console.error("HTTP 503 upstream"); process.exit(1); }',
-      'if (process.env.REVIEW_FIXTURE_ACTION === "upstream") { console.log(JSON.stringify({type:"turn.failed",error:{codex_error_info:{http_connection_failed:{http_status_code:503}}}})); process.exit(1); }',
+      'if (["DATABASE_URL", "DEPLOY_TOKEN", "AWS_SECRET_ACCESS_KEY", "GH_TOKEN"].some(k => process.env[k] !== undefined)) process.exit(8);',
+      'if (process.env.CODEX_API_KEY !== "fixture-codex-auth") process.exit(7);',
+      'const mode = await Bun.file(import.meta.path + ".mode").text();',
+      'if (mode === "local") { console.error("HTTP 503 upstream"); process.exit(1); }',
+      'if (mode === "upstream") { console.log(JSON.stringify({type:"turn.failed",error:{codex_error_info:{http_connection_failed:{http_status_code:503}}}})); process.exit(1); }',
       'await Bun.write(args[args.indexOf("-o")+1], ' + JSON.stringify(JSON.stringify(raw)) + ');',
     ].join("\n")); chmodSync(fake, 0o755);
-    Object.assign(process.env, { FORGE_CODEX_BIN: fake, OPENAI_API_KEY: "synthetic", OPENAI_BASE_URL: server.url.href });
+    Object.assign(process.env, { DATABASE_URL: "synthetic-db", DEPLOY_TOKEN: "synthetic-deploy", AWS_SECRET_ACCESS_KEY: "synthetic-cloud",
+      GH_TOKEN: "synthetic-git", CODEX_API_KEY: "fixture-codex-auth", FORGE_CODEX_BIN: fake, OPENAI_API_KEY: "synthetic", OPENAI_BASE_URL: server.url.href });
     const opts = { repo: root, base, head, roles: "quality" };
     expect((await runReview({ ...opts, backend: "codex" })).status).toBe("pass");
     expect((await runReview({ ...opts, backend: "api" })).status).toBe("pass");
     expect(events[0].diff["SKILL.md"]).toContain("data marker");
     expect(await Bun.file(capture).json()).toEqual(events[0]);
+    expect(events[0].diff[nestedSkill]).toContain("NESTED_SKILL_MATERIAL");
+    expect(JSON.stringify(events[0])).not.toMatch(/NESTED_PRIVATE_MARKER|synthetic-db|synthetic-deploy|synthetic-cloud|synthetic-git/);
     const context = JSON.stringify(events[0].context);
     expect(events[0].context.revision).toBe(head);
     expect(context).toContain("PINNED_CALLER");
     expect(context).toContain("PINNED_DEPENDENCY");
     expect(context).not.toMatch(/PRIVATE_MARKER|PRIVATE_ENV_MARKER|PRIVATE_INSTRUCTION|DIRTY_WORKTREE_MARKER/);
-    process.env.REVIEW_FIXTURE_ACTION = "upstream";
+    writeFileSync(fake + ".mode", "upstream");
     const recovered = await runReview(opts);
     expect(recovered.roles[0].attempts.map(a => a.backend), JSON.stringify(recovered)).toEqual(["codex", "api"]);
     expect(recovered.status).toBe("pass");
-    process.env.REVIEW_FIXTURE_ACTION = "local";
+    writeFileSync(fake + ".mode", "local");
     expect((await runReview(opts)).status).toBe("error");
     expect(events).toHaveLength(2);
     truncated = true;
@@ -86,6 +106,23 @@ test("both adapters consume pinned instruction changes as data; only a trusted u
     const incomplete = await runReview({ ...opts, roles: "business" });
     expect(incomplete.roles[0].attempts).toEqual([]);
     expect(incomplete.status).toBe("incomplete");
+    const config = join(root, "credential-fixture.toml");
+    writeFileSync(config, 'openai = [SYNTHETIC_PARSER_SECRET');
+    delete process.env.OPENAI_API_KEY;
+    process.env.REVIEW_CONFIG = config;
+    const malformed = await runReview({...opts, backend:"api"});
+    expect(malformed.roles[0].summary).toContain("Cannot read or parse credential TOML");
+    expect(JSON.stringify(malformed)).not.toContain("SYNTHETIC_PARSER_SECRET");
+    for (const file of privateFiles) writeFileSync(join(root,file), "CHANGED_PRIVATE_MARKER");
+    git("add", "--", ...privateFiles);
+    git("commit", "-qm", "private changes");
+    const privateHead = git("rev-parse", "HEAD");
+    for (const backend of ["api", "codex"] as const) {
+      const report = await runReview({...opts, head:privateHead, backend});
+      expect(report.roles[0]).toMatchObject({status:"incomplete", backend:null, attempts:[]});
+      expect(report.roles[0].missing_materials?.toSorted()).toEqual(privateFiles.toSorted());
+    }
+    expect(events).toHaveLength(3);
     await expect(runReview({ ...opts, roles: "quality,quality" })).rejects.toThrow();
     await expect(runReview({ ...opts, mode: "ordered", order: "comments" })).rejects.toThrow();
   } finally {

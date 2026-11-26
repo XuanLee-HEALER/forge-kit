@@ -124,9 +124,9 @@ export function checkDeliveryDefinition(root: string, plan: ExactPlan) {
 export function stagePin(root: string, id: string): Extract<ShipAction, { kind: "stage" }> {
   const cfg = resolveInstance(root),
     stage = cfg.stages.get(id);
-  const action = stage && cfg.actions.get(stage.value.action);
-  if (!action || !stage || !cfg.delivery.value.stages.includes(id))
+  if (!stage || stage.source === "core" || !cfg.delivery.value.stages.includes(id))
     throw Error("Expected configured delivery stage " + id);
+  const action = cfg.actions.get(stage.value.action)!;
   const observer = stage.value.observe && cfg.actions.get(stage.value.observe);
   if (!observer || observer.value.purpose !== "observe" || stage.value.observe === stage.value.action)
     throw Error(

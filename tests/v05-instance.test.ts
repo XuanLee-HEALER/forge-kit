@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parse, stringify } from "yaml";
+import { runInstanceStage } from "../src/instance";
 import { locateRepo } from "../src/git";
 import { kit, sandbox, type Sandbox } from "./v05-sandbox";
 
@@ -86,18 +87,52 @@ test("T02 discovery, invocation and repeated sync preserve one effective skill",
   expect(decision.some(reply => reply.code === 2 || /"permissionDecision"\s*:\s*"deny"/.test(reply.text))).toBe(true);
 }, 90_000);
 
+test("instance run dispatches built-ins by stage source even with same-name private actions", () => {
+  s.fresh();
+  const actions = Object.fromEntries(["verify", "ship"].map(id => [id, {
+    purpose: "diagnose", argv: ["bun", "-e", "await Bun.write('" + id + "-ran', 'yes')"],
+  }]));
+  configure({actions});
+  const direct = s.run([s.forge, "verify"]);
+  const builtin = s.run([s.forge, "instance", "run", "verify"]);
+  expect(builtin.code).not.toBe(0);
+  expect(builtin.err).toBe(direct.err);
+  expect(() => runInstanceStage(s.work, "verify")).toThrow("isolated core verification");
+  expect(() => runInstanceStage(s.work, "ship")).toThrow("authorized forge ship");
+  const ship = s.run([s.forge, "instance", "run", "ship"]);
+  expect(ship.code).not.toBe(0);
+  expect(ship.err).toContain("authorized forge ship");
+  expect(existsSync(join(s.work, "ship-ran"))).toBe(false);
+  expect(existsSync(join(s.work, "verify-ran"))).toBe(false);
+  configure({actions, stages:{inspect:{action:"verify"}}});
+  s.ok([s.forge, "instance", "run", "inspect"]);
+  expect(s.read("verify-ran")).toBe("yes");
+  unlinkSync(join(s.work, "verify-ran"));
+  configure({actions:{...actions, verify:{...actions.verify, purpose:"verify"}}, stages:{verify:{action:"verify"}}});
+  s.ok([s.forge, "instance", "run", "verify"]);
+  expect(s.read("verify-ran")).toBe("yes");
+});
+
 test("sync projects referenced Unicode resources while enforcing the skill directory boundary", () => {
   s.fresh();
   const dir = ".workbench/overrides/ready";
   const resource = "references/验收（草案）.md";
   const header = "---\nname: ready\ndescription: 本地技能\n---\n";
-  const skill = s.privateFile(dir + "/SKILL.md", header + "[验收](" + resource + ")");
+  const skill = s.privateFile(dir + "/SKILL.md", header + [
+    '[验收](' + resource + '#section "Usage")', "[Steps][guide]", "",
+    "[guide]: <references/操作 指南.md> 'Guide'", "", "![示例](assets/流程%20图.png)",
+    "[version](references/版本\\(1\\).md)", "`scripts/check.ts`", "`[Example](references/private.md)`",
+  ].join("\n"));
   const source = s.privateFile(dir + "/" + resource, "验收内容");
+  const supporting = ["references/操作 指南.md", "assets/流程 图.png", "references/版本(1).md", "scripts/check.ts"];
+  for (const file of supporting) s.privateFile(dir + "/" + file, file);
   configure({skills:{ready:dir}});
   const sync = [s.forge, "sync", s.work];
   const projected = ".agents/skills/ready/" + resource;
   s.ok(sync);
   expect(s.read(projected)).toBe("验收内容");
+  for (const file of supporting) expect(s.read(".agents/skills/ready/" + file)).toBe(file);
+  expect(existsSync(join(s.work, ".agents/skills/ready/references/private.md"))).toBe(false);
   s.ok([s.forge, "doctor", s.work, "--json"]);
   writeFileSync(source, "修订");
   s.ok(sync);
@@ -108,9 +143,10 @@ test("sync projects referenced Unicode resources while enforcing the skill direc
   for (const [reference, reason] of [
     ["references/链接.md", "Symlink in managed path"],
     ["../../验收.md", "Expected a relative path"],
+    ["%2e%2e/%2e%2e/验收.md", "Expected a relative path"],
     ["references", "Unreadable file"],
   ]) {
-    writeFileSync(skill, header + "[验收](" + reference + ")");
+    writeFileSync(skill, header + '[验收][guide]\n\n[guide]: <' + reference + '> "Usage"');
     const result = s.run(sync);
     expect(result.code).not.toBe(0);
     expect(result.err + result.out).toContain(reason);

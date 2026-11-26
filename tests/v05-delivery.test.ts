@@ -174,6 +174,7 @@ console.log(JSON.stringify(observation));
 }
 
 function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "prod" : "pr", useAtomicHost: boolean | string=true, includeMerge=true) {
+  const rolloutEndpoint = taskEndpoint === "blue-rollout" ? taskEndpoint : "prod";
   const prepared = preparePullRequest("full", false, taskEndpoint);
   const {ledger} = prepared;
   const receipt = join(s.work, "stage-effects");
@@ -187,7 +188,7 @@ function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "pro
     const policyDoc = parse(readFileSync(policy, "utf8"));
     Object.assign(policyDoc.fast_track, {allow_prod: true, max_endpoint: "prod"});
     writeFileSync(policy, stringify(policyDoc));
-    configureStage(localRollout, prepared.head, prepared.base, "prod", "rollout");
+    configureStage(localRollout, prepared.head, prepared.base, rolloutEndpoint, "rollout");
   }
   const cfgPath = join(s.work, ".workbench/workbench.yaml");
   const cfg=parse(readFileSync(cfgPath,"utf8"));
@@ -197,7 +198,7 @@ function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "pro
   writeFileSync(cfgPath,stringify(cfg));
   const book = JSON.parse(ledger("runbook", "create", "--exact", "--task", "ship-task", "--title", "local target", ...(includeMerge ? ["--pr", "app:1"] : []),
     ...(localRollout ? ["--stage", "rollout"] : [])));
-  const envelope = JSON.parse(ledger("fast-track", "prepare", "ship-task", "--to", localRollout ? "prod" : "pr", "--paths", "src/**", "--runbook", book.runbook_id)).envelope_id;
+  const envelope = JSON.parse(ledger("fast-track", "prepare", "ship-task", "--to", localRollout ? rolloutEndpoint : "pr", "--paths", "src/**", "--runbook", book.runbook_id)).envelope_id;
   const transport = localTransport(prepared.bare, prepared.calls);
   const approve = () => {
     const approval = s.hook("UserPromptSubmit", {session_id: "operator", prompt: "快轨批准 " + envelope});
@@ -814,8 +815,8 @@ test("T11 failed observer after submission degrades once with a sanitized diagno
   }
 },90_000);
 
-test("T11 a stage-only rollout records confirmed target evidence and closes while the PR remains open", () => {
-  const f=delivery("success","prod",false,false);
+for (const endpoint of ["prod", "blue-rollout"]) test("T11 a stage-only rollout checks current stages before closing " + endpoint, () => {
+  const f=delivery("success",endpoint,false,false);
   f.approve();
   const run = JSON.parse(s.ok(f.shipArgs));
   expect(run.status).toBe("REDEEMED");
@@ -827,6 +828,16 @@ test("T11 a stage-only rollout records confirmed target evidence and closes whil
     expect(Object.hasOwn(evidence.meta,key)).toBe(false);
   expect(JSON.parse(readFileSync(f.state,"utf8")).state).toBe("OPEN");
   expect(s.git(f.bare,"rev-parse","refs/heads/main").trim()).toBe(f.base);
+  const file = join(s.work, ".workbench/workbench.yaml");
+  const original = readFileSync(file, "utf8");
+  const cfg = parse(original);
+  cfg.extensions.stages.confirm = { ...cfg.extensions.stages.rollout };
+  cfg.extensions.delivery.stages.push("confirm");
+  writeFileSync(file, stringify(cfg));
+  const close = s.run([s.forge, "ledger", "close", "ship-task", "--summary", "check current required stages", "--no-archive"]);
+  expect(close.code).not.toBe(0);
+  expect(close.err + close.out).toContain("delivery evidence");
+  writeFileSync(file, original);
   expect(JSON.parse(f.ledger("close","ship-task","--summary","verified isolated rollout","--no-archive")).task.status).toBe("CLOSED");
   expect(JSON.parse(f.ledger("verify","--task","ship-task","--json")).ok).toBe(true);
 },90_000);

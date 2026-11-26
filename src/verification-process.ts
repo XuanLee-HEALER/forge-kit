@@ -42,7 +42,8 @@ type Options = NonNullable<Parameters<typeof runProcess>[1]> & { cwd: string; ba
 
 export function runVerificationProcess(argv: string[], dynamic: boolean, options: Options) {
   const bin = basename(argv[0]);
-  const env: Record<string, string | undefined> = { ...checkoutEnvironment(options.baseEnv), ...delegatedGoEnvironment(bin, options.cwd), ...options.env };
+  const env = { ...checkoutEnvironment(options.baseEnv), ...options.env };
+  Object.assign(env, delegatedGoEnvironment(bin, options.cwd, env));
   if (bin === "tsc") {
     const executable = Bun.which(argv[0], { PATH: env.PATH, cwd: options.cwd });
     if (!executable) throw Error("TypeScript compiler not found in verification environment");
