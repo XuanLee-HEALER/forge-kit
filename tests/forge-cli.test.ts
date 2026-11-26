@@ -9,12 +9,13 @@ import {
   mkdtempSync,
   readFileSync,
   readlinkSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import {
   addRepo,
   checkCodexHooksTrust,
@@ -58,7 +59,6 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
       targetDir: target,
       name: "acme-garage",
       gitOrg: "acme",
-      packs: ["dbop", "comm-lark"],
       skipReviewAgents: true,
     });
     expect(existsSync(join(res.root, ".workbench", "env", ".gitignore"))).toBe(true);
@@ -128,6 +128,75 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const doc = doctorWorkbench(res.root);
     expect(doc.ok).toBe(true);
     expect(doc.issues.length).toBe(0);
+  });
+
+  test("retired domain skills are absent from clean installs and CLI help", () => {
+    const kit = join(import.meta.dir, "..");
+    const bench = join(target, "bench");
+    const forge = join(kit, "bin/forge");
+    const run = (exe: string, args: string[]) =>
+      Bun.spawnSync([exe, ...args], { cwd: target, env: { ...process.env, BUN_BIN: process.execPath } });
+    const init = run(forge, ["init", bench, "--skip-review-agents"]);
+    expect(init.exitCode, init.stderr.toString()).toBe(0);
+    const skills = readdirSync(join(bench, ".agents/skills"));
+    const retired = ["form-ux", "dbop", "comm-lark", "work-communication"];
+    for (const name of retired) expect(skills).not.toContain(name);
+    const help = run(join(bench, ".workbench/bin/forge"), ["--help"]);
+    expect(help.exitCode).toBe(0);
+    expect(help.stdout.toString()).toContain("forge init");
+    expect(help.stdout.toString()).not.toMatch(/--packs|form-ux|dbop|comm-lark|work-communication/);
+    const requested = join(target, "requested");
+    const legacy = run(forge, ["init", requested, "--packs", "dbop,comm-lark", "--skip-review-agents"]);
+    if (legacy.exitCode === 0) {
+      const installed = readdirSync(join(requested, ".agents/skills"));
+      for (const name of retired) expect(installed).not.toContain(name);
+    }
+  });
+
+  test("Bun distribution excludes retired source assets and instance skills", () => {
+    const kit = join(import.meta.dir, "..");
+    const stage = join(target, "kit");
+    mkdirSync(stage);
+    for (const name of ["package.json", ".gitignore", ".npmignore", "core", "packs", "templates", "dist"]) {
+      if (existsSync(join(kit, name))) cpSync(join(kit, name), join(stage, name), { recursive: true });
+    }
+    // Real workbenches may keep retired skills as private overrides after upgrading.
+    const privateSkill = join(stage, ".agents/skills/form-ux");
+    mkdirSync(privateSkill, { recursive: true });
+    writeFileSync(join(privateSkill, "SKILL.md"), "synthetic private form conventions");
+    const archive = join(target, "distribution.tgz");
+    const pack = Bun.spawnSync([process.execPath, "pm", "pack", "--ignore-scripts", "--filename", archive], { cwd: stage });
+    expect(pack.exitCode, pack.stderr.toString()).toBe(0);
+    const listing = Bun.spawnSync(["tar", "-tzf", archive]);
+    expect(listing.exitCode, listing.stderr.toString()).toBe(0);
+    expect(listing.stdout.toString()).toContain("core/.agents/skills/ready/SKILL.md");
+    expect(listing.stdout.toString()).not.toMatch(/\/(form-ux|dbop|comm-lark|work-communication)(\/|$)|\/qa-polling\.md/m);
+  });
+
+  test("sync preserves edited domain skills and instance data from a v0.4 pack install", () => {
+    initWorkbench({ targetDir: target, skipReviewAgents: true });
+    const lockPath = join(target, ".workbench/kit-lock.json");
+    const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+    writeFileSync(lockPath, JSON.stringify({ ...lock, kit_version: "0.4.1", packs: ["dbop", "comm-lark"] }));
+    const files = {
+      ".agents/skills/form-ux/SKILL.md": "local form conventions",
+      ".agents/skills/dbop/SKILL.md": "local database conventions",
+      ".agents/skills/work-communication/references/qa-polling.md": "local reporting procedure",
+      ".agents/skills/private-specialty/SKILL.md": "unmanaged specialty",
+      ".workbench/env/environments.json": JSON.stringify({ local: { user: "fixture", password: "synthetic-only" } }),
+      "AGENTS.local.md": "private configuration",
+    };
+    for (const [path, content] of Object.entries(files)) {
+      const file = join(target, path);
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, content, { mode: 0o600 });
+    }
+    for (let pass = 0; pass < 2; pass++) {
+      syncWorkbench({ targetDir: target });
+      for (const [path, content] of Object.entries(files)) {
+        expect(readFileSync(join(target, path), "utf8"), path).toBe(content);
+      }
+    }
   });
 
   test("installed forge restores managed shipping files and diagnoses policy and wrapper failures", () => {

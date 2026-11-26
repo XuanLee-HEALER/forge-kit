@@ -20,7 +20,6 @@ copied_dirs = [
   ".agents/skills/ship",
   ".agents/skills/pr-triage",
   ".agents/skills/business-analysis",
-  ".agents/skills/form-ux",
   ".agents/skills/test-environment",
 ]
 
@@ -65,14 +64,4 @@ init_only = [
   ".workbench/ship-policy.yaml",
   ".workbench/env/environments.example.json",
   "one-off-scripts/README.md",
-]
-
-[packs.dbop]
-copied_dirs = [
-  ".agents/skills/dbop",
-]
-
-[packs.comm-lark]
-copied_dirs = [
-  ".agents/skills/work-communication",
 ]

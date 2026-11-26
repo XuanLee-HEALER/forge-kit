@@ -44,7 +44,6 @@ interface KitManifest {
     bin_wrappers: string[];
   };
   private: { init_only: string[] };
-  packs?: Record<string, { copied_dirs?: string[]; copied_files?: string[] }>;
 }
 
 interface KitLock {
@@ -53,7 +52,8 @@ interface KitLock {
   kit_root: string;
   kit_commit: string | null;
   workbench_name: string;
-  packs: string[];
+  // Historical v0.4 installation metadata, retained for ownership checks during migration.
+  packs?: string[];
   review_agents_enabled: boolean;
   review_agents_commit: string | null;
   updated_at: string;
@@ -240,10 +240,9 @@ function syncManagedAssets(params: {
   kitRoot: string;
   targetRoot: string;
   workbenchName: string;
-  packs: string[];
   manifest: KitManifest;
 }): void {
-  const { kitRoot, targetRoot, workbenchName, packs, manifest } = params;
+  const { kitRoot, targetRoot, workbenchName, manifest } = params;
   const models = loadModelsConfig(targetRoot);
   const vars: Record<string, string> = {
     WORKBENCH_NAME: workbenchName,
@@ -277,23 +276,6 @@ function syncManagedAssets(params: {
     cpSync(src, dest, { recursive: true, force: true });
   }
 
-  for (const pack of packs) {
-    const spec = manifest.packs?.[pack];
-    if (!spec) throw new Error(`Unknown pack: ${pack}`);
-    for (const relDir of spec.copied_dirs ?? []) {
-      const src = join(kitRoot, "packs", pack, relDir);
-      const dest = join(targetRoot, relDir);
-      mkdirSync(dirname(dest), { recursive: true });
-      cpSync(src, dest, { recursive: true, force: true });
-    }
-    for (const relFile of spec.copied_files ?? []) {
-      const src = join(kitRoot, "packs", pack, relFile);
-      const dest = join(targetRoot, relFile);
-      mkdirSync(dirname(dest), { recursive: true });
-      cpSync(src, dest);
-    }
-  }
-
   installManagedBins(kitRoot, targetRoot, manifest);
   ensurePrivateGitignores(targetRoot);
 }
@@ -302,7 +284,6 @@ export function initWorkbench(opts: {
   targetDir: string;
   name?: string;
   gitOrg?: string;
-  packs?: string[];
   skipReviewAgents?: boolean;
   force?: boolean;
   kitRoot?: string;
@@ -328,7 +309,6 @@ export function initWorkbench(opts: {
   }
 
   const workbenchName = opts.name || basename(targetRoot);
-  const packs = (opts.packs ?? []).filter(Boolean);
 
   // Create instance directories
   mkdirSync(join(targetRoot, ".workbench", "repos"), { recursive: true });
@@ -364,7 +344,6 @@ export function initWorkbench(opts: {
     kitRoot,
     targetRoot,
     workbenchName,
-    packs,
     manifest,
   });
 
@@ -441,7 +420,6 @@ export function initWorkbench(opts: {
     kit_root: kitRoot,
     kit_commit: headRes.code === 0 ? headRes.stdout.trim() : null,
     workbench_name: workbenchName,
-    packs,
     review_agents_enabled: reviewEnabled,
     review_agents_commit: reviewCommit,
     updated_at: new Date().toISOString(),
@@ -477,7 +455,6 @@ export function syncWorkbench(opts?: {
     kitRoot,
     targetRoot,
     workbenchName: cfg.name || prevLock.workbench_name,
-    packs: prevLock.packs ?? [],
     manifest,
   });
 
@@ -914,13 +891,6 @@ export function doctorWorkbench(targetDir?: string): {
           message:
             "guard.require_prod_db_hosts is true but no prod_db_hosts configured in workbench.yaml or environments.json",
         });
-      } else if (lock.packs?.includes("dbop") && hosts.length === 0) {
-        issues.push({
-          level: "warn",
-          check: "prod-guard",
-          message:
-            "dbop pack is installed but no prod_db_hosts configured in workbench.yaml or environments.json",
-        });
       }
     } catch (e) {
       issues.push({
@@ -1028,7 +998,7 @@ export async function runForgeCli(): Promise<void> {
     console.log(`forge-kit CLI
 
 Usage:
-  forge init <dir> [--name <name>] [--git-org <org>] [--packs dbop,comm-lark] [--skip-review-agents] [--force]
+  forge init <dir> [--name <name>] [--git-org <org>] [--skip-review-agents] [--force]
   forge add-repo <repo-path> [--workbench <dir>] [--force]
   forge sync [<dir>]
   forge doctor [<dir>] [--json]`);
@@ -1043,7 +1013,6 @@ Usage:
       options: {
         name: { type: "string" },
         "git-org": { type: "string" },
-        packs: { type: "string" },
         "skip-review-agents": { type: "boolean", default: false },
         force: { type: "boolean", default: false },
       },
@@ -1052,7 +1021,6 @@ Usage:
       targetDir,
       name: values.name,
       gitOrg: values["git-org"],
-      packs: values.packs ? values.packs.split(",").map((s) => s.trim()) : [],
       skipReviewAgents: Boolean(values["skip-review-agents"]),
       force: Boolean(values.force),
     });

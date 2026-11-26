@@ -3,6 +3,22 @@
   "version": "0.4.1",
   "private": true,
   "type": "module",
+  "files": [
+    "bin",
+    "core",
+    "dist",
+    "docs",
+    "kit.toml",
+    "review-agents/bin",
+    "review-agents/bun.lock",
+    "review-agents/dist",
+    "review-agents/package.json",
+    "review-agents/prompts",
+    "review-agents/skills",
+    "review-agents/src",
+    "src",
+    "templates"
+  ],
   "bin": {
     "forge": "./bin/forge"
   },
