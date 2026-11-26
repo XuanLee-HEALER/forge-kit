@@ -24,6 +24,8 @@ function commit(dir: string, ref: string) {
 }
 
 export function reviewNative(ledger: Ledger, task: string, repo: string, baseRef: string, branch?: string) {
+  if (usesV05(ledger, task))
+    throw Error("review-native is for v0.4 tasks; use forge review --task " + task + " --repo " + repo + " --roles business");
   const attachment = attached(ledger, task, repo, branch);
   const { dir } = resolveTaskCheckout(ledger.workbenchRoot, attachment);
   function current() {

@@ -408,7 +408,11 @@ test("release provides a human merge handoff for the pinned feature worktree ori
   renameSync(gh + "-fixture", gh);
   git(f.wt, "switch", "-c", "next-task");
   const book = cmd("release", "runbook", id);
-  expect(approve(book.runbook_id)).toContain(book.runbook_id);
+  const approval = approve(book.runbook_id);
+  expect(approval).toContain(book.runbook_id);
+  expect(approval).toContain("手动合并");
+  expect(approval).toContain("forge ledger release verify " + id);
+  expect(approval).not.toContain("自动推进执行");
   expect(book.merge_commands).toBeUndefined();
   expect(book.human_merges).toEqual([{ pr_url: f.url, base_branch: "main", expected_head_sha: f.head }]);
   expect(book.merge_instructions).toContain("托管平台");

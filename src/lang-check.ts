@@ -284,7 +284,8 @@ function runTsChecks(targetDir: string, mode: CheckMode, execCheck: ReturnType<t
     const declared = ["check", "typecheck", "lint"].find(name => pkg?.scripts?.[name]?.trim());
     if (declared) {
       items.push(execCheck("ts", "static", declared, [process.execPath, "--bun", "run", declared], targetDir));
-    } else if (existsSync(join(targetDir, "tsconfig.json"))) {
+    }
+    if ((!declared || declared === "lint") && existsSync(join(targetDir, "tsconfig.json"))) {
       const localTsc = join(targetDir, "node_modules", ".bin", "tsc");
       const tscBin = existsSync(localTsc) ? localTsc : whichBin("tsc", targetDir);
       if (tscBin) {

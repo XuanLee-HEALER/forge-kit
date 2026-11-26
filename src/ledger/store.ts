@@ -1175,15 +1175,19 @@ export class Ledger {
       params.checkEndpoint &&
       (task.endpoint === "pr" || task.endpoint === "fat" || isRolloutEndpoint(task.endpoint))
     ) {
+      const syncPr = `forge ledger pr-sync ${params.task_id} --repo ${params.repo}`;
+      const prHint = task.endpoint !== "pr" ? "" : currentWorkflow
+        ? `; after the PR is merged into remote main, run ${syncPr} to verify the merged revision`
+        : `; run ${syncPr} to verify the remote PR head`;
       if (latestEndpointStatus === "fail") {
         hasExplicitFailure = true;
         missing.push(
-          `latest ${task.endpoint} delivery verification failed for ${params.repo}@${params.head_sha.slice(0, 8)}`,
+          `latest ${task.endpoint} delivery verification failed for ${params.repo}@${params.head_sha.slice(0, 8)}` + (currentWorkflow ? prHint : ""),
         );
       } else if (latestEndpointStatus !== "pass") {
         missing.push(
           `endpoint "${task.endpoint}" requires recorded ${task.endpoint} delivery evidence for ${params.repo}@${params.head_sha.slice(0, 8)}` +
-          (task.endpoint === "pr" ? `; run forge ledger pr-sync ${params.task_id} --repo ${params.repo} to verify the remote PR head` : ""),
+          prHint,
         );
       }
     }

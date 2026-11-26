@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parse, stringify } from "yaml";
+import { locateRepo } from "../src/git";
 import { kit, sandbox, type Sandbox } from "./v05-sandbox";
 
 let s: Sandbox;
@@ -162,15 +163,56 @@ test("T05/T12 portable distribution self-bootstraps outside the checkout", () =>
   expect(s.git(s.work, "status", "--porcelain")).toBe("");
   const forge = join(s.root, "package/bin/forge");
   s.ok([forge, "init", "."]);
+  const linked = join(s.root, "worktree");
+  s.git(s.work, "worktree", "add", "-b", "self-bootstrap", linked, "HEAD");
+  for (const checkout of [s.work, linked]) expect(locateRepo(s.work, checkout)).toBeNull();
   s.ok([forge, "add-repo", ".", "--workbench", "."]);
   s.ok([forge, "add-repo", ".", "--workbench", "."]);
   expect(parse(s.read(".workbench/workbench.yaml")).repos).toEqual(["."]);
+  for (const checkout of [s.work, linked]) expect(locateRepo(s.work, checkout)).toMatchObject({
+    repo: ".", repoRoot: realpathSync(s.work), checkoutDir: realpathSync(checkout),
+  });
   expect(s.read(".workbench/root-repo.md")).toContain("`.`");
   const doctor = JSON.parse(s.ok([forge, "doctor", ".", "--json"]));
   expect(doctor.ok).toBe(true);
   expect(doctor.issues.filter((issue: {check: string}) => issue.check === "repos")).toEqual([]);
   s.ok([s.forge, "doctor", "."]);
   expect(existsSync(s.probeLog)).toBe(false);
+}, 60_000);
+
+test("self-hosted root task routes commit, review and isolated verification evidence from a linked checkout", () => {
+  s.git(s.work, "init", "-b", "main");
+  s.git(s.work, "config", "user.name", "Fixture");
+  s.git(s.work, "config", "user.email", "fixture@example.invalid");
+  s.git(s.work, "commit", "--allow-empty", "-m", "base");
+  const base = s.git(s.work, "rev-parse", "HEAD").trim();
+  s.fresh();
+  s.ok([s.forge, "add-repo", ".", "--workbench", "."]);
+  const linked = join(s.root, "worktree");
+  s.git(s.work, "worktree", "add", "-b", "root-task", linked, base);
+  const ledger = (...args: string[]) => s.ok([s.forge, "ledger", ...args]);
+  ledger("open", "--id", "root-task", "--title", "Root task", "--repo", ".", "--branch", "root-task",
+    "--base", base, "--worktree", linked, "--depth", "targeted", "--endpoint", "local");
+  s.privateFile(".workbench/specs/root-task/scope.md", "Exercise the registered root repository.");
+  ledger("freeze", "root-task");
+  writeFileSync(join(linked, "root.test.ts"), 'import { test, expect } from "bun:test"; test("root", () => expect(2+2).toBe(4));');
+  s.git(linked, "add", "--", "root.test.ts");
+  const args = ["git", "-C", linked, "commit", "-m", "root-test", "--", "root.test.ts"];
+  const output = s.ok(args);
+  const head = s.git(linked, "rev-parse", "HEAD").trim();
+  const hook = s.hook("PostToolUse", {cwd: linked, session_id: "test", tool_use_id: "root-commit",
+    tool_name: "Bash", tool_input: {command: args.join(" ")}, tool_response: {exit_code: 0, output}});
+  for (const reply of hook) expect(reply.code, reply.text).toBe(0);
+  const commits = JSON.parse(ledger("query", "--q", "commit", "--repo", ".", "--json")).events;
+  expect(commits).toContainEqual(expect.objectContaining({task_id: "root-task", repo: ".", branch: "root-task", sha: head}));
+  const verified = JSON.parse(s.ok([s.forge, "verify", "--task", "root-task", "--repo", ".", "--kind", "test",
+    "--", "bun", "test", "./root.test.ts"], linked));
+  expect(verified).toMatchObject({ok: true, task_id: "root-task", head, results: [{kind: "test", exit_code: 0}]});
+  const codex = join(s.bin, "codex");
+  writeFileSync(codex, '#!/usr/bin/env bun\nawait Bun.stdin.text(); await Bun.write(process.argv[process.argv.indexOf("-o")+1], JSON.stringify({status:"pass",summary:"Checked",checked:["root.test.ts"],limitations:[],findings:[]}));\n', {mode: 0o755});
+  s.env.FORGE_CODEX_BIN = codex;
+  s.ok([s.forge, "review", "--task", "root-task", "--repo", ".", "--roles", "quality", "--backend", "codex"], linked);
+  expect(JSON.parse(ledger("reviews", "root-task"))).toContainEqual(expect.objectContaining({role: "quality", status: "pass", base, head}));
 }, 60_000);
 
 for (const incident of [

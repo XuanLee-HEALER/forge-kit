@@ -174,7 +174,7 @@ function observeRelease(ledger: Ledger, id: string) {
     const states = targets.map(pin => {
       try {
         const fact = observeStage(ledger.workbenchRoot, pin.stage, pin.action_id, pin.endpoint, pin.versions);
-        return {action_id:pin.action_id, state:fact?.state ?? null};
+        return {action_id:pin.action_id, state:fact.state};
       } catch (error) {
         return {action_id:pin.action_id, state:null, error:String(error)};
       }
@@ -210,7 +210,8 @@ function observeRelease(ledger: Ledger, id: string) {
       });
     }
   });
-  const unconfirmed = reports.flatMap(report => report.states).find(row => row.state !== "completed");
+  const states = reports.flatMap(report => report.states);
+  const unconfirmed = states.find(row => row.error) ?? states.find(row => row.state !== "completed");
   if (unconfirmed) throw Error(unconfirmed.error ?? ("Target has not confirmed delivery for " + unconfirmed.action_id));
   return {ok:true, release_id:id, runbook_id, observations:pins.length};
 }

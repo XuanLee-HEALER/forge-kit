@@ -1,3 +1,4 @@
+import { parseYamlFile } from "./config";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
@@ -6,6 +7,8 @@ export interface GitRunResult {
   code: number;
   stdout: string;
   stderr: string;
+  /** Supervisor-generated termination status, safe to report without child output. */
+  termination?: string;
 }
 
 export interface RepoLocation {
@@ -52,6 +55,7 @@ export function runProcess(
         : "Process terminated by " + proc.signalCode;
       return {
         code: proc.exitCode || 1,
+        termination: cause,
         stdout: proc.stdout.toString(),
         stderr: stderr ? cause + ": " + stderr : cause,
       };
@@ -126,10 +130,13 @@ export function locateRepo(
 
   const mainCheckout = resolve(common, "..");
 
-  // Verify the owning main repository belongs to this workbench (not the workbench root itself).
+  // A host checkout also owns its linked worktrees, but is a business repository only by explicit opt-in.
   const relMain = relative(canonicalRoot, mainCheckout);
-  if (relMain === "" || relMain.startsWith("..")) {
-    return null;
+  if (relMain.startsWith("..")) return null;
+  if (!relMain) {
+    const config = parseYamlFile<{ repos?: unknown }>(join(canonicalRoot, ".workbench/workbench.yaml"));
+    if (common !== join(canonicalRoot, ".git") || !Array.isArray(config?.repos) ||
+        !config.repos.some(repo => repo === "." || repo === "./")) return null;
   }
 
   const branch = lines[2];
@@ -137,7 +144,7 @@ export function locateRepo(
   const headSha = headRes.code === 0 ? headRes.stdout.trim() : null;
 
   return {
-    repo: relMain,
+    repo: relMain || ".",
     repoRoot: mainCheckout,
     checkoutDir: top,
     worktree: top !== mainCheckout ? top : null,

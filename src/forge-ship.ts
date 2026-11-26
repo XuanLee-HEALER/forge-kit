@@ -250,7 +250,7 @@ function reconcileStage(
   const actionId = e.envelope_id + "/" + index;
   function observe() {
     const fact = observeStage(ledger.workbenchRoot, a, actionId, plan.endpoint, versions);
-    if (!fact || fact.state === "pending") throw new WaitingForTarget(index, e.envelope_id);
+    if (fact.state === "pending") throw new WaitingForTarget(index, e.envelope_id);
     if (fact.state === "failed") throw Error("Target reports failed delivery for " + a.stage);
     return fact.state === "completed" ? canonicalJson(fact) : null;
   }

@@ -8,7 +8,7 @@ const root = process.env.TARGET_GIT!,
   statusFile = process.env.PR_STATE!;
 const pr = JSON.parse(readFileSync(statusFile, "utf8"));
 const protocol = "forge.atomic-pr.v1",
-  repository = "https://forge.example.test/fixture/app";
+  repository = "https://forge.example.test:8443/fixture/app";
 const required = [
   "base_branch",
   "base_oid",

@@ -79,7 +79,7 @@ export function handleUserPromptRunbookDirectives(
     }
     for (const id of approveIds) {
       try {
-        const { record, actions } = approveRunbookFromUserPrompt(ledger,{
+        const { record, actions, releaseId } = approveRunbookFromUserPrompt(ledger,{
           runbook_id: id,
           session_id: sessionId,
         },deadline);
@@ -90,8 +90,10 @@ export function handleUserPromptRunbookDirectives(
         }
         notes.push(
           `[Forge Runbook] 用户已在主会话批准发版单 ${record.runbook_id}（有效至 ${record.expires_at}，绑定当前 session）。` +
-            `底层 guard 将自动放行已登记项：${formatRunbookScopeSummary(actions)}。` +
-            `请按 Runbook 自动推进执行，完成后运行 \`.workbench/bin/forge ledger runbook complete ${record.runbook_id}\`。`,
+            `登记范围：${formatRunbookScopeSummary(actions)}。` +
+            (actions.prs?.length ? "请操作者在托管平台核对目标分支、固定 HEAD 和必需检查，手动合并所列 PR。" : "") +
+            (releaseId ? `发布线程随后运行 forge ledger release verify ${releaseId} 核验远端结果。` : "") +
+            `完成登记项后运行 forge ledger runbook complete ${record.runbook_id}。`,
         );
       } catch (err) {
         notes.push(

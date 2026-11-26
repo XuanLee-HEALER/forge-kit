@@ -113,7 +113,7 @@ function requireTargetObservation(endpoint: string, actions: ShipAction[]) {
 export function checkDeliveryDefinition(root: string, plan: ExactPlan) {
   const cfg = resolveInstance(root);
   requireTargetObservation(plan.endpoint, plan.actions);
-  if (plan.actions.some(a => a.kind === "pr" && a.atomicProtocol && !cfg.delivery.value.atomic_pr_hosts.includes(new URL(a.url).hostname)))
+  if (plan.actions.some(a => a.kind === "pr" && a.atomicProtocol && !cfg.delivery.value.atomic_pr_hosts.includes(new URL(a.url).host)))
     throw Error("Approved atomic PR host removed from instance delivery configuration");
   if (
     cfg.delivery.value.endpoint !== plan.endpoint ||
@@ -286,7 +286,7 @@ export function buildPlan(
       base: String(data.baseRefName),
       baseOid: String(data.baseRefOid),
       tree: prospectiveMergeTree(dir, data.baseRefOid, pin.head),
-      ...(cfg.delivery.value.atomic_pr_hosts.includes(new URL(data.url).hostname) && {atomicProtocol}),
+      ...(cfg.delivery.value.atomic_pr_hosts.includes(new URL(data.url).host) && {atomicProtocol}),
     };
     ci.push(check);
     if (pr) items.push(check);

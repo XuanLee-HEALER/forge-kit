@@ -13,7 +13,19 @@ function oldInstance() {
   const legacy = join(s.root, "legacy-kit");
   mkdirSync(legacy);
   const archive = join(s.root, "release.tar");
-  s.git(kit, "archive", "--format=tar", "--output", archive, legacyRevision);
+  const expected = "0fb9dc3bab1714fcdf54e514e46561e4ceca516784301bd98efb00e6e9355468";
+  const supplied = process.env.FORGE_V04_TEST_ARCHIVE;
+  if (supplied !== undefined) {
+    // Verify and extract the same private copy even when the external fixture cache changes.
+    writeFileSync(archive, readFileSync(supplied));
+  } else {
+    const built = s.run(["git", "-C", kit, "--no-replace-objects", "-c", "core.attributesFile=/dev/null",
+      "-c", "tar.umask=0002", "archive", "--format=tar", "--output", archive, legacyRevision]);
+    if (built.code !== 0) throw Error("T03/T06 require Git commit " + legacyRevision +
+      " and its tree/blobs, or set FORGE_V04_TEST_ARCHIVE to its verified local tar (see README). " + built.err);
+  }
+  if (createHash("sha256").update(readFileSync(archive)).digest("hex") !== expected)
+    throw Error("T03/T06 v0.4.1 archive SHA-256 mismatch; expected " + expected + " (see README)");
   s.ok(["tar", "-xf", archive, "-C", legacy]);
   symlinkSync(join(kit, "node_modules"), join(legacy, "node_modules"));
   s.ok(["bun", "run", "build"], legacy);

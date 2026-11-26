@@ -208,9 +208,17 @@ function resume(root: string) {
       continue;
     }
     const src = localPath(journal, i + ".new");
-    if (hash(readRequired(src)) !== op.after) throw Error("Damaged staged file for " + dest);
+    if (!existsSync(src))
+      throw Error("Missing staged file " + src + " for " + dest + "; restore the staged bytes with SHA-256 " + op.after + " and retry sync");
+    const bytes = readRequired(src);
+    if (hash(bytes) !== op.after) throw Error("Damaged staged file for " + dest);
     mkdirSync(dirname(dest), { recursive: true });
-    renameSync(src, dest);
+    // Retain .new until the entire journal is retired. A later conflict may require
+    // the operator to restore .old and replay this already-published replacement.
+    const pending = localPath(journal, "publish-" + randomUUID());
+    writeFileSync(pending, bytes, { flag: "wx", mode: op.mode });
+    chmodSync(pending, op.mode!);
+    renameSync(pending, dest);
   }
   // Remove only empty, previously managed skill directories. Private neighbors keep their directory.
   for (const op of ops.filter((op) => op.after === null && op.path.startsWith(".agents/skills/"))) {

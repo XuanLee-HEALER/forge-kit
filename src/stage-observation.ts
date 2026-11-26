@@ -32,11 +32,15 @@ export function observeStage(
   actionId: string,
   endpoint: string,
   versions: Revision[],
-): TargetObservation | null {
+): TargetObservation {
   checkStagePin(root, stage);
   const env = { ...stageEnvironment(actionId, endpoint, versions), FORGE_ACTIVE_STAGE: stage.stage };
   const r = runProcess(stage.observe.argv, { cwd: stage.observe.cwd, env, timeoutMs: 60_000 });
-  if (r.code !== 0) return null;
+  if (r.code !== 0) {
+    const failure = r.termination ?? ("exit code " + r.code);
+    throw Error("Target observer for stage " + stage.stage + " failed (" + failure + "). Inspect action " +
+      actionId + " on the target and repair the observer before manual recovery.");
+  }
   let fact;
   try {
     fact = JSON.parse(r.stdout);

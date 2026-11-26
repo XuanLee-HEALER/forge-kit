@@ -53,11 +53,11 @@ delivery: {endpoint: rollout, stages: [ship, rollout]}
 {"state":"completed","action_id":"ft-123/1","endpoint":"rollout","versions":[{"repo":"api","head":"0123456789abcdef0123456789abcdef01234567"}]}
 ```
 
-观察程序使用 `absent` 表示目标不存在，`pending` 表示执行中，`failed` 表示失败。初次观察为 absent 时可以提交一次。已经发起提交且目标尚未确认时，在原批准会话使用本次授权编号重跑 `forge ship run --envelope <ft-id>` 查询进度。只有目标返回 `completed` 且动作、终点及全部版本匹配时才记录成功。失败或版本不符时暂停并检查实际目标。
+观察程序使用 `absent` 表示目标不存在，`pending` 表示执行中，`failed` 表示失败。初次观察为 absent 时可以提交一次。已经发起提交且目标尚未确认时，在原批准会话使用本次授权编号重跑 `forge ship run --envelope <ft-id>` 查询进度。只有目标返回 `completed` 且动作、终点及全部版本匹配时才记录成功。观察程序非零退出、被终止或超时时，快轨转人工并保留提交意图。检查具体动作在目标端的状态并修复观察程序后再人工恢复。目标返回失败或版本不符时也暂停核验。
 
 ### 托管端原子 PR 合并接口
 
-默认的 `atomic_pr_hosts` 为空。实例运维方在验证自托管平台确实实现以下事务后，可在 `extensions.delivery.atomic_pr_hosts` 列出该平台的确切主机名。授权绑定 HTTPS 仓库、PR 编号、base 分支及 SHA、head SHA、合并结果的 Git tree SHA 和协议版本。
+默认的 `atomic_pr_hosts` 为空。实例运维方在验证自托管平台确实实现以下事务后，可在 `extensions.delivery.atomic_pr_hosts` 列出该平台的 HTTPS 主机及非默认端口，例如 `forge.example.test:8443`。默认 443 端口使用主机名登记。授权绑定 HTTPS 仓库、PR 编号、base 分支及 SHA、head SHA、合并结果的 Git tree SHA 和协议版本。
 
 - 在已登记仓库的 REST API 根下，`GET repos/<owner>/<repo>/forge/atomic-pr/v1/capabilities` 返回 `protocol: "forge.atomic-pr.v1"`、`repository`（完整 HTTPS 仓库 URL）及 `preconditions`。列表须包含 `open_pr`、`head_oid`、`base_branch`、`base_oid`、`merge_tree`、`protected_branch_rules` 和 `required_checks`。
 - 唯一写请求为同仓的 `POST repos/<owner>/<repo>/forge/atomic-pr/v1/pulls/<number>/merge`。JSON 字段为 `protocol`、`pull_request`（完整 PR URL）、`expected_state`（OPEN）、`expected_head_oid`、`expected_base_branch`、`expected_base_oid`、`expected_merge_tree` 和 `policy`（protected_branch_rules_and_required_checks）。

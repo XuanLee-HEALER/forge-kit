@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, expect, test } from "bun:test";
-import { chmodSync, readFileSync, realpathSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, realpathSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { handleLedgerHook } from "../src/ledger-hook";
@@ -62,6 +62,19 @@ printf '%s' '{"passed":true,"report":"validated pinned diff"}' > "$2"`);
 });
 afterEach(() => { ledger.closeDb(); rmSync(root, { recursive: true, force: true }); });
 const native = (ref: string, action = "") => invoke(["review-native", "--task", "fix", "--repo", "svc", "--base", ref], { FIX_ACTION: action });
+
+test("v0.5 rejects the legacy native review before executing Codex or writing evidence", () => {
+  ledger.openTask({ task_id:"fix", title:"Modern review", repo:"svc", branch:"feature",
+    endpoint:"local", depth:"targeted", base_sha:base, head_sha:base });
+  const marker = join(root, "native-started");
+  tool("codex", 'touch "$NATIVE_MARKER"');
+  const tip = ledger.getTask("fix")!.tip_hash;
+  const result = invoke(["review-native", "--task", "fix", "--repo", "svc", "--base", base], {NATIVE_MARKER:marker});
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stderr.toString()).toContain("forge review --task fix --repo svc --roles business");
+  expect(existsSync(marker)).toBe(false);
+  expect(ledger.getTask("fix")!.tip_hash).toBe(tip);
+});
 
 test("review range and launch floor bind primary, fallback and native evidence", () => {
   open("local");

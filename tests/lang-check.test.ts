@@ -1,8 +1,8 @@
 import { isolateHome } from "./helpers/hermetic";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { detectRepoLanguages, runLangChecks } from "../src/lang-check";
 
 isolateHome();
@@ -56,3 +56,19 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks)", () => 
     expect(detectRepoLanguages(deepJsRepo)).toEqual(["ts"]);
   });
 });
+
+test("a passing lint-only package still runs the installed TypeScript compiler", () => {
+  const bin = join(dir, "node_modules/.bin");
+  mkdirSync(bin, { recursive: true });
+  symlinkSync(join(dirname(require.resolve("typescript/package.json")), "bin/tsc"), join(bin, "tsc"));
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { lint: "bun lint.js" } }));
+  writeFileSync(join(dir, "lint.js"), 'console.log("lint passed")');
+  writeFileSync(join(dir, "tsconfig.json"), JSON.stringify({ compilerOptions: { strict: true, skipLibCheck: true }, files: ["example.ts"] }));
+  writeFileSync(join(dir, "example.ts"), 'const count: number = "invalid";');
+  const report = runLangChecks({ targetDir: dir, mode: "static" });
+  expect(report.ok).toBe(false);
+  expect(report.checks).toContainEqual(expect.objectContaining({name: "lint", status: "pass"}));
+  expect(report.checks).toContainEqual(expect.objectContaining({
+    name: "tsc-noEmit", status: "fail", output_excerpt: expect.stringContaining("TS2322"),
+  }));
+}, 30_000);

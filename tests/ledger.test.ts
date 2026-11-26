@@ -1227,6 +1227,8 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         }).ready,
       ).toBe(true);
 
+      expect(() => ledger.closeTask({task_id: "20261124-retry", archive: false}))
+        .toThrow("run forge ledger pr-sync 20261124-retry --repo web to verify the remote PR head");
       // Record PR evidence and close again cleanly (without duplicating lint/test/review!)
       ledger.recordEvidence({
         source: "tool",

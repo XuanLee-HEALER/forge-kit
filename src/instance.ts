@@ -258,12 +258,14 @@ export function resolveInstance(root: string, kitRoot?: string) {
   known(v, ["environment", "stages"], loc + ".verification");
   known(d, ["endpoint", "stages", "atomic_pr_hosts"], loc + ".delivery");
   const atomicHosts = d.atomic_pr_hosts === undefined ? [] : d.atomic_pr_hosts;
-  if (
-    !Array.isArray(atomicHosts) ||
-    atomicHosts.some(host => typeof host !== "string" || host === "github.com" ||
-      !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*$/.test(host))
-  )
-    throw Error(loc + ".delivery.atomic_pr_hosts must list trusted hostnames supporting the forge.atomic-pr.v1 protocol");
+  const validAuthority = (value: unknown) => {
+    if (typeof value !== "string" || !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*(?::[1-9][0-9]{0,4})?$/.test(value))
+      return false;
+    const url = URL.parse("https://" + value);
+    return url !== null && url.hostname !== "github.com" && url.host === value;
+  };
+  if (!Array.isArray(atomicHosts) || !atomicHosts.every(validAuthority))
+    throw Error(loc + ".delivery.atomic_pr_hosts must list canonical HTTPS authorities (host or host:port) supporting forge.atomic-pr.v1");
   const verification = {
     kind: "verification",
     id: "default",
@@ -356,7 +358,7 @@ export function verificationStageCwd(root: string, repo: string, checkout: strin
 export function runInstanceStage(
   root: string,
   id: string,
-  verification?: { checkout: string; head: string; repo: string; config?: ReturnType<typeof resolveInstance> },
+  verification?: { checkout: string; head: string; repo: string; env: NodeJS.ProcessEnv; config?: ReturnType<typeof resolveInstance> },
   onOutput?: (stdout: Uint8Array, stderr: Uint8Array) => void,
 ) {
   const cfg = verification?.config ?? resolveInstance(root),
@@ -392,6 +394,7 @@ export function runInstanceStage(
     env: {
       PATH: process.env.PATH,
       LANG: process.env.LANG,
+      ...verification?.env,
       FORGE_ACTIVE_STAGE: id,
       ...(cfg.verification.value.stages.includes(id) ? {FORGE_VERIFY_ENVIRONMENT:cfg.verification.value.environment}:{}),
       ...(verification ? { FORGE_VERIFY_HEAD: verification.head } : {}),

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parse, stringify } from "yaml";
 import { executorFixture } from "./helpers/executor";
 
@@ -18,7 +18,7 @@ test("custom and core stages execute in declaration order against one isolated r
   const configDir = configureInstance();
   const trace = join(f.root, "trace");
   const step = (id: string) => "import {appendFileSync} from 'node:fs'; appendFileSync(" +
-    JSON.stringify(trace) + ", JSON.stringify([" + JSON.stringify(id) + ",process.cwd(),process.env.FIXTURE_CREDENTIAL ?? null])+'\\n');console.log(" + JSON.stringify(id) + ")";
+    JSON.stringify(trace) + ", JSON.stringify([" + JSON.stringify(id) + ",process.cwd(),process.env.FIXTURE_CREDENTIAL ?? null, process.env.HOME, process.env.TMPDIR])+'\\n');console.log(" + JSON.stringify(id) + ")";
   const builtin = (id: string) => {
     const filename = id + ".ts";
     writeFileSync(join(f.repo, filename), step(id));
@@ -39,11 +39,25 @@ test("custom and core stages execute in declaration order against one isolated r
   mkdirSync(docs, { recursive: true });
   writeFileSync(join(docs, "scope.md"), "Check the configured stages in order.");
   f.ledger.freezeSpec({ task_id: "task" });
-  const result = f.cli("verify", [], { FIXTURE_CREDENTIAL: "synthetic" });
+  const operatorHome = join(f.root, "operator-home");
+  const operatorTmp = join(f.root, "operator-tmp");
+  const hooks = join(operatorHome, "hooks");
+  mkdirSync(hooks, {recursive:true});
+  mkdirSync(operatorTmp);
+  // An ordinary site hook rejects checkouts in this environment. The verifier
+  // selects its own revision without consulting host hooks or Git configuration.
+  writeFileSync(join(hooks, "post-checkout"), "#!/bin/sh\nexit 21\n", {mode:0o755});
+  const globalConfig = join(operatorHome, ".gitconfig");
+  writeFileSync(globalConfig, "[core]\n    hooksPath = " + JSON.stringify(hooks) + "\n");
+  const result = f.cli("verify", [], { HOME: operatorHome, TMPDIR: operatorTmp,
+    FIXTURE_CREDENTIAL: "synthetic", GIT_CONFIG_GLOBAL: globalConfig });
   expect(result.exitCode, result.stderr.toString() + result.stdout.toString()).toBe(0);
   const events = readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
   expect(events.map(row => row[0])).toEqual(["first", "static", "dynamic", "last"]);
   expect(events.every(row => row[1] === events[0][1] && row[2] === null)).toBe(true);
+  const isolated = dirname(events[0][1]);
+  expect(events.every(row => row[3] === join(isolated, "home") && row[4] === isolated)).toBe(true);
+  expect(isolated).not.toBe(operatorTmp);
   expect(events[0][1]).not.toBe(f.repo);
   expect(existsSync(events[0][1])).toBe(false);
   const receipt = f.evidence().at(-1);

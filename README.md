@@ -141,6 +141,19 @@ git clone <repo-url> ~/work/my-workbench/backend
 ./bin/forge sync ~/work/my-workbench
 ```
 
+### 浅克隆的离线升级测试
+
+T03/T06 从 forge-kit v0.4.1 提交 `eb139c117be733173648abce723b6eaaf975f7bc` 及其完整目录树、文件对象生成旧实例。完整克隆直接运行测试。单提交浅克隆可使用以下命令从已有可信历史仓预供一份 tar，设置 `FORGE_V04_TEST_ARCHIVE` 为归档的本地绝对路径。测试在解包和构建前核对 SHA-256，固定值为 `0fb9dc3bab1714fcdf54e514e46561e4ceca516784301bd98efb00e6e9355468`。
+
+```bash
+git -C /path/to/full-forge-kit --no-replace-objects -c core.attributesFile=/dev/null -c tar.umask=0002 archive \
+  --format=tar --output=/path/to/fixtures/forge-kit-v0.4.1.tar eb139c117be733173648abce723b6eaaf975f7bc
+export FORGE_V04_TEST_ARCHIVE=/path/to/fixtures/forge-kit-v0.4.1.tar
+bun test tests/v05-upgrade.test.ts
+```
+
+离线机器还需预供 Bun、Git、tar 和本仓锁定的 Bun 依赖。夹具在临时目录构建原版安装器，并用本地评审替身生成历史见证，无需旧评审子模块或远端服务。
+
 ### 在本仓库自举
 
 ```bash

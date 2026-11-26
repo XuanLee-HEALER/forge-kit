@@ -465,14 +465,15 @@ export function doctorWorkbench(targetDir?: string): {
   issues: DoctorIssue[];
 } {
   let root = resolve(targetDir ?? process.cwd());
+  const issues: DoctorIssue[] = [];
   try {
     root = findWorkbenchRoot(targetDir, targetDir !== undefined);
-    return inspectWorkbench(root);
+    return inspectWorkbench(root, issues);
   } catch (e) {
     return {
       root,
       ok: false,
-      issues: [
+      issues: [...issues,
         {
           level: "error",
           check: "configuration",
@@ -483,31 +484,26 @@ export function doctorWorkbench(targetDir?: string): {
   }
 }
 
-function inspectWorkbench(root: string) {
-  const issues: DoctorIssue[] = [];
-
-  for (const [name, mode] of [
-    ["forge", constants.X_OK],
-    ["cli.js", constants.R_OK],
-  ] as const) {
+function inspectWorkbench(root: string, issues: DoctorIssue[]) {
+  // The release launcher remains usable even when an installed entry point has changed.
+  const releaseRepair = "From the forge-kit release directory, run ./bin/forge sync " + Bun.$.escape(root);
+  for (const name of ["forge", "cli.js"]) {
     const path = localPath(root, ".workbench/bin/" + name);
     try {
       const st = statSync(path);
-      if (!st.isFile() || !(st.mode & (mode === constants.X_OK ? 0o111 : 0o444))) throw Error("permissions");
-      accessSync(path, mode);
+      const executable = name === "forge";
+      if (!st.isFile() || !(st.mode & 0o444) || (executable && !(st.mode & 0o111))) throw Error("permissions");
+      accessSync(path, constants.R_OK | (executable ? constants.X_OK : 0));
     } catch {
       issues.push({
         level: "error",
         check: "bins",
         message: "Missing or inaccessible " + path +
           ". If the file exists but cannot be read, restore read permission or move it aside. " +
-          "From the forge-kit release directory, run ./bin/forge sync " + Bun.$.escape(root),
+          releaseRepair,
       });
     }
   }
-  const syncCommand = issues.some(issue => issue.check === "bins")
-    ? "./bin/forge sync " + Bun.$.escape(root) + " from the forge-kit release directory"
-    : "forge sync " + Bun.$.escape(root);
   const agentsPath = localPath(root, "AGENTS.md");
   const agentsMissing = !existsSync(agentsPath);
   if (agentsMissing || readRequired(agentsPath).length >= 8000)
@@ -515,8 +511,8 @@ function inspectWorkbench(root: string) {
       level: "error",
       check: "agents-md",
       message: agentsMissing
-        ? "Missing " + agentsPath + "; run " + syncCommand + " to recreate it"
-        : agentsPath + " must be under 8000 bytes; move the edited file aside, then run " + syncCommand + " to recreate it",
+        ? "Missing " + agentsPath + ". " + releaseRepair
+        : agentsPath + " must be under 8000 bytes; move the edited file aside. " + releaseRepair,
     });
 
   const lockPath = localPath(root, ".workbench/kit-lock.json");
@@ -531,13 +527,22 @@ function inspectWorkbench(root: string) {
     for (const [path, expected] of Object.entries(lock.managed_files ?? {})) {
       const dest = localPath(root, path);
       const missing = !existsSync(dest);
-      if (missing || hash(readRequired(dest)) !== expected)
+      let matches = false;
+      if (!missing) {
+        try { matches = hash(readRequired(dest)) === expected; }
+        catch (error) {
+          issues.push({level: "error", check: "projection",
+            message: String(error) + "; restore read permission or move the file aside. " + releaseRepair});
+          continue;
+        }
+      }
+      if (!matches)
         issues.push({
           level: "error",
           check: "projection",
           message: missing
-            ? "Missing " + dest + "; run " + syncCommand + " to recreate it"
-            : dest + " differs from the installed manifest; move the edited file aside, then run " + syncCommand + " to recreate it",
+            ? "Missing " + dest + ". " + releaseRepair
+            : dest + " differs from the installed manifest; move the edited file aside. " + releaseRepair,
         });
     }
   }

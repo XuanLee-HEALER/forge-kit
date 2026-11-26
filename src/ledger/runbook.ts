@@ -186,7 +186,7 @@ export function approveRunbookFromUserPrompt(ledger: ReleaseLedger, params: {
   runbook_id: string;
   session_id: string;
   ttl_minutes?: number;
-}, deadline = Date.now() + 4500): { record: RunbookRecord; actions: RunbookActions } {
+}, deadline = Date.now() + 4500): { record: RunbookRecord; actions: RunbookActions; releaseId?: string } {
   return withinProcessDeadline(deadline, () => {
     const id = params.runbook_id.trim().toLowerCase();
     const sessionId = params.session_id.trim();
@@ -241,7 +241,7 @@ export function approveRunbookFromUserPrompt(ledger: ReleaseLedger, params: {
         .run(approvedAt, sessionId, expiresAt, id);
 
       ledger.db.query("UPDATE releases SET status='APPROVED', updated_at=? WHERE runbook_id=? AND status='VERIFIED'").run(approvedAt,id);
-      return { record: ledger.getRunbook(id)!, actions };
+      return { record: ledger.getRunbook(id)!, actions, releaseId };
     });
   });
 }

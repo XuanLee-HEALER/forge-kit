@@ -5,7 +5,7 @@ import { runVerificationProcess } from "./verification-process";
 import { basename, join, resolve } from "node:path";
 import { mkdtempSync, mkdirSync, existsSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { runGit, runProcess } from "./git";
+import { runProcess } from "./git";
 import { usesV05 } from "./ledger/types";
 import { resolveInstance, runInstanceStage, verificationStageCwd } from "./instance";
 import { isVerificationCommand, type VerificationKind as Kind } from "./verify-command";
@@ -67,6 +67,12 @@ export function verifyCli(args: string[]) {
         recordRun(false, true);
       }).immediate();
     }
+    function isolatedGit(cwd: string, args: string[]) {
+      if (!baseEnv) throw Error("Missing isolated verification environment");
+      return runProcess(["git", "-c", "core.hooksPath=/dev/null", ...args], {
+        cwd, env: { ...baseEnv, GIT_CONFIG_GLOBAL: "/dev/null" },
+      });
+    }
     if (modern) {
       if (!snap.freeze_seq) throw Error("Freeze the confirmed specification before verification");
       temporary = realpathSync(mkdtempSync(join(tmpdir(), "forge-verify-")));
@@ -75,9 +81,9 @@ export function verifyCli(args: string[]) {
       mkdirSync(home, { mode: 0o700 });
       baseEnv = { PATH: process.env.PATH, LANG: process.env.LANG, HOME: home, TMPDIR: temporary,
         FORGE_VERIFY_ACTIVE_SHA: snap.head, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" };
-      const clone = runGit(temporary, ["clone", "--no-local", "--no-checkout", "--", snap.dir, dir]);
+      const clone = isolatedGit(temporary, ["clone", "--template=", "--no-local", "--no-checkout", "--", snap.dir, dir]);
       if (clone.code) throw Error("Cannot isolate verification checkout: " + clone.stderr);
-      const checkout = runGit(dir, ["-c", "advice.detachedHead=false", "checkout", "--detach", snap.head]);
+      const checkout = isolatedGit(dir, ["-c", "advice.detachedHead=false", "checkout", "--detach", snap.head]);
       if (checkout.code) throw Error("Cannot select verification version: " + checkout.stderr);
       if (existsSync(join(dir, "bun.lock")) || existsSync(join(dir, "bun.lockb"))) {
         const cache = process.env.BUN_INSTALL_CACHE_DIR;
@@ -127,7 +133,7 @@ export function verifyCli(args: string[]) {
           const action = config.actions.get(custom.value.action);
           if (!action) throw Error("Missing verification action for stage " + stage);
           const hash = createHash("sha256");
-          const code = runInstanceStage(ledger.workbenchRoot, stage, { checkout: dir, head: snap.head, repo: snap.repo, config },
+          const code = runInstanceStage(ledger.workbenchRoot, stage, { checkout: dir, head: snap.head, repo: snap.repo, config, env: baseEnv! },
             (stdout, stderr) => { hash.update(stdout).update(stderr); });
           results.push({ kind: "verify", stage, action: custom.value.action, command: ["forge", "instance", "run", stage],
             options_sha256: createHash("sha256").update(JSON.stringify([action.value, custom.value.options])).digest("hex"),
@@ -163,8 +169,8 @@ export function verifyCli(args: string[]) {
       }
     }
     if (modern) {
-      const current = runGit(dir, ["rev-parse", "HEAD"]);
-      const changes = runGit(dir, ["status", "--porcelain", "--untracked-files=no"]);
+      const current = isolatedGit(dir, ["rev-parse", "HEAD"]);
+      const changes = isolatedGit(dir, ["status", "--porcelain", "--untracked-files=no"]);
       if (current.code || current.stdout.trim() !== snap.head || changes.code || changes.stdout)
         throw Error("Verification changed the isolated checkout revision or tracked inputs");
     }

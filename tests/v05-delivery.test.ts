@@ -40,7 +40,7 @@ function preparePullRequest(track: "full" | "targeted" = "full", defect = false,
   const base = commit("example.test.ts", 'import {expect,test} from "bun:test"; import {message} from "./src/feature"; test("ready output", ()=>expect(message.toLowerCase()).toBe("ready"));\n');
   s.git(s.root, "init", "--bare", "-b", "main", bare);
   // Preserve hosted identity for the forge CLI while restricting every Git push to the bare fixture.
-  git("remote", "add", "origin", "https://forge.example.test/fixture/app.git");
+  git("remote", "add", "origin", "https://forge.example.test:8443/fixture/app.git");
   git("push", bare, "main");
   git("switch", "-c", "feature-fixture");
   const config = join(s.work, ".workbench/workbench.yaml");
@@ -64,7 +64,7 @@ function preparePullRequest(track: "full" | "targeted" = "full", defect = false,
   const head = commit("src/feature.ts", 'export const message = "ready";\n');
   git("push", bare, "feature-fixture");
   if (endpoint === "blue-rollout") configureStage("success", head, base, endpoint, "publish");
-  const pr = { url: "https://forge.example.test/fixture/app/pull/1", number: 1, state: "OPEN", baseRefName: "main",
+  const pr = { url: "https://forge.example.test:8443/fixture/app/pull/1", number: 1, state: "OPEN", baseRefName: "main",
     headRefName: "feature-fixture", headRefOid: head, baseRefOid: base, isCrossRepository: false,
     headRepository: {name: "app"}, headRepositoryOwner: {login: "fixture"}, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" };
   const state = join(s.root, "host-pr.json");
@@ -94,7 +94,7 @@ const pr = await Bun.file(file).json();
 const ref = (name) => Bun.spawnSync(["git", "-C", process.env.TARGET_GIT, "rev-parse", "refs/heads/"+name]).stdout.toString().trim();
 if (args[0] === "api" && args.some(arg => arg.includes("/forge/atomic-pr/"))) {
   const route=args.find(arg=>arg.includes("/forge/atomic-pr/"));
-  if(args[args.indexOf("--hostname")+1]!=="forge.example.test" || !route.startsWith("repos/fixture/app/")) process.exit(2);
+  if(args[args.indexOf("--hostname")+1]!=="forge.example.test:8443" || !route.startsWith("repos/fixture/app/")) process.exit(2);
   const result=Bun.spawnSync(["bun",${JSON.stringify(hostFixture)},route,...args],{env:process.env,stdout:"inherit",stderr:"inherit"});
   process.exit(result.exitCode??1);
 }
@@ -135,7 +135,7 @@ await Bun.write(args[args.indexOf("-o")+1],JSON.stringify({status:"pass",summary
   return {ledger, repo, head, base, bare, state, ci, calls};
 }
 
-type RolloutMode = "success" | "failure" | "pending" | "wrong-version" | "rejected";
+type RolloutMode = "success" | "failure" | "pending" | "wrong-version" | "rejected" | "broken-observer";
 
 function configureStage(localRollout: RolloutMode, head: string, base: string, endpoint: string, stage: string) {
   const cfgPath = join(s.work, ".workbench/workbench.yaml");
@@ -156,6 +156,10 @@ if(mode==="failure") process.exit(3);
 `);
   writeFileSync(join(s.work, "observe-target.ts"), `import {appendFileSync} from "node:fs";
 const target = Bun.file(process.argv[2]);
+if (${JSON.stringify(localRollout)} === "broken-observer" && await target.exists()) {
+  console.error("fixture-private-marker");
+  process.exit(23);
+}
 const observation = await target.exists() ? await target.json() : {state:"absent",action_id:process.env.FORGE_ACTION_ID,
   endpoint:process.env.FORGE_ENDPOINT,versions:JSON.parse(process.env.FORGE_APPROVED_HEADS)};
 appendFileSync("target-reads", JSON.stringify(observation)+"\\n");
@@ -168,7 +172,7 @@ console.log(JSON.stringify(observation));
   writeFileSync(cfgPath, stringify(cfg));
 }
 
-function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "prod" : "pr", useAtomicHost=true) {
+function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "prod" : "pr", useAtomicHost: boolean | string=true) {
   const prepared = preparePullRequest("full", false, taskEndpoint);
   const {ledger} = prepared;
   const receipt = join(s.work, "stage-effects");
@@ -188,7 +192,7 @@ function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "pro
   const cfg=parse(readFileSync(cfgPath,"utf8"));
   cfg.extensions ??= {};
   cfg.extensions.delivery ??= {stages:["ship"], endpoint:"pr"};
-  if(useAtomicHost) cfg.extensions.delivery.atomic_pr_hosts=["forge.example.test"];
+  if(useAtomicHost) cfg.extensions.delivery.atomic_pr_hosts=[typeof useAtomicHost==="string" ? useAtomicHost : "forge.example.test:8443"];
   writeFileSync(cfgPath,stringify(cfg));
   const book = JSON.parse(ledger("runbook", "create", "--task", "ship-task", "--title", "local target", "--pr", "app:1",
     ...(localRollout ? ["--stage", "rollout"] : [])));
@@ -263,7 +267,9 @@ test("T11 simultaneous and restarted requests preserve one local effect and one 
 for (const track of ["full", "targeted"] as const) {
   test(`T01/T09 isolated ${track} workflow reaches a human-merged PR on main`, () => {
     const f = preparePullRequest(track, track === "targeted");
-    expect(s.run([s.forge, "ledger", "close", "ship-task", "--summary", "open PR"]).code).not.toBe(0);
+    const open = s.run([s.forge, "ledger", "close", "ship-task", "--summary", "open PR"]);
+    expect(open.code).not.toBe(0);
+    expect(open.err + open.out).toContain("after the PR is merged into remote main, run forge ledger pr-sync ship-task --repo app");
     expect(s.ok(["bun", "-e", "import {message} from './src/feature'; console.log(message)"], f.repo).trim()).toBe("ready");
     s.env.FIXTURE_HUMAN_MERGE = "1";
     s.ok(["gh", "pr", "merge", "1", "--merge", "--match-head-commit", f.head]);
@@ -295,7 +301,7 @@ test("T13 release keeps both handoff identities across stale-head rejection and 
   s.ok([s.forge, "review", "--task", "second", "--repo", "app", "--cwd", repo, "--base", first.head, "--head", sha,
     "--roles", "quality", "--mode", "serial", "--backend", "codex"]);
   const secondState = first.state + "-2";
-  const record = {...JSON.parse(readFileSync(first.state, "utf8")), url:"https://forge.example.test/fixture/app/pull/2",
+  const record = {...JSON.parse(readFileSync(first.state, "utf8")), url:"https://forge.example.test:8443/fixture/app/pull/2",
     number:2, headRefName:"followup",headRefOid:sha,baseRefOid:first.head};
   writeFileSync(secondState, JSON.stringify(record));
   ledger("pr-sync", "second", "--repo", "app", "--branch", "followup", "--pr", "2");
@@ -404,9 +410,9 @@ for (const when of ["before-host-check", "before-transaction"]) {
   }, 90_000);
 }
 
-for (const fault of ["unconfigured","unknown-protocol","closed","head-change"]) {
+for (const fault of ["unconfigured","wrong-port","unknown-protocol","closed","head-change"]) {
   test("T11 hosted atomic preconditions prevent a target write: "+fault, () => {
-    const f=delivery(undefined,"pr",fault!=="unconfigured");
+    const f=delivery(undefined,"pr",fault==="wrong-port" ? "forge.example.test" : fault!=="unconfigured");
     f.approve();
     if(fault==="unknown-protocol") s.env.WITHHOLD_CAPABILITY="1";
     if(fault==="closed" || fault==="head-change") writeFileSync(f.race,JSON.stringify({when:fault,other:f.base}));
@@ -688,3 +694,20 @@ for (const extra of [false, true]) {
     expect(readFileSync(f.calls,"utf8")).toBe("merge "+oid+"\n");
   },90_000);
 }
+
+test("T11 failed observer after submission degrades once with a sanitized diagnostic and keeps the submission intent", () => {
+  const f=delivery("broken-observer");
+  f.approve();
+  for(let attempt=0;attempt<2;attempt++) {
+    const run=s.run(f.shipArgs);
+    expect(run.code).not.toBe(0);
+    expect(run.out+run.err).not.toContain("fixture-private-marker");
+    const report=JSON.parse(run.out||run.err);
+    expect(report.status).toBe("DEGRADED");
+    expect(report.reason.message).toContain("stage rollout failed (exit code 23)");
+    expect(report.reason.message).toContain(f.envelope+"/1");
+    expect(report.reason.message).toContain("manual recovery");
+    expect(readFileSync(f.receipt,"utf8")).toBe(f.head+"\n");
+    expect(report.receipts.map((row:{status:string})=>row.status)).toEqual(["confirmed","claimed"]);
+  }
+},90_000);

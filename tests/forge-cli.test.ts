@@ -10,6 +10,7 @@ import {
   readFileSync,
   readlinkSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -25,7 +26,9 @@ import {
 } from "../src/cli";
 import { recoverInstall } from "../src/managed-assets";
 import { loadWorkbenchConfig } from "../src/config";
-import { runGit } from "../src/git";
+import { runGit, withinProcessDeadline } from "../src/git";
+import { stagePin } from "../src/ledger/ship-actions";
+import { observeStage } from "../src/stage-observation";
 import { Ledger } from "../src/ledger";
 
 isolateHome();
@@ -298,6 +301,25 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
       expect.objectContaining({ check: "ship-policy" }),
     );
     writeFileSync(policy, custom);
+    for (const entry of [forge, bundle]) {
+      const release = join(kit, "bin/forge");
+      const repair = "From the forge-kit release directory, run ./bin/forge sync " + Bun.$.escape(broken.root);
+      // Executable permissions alone cannot establish launcher integrity.
+      writeFileSync(entry, "changed entry point");
+      const moved = entry + ".saved";
+      const drift = run(release, ["doctor", root, "--json"], 1);
+      expect(drift.issues).toContainEqual(expect.objectContaining({check:"projection",
+        message:expect.stringContaining(repair)}));
+      renameSync(entry, moved);
+      run(release, ["sync", root]);
+      expect(run(release, ["doctor", root, "--json"]).ok).toBe(true);
+      chmodSync(entry, 0o000);
+      const unreadable = run(release, ["doctor", root, "--json"], 1);
+      expect(unreadable.issues).toContainEqual(expect.objectContaining({check:"bins", message:expect.stringContaining(repair)}));
+      expect(unreadable.issues).toContainEqual(expect.objectContaining({check:"projection", message:expect.stringContaining(entry)}));
+      chmodSync(entry, entry === forge ? 0o755 : 0o644);
+      rmSync(moved);
+    }
     chmodSync(join(bin, "forge"), 0o644);
     expect(run(join(kit,"bin/forge"), ["doctor", root, "--json"], 1).issues).toContainEqual(
       expect.objectContaining({
@@ -634,4 +656,61 @@ test("interrupted migration recovery describes the original destination for abse
     expect(existsSync(journal)).toBe(false);
     mkdirSync(journal);
   }
+});
+
+test("a timed-out target observer reports the stage, action and manual recovery without printing child output", () => {
+  const { root } = initWorkbench({ targetDir: target });
+  const file = join(root,".workbench/workbench.yaml");
+  writeFileSync(file,readFileSync(file,"utf8")+`
+extensions:
+  actions:
+    submit: {purpose: deliver, argv: [bun, -e, "console.log('submit')"], inputs: []}
+    checkRollout: {purpose: observe, argv: [bun, -e, "console.error('private-output'); await Bun.sleep(30000)"], inputs: []}
+  stages:
+    rollout: {action: submit, observe: checkRollout}
+  delivery: {endpoint: rollout, stages: [rollout]}
+`);
+  const stage = stagePin(root, "rollout");
+  let failure = "";
+  try {
+    withinProcessDeadline(Date.now()+700, () => observeStage(root,stage,"ft-test/1","rollout",[]));
+  } catch(error) {
+    failure=String(error);
+  }
+  expect(failure).toContain("stage rollout failed (Process timed out");
+  expect(failure).toContain("ft-test/1");
+  expect(failure).toContain("manual recovery");
+  expect(failure).not.toContain("private-output");
+});
+
+test("a partially published install can replay a restored file after a later conflict", () => {
+  const journal = join(target, ".workbench/sync-journal");
+  const dest = join(target, "AGENTS.md");
+  const lock = join(target, ".workbench/kit-lock.json");
+  const hash = (bytes: string) => new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+  mkdirSync(journal, {recursive: true});
+  writeFileSync(dest, "old");
+  writeFileSync(lock, "concurrent edit");
+  writeFileSync(join(journal, "0.old"), "old");
+  writeFileSync(join(journal, "0.new"), "updated");
+  writeFileSync(join(journal, "1.new"), "new lock");
+  writeFileSync(join(journal, "operations.json"), JSON.stringify([
+    {path: "AGENTS.md", before: hash("old"), after: hash("updated"), mode: 0o640},
+    {path: ".workbench/kit-lock.json", before: null, after: hash("new lock"), mode: 0o600},
+  ]));
+  const recover = () => recoverInstall(target);
+  expect(recover).toThrow("Migration conflict at " + lock);
+  expect(readFileSync(dest, "utf8")).toBe("updated");
+  expect(recover).toThrow("Migration conflict at " + lock);
+  writeFileSync(dest, "edit after interruption");
+  expect(recover).toThrow("Copy the saved file " + join(journal, "0.old"));
+  expect(readFileSync(join(journal, "0.new"), "utf8")).toBe("updated");
+  cpSync(join(journal, "0.old"), dest);
+  rmSync(lock);
+  recover();
+  recover();
+  expect(readFileSync(dest, "utf8")).toBe("updated");
+  expect(lstatSync(dest).mode & 0o777).toBe(0o640);
+  expect(readFileSync(lock, "utf8")).toBe("new lock");
+  expect(existsSync(journal)).toBe(false);
 });

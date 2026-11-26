@@ -22,7 +22,7 @@ function hostApi(dir: string, url: URL, route: string, args: string[]) {
       process.env.FORGE_GH_BIN || "gh",
       "api",
       "--hostname",
-      url.hostname,
+      url.host,
       "repos/" + owner + "/" + repo + "/forge/atomic-pr/v1/" + route,
       ...args,
     ],

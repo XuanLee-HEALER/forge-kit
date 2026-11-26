@@ -37,7 +37,7 @@ Commands:
   blocker   <task_id> <open|close> --id <bid> --summary <text>
   record    <task_id> --kind <fat|prod|verify|deploy|smoke|manual|note> --status <pass|fail|fallback|info> --summary <text> [--repo <r> --branch <b> --sha <sha> --meta <json>]
   reviews <task_id>
-  review-native --task <id> --repo <repo> --base <ref> [--branch <branch>]
+  review-native --task <id> --repo <repo> --base <ref> [--branch <branch>]  (v0.4 tasks only)
   pr-sync <task_id> --repo <repo> [--pr <number-or-url>] [--branch <branch>]
   review-fallback <task_id> --repo <repo> --role <role> --sha <full-sha>
   exempt    --repo <r> --branch <b> --reason <text> [--sha <sha> --ttl-hours <n>]
