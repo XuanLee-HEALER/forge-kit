@@ -166,12 +166,28 @@ test("T05/T12 portable distribution self-bootstraps outside the checkout", () =>
   s.git(s.root, "clone", "--local", "--", kit, s.work);
   expect(s.git(s.work, "status", "--porcelain")).toBe("");
   const forge = join(s.root, "package/bin/forge");
-  s.ok([forge, "init", "."]);
+  const release = join(s.root, "package");
+  const uninitialized = s.run([forge, "add-repo", s.work], release);
+  expect(uninitialized.code).not.toBe(0);
+  expect(uninitialized.err + uninitialized.out).toContain("Not an initialized workbench");
+  expect(existsSync(join(s.root, ".workbench"))).toBe(false);
+  expect(existsSync(join(s.work, ".workbench"))).toBe(false);
+  const parentConfig = join(s.root, ".workbench/workbench.yaml");
+  mkdirSync(dirname(parentConfig));
+  writeFileSync(parentConfig, "repos: []\n");
+  const partial = s.run([forge, "add-repo", s.work], release);
+  expect(partial.code).not.toBe(0);
+  expect(partial.err + partial.out).toContain("kit-lock.json");
+  expect(readFileSync(parentConfig, "utf8")).toBe("repos: []\n");
+  expect(readdirSync(dirname(parentConfig))).toEqual(["workbench.yaml"]);
+  s.ok([forge, "init", s.work], release);
   const linked = join(s.root, "worktree");
   s.git(s.work, "worktree", "add", "-b", "self-bootstrap", linked, "HEAD");
   for (const checkout of [s.work, linked]) expect(locateRepo(s.work, checkout)).toBeNull();
-  s.ok([forge, "add-repo", ".", "--workbench", "."]);
-  s.ok([forge, "add-repo", ".", "--workbench", "."]);
+  const registered = JSON.parse(s.ok([forge, "add-repo", s.work], release));
+  expect(registered).toMatchObject({repoName: ".", registered: true});
+  expect(JSON.parse(s.ok([forge, "add-repo", s.work], release)).registered).toBe(false);
+  expect(readdirSync(dirname(parentConfig))).toEqual(["workbench.yaml"]);
   expect(parse(s.read(".workbench/workbench.yaml")).repos).toEqual(["."]);
   for (const checkout of [s.work, linked]) expect(locateRepo(s.work, checkout)).toMatchObject({
     repo: ".", repoRoot: realpathSync(s.work), checkoutDir: realpathSync(checkout),

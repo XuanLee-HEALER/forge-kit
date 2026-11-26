@@ -166,11 +166,13 @@ T10 使用三个独立 Codex CLI 会话读取安装后的 bugfix 说明，为 QA
 bun install --frozen-lockfile
 bun run build
 ./bin/forge init . --name forge-kit
-./bin/forge add-repo . --workbench .
+./bin/forge add-repo .
 ./bin/forge doctor .
 ```
 
 ## 实例配置示例
+
+在私有 `.workbench/models.toml` 中按需配置 `tiers.mechanical`、`tiers.standard` 或 `tiers.deep`。每个声明的层级需有 `model` 和 `effort`；省略的层级沿用默认值。
 
 在已初始化的工作台根目录，创建私有文件 `.workbench/overrides/ready/SKILL.md`，写入以下全文。
 

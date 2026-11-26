@@ -269,6 +269,7 @@ export function listActiveApprovedRunbooks(
     if (hasExactBindings && ledger.db.query("SELECT 1 FROM exact_ship_envelopes WHERE runbook_id=?").get(r.runbook_id)) continue;
     try {
       const actions = JSON.parse(r.actions_json) as RunbookActions;
+      if (Object.hasOwn(actions, "exact")) continue;
       // The push guard reads the authorized remote only after matching the local repository and tag.
       // Use the hashed remote, even when the pushing worktree and the primary checkout have different origins.
       if (actions.tags?.some(tag => tag.remote)) {
@@ -306,6 +307,8 @@ export function completeRunbook(ledger: ReleaseLedger, runbook_id: string): Runb
     if (rb.status === "REVOKED") {
       throw new Error(`Cannot complete REVOKED runbook: ${id}`);
     }
+    if (Object.hasOwn(JSON.parse(rb.actions_json), "exact"))
+      throw Error("Prepare and approve a fast-track envelope for this exact runbook before executing its actions.");
     const linked = ledger.db.query<{release_id:string},[string]>("SELECT release_id FROM releases WHERE runbook_id=?").get(id);
     if (linked) {
       if (!rb.approved_at) throw Error("Release runbook requires human approval");

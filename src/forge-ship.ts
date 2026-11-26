@@ -248,6 +248,7 @@ function reconcileStage(
 ): string {
   const versions = plan.pins.map(({ repo, head }) => ({ repo, head }));
   const actionId = e.envelope_id + "/" + index;
+  const absentAfterIntent = "Target reports action " + actionId + " absent after submission intent. Inspect the submitter and target before manual recovery.";
   function observe() {
     const fact = observeStage(ledger.workbenchRoot, a, actionId, plan.endpoint, versions);
     if (fact.state === "pending") throw new WaitingForTarget(index, e.envelope_id);
@@ -265,7 +266,7 @@ function reconcileStage(
         "SELECT 1 FROM events WHERE task_id=? AND event_type='SHIP_STAGE_SUBMISSION_INTENT' AND json_extract(payload_json,'$.envelope_id')=? AND json_extract(payload_json,'$.index')=? LIMIT 1",
       )
       .get(e.task_id, e.envelope_id, index);
-    if (submitted) throw new WaitingForTarget(index, e.envelope_id);
+    if (submitted) throw Error(absentAfterIntent);
     trackEvent(ledger, e, "SHIP_STAGE_SUBMISSION_INTENT", { index, action_id: actionId });
   });
   const env = { ...stageEnvironment(actionId, plan.endpoint, versions), FORGE_ACTIVE_STAGE: a.stage };
@@ -276,7 +277,7 @@ function reconcileStage(
     throw Error(
       `Stage ${a.stage} submission exited with code ${submission.code}; target reports action ${actionId} absent. Inspect the submitter and target before manual recovery.`,
     );
-  throw new WaitingForTarget(index, e.envelope_id);
+  throw Error(absentAfterIntent);
 }
 function perform(
   ledger: Ledger,
@@ -422,9 +423,13 @@ export function shipCli(argv: string[]) {
     } catch (err) {
       if (Date.parse(initial.expires_at!) > Date.now()) return state(ledger, id, String(err));
     }
+    let expectedToken: string | null = null;
     try {
       const execute = cmd === "run" && !values["dry-run"];
-      if (execute && !acquireRunner(ledger, id)) return state(ledger, id);
+      if (execute) {
+        if (!acquireRunner(ledger, id)) return state(ledger, id);
+        expectedToken = String(process.pid);
+      }
       const { plan } = preflight(ledger, envelope(ledger, id));
       if (cmd === "evaluate" || values["dry-run"]) return { ok: true, status: "ELIGIBLE", plan };
       for (const [index, action] of plan.actions.entries()) {
@@ -552,12 +557,14 @@ export function shipCli(argv: string[]) {
             runbook_id: rb.runbook_id,
             envelope_id: id,
             delivery_endpoint: plan.endpoint,
-            pr_url: pr.url,
-            pr_head_oid: pr.head,
-            base_branch: pr.base,
-            merge_commit: receipt?.observation,
-            target_oid: receipt?.observation,
-            ...(receipt && { state: "MERGED" }),
+            ...(receipt && {
+              pr_url: pr.url,
+              pr_head_oid: pr.head,
+              base_branch: pr.base,
+              merge_commit: receipt.observation,
+              target_oid: receipt.observation,
+              state: "MERGED",
+            }),
           };
           if (receipt)
             ledger.recordEvidence({
@@ -595,6 +602,11 @@ export function shipCli(argv: string[]) {
       });
     } catch (err) {
       return withImmediateTx(ledger.db, () => {
+        const current = envelope(ledger, id);
+        const reason = err instanceof Error ? err.message : String(err);
+        if (current.status !== "ACTIVE") return state(ledger, id);
+        // Evaluation may fail after an executor has claimed its first external action.
+        if (current.run_token !== expectedToken) return state(ledger, id, reason);
         if (err instanceof WaitingForTarget) {
           ledger.db
             .query(
@@ -608,14 +620,13 @@ export function shipCli(argv: string[]) {
             .run(id, String(process.pid));
           return state(ledger, id, err.message);
         }
-        const reason = err instanceof Error ? err.message : String(err);
-        const status = Date.parse(initial.expires_at!) <= Date.now() ? "EXPIRED" : "DEGRADED";
+        const status = Date.parse(current.expires_at!) <= Date.now() ? "EXPIRED" : "DEGRADED";
         if (
           ledger.db
             .query(
-              "UPDATE fast_track_envelopes SET status=?,degraded_reason=?,updated_at=? WHERE envelope_id=? AND status='ACTIVE'",
+              "UPDATE fast_track_envelopes SET status=?,degraded_reason=?,updated_at=? WHERE envelope_id=? AND status='ACTIVE' AND run_token IS ?",
             )
-            .run(status, reason, nowIso(), id).changes
+            .run(status, reason, nowIso(), id, expectedToken).changes
         )
           trackEvent(ledger, initial, "FAST_TRACK_DEGRADED", { reason });
         return state(ledger, id);

@@ -53,7 +53,7 @@ delivery: {endpoint: rollout, stages: [ship, rollout]}
 {"state":"completed","action_id":"ft-123/1","endpoint":"rollout","versions":[{"repo":"api","head":"0123456789abcdef0123456789abcdef01234567"}]}
 ```
 
-观察程序使用 `absent` 表示目标不存在，`pending` 表示执行中，`failed` 表示失败。初次观察为 absent 时可以提交一次。已经发起提交且目标尚未确认时，在原批准会话使用本次授权编号重跑 `forge ship run --envelope <ft-id>` 查询进度。只有目标返回 `completed` 且动作、终点及全部版本匹配时才记录成功。观察程序非零退出、被终止或超时时，快轨转人工并保留提交意图。检查具体动作在目标端的状态并修复观察程序后再人工恢复。目标返回失败或版本不符时也暂停核验。
+观察程序使用 `absent` 表示目标不存在，`pending` 表示执行中，`failed` 表示失败。初次观察为 absent 时可以提交一次。提交后目标返回 absent 时，保留提交意图并转人工核对。目标返回 pending 时，在原批准会话使用本次授权编号重跑 `forge ship run --envelope <ft-id>` 查询进度。只有目标返回 `completed` 且动作、终点及全部版本匹配时才记录成功。观察程序非零退出、被终止或超时时，快轨转人工并保留提交意图。检查具体动作在目标端的状态并修复观察程序后再人工恢复。目标返回失败或版本不符时也暂停核验。
 
 ### 托管端原子 PR 合并接口
 

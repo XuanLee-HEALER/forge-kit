@@ -39,7 +39,7 @@ export interface WorkbenchConfig {
 
 export interface ModelTier {
   model: string;
-  effort: "medium" | "high";
+  effort: "low" | "medium" | "high" | "xhigh";
 }
 
 export interface ModelsConfig {
@@ -354,26 +354,37 @@ export function productionHosts(cfg: WorkbenchConfig, envs: Record<string,DbEnvE
   return [...new Set(values.flatMap(normalizeDbHosts).filter(Boolean))];
 }
 
-export function loadModelsConfig(root: string): ModelsConfig {
-  const parsed = parseTomlFile<Partial<ModelsConfig>>(
-    process.env.FORGE_MODELS_TOML || join(root, ".workbench", "models.toml"),
-  );
-  return {
-    tiers: {
-      mechanical: parsed?.tiers?.mechanical ?? {
-        model: "gpt-6.1-terra",
-        effort: "medium",
-      },
-      standard: parsed?.tiers?.standard ?? {
-        model: "gpt-6.2-astra",
-        effort: "medium",
-      },
-      deep: parsed?.tiers?.deep ?? {
-        model: "gpt-6.2-astra",
-        effort: "high",
-      },
-    },
+export function decodeModelsConfig(parsed: object, file: string): ModelsConfig {
+  const tiers: ModelsConfig["tiers"] = {
+    mechanical: { model: "gpt-6.1-terra", effort: "medium" },
+    standard: { model: "gpt-6.2-astra", effort: "medium" },
+    deep: { model: "gpt-6.2-astra", effort: "high" },
   };
+  for (const key of Object.keys(parsed))
+    if (key !== "tiers") throw Error(file + ": Unknown field " + key);
+  const overrides = "tiers" in parsed ? parsed.tiers : undefined;
+  if (!overrides || typeof overrides !== "object" || Array.isArray(overrides))
+    throw Error(file + ": tiers must be a mapping");
+  // A v0.4 instance may override one tier and inherit every other default.
+  for (const [name, tier] of Object.entries(overrides)) {
+    const field = "tiers." + name;
+    if (!Object.hasOwn(tiers, name)) throw Error(file + ": Unknown field " + field);
+    if (!tier || typeof tier !== "object" || Array.isArray(tier)) throw Error(file + ": " + field + " must be a mapping");
+    for (const key of Object.keys(tier))
+      if (key !== "model" && key !== "effort") throw Error(file + ": Unknown field " + field + "." + key);
+    const { model, effort } = tier as Record<string, unknown>;
+    if (typeof model !== "string" || !model.trim()) throw Error(file + ": " + field + ".model must be a nonempty string");
+    if (effort !== "low" && effort !== "medium" && effort !== "high" && effort !== "xhigh")
+      throw Error(file + ": Invalid " + field + ".effort");
+    tiers[name as keyof typeof tiers] = { model, effort };
+  }
+  return { tiers };
+}
+
+export function loadModelsConfig(root: string): ModelsConfig {
+  const file = process.env.FORGE_MODELS_TOML || join(root, ".workbench", "models.toml");
+  const parsed = existsSync(file) ? Bun.TOML.parse(readFileSync(file, "utf8")) : { tiers: {} };
+  return decodeModelsConfig(parsed, file);
 }
 
 export interface ShipPolicy {

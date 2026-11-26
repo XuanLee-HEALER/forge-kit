@@ -135,7 +135,7 @@ await Bun.write(args[args.indexOf("-o")+1],JSON.stringify({status:"pass",summary
   return {ledger, repo, head, base, bare, state, ci, calls};
 }
 
-type RolloutMode = "success" | "failure" | "pending" | "wrong-version" | "rejected" | "broken-observer";
+type RolloutMode = "success" | "failure" | "pending" | "wrong-version" | "rejected" | "broken-observer" | "unobserved";
 
 function configureStage(localRollout: RolloutMode, head: string, base: string, endpoint: string, stage: string) {
   const cfgPath = join(s.work, ".workbench/workbench.yaml");
@@ -146,6 +146,7 @@ const plan = await Bun.file("release-plan.json").json();
 const mode = process.argv[3];
 appendFileSync("stage-effects", plan.head+"\\n");
 if (mode==="rejected") process.exit(17);
+if (mode==="unobserved") process.exit(0);
 const ticket = {action_id:process.env.FORGE_ACTION_ID, endpoint:process.env.FORGE_ENDPOINT,
   state:mode==="pending"?"pending":mode==="failure"?"failed":"completed",
   versions:[{repo:plan.repo,head:mode==="wrong-version"?process.argv[4]:plan.head}]};
@@ -172,7 +173,7 @@ console.log(JSON.stringify(observation));
   writeFileSync(cfgPath, stringify(cfg));
 }
 
-function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "prod" : "pr", useAtomicHost: boolean | string=true) {
+function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "prod" : "pr", useAtomicHost: boolean | string=true, includeMerge=true) {
   const prepared = preparePullRequest("full", false, taskEndpoint);
   const {ledger} = prepared;
   const receipt = join(s.work, "stage-effects");
@@ -194,7 +195,7 @@ function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "pro
   cfg.extensions.delivery ??= {stages:["ship"], endpoint:"pr"};
   if(useAtomicHost) cfg.extensions.delivery.atomic_pr_hosts=[typeof useAtomicHost==="string" ? useAtomicHost : "forge.example.test:8443"];
   writeFileSync(cfgPath,stringify(cfg));
-  const book = JSON.parse(ledger("runbook", "create", "--task", "ship-task", "--title", "local target", "--pr", "app:1",
+  const book = JSON.parse(ledger("runbook", "create", "--task", "ship-task", "--title", "local target", ...(includeMerge ? ["--pr", "app:1"] : []),
     ...(localRollout ? ["--stage", "rollout"] : [])));
   const envelope = JSON.parse(ledger("fast-track", "prepare", "ship-task", "--to", localRollout ? "prod" : "pr", "--paths", "src/**", "--runbook", book.runbook_id)).envelope_id;
   const transport = localTransport(prepared.bare, prepared.calls);
@@ -263,6 +264,79 @@ test("T11 simultaneous and restarted requests preserve one local effect and one 
     await Promise.all([first.exited, second?.exited]);
   }
 }, 90_000);
+
+test("T11 failing evaluate and dry-run report their observations while another process owns delivery", async () => {
+  const f=delivery();
+  f.approve();
+  const evalGate=join(s.root,"evaluation-checks");
+  const checks=join(s.root,"delayed-gh");
+  writeFileSync(checks, `#!/usr/bin/env bun
+const args=process.argv.slice(2);
+if(args[0]==="pr" && args[1]==="checks") {
+  const gate=${JSON.stringify(evalGate)};
+  await Bun.write(gate+".entered","1");
+  while(!await Bun.file(gate).exists()) await Bun.sleep(20);
+  console.log(JSON.stringify([{name:"isolated-evaluation",bucket:"fail"}]));
+} else {
+  const r=Bun.spawnSync(["gh",...args],{stdout:"inherit",stderr:"inherit"});
+  process.exit(r.exitCode??1);
+}
+`,{mode:0o755});
+  const diagnostic=Bun.spawn([s.forge,"ship","evaluate","--envelope",f.envelope],{
+    cwd:s.work,env:{...s.env,FORGE_GH_BIN:checks},stdout:"pipe",stderr:"pipe",timeout:30_000,
+  });
+  const waitFor=async (path:string)=>{
+    const deadline=Date.now()+15_000;
+    while(!existsSync(path) && Date.now()<deadline) await Bun.sleep(20);
+    expect(existsSync(path)).toBe(true);
+  };
+  let owner:ReturnType<typeof Bun.spawn<"ignore","pipe","pipe">> | undefined;
+  try {
+    await waitFor(evalGate+".entered");
+    writeFileSync(f.gate+".armed","1");
+    owner=Bun.spawn(f.shipArgs,{cwd:s.work,env:s.env,stdin:"ignore",stdout:"pipe",stderr:"pipe",timeout:45_000});
+    await waitFor(f.gate+".entered");
+    writeFileSync(evalGate,"1");
+    const probe=await Promise.all([diagnostic.exited,new Response(diagnostic.stdout).text(),new Response(diagnostic.stderr).text()]);
+    const failedChecks=join(s.root,"evaluator-ci");
+    writeFileSync(failedChecks,"fail");
+    s.env.CI_STATE=failedChecks;
+    const dryRun=s.run([s.forge,"ship","run","--dry-run","--envelope",f.envelope]);
+    for (const {code,out,err} of [{code:probe[0],out:probe[1],err:probe[2]},dryRun]) {
+      expect(code).not.toBe(0);
+      const report=JSON.parse(out||err);
+      expect(report.status).toBe("ACTIVE");
+      expect(report.reason.message).toContain("Required CI checks missing or failing");
+      const [active]=JSON.parse(f.ledger("fast-track","status",f.envelope));
+      expect(active.run_token).toBe(String(owner.pid));
+      expect(active.degraded_reason).toBeNull();
+    }
+    writeFileSync(f.gate,"1");
+    const [code,out,err]=await Promise.all([owner.exited,new Response(owner.stdout).text(),new Response(owner.stderr).text()]);
+    expect(code,out+err).toBe(0);
+    expect(JSON.parse(out).receipts.map((r:{status:string})=>r.status)).toEqual(["confirmed"]);
+    expect(readFileSync(f.calls,"utf8")).toBe("merge "+f.head+"\n");
+  } finally {
+    s.env.CI_STATE=f.ci;
+    writeFileSync(f.gate,"1");
+    writeFileSync(evalGate,"1");
+    if(diagnostic.exitCode===null) diagnostic.kill();
+    if(owner && owner.exitCode===null) owner.kill();
+    await Promise.all([diagnostic.exited,owner?.exited]);
+  }
+},90_000);
+
+test("T11 failed evaluation of an unclaimed active envelope still persists degradation", () => {
+  const f=delivery();
+  f.approve();
+  writeFileSync(f.ci,"fail");
+  const probe=s.run([s.forge,"ship","evaluate","--envelope",f.envelope]);
+  expect(probe.code).not.toBe(0);
+  expect(JSON.parse(probe.out||probe.err).status).toBe("DEGRADED");
+  const [stored]=JSON.parse(f.ledger("fast-track","status",f.envelope));
+  expect(stored.degraded_reason).toContain("Required CI checks missing or failing");
+  expect(readFileSync(f.calls,"utf8")).toBe("");
+},90_000);
 
 for (const track of ["full", "targeted"] as const) {
   test(`T01/T09 isolated ${track} workflow reaches a human-merged PR on main`, () => {
@@ -356,15 +430,15 @@ for (const mode of ["success", "failure"] as const) {
   }, 90_000);
 }
 
-test("T11 rejected submission with absent target degrades immediately and cannot replay", () => {
-  const f = delivery("rejected");
+for (const mode of ["rejected", "unobserved"] as const) test(`T11 ${mode} submission with absent target degrades immediately and cannot replay`, () => {
+  const f = delivery(mode);
   f.approve();
   for (let attempt = 0; attempt < 2; attempt++) {
     const run = s.run(f.shipArgs);
     expect(run.code, run.out + run.err).not.toBe(0);
     const report = JSON.parse(run.out || run.err);
     expect(report.status).toBe("DEGRADED");
-    expect(report.reason.message).toContain("rollout submission exited with code 17");
+    expect(report.reason.message).toContain(mode === "rejected" ? "rollout submission exited with code 17" : "manual recovery");
     expect(report.reason.message).toContain(f.envelope + "/1 absent");
     expect(report.receipts.map((item: {status:string}) => item.status)).toEqual(["confirmed", "claimed"]);
     expect(existsSync(f.targetState)).toBe(false);
@@ -483,6 +557,13 @@ for (const outcome of ["completed", "disappeared", "wrong-version"]) {
     expect(resumed.code === 0, resumed.out + resumed.err).toBe(outcome === "completed");
     const final = JSON.parse(resumed.out || resumed.err);
     expect(final.receipts.filter((row: {status: string}) => row.status === "confirmed")).toHaveLength(outcome === "completed" ? 2 : 1);
+    if (outcome === "disappeared") {
+      expect(final.status).toBe("DEGRADED");
+      expect(final.reason.message).toContain("absent after submission intent");
+      expect(final.reason.message).toContain("manual recovery");
+      const retry = s.run(f.shipArgs);
+      expect(JSON.parse(retry.out || retry.err).status).toBe("DEGRADED");
+    }
     if (outcome === "completed") expect(reads()).toContainEqual({...target, state:"completed"});
     expect(readFileSync(f.receipt, "utf8")).toBe(f.head + "\n");
     expect(readFileSync(f.calls, "utf8")).toBe("merge " + f.head + "\n");
@@ -730,5 +811,50 @@ test("T11 failed observer after submission degrades once with a sanitized diagno
     expect(report.reason.message).toContain("manual recovery");
     expect(readFileSync(f.receipt,"utf8")).toBe(f.head+"\n");
     expect(report.receipts.map((row:{status:string})=>row.status)).toEqual(["confirmed","claimed"]);
+  }
+},90_000);
+
+test("T11 a stage-only rollout records confirmed target evidence and closes while the PR remains open", () => {
+  const f=delivery("success","prod",false,false);
+  f.approve();
+  const run = JSON.parse(s.ok(f.shipArgs));
+  expect(run.status).toBe("REDEEMED");
+  expect(run.receipts).toHaveLength(1);
+  const events=JSON.parse(f.ledger("query","--q","prod","--repo","app","--json")).events;
+  const evidence=events.map((event:{payload_json:string})=>JSON.parse(event.payload_json)).find((p:{kind:string})=>p.kind==="prod");
+  expect(evidence.meta.stage_receipts[0]).toMatchObject({stage:"rollout",state:"completed",versions:[{repo:"app",head:f.head}]});
+  for(const key of ["pr_url","pr_head_oid","base_branch","merge_commit","target_oid","state"])
+    expect(Object.hasOwn(evidence.meta,key)).toBe(false);
+  expect(JSON.parse(readFileSync(f.state,"utf8")).state).toBe("OPEN");
+  expect(s.git(f.bare,"rev-parse","refs/heads/main").trim()).toBe(f.base);
+  expect(JSON.parse(f.ledger("close","ship-task","--summary","verified isolated rollout","--no-archive")).task.status).toBe("CLOSED");
+  expect(JSON.parse(f.ledger("verify","--task","ship-task","--json")).ok).toBe(true);
+},90_000);
+
+test("T11 approving an exact runbook before preparing an envelope cannot authorize a generic tag push or SQL call", () => {
+  const f=preparePullRequest();
+  const tag="v1.2.3";
+  s.git(f.repo,"tag",tag,f.head);
+  const sql=s.privateFile("fixture-migration.sql","SELECT 1;\n");
+  s.privateFile(".workbench/env/environments.json", JSON.stringify({prodfixture:{
+    host:"db.example.invalid",database:"fixture",engine:"postgres",ro:{user:"reader"},rw:{user:"writer"}
+  }}));
+  writeFileSync(join(s.bin,"psql"),"#!/bin/sh\nexit 20\n",{mode:0o755});
+  const args=["--tag","app:"+tag+":"+f.head,"--sql","db.example.invalid:"+sql];
+  const book=JSON.parse(f.ledger("runbook","create","--task","ship-task","--title","exact tag","--pr","app:1",...args));
+  const approve=(id:string)=>s.hook("UserPromptSubmit",{session_id:"operator",prompt:"批准 "+id});
+  expect(JSON.stringify(approve(book.runbook_id))).toContain("fast-track prepare");
+  const decision=(command:string)=>s.hook("PreToolUse",{cwd:f.repo,tool_name:"Bash",session_id:"operator",tool_input:{command}});
+  const tagPush="git push origin refs/tags/"+tag;
+  const sqlCall="psql -h db.example.invalid -f '"+sql+"'";
+  expect(JSON.stringify(decision(tagPush))).toContain("禁止未批准推送生产发布 tag");
+  expect(JSON.stringify(decision(sqlCall))).toContain("连接 prod 数据库");
+  expect(s.run([s.forge,"ledger","runbook","complete",book.runbook_id]).code).not.toBe(0);
+  expect(JSON.parse(f.ledger("runbook","show",book.runbook_id)).status).toBe("APPROVED");
+  const ordinary=JSON.parse(f.ledger("runbook","create","--title","ordinary tag",...args));
+  approve(ordinary.runbook_id);
+  for (const command of [tagPush,sqlCall]) {
+    const replies=decision(command);
+    expect(replies.some(r => r.code===2 || /"permissionDecision"\s*:\s*"deny"/.test(r.text)), JSON.stringify(replies)).toBe(false);
   }
 },90_000);

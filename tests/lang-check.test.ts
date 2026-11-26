@@ -57,18 +57,34 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks)", () => 
   });
 });
 
-test("a passing lint-only package still runs the installed TypeScript compiler", () => {
+test("the compiler checks the project independently of package script names", () => {
   const bin = join(dir, "node_modules/.bin");
   mkdirSync(bin, { recursive: true });
   symlinkSync(join(dirname(require.resolve("typescript/package.json")), "bin/tsc"), join(bin, "tsc"));
-  writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { lint: "bun lint.js" } }));
+
   writeFileSync(join(dir, "lint.js"), 'console.log("lint passed")');
   writeFileSync(join(dir, "tsconfig.json"), JSON.stringify({ compilerOptions: { strict: true, skipLibCheck: true }, files: ["example.ts"] }));
   writeFileSync(join(dir, "example.ts"), 'const count: number = "invalid";');
-  const report = runLangChecks({ targetDir: dir, mode: "static" });
-  expect(report.ok).toBe(false);
-  expect(report.checks).toContainEqual(expect.objectContaining({name: "lint", status: "pass"}));
-  expect(report.checks).toContainEqual(expect.objectContaining({
-    name: "tsc-noEmit", status: "fail", output_excerpt: expect.stringContaining("TS2322"),
-  }));
+  const situations = [
+    { name: "lint", body: "bun lint.js" },
+    { name: "check", body: "bun lint.js" },
+    { name: "typecheck", body: "bun lint.js" },
+    { name: "check", body: "bun --bun run tsc --noEmit", extra: { tsc: "bun lint.js" } },
+  ];
+  for (const { name, body, extra } of situations) {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { [name]: body, ...extra } }));
+    const report = runLangChecks({ targetDir: dir, mode: "static" });
+    expect(report.ok, name).toBe(false);
+    expect(report.checks).toContainEqual(expect.objectContaining({name, status: "pass"}));
+    expect(report.checks).toContainEqual(expect.objectContaining({
+      name: "tsc-noEmit", status: "fail", output_excerpt: expect.stringContaining("TS2322"),
+    }));
+  }
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { check: "bun --bun run tsc --noEmit" } }));
+  const direct = runLangChecks({targetDir: dir, mode: "static"});
+  expect(direct.checks.map(item => [item.name, item.status])).toEqual([["tsc-noEmit", "fail"]]);
+  // Bun resolves a local tsc.ts before the installed binary for "bun run tsc".
+  writeFileSync(join(dir, "tsc.ts"), 'console.log("project check")');
+  const shadowed = runLangChecks({targetDir: dir, mode: "static"});
+  expect(shadowed.checks.map(item => [item.name, item.status])).toEqual([["check", "pass"], ["tsc-noEmit", "fail"]]);
 }, 30_000);

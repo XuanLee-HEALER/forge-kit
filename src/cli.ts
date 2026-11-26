@@ -410,8 +410,12 @@ export function addRepo(opts: { repoPath: string; workbenchDir?: string; force?:
       `${absRepo} is a linked git worktree (.git is a file, not a directory). Register the primary repository instead.`,
     );
   }
-  const root = findWorkbenchRoot(opts.workbenchDir ?? dirname(absRepo), opts.workbenchDir !== undefined);
+  const root = findWorkbenchRoot(opts.workbenchDir ?? absRepo, true);
   checkMigration(root);
+  const yamlPath = localPath(root, ".workbench/workbench.yaml");
+  for (const file of [yamlPath, localPath(root, ".workbench/kit-lock.json")])
+    if (!statSync(file, {throwIfNoEntry: false})?.isFile())
+      throw Error("Not an initialized workbench: missing " + file + "; use forge init");
   const rel = relative(root, absRepo);
   if (rel.startsWith("..") || rel.includes("/")) {
     throw new Error(
@@ -447,8 +451,7 @@ export function addRepo(opts: { repoPath: string; workbenchDir?: string; force?:
     writeFileSync(cardPath, md, "utf8");
   }
 
-  const yamlPath = join(root, ".workbench", "workbench.yaml");
-  const registered = existsSync(yamlPath) ? updateReposInWorkbenchYaml(yamlPath, repoName) : false;
+  const registered = updateReposInWorkbenchYaml(yamlPath, repoName);
 
   return { repoName, cardPath, registered };
 }

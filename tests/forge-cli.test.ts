@@ -25,7 +25,7 @@ import {
   syncWorkbench,
 } from "../src/cli";
 import { recoverInstall } from "../src/managed-assets";
-import { loadWorkbenchConfig } from "../src/config";
+import { loadModelsConfig, loadWorkbenchConfig } from "../src/config";
 import { runGit, withinProcessDeadline } from "../src/git";
 import { stagePin } from "../src/ledger/ship-actions";
 import { observeStage } from "../src/stage-observation";
@@ -454,10 +454,23 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const { root } = initWorkbench({ targetDir: join(target, "instance") });
     const lock = join(root, ".workbench/kit-lock.json");
     const before = readFileSync(lock);
-    writeFileSync(join(root, ".workbench/models.toml"), '[tiers.standard]\nmodel = "fixture-standard"\n');
-    expect(JSON.stringify(doctorWorkbench(root).issues)).toContain("tiers.standard.effort");
-    expect(() => syncWorkbench({ targetDir: root })).toThrow("tiers.standard.effort");
-    expect(readFileSync(lock)).toEqual(before);
+    const models = join(root, ".workbench/models.toml");
+    const valid = '[tiers.standard]\nmodel = "fixture-standard"\neffort = "low"\n';
+    for (const [contents, field] of [
+      ['[tiers.standard]\nmodel = "fixture-standard"\n', "tiers.standard.effort"],
+      [valid + '[tiers.deeep]\nmodel = "unused"\neffort = "high"\n', "tiers.deeep"],
+      [valid + 'modle = "unused"\n', "tiers.standard.modle"],
+    ]) {
+      writeFileSync(models, contents);
+      expect(JSON.stringify(doctorWorkbench(root).issues)).toContain(field);
+      expect(() => syncWorkbench({ targetDir: root })).toThrow(field);
+      expect(() => loadModelsConfig(root)).toThrow(field);
+      expect(readFileSync(lock)).toEqual(before);
+    }
+    writeFileSync(models, valid);
+    syncWorkbench({ targetDir: root });
+    expect(doctorWorkbench(root).ok).toBe(true);
+    expect(loadModelsConfig(root).tiers.standard).toEqual({model: "fixture-standard", effort: "low"});
   });
 
   test("sync and doctor validate both private environment files before changing projections", () => {

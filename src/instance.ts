@@ -4,7 +4,7 @@ import { accessSync, constants, existsSync, lstatSync, readFileSync, statSync } 
 import { basename, isAbsolute, join, normalize, relative } from "node:path";
 import { parse } from "yaml";
 import { locateRepo } from "./git";
-import { loadShipPolicy, loadWorkbenchConfig } from "./config";
+import { decodeModelsConfig, loadShipPolicy, loadWorkbenchConfig } from "./config";
 
 export const CORE_SKILLS = [
   "ready",
@@ -124,17 +124,7 @@ export function resolveInstance(root: string, kitRoot?: string) {
   if ("repos" in cfg && (!Array.isArray(cfg.repos) || !cfg.repos.every((r) => typeof r === "string")))
     throw Error(`${file} repos must be a string list`);
   const modelFile = process.env.FORGE_MODELS_TOML || localPath(root, ".workbench/models.toml");
-  load(modelFile, (bytes) => {
-    const tiers = record(record(Bun.TOML.parse(bytes.toString()), "models").tiers, "tiers");
-    for (const name of ["mechanical", "standard", "deep"]) {
-      // v0.4 instances may override individual tiers and inherit defaults for the rest.
-      if (!Object.hasOwn(tiers, name)) continue;
-      const tier = record(tiers[name], `tiers.${name}`);
-      str(tier.model, `tiers.${name}.model`);
-      if (!["low", "medium", "high", "xhigh"].includes(String(tier.effort)))
-        throw Error(`Invalid tiers.${name}.effort`);
-    }
-  });
+  load(modelFile, bytes => decodeModelsConfig(Bun.TOML.parse(bytes.toString()), modelFile));
   load(localPath(root, ".workbench/ship-policy.yaml"), () => loadShipPolicy(root));
   const { repos } = load(file, () => loadWorkbenchConfig(root));
   const loc = `${file} extensions`;

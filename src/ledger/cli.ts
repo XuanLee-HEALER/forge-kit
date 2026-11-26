@@ -66,7 +66,9 @@ Commands:
   prune     --before <days> [--apply]
   runbook   <create|show|list|complete|revoke> [options]`;
 
-  if (!cmd || cmd === "--help" || cmd === "-h" || rest.includes("--help") || rest.includes("-h")) {
+  const runbookHelp = cmd === "runbook" && (!rest[0] || ["--help", "-h"].includes(rest[0]) ||
+    (rest[0] === "create" && ["--help", "-h"].includes(rest[1])));
+  if (!runbookHelp && (!cmd || cmd === "--help" || cmd === "-h" || rest.includes("--help") || rest.includes("-h"))) {
     console.log(USAGE);
     return;
   }

@@ -281,13 +281,29 @@ function runTsChecks(targetDir: string, mode: CheckMode, execCheck: ReturnType<t
   }
 
   if (mode === "static" || mode === "all") {
-    const declared = ["check", "typecheck", "lint"].find(name => pkg?.scripts?.[name]?.trim());
+    const scripts = pkg?.scripts ?? {};
+    const declared = ["check", "typecheck", "lint"].find(name => scripts[name]?.trim());
+    const hasProject = existsSync(join(targetDir, "tsconfig.json"));
+    const localTsc = join(targetDir, "node_modules", ".bin", "tsc");
+    const hasLocalTsc = hasProject && existsSync(localTsc);
     if (declared) {
-      items.push(execCheck("ts", "static", declared, [process.execPath, "--bun", "run", declared], targetDir));
+      const body = scripts[declared].trim();
+      // Execute the native compiler ourselves. A lifecycle hook, package script
+      // shadowing tsc, or any extra shell command is separate project behavior.
+      const direct = body === "tsc --noEmit";
+      const unshadowedBun = !existsSync(join(targetDir, "node_modules", ".bin", "bun"));
+      const directBun = unshadowedBun && body === "bun ./node_modules/.bin/tsc --noEmit";
+      const bunAlias = unshadowedBun && body === "bun --bun run tsc --noEmit" &&
+        !["tsc", "pretsc", "posttsc"].some(name => Object.hasOwn(scripts, name)) &&
+        !readdirSync(targetDir).some(name => name === "tsc" || name.startsWith("tsc."));
+      const equivalent = hasLocalTsc && !scripts["pre" + declared] && !scripts["post" + declared] &&
+        (direct || directBun || bunAlias);
+      if (!equivalent) {
+        items.push(execCheck("ts", "static", declared, [process.execPath, "--bun", "run", declared], targetDir));
+      }
     }
-    if ((!declared || declared === "lint") && existsSync(join(targetDir, "tsconfig.json"))) {
-      const localTsc = join(targetDir, "node_modules", ".bin", "tsc");
-      const tscBin = existsSync(localTsc) ? localTsc : whichBin("tsc", targetDir);
+    if (hasProject) {
+      const tscBin = hasLocalTsc ? localTsc : whichBin("tsc", targetDir);
       if (tscBin) {
         items.push(execCheck("ts", "static", "tsc-noEmit", [process.execPath, tscBin, "--noEmit"], targetDir));
       } else {

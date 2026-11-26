@@ -88,10 +88,15 @@ export function handleUserPromptRunbookDirectives(
           notes.push(`已批准 ${id}。按本次授权激活 ${binding.envelope_id}，然后运行 forge ship run --envelope ${binding.envelope_id}。逐项回执齐备后执行器自动完成 runbook。`);
           continue;
         }
+        if (Object.hasOwn(actions, "exact")) {
+          notes.push(`已批准 ${id}。请用 forge ledger fast-track prepare 为此精确 runbook 登记执行范围，再批准返回的授权编号。逐项回执齐备后执行器自动完成 runbook。`);
+          continue;
+        }
         notes.push(
           `[Forge Runbook] 用户已在主会话批准发版单 ${record.runbook_id}（有效至 ${record.expires_at}，绑定当前 session）。` +
             `登记范围：${formatRunbookScopeSummary(actions)}。` +
-            (actions.prs?.length ? "请操作者在托管平台核对目标分支、固定 HEAD 和必需检查，手动合并所列 PR，使获批 HEAD 在目标分支上保持可达（例如创建合并提交）。" : "") +
+            (actions.prs?.some(pr => pr.pin) ? "请操作者在托管平台核对目标分支、固定 HEAD 和必需检查，手动合并带有版本绑定的 PR，使获批 HEAD 在目标分支上保持可达（例如创建合并提交）。" : "") +
+            (actions.prs?.some(pr => !pr.pin) ? "仅登记仓库和编号的 PR 由操作者在托管平台核对当前 HEAD、目标分支和必需检查。该登记项没有绑定提交 SHA。" : "") +
             (releaseId ? `发布线程随后刷新各仓固定目标分支的 origin 跟踪引用，再运行 forge ledger release verify ${releaseId} 核验远端结果。` : "") +
             `完成登记项后运行 forge ledger runbook complete ${record.runbook_id}。`,
         );
