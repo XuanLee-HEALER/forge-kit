@@ -20,7 +20,7 @@ export const EXECUTABLE_EVIDENCE = new Set(["lint", "test", "build", "hurl", "re
 
 export type TaskStatus = "OPEN" | "HANDED_OFF" | "CLOSED" | "CANCELLED";
 
-export type DeliveryEndpoint = "investigation" | "local" | "fat" | "pr" | "prod";
+export type DeliveryEndpoint = string;
 
 export type VerificationDepth = "targeted" | "full";
 
@@ -264,4 +264,8 @@ export function usesV05(ledger: LedgerReader, taskId: string): boolean {
     "SELECT json_extract(payload_json, '$.workflow_version') AS version FROM events WHERE task_id=? AND event_type='TASK_OPENED' ORDER BY seq LIMIT 1"
   ).get(taskId);
   return row?.version === "0.5";
+}
+
+export function isRolloutEndpoint(endpoint: string): boolean {
+  return endpoint === "prod" || !VALID_ENDPOINTS.has(endpoint);
 }

@@ -43,6 +43,14 @@ type Options = NonNullable<Parameters<typeof runProcess>[1]> & { cwd: string; ba
 export function runVerificationProcess(argv: string[], dynamic: boolean, options: Options) {
   const bin = basename(argv[0]);
   const env: Record<string, string | undefined> = { ...checkoutEnvironment(options.baseEnv), ...delegatedGoEnvironment(bin, options.cwd), ...options.env };
+  if (bin === "tsc") {
+    const executable = Bun.which(argv[0], { PATH: env.PATH, cwd: options.cwd });
+    if (!executable) throw Error("TypeScript compiler not found in verification environment");
+    argv = [process.execPath, executable, ...argv.slice(1)];
+  } else if (bin === "bun" && !argv.includes("--bun")) {
+    // Package binaries can declare a Node shebang even in a Bun-only checkout.
+    argv = [argv[0], "--bun", ...argv.slice(1)];
+  }
   const observe = dynamic && ["pytest", "bun"].includes(bin);
   const delegated = ["bun", "make"].includes(bin);
   const cargo = delegated ? Bun.which("cargo", {PATH: env.PATH, cwd: options.cwd}) : null;
@@ -58,9 +66,10 @@ export function runVerificationProcess(argv: string[], dynamic: boolean, options
       env.PYTEST_PLUGINS = [env.PYTEST_PLUGINS, plugin].filter(Boolean).join(",");
     }
     if (delegated) {
-      const preload = join(dir, "tsc-project.cjs");
-      writeFileSync(preload, tscProjectPreload);
-      env.NODE_OPTIONS = [env.NODE_OPTIONS, "--require=" + JSON.stringify(preload)].filter(Boolean).join(" ");
+      // BUN_OPTIONS is inherited by package-script children. A data URL also
+      // works when the system temporary path contains spaces.
+      const preload = "data:text/javascript;base64," + Buffer.from(tscProjectPreload).toString("base64");
+      env.BUN_OPTIONS = [env.BUN_OPTIONS, "--preload=" + preload].filter(Boolean).join(" ");
     }
     if (cargo) {
       const shim = join(dir, "cargo");

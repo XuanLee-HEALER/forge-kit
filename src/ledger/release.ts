@@ -1,3 +1,4 @@
+import { isRolloutEndpoint } from "./types";
 import { canonicalRepoPath } from "../config";
 import { randomBytes } from "node:crypto";
 import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
@@ -185,7 +186,7 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
         .map((i) => "gh pr merge " + i.pr_url + " --merge --match-head-commit " + i.expected_head_sha);
       return { ...rb, actions, release_id: id, execution_actions: productionActions(actions), merge_commands };
     }
-    const prodItems = checked.items.filter((i) => ledger.getTask(i.task_id)?.endpoint === "prod");
+    const prodItems = checked.items.filter((i) => isRolloutEndpoint(ledger.getTask(i.task_id)!.endpoint));
     if ((prodItems.length || checked.sql_files.length) && !release.runbook_id)
       throw Error("Production release requires an approved and COMPLETED runbook");
     if (release.runbook_id) {
@@ -195,14 +196,16 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
       checkedActions(checked, rb);
       requireActionReceipts(ledger, id, rb);
       for (const item of prodItems) {
+        const endpoint = ledger.getTask(item.task_id)!.endpoint;
         const last = ledger.db
-          .query<{ status: string }, [string, string, string, string, string]>(
+          .query<{ status: string }, [string, string, string, string, string, string, string]>(
             `SELECT json_extract(payload_json,'$.status') AS status FROM events WHERE task_id=?
            AND canonical_repo(repo)=canonical_repo(?) AND branch=? AND sha=? AND event_type='EVIDENCE_CAPTURED'
            AND json_extract(payload_json,'$.release_id')=?
+           AND (?='prod' OR (json_extract(payload_json,'$.source')='tool' AND json_extract(payload_json,'$.meta.delivery_endpoint')=?))
            AND json_extract(payload_json,'$.kind')='prod' AND json_type(payload_json,'$.meta.action_id') IS NULL AND json_extract(payload_json,'$.status') IN ('pass','fail') ORDER BY seq DESC LIMIT 1`,
           )
-          .get(item.task_id, item.repo, item.branch, item.expected_head_sha, id);
+          .get(item.task_id, item.repo, item.branch, item.expected_head_sha, id, endpoint, endpoint);
         if (last?.status !== "pass")
           throw Error(
             "Missing SHA-bound production delivery evidence for " + item.repo + "@" + item.expected_head_sha,

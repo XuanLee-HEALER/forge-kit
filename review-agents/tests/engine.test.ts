@@ -12,11 +12,16 @@ test("both adapters consume pinned instruction changes as data; only a trusted u
     return p.stdout.toString().trim();
   };
   const events: any[] = [];
+  let truncated = false;
   const raw = { status: "pass", summary: "examined", checked: [], limitations: [], findings: [] };
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0, async fetch(request) {
       const body = await request.json();
       events.push(JSON.parse(body.input));
+      if (truncated) return Response.json({ id: "resp_partial", object: "response", status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" }, output: [
+          { type: "message", role: "assistant", status: "incomplete", content: [{ type: "output_text", text: '{"status":"pass"' }] },
+        ] });
       return Response.json({ id: "resp_test", object: "response", status: "completed", output: [
         { id: "msg_test", type: "message", role: "assistant", content: [{ type: "output_text", text: JSON.stringify(raw) }] },
       ] });
@@ -52,6 +57,14 @@ test("both adapters consume pinned instruction changes as data; only a trusted u
     process.env.REVIEW_FIXTURE_ACTION = "local";
     expect((await runReview(opts)).status).toBe("error");
     expect(events).toHaveLength(2);
+    truncated = true;
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, "../src/review.ts"), "--repo", root,
+      "--base", base, "--head", head, "--roles", "quality", "--backend", "api"], { env: { ...process.env }, stdout: "pipe" });
+    const [reply, exitCode] = await Promise.all([new Response(child.stdout).json(), child.exited]);
+    expect(exitCode).toBe(3);
+    expect(reply.status).toBe("incomplete");
+    expect(reply.roles[0]).toMatchObject({ status: "incomplete", findings: [], attempts: [{ backend: "api", status: "incomplete" }] });
+    expect(events).toHaveLength(3);
     const incomplete = await runReview({ ...opts, roles: "business" });
     expect(incomplete.roles[0].attempts).toEqual([]);
     expect(incomplete.status).toBe("incomplete");

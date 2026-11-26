@@ -1,3 +1,4 @@
+import { verificationPolicy } from "./workflow-config";
 import { createHash } from "node:crypto";
 import { runVerificationProcess } from "./verification-process";
 import { basename, join } from "node:path";
@@ -5,7 +6,7 @@ import { mkdtempSync, mkdirSync, existsSync, realpathSync, rmSync } from "node:f
 import { tmpdir } from "node:os";
 import { runGit, runProcess } from "./git";
 import { usesV05 } from "./ledger/types";
-import { resolveInstance, runInstanceStage } from "./instance";
+import { resolveInstance, runInstanceStage, verificationStageCwd } from "./instance";
 import { findKitRoot } from "./kit-root";
 import { isVerificationCommand, type VerificationKind as Kind } from "./verify-command";
 import { parseArgs } from "node:util";
@@ -62,6 +63,7 @@ export function verifyCli(args: string[]) {
     const started = Date.now();
     const results: { kind: Kind | "verify"; stage?: string; action?: string; options_sha256?: string; command: string[]; exit_code: number; output_sha256: string }[] = [];
     let environment: string | undefined;
+    let policyDigest: string | undefined;
     let skipped = false;
     function result(k: Kind, command: string[], code: number, output_sha256: string) {
       results.push({ kind: k, command, exit_code: code, output_sha256 });
@@ -84,14 +86,22 @@ export function verifyCli(args: string[]) {
     } else {
       const config = modern ? resolveInstance(ledger.workbenchRoot, findKitRoot()) : undefined;
       environment = config?.verification.value.environment;
+      if (config) policyDigest = verificationPolicy(config);
       const stages = config?.verification.value.stages ?? ["verify"];
+      if (config) {
+        for (const id of stages) {
+          const stage = config.stages.get(id);
+          const action = stage && config.actions.get(stage.value.action);
+          if (action) verificationStageCwd(ledger.workbenchRoot, snap.repo, dir, action.value.cwd, config.repos);
+        }
+      }
       for (const stage of stages) {
         const custom = config?.stages.get(stage);
         if (custom?.source !== "core" && config && custom) {
           const action = config.actions.get(custom.value.action);
           if (!action) throw Error("Missing verification action for stage " + stage);
           const hash = createHash("sha256");
-          const code = runInstanceStage(ledger.workbenchRoot, findKitRoot(), stage, { checkout: dir, head: snap.head, config },
+          const code = runInstanceStage(ledger.workbenchRoot, findKitRoot(), stage, { checkout: dir, head: snap.head, repo: snap.repo, config },
             (stdout, stderr) => { hash.update(stdout).update(stderr); });
           results.push({ kind: "verify", stage, action: custom.value.action, command: ["forge", "instance", "run", stage],
             options_sha256: createHash("sha256").update(JSON.stringify([action.value, custom.value.options])).digest("hex"),
@@ -159,7 +169,7 @@ export function verifyCli(args: string[]) {
           ledger.recordEvidence({
             task_id: snap.task_id, repo: snap.repo, branch: snap.branch, sha: snap.head, kind: "verify",
             source: "tool", actor: "tool", status: ok ? "pass" : "fail", summary: "Configured verification stages",
-            meta: { mode, environment, stages: results, review_task_id: snap.task_id, freeze_seq: snap.freeze_seq,
+            meta: { mode, environment, policy_sha256: policyDigest, stages: results, review_task_id: snap.task_id, freeze_seq: snap.freeze_seq,
               started_at: new Date(started).toISOString(), duration_ms: Date.now() - started },
           });
         }

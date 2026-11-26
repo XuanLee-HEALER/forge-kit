@@ -46,6 +46,25 @@ test("custom and core stages execute in declaration order against one isolated r
   expect(receipt.meta.stages.map((s: { kind: string }) => s.kind)).toEqual(["verify", "lint", "test", "verify"]);
   expect(receipt.meta.stages[0].output_sha256).toBe(new Bun.CryptoHasher("sha256").update("first\n").digest("hex"));
 
+  const adapters = join(configDir, "actions");
+  mkdirSync(adapters);
+  const output = join(f.root, "adapter-result.json");
+  writeFileSync(join(adapters, "check.ts"),
+    "await Bun.write(" + JSON.stringify(output) + ", JSON.stringify({cwd:process.cwd(), checkout:process.env.FORGE_VERIFY_CHECKOUT, environment:process.env.FORGE_VERIFY_ENVIRONMENT}));");
+  config.extensions.actions.first.cwd = "service";
+  config.extensions.actions.last = { cwd: ".workbench/actions", argv: ["bun", "check.ts"], purpose: "verify" };
+  config.extensions.verification.environment = "fixture-lab";
+  writeFileSync(file, stringify(config));
+  const custom = f.cli("verify", []);
+  expect(custom.exitCode, custom.stderr.toString() + custom.stdout.toString()).toBe(0);
+  const adapter = JSON.parse(readFileSync(output, "utf8"));
+  expect(adapter.cwd).toBe(adapters);
+  expect(adapter.environment).toBe("fixture-lab");
+  expect(f.evidence().at(-1)?.meta.environment).toBe(adapter.environment);
+  const lastFirst = readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(row => row[0] === "first").at(-1);
+  expect(lastFirst[1]).toBe(adapter.checkout);
+  expect(existsSync(adapter.checkout)).toBe(false);
+
   config.extensions.actions.first.argv = ["bun", "-e", "process.exit(9)"];
   writeFileSync(file, stringify(config));
   expect(f.cli("verify", []).exitCode).toBe(1);

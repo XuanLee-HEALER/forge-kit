@@ -72,6 +72,12 @@ export async function invoke(backend: Backend, prompt: string, model: Model) {
       reasoning: { effort: model.effort as "medium" | "high" },
       text: { format: { type: "json_schema", name: "review", strict: true, schema } },
     });
+    if (response.status === "incomplete") {
+      const reason = response.incomplete_details?.reason;
+      const summary = reason === "max_output_tokens" || reason === "content_filter"
+        ? "API response incomplete: " + reason : "API response incomplete";
+      return { status: "incomplete", summary, findings: [], checked: [], limitations: [summary] };
+    }
     if (response.status && response.status !== "completed") throw new BackendFailure("API response was " + response.status);
     return JSON.parse(response.output_text);
   } catch (err) {

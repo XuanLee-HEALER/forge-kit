@@ -1,4 +1,5 @@
-import { usesV05 } from "./types";
+import { usesV05, isRolloutEndpoint } from "./types";
+import { installedInstance, verificationPolicy } from "../workflow-config";
 import {
   availableHandoffs,
   currentHandoff,
@@ -117,6 +118,10 @@ export class Ledger {
     throw new Error("Cannot resolve --base to a commit in " + repo + ": " + ref);
   }
 
+  private validEndpoint(endpoint: string) {
+    return VALID_ENDPOINTS.has(endpoint) || (!!endpoint && installedInstance(this.workbenchRoot)?.delivery.value.endpoint === endpoint);
+  }
+
   openTask(params: {
     workflow_version?: "0.4" | "0.5";
     task_id: string;
@@ -131,7 +136,7 @@ export class Ledger {
     actor?: string;
     session_id?: string | null;
   }): { task: TaskRecord; event: EventRecord } {
-    if (!VALID_ENDPOINTS.has(params.endpoint)) {
+    if (!this.validEndpoint(params.endpoint)) {
       throw new Error(`Invalid endpoint: ${params.endpoint}`);
     }
     if (!VALID_DEPTHS.has(params.depth)) {
@@ -350,7 +355,7 @@ export class Ledger {
     actor?: string;
     session_id?: string | null;
   }): { task: TaskRecord; event: EventRecord } {
-    if (params.endpoint !== undefined && !VALID_ENDPOINTS.has(params.endpoint)) {
+    if (params.endpoint !== undefined && !this.validEndpoint(params.endpoint)) {
       throw new Error(`Invalid endpoint: ${params.endpoint}`);
     }
     if (params.depth !== undefined && !VALID_DEPTHS.has(params.depth)) {
@@ -366,7 +371,7 @@ export class Ledger {
       }
       const nextEndpoint = params.endpoint !== undefined ? params.endpoint : task.endpoint;
       const nextDepth = params.depth !== undefined ? params.depth : task.verification_depth;
-      const isDowngrade = ENDPOINT_RANK[nextEndpoint] < ENDPOINT_RANK[task.endpoint];
+      const isDowngrade = (ENDPOINT_RANK[nextEndpoint] ?? ENDPOINT_RANK.prod) < (ENDPOINT_RANK[task.endpoint] ?? ENDPOINT_RANK.prod);
       if (isDowngrade) {
         if (nextEndpoint === "investigation") {
           throw new Error(
@@ -417,7 +422,7 @@ export class Ledger {
     actor?: string;
     session_id?: string | null;
   }): { task: TaskRecord; event: EventRecord } {
-    if (!VALID_ENDPOINTS.has(params.endpoint)) {
+    if (!this.validEndpoint(params.endpoint)) {
       throw new Error(`Invalid endpoint: ${params.endpoint}`);
     }
     return withImmediateTx(this.db, () => {
@@ -426,7 +431,7 @@ export class Ledger {
       if (task.status !== "OPEN") {
         throw new Error(`Cannot update endpoint on ${task.status} task: ${params.task_id}`);
       }
-      const isDowngrade = ENDPOINT_RANK[params.endpoint] < ENDPOINT_RANK[task.endpoint];
+      const isDowngrade = (ENDPOINT_RANK[params.endpoint] ?? ENDPOINT_RANK.prod) < (ENDPOINT_RANK[task.endpoint] ?? ENDPOINT_RANK.prod);
       if (isDowngrade) {
         if (params.endpoint === "investigation") {
           throw new Error(
@@ -610,7 +615,7 @@ export class Ledger {
           if (!item || !linked || book?.status !== "APPROVED" || !action || !actionMatchesItem(snapshot,item,action))
             throw Error("Production receipt must match an approved release action and handoff SHA");
           prodReceipt = true;
-        } else if (item && task.endpoint === "prod") {
+        } else if (item && isRolloutEndpoint(task.endpoint)) {
           prodReceipt = true;
           releaseId = this.db.query<{ release_id: string }, [string, string]>(
             `SELECT r.release_id FROM releases r JOIN release_items i USING(release_id)
@@ -902,6 +907,10 @@ export class Ledger {
 
     params = {...params, repo:canonicalRepoPath(this.workbenchRoot,params.repo)};
     const currentWorkflow = usesV05(this, params.task_id);
+    const config = currentWorkflow ? installedInstance(this.workbenchRoot) : undefined;
+    const customVerification = config && (config.verification.source !== "core" ||
+      config.verification.value.stages.some(id => config.stages.get(id)?.source !== "core"));
+    const expectedPolicy = customVerification ? verificationPolicy(config) : undefined;
     const specState = getSpecState(this, params.task_id, { delivery: params, closing });
     if (currentWorkflow && specState.state === "NONE") missing.push("A confirmed frozen specification is required for delivery");
     if (specState.drifted_locked_tests.length) {
@@ -952,7 +961,7 @@ export class Ledger {
     }
     type BranchEvidence = {
       checks: Map<string, string>;
-      reviews: Map<string, string>;
+      reviews: Map<string, {role: string; status: string}>;
       endpoint?: string;
     };
     const byBranch = new Map<string | null, BranchEvidence>();
@@ -987,6 +996,7 @@ export class Ledger {
             state?: string; base_branch?: string; target_oid?: string;
             pr_url?: string;
             role?: string;
+            policy_sha256?: string; delivery_endpoint?: string;
             mode?: string; freeze_seq?: number; review_task_id?: string;
             started_at?: string;
             review_floor_seq?: number;
@@ -997,6 +1007,7 @@ export class Ledger {
         if (EXECUTABLE_EVIDENCE.has(p.kind) && evidenceSource(p, ev.actor) === "manual") continue;
         if (currentWorkflow && p.kind === "verify" && p.meta?.mode === "all" &&
             p.meta.review_task_id === params.task_id && p.meta.freeze_seq === specState.freeze_seq &&
+            (!expectedPolicy || expectedPolicy === p.meta.policy_sha256) &&
             evidenceSource(p, ev.actor) === "tool" && ev.seq >= Math.max(floors.lint, floors.test)) {
           evidence.checks.set("verify", p.status);
         }
@@ -1015,16 +1026,17 @@ export class Ledger {
           const current = branch ? repoAttachments.filter((r) => r.branch === branch) : [];
           const covered = (row: ReviewAttachment | undefined) =>
             !!row && coversReviewBase(this.workbenchRoot, row, p.meta?.base);
-          if ((!currentWorkflow && p.status === "fail") || (historical.length > 0 && historical.every(covered) && current.every(covered))) {
+          if (currentWorkflow || p.status === "fail" || (historical.length > 0 && historical.every(covered) && current.every(covered))) {
             const roleKey = normalizeReviewRole(p.meta?.role);
-            evidence.reviews.set(roleKey, p.status);
+            evidence.reviews.set(currentWorkflow ? JSON.stringify([p.meta?.base, roleKey]) : roleKey, { role: roleKey, status: p.status });
           }
         }
         if (
           (task.endpoint === "pr" && p.kind === "pr" && attachments.length === 1 && ev.branch === attachments[0].branch) ||
           (task.endpoint === "fat" && (p.kind === "fat" ||
             (p.kind === "hurl" && evidenceSource(p, ev.actor) === "hook"))) ||
-          (task.endpoint === "prod" && p.kind === "prod")
+          (isRolloutEndpoint(task.endpoint) && p.kind === "prod" && (task.endpoint === "prod" ||
+            (evidenceSource(p, ev.actor) === "tool" && p.meta?.delivery_endpoint === task.endpoint)))
         ) {
           if (p.kind === "pr" && p.status === "pass" &&
               (p.meta?.pr_head_oid !== params.head_sha || !p.meta.pr_url)) continue;
@@ -1058,7 +1070,7 @@ export class Ledger {
         if (status === "fail") failedKinds.add(kind);
         if (eligible && status === "pass") latestByKind.set(kind, status);
       }
-      for (const [role, status] of evidence.reviews) {
+      for (const {role, status} of evidence.reviews.values()) {
         if (status === "fail") failedRoles.add(role);
         if (eligible && (status === "pass" || status === "fallback")) passingRoles.add(role);
       }
@@ -1079,6 +1091,8 @@ export class Ledger {
       );
     } else if (currentWorkflow && latestByKind.get("verify") === "pass") {
       // The configured verification sequence completed at this freeze and SHA.
+    } else if (customVerification) {
+      missing.push("Missing completed verification for the configured environment and stages");
     } else if (currentWorkflow || task.verification_depth === "full") {
       if (latestByKind.get("lint") !== "pass") {
         missing.push(
@@ -1123,7 +1137,7 @@ export class Ledger {
 
     if (
       params.checkEndpoint &&
-      (task.endpoint === "pr" || task.endpoint === "fat" || task.endpoint === "prod")
+      (task.endpoint === "pr" || task.endpoint === "fat" || isRolloutEndpoint(task.endpoint))
     ) {
       if (latestEndpointStatus === "fail") {
         hasExplicitFailure = true;
@@ -1192,7 +1206,7 @@ export class Ledger {
               // 3) that exact SHA already has complete verification + endpoint delivery evidence.
               const remoteRefs = task.endpoint === "fat" ? ["refs/remotes/origin/fat"]
                 : task.endpoint === "pr" ? prRemoteRefs(candidateDir, r.branch)
-                : task.endpoint === "prod" ? ["refs/remotes/origin/main", "refs/remotes/origin/master"] : [];
+                : isRolloutEndpoint(task.endpoint) ? ["refs/remotes/origin/main", "refs/remotes/origin/master"] : [];
               if (r.head_sha && reachableFromRefs(candidateDir, r.head_sha, remoteRefs)) {
                 const deliveredCheck = this.checkReadiness({
                   task_id: params.task_id,
