@@ -32,6 +32,7 @@ export async function reviewCli(args: string[]) {
     const execution = crypto.randomUUID();
     const report = await runReview({
       ...values, repo: snap.dir, base, head, spec: specPath ? join(root, specPath) : undefined,
+      specSha256: spec.hashes?.ssot ?? spec.hashes?.scope,
       models: { business: config.tiers.deep, quality: config.tiers.deep, simplify: config.tiers.standard, comments: config.tiers.mechanical },
     });
     ledger.db.transaction(() => {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { Repo } from "./repo";
@@ -67,7 +68,7 @@ function materials(repo: Repo) {
 }
 
 export async function runReview(params: Option & {
-  repo: string; base: string; head: string; spec?: string;
+  repo: string; base: string; head: string; spec?: string; specSha256?: string;
   models?: Partial<Record<Role, Model>>; model?: Model;
 }) {
   const { mode, sequence, backend } = options(params);
@@ -77,7 +78,11 @@ export async function runReview(params: Option & {
   const material = materials(repo);
   let spec: string | undefined;
   if (params.spec) {
-    try { spec = readFileSync(params.spec, "utf8").trim() || undefined; } catch { /* Report missing material on the affected role. */ }
+    try {
+      const bytes = readFileSync(params.spec);
+      if (!params.specSha256 || createHash("sha256").update(bytes).digest("hex") === params.specSha256)
+        spec = bytes.toString("utf8").trim() || undefined;
+    } catch { /* The business role reports missing material. */ }
   }
   async function run(role: Role): Promise<RoleReport> {
     const common = { role, base, head };

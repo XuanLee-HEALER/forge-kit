@@ -27,12 +27,7 @@ function git(cwd: string, args: string[]): string {
 beforeEach(() => {
   wbRoot = mkdtempSync(join(tmpdir(), "forge-runbook-test-"));
   mkdirSync(join(wbRoot, ".workbench", "bin"), { recursive: true });
-  writeFileSync(join(wbRoot, ".workbench", "bin", "dbcred"), "#!/bin/sh\necho secret\n", {
-    mode: 0o755,
-  });
-  writeFileSync(join(wbRoot, ".workbench", "bin", "ledger"), "#!/bin/sh\necho ledger\n", {
-    mode: 0o755,
-  });
+  writeFileSync(join(wbRoot, ".workbench", "bin", "forge"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
   writeFileSync(
     join(wbRoot, ".workbench", "workbench.yaml"),
     [
@@ -872,7 +867,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         cwd: wbRoot,
         tool_name: "Bash",
         tool_input: {
-          command: `PGCONNECT_TIMEOUT=5 PGOPTIONS='-c statement_timeout=30000' usql "postgres://$(.workbench/bin/dbcred prod)@pg-prod.demo.internal:5432/app?sslmode=disable" -f "${sqlFile}" 2>&1`,
+          command: `PGCONNECT_TIMEOUT=5 PGOPTIONS='-c statement_timeout=30000' usql "postgres://$(.workbench/bin/forge dbcred prod)@pg-prod.demo.internal:5432/app?sslmode=disable" -f "${sqlFile}" 2>&1`,
         },
       }),
     ).toBeNull();
@@ -885,7 +880,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         cwd: repoDir,
         tool_name: "Bash",
         tool_input: {
-          command: `usql "postgres://$(../.workbench/bin/dbcred prod)@pg-prod.demo.internal:5432/app?sslmode=disable" -f "${sqlFile}"`,
+          command: `usql "postgres://$(../.workbench/bin/forge dbcred prod)@pg-prod.demo.internal:5432/app?sslmode=disable" -f "${sqlFile}"`,
         },
       }),
     ).toBeNull();
@@ -896,7 +891,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         cwd: repoDir,
         tool_name: "Bash",
         tool_input: {
-          command: `usql "postgres://$(.workbench/bin/dbcred prod)@pg-prod.demo.internal:5432/app" -f "${sqlFile}"`,
+          command: `usql "postgres://$(.workbench/bin/forge dbcred prod)@pg-prod.demo.internal:5432/app" -f "${sqlFile}"`,
         },
       }),
     ).toContain("prod 数据库");
@@ -918,7 +913,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         cwd: wbRoot,
         tool_name: "Bash",
         tool_input: {
-          command: `usql postgres://$(.workbench/bin/dbcred prod)@pg-prod.demo.internal:5432/app -f "${sqlFile}"`,
+          command: `usql postgres://$(.workbench/bin/forge dbcred prod)@pg-prod.demo.internal:5432/app -f "${sqlFile}"`,
         },
       }),
     ).toContain("prod 数据库");
@@ -958,8 +953,8 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
     mkdirSync(dbEnv, {recursive:true});
     writeFileSync(join(dbEnv, "environments.json"), JSON.stringify({prod: {host:"pg-prod.demo.internal.:5432",
       ro:{user:"reader"}, rw:{user:"writer"}}}));
-    const rwMigration = (args: string) => `psql "postgresql://$(.workbench/bin/dbcred prod --rw --runbook ${args})@pg-prod.demo.internal/app" -f "${sqlFile}"`;
-    expect(checkMigration(rwMigration("rb-1124-chain --session sess-chain"))).toBeNull();
+    const rwMigration = (args: string) => `psql "postgresql://$(.workbench/bin/forge dbcred prod --rw --runbook ${args})@pg-prod.demo.internal/app" -f "${sqlFile}"`;
+    expect(checkMigration(rwMigration("rb-1124-chain --session sess-chain"))).toContain("prod 数据库");
     expect(checkMigration(rwMigration("rb-other --session sess-chain"))).toContain("prod 数据库");
     expect(checkMigration(rwMigration("rb-1124-chain --session other"))).toContain("prod 数据库");
     const dsn = "'postgresql://pg-prod.demo.internal:5432/app'";
@@ -1069,7 +1064,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         cwd: wbRoot,
         tool_name: "Bash",
         tool_input: {
-          command: `usql "postgres://$(.workbench/bin/dbcred prod; id)@pg-prod.demo.internal:5432/app" -f "${sqlFile}"`,
+          command: `usql "postgres://$(.workbench/bin/forge dbcred prod; id)@pg-prod.demo.internal:5432/app" -f "${sqlFile}"`,
         },
       }),
     ).toContain("prod 数据库");
@@ -1253,7 +1248,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         }),
       ).toContain("禁止通过 Shell 直接调用 ledger-hook");
     }
-    // 4. Local `.workbench/bin/ledger runbook create --sql <prod-host>:<file>` and `ledger record` MUST NOT be falsely blocked by `checkProdDb` (even though `create` matches SQL_WRITE_RE!),
+    // 4. Local `.workbench/bin/forge ledger runbook create --sql <prod-host>:<file>` and `ledger record` MUST NOT be falsely blocked by `checkProdDb` (even though `create` matches SQL_WRITE_RE!),
     //    while fake/chained/command-substituted invocations MUST stay blocked!
     expect(
       evaluatePreToolUse(wbRoot, {
@@ -1262,7 +1257,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         cwd: wbRoot,
         tool_name: "Bash",
         tool_input: {
-          command: `.workbench/bin/ledger runbook create --title 'Backfill migration 159' --sql pg-prod.demo.internal:${sqlFile}`,
+          command: `.workbench/bin/forge ledger runbook create --title 'Backfill migration 159' --sql pg-prod.demo.internal:${sqlFile}`,
         },
       }),
     ).toBeNull();
@@ -1273,7 +1268,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         cwd: repoDir,
         tool_name: "Bash",
         tool_input: {
-          command: `../.workbench/bin/ledger record demo-1 --kind prod --status pass --summary 'ALTER/CREATE verified on pg-prod.demo.internal'`,
+          command: `../.workbench/bin/forge ledger record demo-1 --kind prod --status pass --summary 'ALTER/CREATE verified on pg-prod.demo.internal'`,
         },
       }),
     ).toBeNull();
@@ -1285,7 +1280,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         cwd: wbRoot,
         tool_name: "Bash",
         tool_input: {
-          command: `.workbench/bin/ledger runbook create --title 'x' --sql pg-prod.demo.internal:${sqlFile} && psql -h pg-prod.demo.internal -c 'DROP TABLE t'`,
+          command: `.workbench/bin/forge ledger runbook create --title 'x' --sql pg-prod.demo.internal:${sqlFile} && psql -h pg-prod.demo.internal -c 'DROP TABLE t'`,
         },
       }),
     ).toContain("prod 数据库");
@@ -1296,7 +1291,7 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         cwd: wbRoot,
         tool_name: "Bash",
         tool_input: {
-          command: `.workbench/bin/ledger runbook create --title "$(psql -h pg-prod.demo.internal -c 'CREATE TABLE t(id int)')"`,
+          command: `.workbench/bin/forge ledger runbook create --title "$(psql -h pg-prod.demo.internal -c 'CREATE TABLE t(id int)')"`,
         },
       }),
     ).toContain("prod 数据库");

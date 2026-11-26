@@ -171,7 +171,7 @@ for (const [path, content, why] of [
     git(f.wt, "add", "--", path);
     git(f.wt, "commit", "-m", "change", "--", path);
     const head = git(f.wt, "rev-parse", "HEAD");
-    const policy = { ...loadShipPolicy(root).policy, max_lines_changed: 2 };
+    const policy = { ...loadShipPolicy(root).policy, forbid_db_rw: true, max_lines_changed: 2 };
     const paths = path.endsWith("package.json") ? ["./package.json"] : ["src/**"];
     expect(() => deliveryDiff(policy, paths)(f.repo, f.wt, f.base, head)).toThrow(why);
   });

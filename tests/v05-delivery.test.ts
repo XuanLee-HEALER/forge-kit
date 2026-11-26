@@ -8,7 +8,7 @@ let s: Sandbox;
 beforeEach(() => { s = sandbox(); });
 afterEach(() => s.cleanup());
 
-function preparePullRequest(track: "full" | "targeted" = "full", defect = false) {
+function preparePullRequest(track: "full" | "targeted" = "full", defect = false, endpoint = "pr") {
   s.fresh();
   const repo = join(s.work, "app");
   const bare = join(s.root, "remote.git");
@@ -35,7 +35,7 @@ function preparePullRequest(track: "full" | "targeted" = "full", defect = false)
   const doc = parse(readFileSync(config, "utf8"));
   writeFileSync(config, stringify({...doc, repos: ["app"]}));
   const ledger = (...args: string[]) => s.ok([s.forge, "ledger", ...args]);
-  ledger("open", "--id", "ship-task", "--title", "isolated local merge", "--endpoint", "pr", "--depth", track,
+  ledger("open", "--id", "ship-task", "--title", "isolated local merge", "--endpoint", endpoint, "--depth", track,
     "--repo", "app", "--branch", "feature-fixture", "--worktree", repo, "--base", base, "--head", base);
   const files = track === "targeted" ? ["scope.md"] : ["ssot.md", "tech-spec.md", "test-spec.md"];
   for (const file of files)
@@ -101,16 +101,32 @@ await Bun.write(args[args.indexOf("-o")+1],JSON.stringify({status:"pass",summary
   return {ledger, repo, head, base, bare, state, ci, calls};
 }
 
-function delivery() {
-  const prepared = preparePullRequest();
+function delivery(localRollout?: "success" | "failure") {
+  const prepared = preparePullRequest("full", false, localRollout ? "prod" : "pr");
   const {ledger} = prepared;
-  const book = JSON.parse(ledger("runbook", "create", "--task", "ship-task", "--title", "local target", "--pr", "app:1"));
-  const envelope = JSON.parse(ledger("fast-track", "prepare", "ship-task", "--to", "pr", "--paths", "src/**", "--runbook", book.runbook_id)).envelope_id;
+  const receipt = join(s.work, "stage-effects");
+  const stageFile = join(s.work, "release-stage.ts");
+  if (localRollout) {
+    // The operator policy here belongs to the disposable instance created by sandbox().
+    const policy = join(s.work, ".workbench/ship-policy.yaml");
+    const policyDoc = parse(readFileSync(policy, "utf8"));
+    Object.assign(policyDoc.fast_track, {allow_prod: true, max_endpoint: "prod"});
+    writeFileSync(policy, stringify(policyDoc));
+    const cfgPath = join(s.work, ".workbench/workbench.yaml");
+    const cfg = parse(readFileSync(cfgPath, "utf8"));
+    writeFileSync(stageFile, 'import {appendFileSync} from "node:fs";\nappendFileSync("stage-effects", process.argv[2]+"\\n");\nif (process.argv[3]==="failure") process.exit(3);\n');
+    cfg.extensions = {actions: {rolloutAction: {purpose: "deliver", cwd: ".", argv: ["bun", "release-stage.ts", prepared.head, localRollout]}},
+      stages: {rollout: {action: "rolloutAction"}}, delivery: {endpoint: "prod", stages: ["rollout"]}};
+    writeFileSync(cfgPath, stringify(cfg));
+  }
+  const book = JSON.parse(ledger("runbook", "create", "--task", "ship-task", "--title", "local target", "--pr", "app:1",
+    ...(localRollout ? ["--stage", "rollout"] : [])));
+  const envelope = JSON.parse(ledger("fast-track", "prepare", "ship-task", "--to", localRollout ? "prod" : "pr", "--paths", "src/**", "--runbook", book.runbook_id)).envelope_id;
   const approve = () => {
     s.hook("UserPromptSubmit", {session_id: "operator", prompt: "快轨批准 " + envelope});
     expect(JSON.parse(ledger("fast-track", "status", envelope))[0].status).toBe("ACTIVE");
   };
-  return {...prepared, approve, envelope, shipArgs: [s.forge, "ship", "run", "--envelope", envelope]};
+  return {...prepared, approve, envelope, receipt, stageFile, shipArgs: [s.forge, "ship", "run", "--envelope", envelope]};
 }
 
 for (const fault of ["unapproved", "session", "ci", "remote-head", "success"]) {
@@ -231,3 +247,49 @@ test("T13 release keeps both handoff identities across stale-head rejection and 
   for (const name of result.task_ids) expect(JSON.parse(ledger("verify", "--task", name, "--json")).ok).toBe(true);
   expect(s.git(first.bare, "rev-parse", "refs/heads/main").trim()).toBe(sha);
 }, 90_000);
+
+for (const mode of ["success", "failure"] as const) {
+  test(`T11 custom local delivery stage retains completed steps across restart: ${mode}`, () => {
+    const f = delivery(mode);
+    f.approve();
+    const denied = s.run([s.forge, "instance", "run", "rollout"]);
+    expect(denied.code, denied.err + denied.out).not.toBe(0);
+    expect(existsSync(f.receipt)).toBe(false);
+    const first = s.run(f.shipArgs);
+    expect(first.code === 0, first.out + first.err).toBe(mode === "success");
+    expect(readFileSync(f.calls, "utf8")).toBe("merge " + f.head + "\n");
+    expect(readFileSync(f.receipt, "utf8")).toBe(f.head + "\n");
+    const report = JSON.parse(first.out || first.err);
+    expect(report.receipts.filter((r: {status: string}) => r.status === "confirmed")).toHaveLength(mode === "success" ? 2 : 1);
+    const second = s.run(f.shipArgs);
+    expect(second.code === 0, second.out + second.err).toBe(mode === "success");
+    expect(readFileSync(f.calls, "utf8")).toBe("merge " + f.head + "\n");
+    expect(readFileSync(f.receipt, "utf8")).toBe(f.head + "\n");
+    const after = JSON.parse(second.out || second.err);
+    expect(after.receipts).toEqual(report.receipts);
+  }, 90_000);
+}
+
+for (const change of ["script", "arguments", "later-stage"]) {
+  test(`T11 exact stage preflight stops all effects after ${change} changes`, () => {
+    const f = delivery("success");
+    f.approve();
+    if (change === "script") writeFileSync(f.stageFile, "console.log('different content')\n");
+    else {
+      const path = join(s.work, ".workbench/workbench.yaml");
+      const doc = parse(readFileSync(path, "utf8"));
+      if (change === "arguments") doc.extensions.actions.rolloutAction.argv[2] = f.base;
+      else {
+        doc.extensions.stages.late = {action: "rolloutAction"};
+        doc.extensions.delivery.stages.push("late");
+      }
+      writeFileSync(path, stringify(doc));
+    }
+    const denied = s.run(f.shipArgs);
+    expect(denied.code, denied.out + denied.err).not.toBe(0);
+    expect(denied.out + denied.err).toMatch(/drift|scope|changed|stage|runbook/i);
+    expect(readFileSync(f.calls, "utf8")).toBe("");
+    expect(existsSync(f.receipt)).toBe(false);
+    expect(s.git(f.bare, "rev-parse", "refs/heads/main").trim()).toBe(f.base);
+  }, 90_000);
+}
