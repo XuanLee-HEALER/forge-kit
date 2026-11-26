@@ -19,5 +19,15 @@
   "version": "0.5.0",
   "bin": {
     "review-agents": "./bin/review"
-  }
+  },
+  "files": [
+    "bin/review",
+    "dist/review.js",
+    "src",
+    "prompts",
+    "scripts/evaluate.ts",
+    "evals/paired.json",
+    "tests",
+    "tsconfig.json"
+  ]
 }

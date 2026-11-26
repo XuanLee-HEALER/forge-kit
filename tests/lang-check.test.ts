@@ -43,7 +43,7 @@ describe("lang-check (Go / TypeScript / Python static & dynamic checks)", () => 
     mkdirSync(jsRepo, { recursive: true });
     writeFileSync(
       join(jsRepo, "package.json"),
-      JSON.stringify({ name: "js-pkg", scripts: { test: "node -e 'process.exit(0)'" } }),
+      JSON.stringify({ name: "js-pkg", scripts: { test: "bun -e 'process.exit(0)'" } }),
     );
     writeFileSync(join(jsRepo, "index.js"), "export const ok = true;\n");
     expect(detectRepoLanguages(jsRepo)).toEqual(["ts"]);

@@ -51,7 +51,7 @@ test("v3 migration preserves data, FTS rowids, chains and foreign keys", () => {
   const migrated = new Ledger(root, { dbPath: path });
   try {
     expect(dump(migrated.db)).toEqual(before);
-    expect(migrated.db.query("PRAGMA user_version").get()).toEqual({ user_version: 5 });
+    expect(migrated.db.query("PRAGMA user_version").get()).toEqual({ user_version: 6 });
     expect(migrated.db.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(migrated.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
     expect(
@@ -122,7 +122,7 @@ test("handoff, resume and batch release bind evidence, SQL, approvals and sweep 
     if (f === second) {
       const dir = join(root, ".workbench", "specs", f.task);
       mkdirSync(dir, { recursive: true });
-      for (const file of ["ssot.md", "tech-spec.md", "test-spec.md"]) writeFileSync(join(dir, file), "contract");
+      for (const file of ["scope.md"]) writeFileSync(join(dir, file), "contract");
       ledger.freezeSpec({ task_id: f.task, locked_test_globs: ["example.test.ts"] });
     }
     verifyFeature(f);

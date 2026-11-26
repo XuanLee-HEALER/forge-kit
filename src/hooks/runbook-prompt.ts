@@ -85,7 +85,7 @@ export function handleUserPromptRunbookDirectives(
         notes.push(
           `[Forge Runbook] 用户已在主会话批准发版单 ${record.runbook_id}（有效至 ${record.expires_at}，绑定当前 session）。` +
             `底层 guard 将自动放行已登记项：${formatRunbookScopeSummary(actions)}。` +
-            `请按 Runbook 自动推进执行，完成后运行 \`.workbench/bin/ledger runbook complete ${record.runbook_id}\`。`,
+            `请按 Runbook 自动推进执行，完成后运行 \`.workbench/bin/forge ledger runbook complete ${record.runbook_id}\`。`,
         );
       } catch (err) {
         notes.push(

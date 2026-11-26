@@ -1,10 +1,20 @@
+import { findKitRoot } from "./kit-root";
+export { findKitRoot };
 import { loadShipPolicy } from "./config";
+import {
+  checkMigration,
+  hash,
+  installAssets,
+  recoverInstall,
+  wrapper,
+  type Asset,
+  type InstallLock,
+} from "./managed-assets";
+import { localPath, readRequired, resolveInstance, runInstanceStage } from "./instance";
 import { Database } from "bun:sqlite";
 import {
   accessSync,
-  chmodSync,
   constants,
-  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -14,8 +24,6 @@ import {
   realpathSync,
   renameSync,
   statSync,
-  symlinkSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -31,14 +39,14 @@ import {
   loadWorkbenchConfig,
   parseTomlFile,
 } from "./config";
-import { runGit, runProcess } from "./git";
+import { runGit } from "./git";
 import { Ledger } from "./ledger";
 
 interface KitManifest {
   kit: { name: string; version: string; runtime: string };
   managed: {
     rendered_files: string[];
-    copied_dirs: string[];
+    agent_files: string[];
     copied_files: string[];
     bin_bundles: string[];
     bin_wrappers: string[];
@@ -46,49 +54,7 @@ interface KitManifest {
   private: { init_only: string[] };
 }
 
-interface KitLock {
-  kit_name: string;
-  kit_version: string;
-  kit_root: string;
-  kit_commit: string | null;
-  workbench_name: string;
-  // Historical v0.4 installation metadata, retained for ownership checks during migration.
-  packs?: string[];
-  review_agents_enabled: boolean;
-  review_agents_commit: string | null;
-  updated_at: string;
-}
-
-const REVIEW_SKILLS = [
-  "implementation-review",
-  "simplicity-performance-review",
-  "code-simplification-review",
-  "comment-normalization-review",
-] as const;
-
-const REVIEW_BINS = [
-  "review-quality",
-  "review-performance",
-  "review-simplify",
-  "review-comments",
-] as const;
-
-export function findKitRoot(): string {
-  const fromEnv = process.env.FORGE_KIT_ROOT;
-  if (fromEnv && existsSync(join(fromEnv, "kit.toml"))) {
-    return realpathSync(fromEnv);
-  }
-  const candidate = resolve(import.meta.dir, "..");
-  if (existsSync(join(candidate, "kit.toml"))) {
-    return realpathSync(candidate);
-  }
-  const lockPath = join(candidate, "kit-lock.json");
-  if (existsSync(lockPath)) {
-    const { kit_root } = JSON.parse(readFileSync(lockPath, "utf8")) as KitLock;
-    if (kit_root && existsSync(join(kit_root, "kit.toml"))) return realpathSync(kit_root);
-  }
-  throw new Error("Cannot locate forge-kit root (missing kit.toml)");
-}
+type KitLock = InstallLock;
 
 function loadKitManifest(kitRoot: string): KitManifest {
   const m = parseTomlFile<KitManifest>(join(kitRoot, "kit.toml"));
@@ -104,92 +70,18 @@ function renderTemplate(content: string, vars: Record<string, string>): string {
   return out;
 }
 
-function newestMtimeMs(dir: string): number {
-  let latest = 0;
-  if (!existsSync(dir)) return 0;
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) {
-      latest = Math.max(latest, newestMtimeMs(full));
-    } else if (entry.name.endsWith(".ts")) {
-      latest = Math.max(latest, statSync(full).mtimeMs);
-    }
+function loadBundle(kitRoot: string, name: string): Buffer {
+  // A checkout can have an arbitrarily stale dist file. Build the running source directly, leaving the checkout untouched.
+  if (name === "cli.js" && existsSync(join(kitRoot, "src/bin/cli.ts"))) {
+    const result = Bun.spawnSync([process.execPath, "build", "--target=bun", "src/bin/cli.ts"], {
+      cwd: kitRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (result.exitCode !== 0) throw Error("Cannot build current forge entry: " + result.stderr.toString());
+    return result.stdout;
   }
-  return latest;
-}
-
-function ensureKitBuilt(kitRoot: string, bundles: string[]): void {
-  const srcNewest = newestMtimeMs(join(kitRoot, "src"));
-  const needsBuild = bundles.some((b) => {
-    const p = join(kitRoot, "dist", b);
-    if (!existsSync(p)) return true;
-    return statSync(p).mtimeMs < srcNewest;
-  });
-  if (!needsBuild) return;
-  const bunBin = process.execPath || "bun";
-  const res = runProcess([bunBin, "run", "build"], {
-    cwd: kitRoot,
-    timeoutMs: 30_000,
-  });
-  if (res.code !== 0) {
-    throw new Error(`Failed to build forge-kit bundles: ${res.stderr || res.stdout}`);
-  }
-}
-
-function bundleName(wrapper: string): string {
-  return (wrapper === "forge" ? "cli" : wrapper) + ".js";
-}
-
-function installManagedBins(kitRoot: string, targetRoot: string, manifest: KitManifest): void {
-  ensureKitBuilt(kitRoot, manifest.managed.bin_bundles);
-  const binDir = join(targetRoot, ".workbench", "bin");
-  mkdirSync(binDir, { recursive: true });
-
-  for (const bundle of manifest.managed.bin_bundles) {
-    cpSync(join(kitRoot, "dist", bundle), join(binDir, bundle));
-  }
-  for (const wrapper of manifest.managed.bin_wrappers) {
-    const wrapperPath = join(binDir, wrapper);
-    const script = `#!/usr/bin/env bash
-set -euo pipefail
-DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-BUN="\${BUN_BIN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
-exec "$BUN" "$DIR/${bundleName(wrapper)}" "$@"
-`;
-    writeFileSync(wrapperPath, script, "utf8");
-    chmodSync(wrapperPath, 0o755);
-  }
-}
-
-function installReviewAgentLinks(targetRoot: string): string[] {
-  const raRoot = join(targetRoot, "review-agents");
-  if (!existsSync(join(raRoot, "skills"))) return [];
-  const skillsRoot = join(targetRoot, ".agents", "skills");
-  mkdirSync(skillsRoot, { recursive: true });
-  const installed: string[] = [];
-
-  for (const name of REVIEW_SKILLS) {
-    const targetSkill = join(raRoot, "skills", name);
-    if (!existsSync(targetSkill)) continue;
-    const linkPath = join(skillsRoot, name);
-    const relTarget = relative(skillsRoot, targetSkill);
-
-    if (existsSync(linkPath)) {
-      const st = lstatSync(linkPath);
-      if (st.isSymbolicLink()) {
-        if (readlinkSync(linkPath) === relTarget) {
-          installed.push(name);
-          continue;
-        }
-        unlinkSync(linkPath);
-      } else {
-        throw new Error(`Refusing to overwrite non-symlink skill at ${linkPath}`);
-      }
-    }
-    symlinkSync(relTarget, linkPath);
-    installed.push(name);
-  }
-  return installed;
+  return readRequired(localPath(kitRoot, "dist/" + name));
 }
 
 function ensurePrivateGitignores(targetRoot: string): void {
@@ -213,265 +105,170 @@ function ensurePrivateGitignores(targetRoot: string): void {
   }
 }
 
-function renderCodexAgentsFromModels(
-  kitRoot: string,
-  targetRoot: string,
-): void {
-  const models = loadModelsConfig(targetRoot);
-  const vars: Record<string, string> = {
-    MECHANICAL_MODEL: models.tiers.mechanical.model,
-    MECHANICAL_EFFORT: models.tiers.mechanical.effort,
-    STANDARD_MODEL: models.tiers.standard.model,
-    STANDARD_EFFORT: models.tiers.standard.effort,
-    DEEP_MODEL: models.tiers.deep.model,
-    DEEP_EFFORT: models.tiers.deep.effort,
-  };
-  const srcDir = join(kitRoot, "core", ".codex", "agents");
-  const destDir = join(targetRoot, ".codex", "agents");
-  mkdirSync(destDir, { recursive: true });
-  for (const f of readdirSync(srcDir)) {
-    if (!f.endsWith(".toml")) continue;
-    const raw = readFileSync(join(srcDir, f), "utf8");
-    writeFileSync(join(destDir, f), renderTemplate(raw, vars), "utf8");
+function visitSkillFiles(
+  effective: ReturnType<typeof resolveInstance>,
+  visit: (dest: string, src: string) => void,
+) {
+  for (const skill of effective.skills.values()) {
+    const base = dirname(skill.value.path);
+    const dest = ".agents/skills/" + skill.id + "/";
+    visit(dest + "SKILL.md", skill.value.path);
+    // Skill authors explicitly reference supporting files; adjacent private materials are never projected.
+    const resources = new Set<string>();
+    for (const m of skill.value.body.matchAll(
+      /\]\(([^)# ]+)(?:#[^) ]*)?\)|`((?:references|assets|scripts)\/[^\s`]+)`/g,
+    )) {
+      const path = m[1] ?? m[2];
+      if (/^[a-z]+:/i.test(path) || path.startsWith("#")) continue;
+      resources.add(path.replace(/^\.\//, ""));
+    }
+    for (const rel of resources) {
+      const src = localPath(base, rel);
+      visit(dest + rel, src);
+    }
   }
 }
 
-function syncManagedAssets(params: {
-  kitRoot: string;
-  targetRoot: string;
-  workbenchName: string;
-  manifest: KitManifest;
-}): void {
-  const { kitRoot, targetRoot, workbenchName, manifest } = params;
-  const models = loadModelsConfig(targetRoot);
-  const vars: Record<string, string> = {
-    WORKBENCH_NAME: workbenchName,
-    WORKBENCH_ROOT: realpathSync(targetRoot),
-    STANDARD_MODEL: models.tiers.standard.model,
-    STANDARD_EFFORT: models.tiers.standard.effort,
+function managedPlan(kitRoot: string, root: string, manifest: KitManifest) {
+  const effective = resolveInstance(root, kitRoot);
+  const cfg = loadWorkbenchConfig(root),
+    models = loadModelsConfig(root);
+  const vars: Record<string, string> = { WORKBENCH_NAME: cfg.name, WORKBENCH_ROOT: root };
+  for (const [key, tier] of Object.entries(models.tiers)) {
+    vars[key.toUpperCase() + "_MODEL"] = tier.model;
+    vars[key.toUpperCase() + "_EFFORT"] = tier.effort;
+  }
+  const assets = new Map<string, Asset>();
+  function put(path: string, bytes: string | Buffer, mode = 0o644) {
+    assets.set(path, { bytes: Buffer.from(bytes), mode });
+  }
+  const files = [
+    ...manifest.managed.rendered_files,
+    ...manifest.managed.copied_files,
+    ...manifest.managed.agent_files.map((f) => ".codex/agents/" + f),
+  ];
+  for (const rel of files)
+    put(rel, renderTemplate(readRequired(localPath(kitRoot, "core/" + rel)).toString(), vars));
+  visitSkillFiles(effective, (path, src) => put(path, readRequired(src), statSync(src).mode & 0o777));
+  if ((assets.get("AGENTS.md")?.bytes.length ?? 0) >= 8000)
+    throw Error(
+      "Rendered AGENTS.md must be under 8000 bytes; shorten the workbench name or core instructions",
+    );
+  for (const b of manifest.managed.bin_bundles) put(".workbench/bin/" + b, loadBundle(kitRoot, b));
+  for (const b of manifest.managed.bin_wrappers) put(".workbench/bin/" + b, wrapper(b), 0o755);
+  return { assets, vars };
+}
+
+function install(root: string, kitRoot: string, previous?: KitLock, force = false) {
+  const manifest = loadKitManifest(kitRoot);
+  const { assets, vars } = managedPlan(kitRoot, root, manifest);
+  const head = runGit(kitRoot, ["rev-parse", "HEAD"]);
+  const lock: KitLock = {
+    kit_name: manifest.kit.name,
+    kit_version: manifest.kit.version,
+    kit_root: kitRoot,
+    kit_commit: head.code === 0 ? head.stdout.trim() : null,
+    workbench_name: vars.WORKBENCH_NAME,
+    updated_at: new Date().toISOString(),
   };
-
-  for (const relPath of manifest.managed.rendered_files) {
-    const src = join(kitRoot, "core", relPath);
-    const dest = join(targetRoot, relPath);
-    mkdirSync(dirname(dest), { recursive: true });
-    writeFileSync(dest, renderTemplate(readFileSync(src, "utf8"), vars), "utf8");
-  }
-
-  for (const relPath of manifest.managed.copied_files) {
-    const src = join(kitRoot, "core", relPath);
-    const dest = join(targetRoot, relPath);
-    mkdirSync(dirname(dest), { recursive: true });
-    writeFileSync(dest, renderTemplate(readFileSync(src, "utf8"), vars), "utf8");
-  }
-
-  for (const relDir of manifest.managed.copied_dirs) {
-    if (relDir === ".codex/agents") {
-      renderCodexAgentsFromModels(kitRoot, targetRoot);
-      continue;
-    }
-    const src = join(kitRoot, "core", relDir);
-    const dest = join(targetRoot, relDir);
-    mkdirSync(dirname(dest), { recursive: true });
-    cpSync(src, dest, { recursive: true, force: true });
-  }
-
-  installManagedBins(kitRoot, targetRoot, manifest);
-  ensurePrivateGitignores(targetRoot);
+  const preserved = installAssets(root, assets, lock, previous, vars, force);
+  return { root, lock, preserved };
 }
 
 export function initWorkbench(opts: {
   targetDir: string;
   name?: string;
   gitOrg?: string;
-  skipReviewAgents?: boolean;
   force?: boolean;
   kitRoot?: string;
-}): { root: string; lock: KitLock; reviewSkills: string[] } {
+}) {
   const kitRoot = opts.kitRoot ?? findKitRoot();
-  const manifest = loadKitManifest(kitRoot);
-
   mkdirSync(opts.targetDir, { recursive: true });
   const targetRoot = realpathSync(opts.targetDir);
 
-  // Conflict protection: refuse to silently overwrite an existing unmanaged workbench without --force!
-  const hasLock = existsSync(join(targetRoot, ".workbench", "kit-lock.json"));
-  if (!hasLock && !opts.force) {
-    const conflicts = ["AGENTS.md", ".codex/config.toml", ".codex/hooks.json"].filter(
-      (rel) => existsSync(join(targetRoot, rel)),
-    );
-    if (conflicts.length > 0) {
-      throw new Error(
-        `Target directory already contains existing unmanaged files (${conflicts.join(", ")}). ` +
-          `Inspect/backup first or pass --force to overwrite managed files.`,
+  return withConfigWriteLock(localPath(targetRoot, ".workbench/workbench.yaml"), () => {
+    recoverInstall(targetRoot);
+    // Conflict protection: refuse to silently overwrite an existing unmanaged workbench without --force!
+    const hasLock = existsSync(join(targetRoot, ".workbench", "kit-lock.json"));
+    if (hasLock)
+      return install(
+        targetRoot,
+        kitRoot,
+        JSON.parse(readRequired(localPath(targetRoot, ".workbench/kit-lock.json")).toString()),
       );
+    if (!opts.force) {
+      const conflicts = ["AGENTS.md", ".codex/config.toml", ".codex/hooks.json"].filter((rel) =>
+        existsSync(join(targetRoot, rel)),
+      );
+      if (conflicts.length > 0) {
+        throw new Error(
+          `Target directory already contains existing unmanaged files (${conflicts.join(", ")}). ` +
+            `Inspect/backup first or pass --force to overwrite managed files.`,
+        );
+      }
     }
-  }
 
-  const workbenchName = opts.name || basename(targetRoot);
+    for (const path of [
+      ".workbench/repos",
+      ".workbench/env/.gitignore",
+      ".workbench/ledger/.gitignore",
+      "one-off-scripts/README.md",
+    ])
+      localPath(targetRoot, path);
+    const workbenchName = opts.name || basename(targetRoot);
 
-  // Create instance directories
-  mkdirSync(join(targetRoot, ".workbench", "repos"), { recursive: true });
-  mkdirSync(join(targetRoot, ".workbench", "env"), { recursive: true });
-  mkdirSync(join(targetRoot, ".workbench", "ledger"), { recursive: true });
-  mkdirSync(join(targetRoot, "one-off-scripts"), { recursive: true });
+    // Create instance directories
+    mkdirSync(join(targetRoot, ".workbench", "repos"), { recursive: true });
+    mkdirSync(join(targetRoot, ".workbench", "env"), { recursive: true });
+    mkdirSync(join(targetRoot, ".workbench", "ledger"), { recursive: true });
+    mkdirSync(join(targetRoot, "one-off-scripts"), { recursive: true });
 
-  // 1. Write instance-private skeletons FIRST (so models.toml is available for rendering agents!)
-  const vars: Record<string, string> = {
-    WORKBENCH_NAME: workbenchName,
-    WORKBENCH_ROOT: targetRoot,
-    GIT_ORG: opts.gitOrg ?? "",
-  };
-  const initMappings: Array<[string, string]> = [
-    ["AGENTS.local.md", "AGENTS.local.md"],
-    ["workbench.yaml", ".workbench/workbench.yaml"],
-    ["models.toml", ".workbench/models.toml"],
-    ["ship-policy.yaml", ".workbench/ship-policy.yaml"],
-    ["environments.example.json", ".workbench/env/environments.example.json"],
-    ["one-off-scripts-README.md", "one-off-scripts/README.md"],
-  ];
-  for (const [tmpl, destRel] of initMappings) {
-    const dest = join(targetRoot, destRel);
-    if (!existsSync(dest)) {
-      const src = join(kitRoot, "templates", tmpl);
-      mkdirSync(dirname(dest), { recursive: true });
-      writeFileSync(dest, renderTemplate(readFileSync(src, "utf8"), vars), "utf8");
+    // 1. Write instance-private skeletons FIRST (so models.toml is available for rendering agents!)
+    const vars: Record<string, string> = {
+      WORKBENCH_NAME: workbenchName,
+      WORKBENCH_ROOT: targetRoot,
+      GIT_ORG: opts.gitOrg ?? "",
+    };
+    const initMappings: Array<[string, string]> = [
+      ["AGENTS.local.md", "AGENTS.local.md"],
+      ["workbench.yaml", ".workbench/workbench.yaml"],
+      ["models.toml", ".workbench/models.toml"],
+      ["ship-policy.yaml", ".workbench/ship-policy.yaml"],
+      ["environments.example.json", ".workbench/env/environments.example.json"],
+      ["one-off-scripts-README.md", "one-off-scripts/README.md"],
+    ];
+    for (const [tmpl, destRel] of initMappings) {
+      const dest = localPath(targetRoot, destRel);
+      if (!existsSync(dest)) {
+        const src = join(kitRoot, "templates", tmpl);
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, renderTemplate(readFileSync(src, "utf8"), vars), "utf8");
+      }
     }
-  }
 
-  // 2. Sync all managed files from kit (using models.toml)
-  syncManagedAssets({
-    kitRoot,
-    targetRoot,
-    workbenchName,
-    manifest,
+    ensurePrivateGitignores(targetRoot);
+    const result = install(targetRoot, kitRoot, undefined, opts.force);
+    const ledger = new Ledger(targetRoot);
+    ledger.closeDb();
+    return result;
   });
-
-  // 3. Provision review-agents meta-project strictly unless --skip-review-agents
-  let reviewEnabled = false;
-  let reviewCommit: string | null = null;
-  let reviewSkills: string[] = [];
-  const kitRa = join(kitRoot, "review-agents");
-  const targetRa = join(targetRoot, "review-agents");
-  if (!opts.skipReviewAgents) {
-    if (!existsSync(join(kitRa, "package.json"))) {
-      throw new Error(
-        `review-agents submodule is missing in ${kitRa}. Run 'git submodule update --init' or pass --skip-review-agents.`,
-      );
-    }
-    reviewEnabled = true;
-
-    if (!existsSync(targetRa)) {
-      if (existsSync(join(kitRa, ".git"))) {
-        const cloneRes = runProcess(["git", "clone", kitRa, targetRa], {
-          timeoutMs: 60_000,
-        });
-        if (cloneRes.code !== 0) {
-          throw new Error(`Failed to clone review-agents: ${cloneRes.stderr}`);
-        }
-        // Detach local kit origin so moving/deleting kit doesn't leave a stale local remote
-        runGit(targetRa, ["remote", "remove", "origin"]);
-      } else {
-        cpSync(kitRa, targetRa, {
-          recursive: true,
-          filter: (p) => !p.includes("/.local") && !p.includes("/node_modules"),
-        });
-      }
-    }
-    // Always record the ACTUAL commit present in the instance's review-agents/, never kit's!
-    const targetRaHead = runGit(targetRa, ["rev-parse", "HEAD"]);
-    reviewCommit = targetRaHead.code === 0 ? targetRaHead.stdout.trim() : null;
-    if (existsSync(join(kitRa, "dist")) && !existsSync(join(targetRa, "dist"))) {
-      cpSync(join(kitRa, "dist"), join(targetRa, "dist"), { recursive: true });
-    }
-    if (
-      existsSync(join(kitRa, "node_modules")) &&
-      !existsSync(join(targetRa, "node_modules"))
-    ) {
-      cpSync(join(kitRa, "node_modules"), join(targetRa, "node_modules"), {
-        recursive: true,
-      });
-    }
-    for (const binName of REVIEW_BINS) {
-      const p = join(targetRa, "bin", binName);
-      if (existsSync(p)) chmodSync(p, 0o755);
-    }
-    if (!existsSync(join(targetRa, "dist", "quality.js"))) {
-      const buildRes = runProcess([process.execPath || "bun", "run", "build"], {
-        cwd: targetRa,
-        timeoutMs: 30_000,
-      });
-      if (buildRes.code !== 0) {
-        throw new Error(`Failed to build review-agents in instance: ${buildRes.stderr}`);
-      }
-    }
-    reviewSkills = installReviewAgentLinks(targetRoot);
-  }
-
-  // Initialize empty ledger SQLite DB so schema & triggers are active from day 1
-  const ledger = new Ledger(targetRoot);
-  ledger.closeDb();
-
-  // Write kit-lock.json
-  const headRes = runGit(kitRoot, ["rev-parse", "HEAD"]);
-  const lock: KitLock = {
-    kit_name: manifest.kit.name,
-    kit_version: manifest.kit.version,
-    kit_root: kitRoot,
-    kit_commit: headRes.code === 0 ? headRes.stdout.trim() : null,
-    workbench_name: workbenchName,
-    review_agents_enabled: reviewEnabled,
-    review_agents_commit: reviewCommit,
-    updated_at: new Date().toISOString(),
-  };
-  writeFileSync(
-    join(targetRoot, ".workbench", "kit-lock.json"),
-    JSON.stringify(lock, null, 2) + "\n",
-    "utf8",
-  );
-
-  return { root: targetRoot, lock, reviewSkills };
 }
 
-export function syncWorkbench(opts?: {
-  targetDir?: string;
-  kitRoot?: string;
-}): { root: string; lock: KitLock } {
-  const targetRoot = findWorkbenchRoot(opts?.targetDir);
-  const lockPath = join(targetRoot, ".workbench", "kit-lock.json");
-  if (!existsSync(lockPath)) {
-    throw new Error(`Not a forge-kit workbench (missing ${lockPath})`);
-  }
-  const prevLock = JSON.parse(readFileSync(lockPath, "utf8")) as KitLock;
-  const kitRoot =
-    opts?.kitRoot ??
-    (existsSync(prevLock.kit_root) ? prevLock.kit_root : findKitRoot());
-  const manifest = loadKitManifest(kitRoot);
-  const policyPath = join(targetRoot,".workbench/ship-policy.yaml");
-  if (!existsSync(policyPath)) cpSync(join(kitRoot,"templates/ship-policy.yaml"),policyPath,{force:false});
-  const cfg = loadWorkbenchConfig(targetRoot);
-
-  syncManagedAssets({
-    kitRoot,
-    targetRoot,
-    workbenchName: cfg.name || prevLock.workbench_name,
-    manifest,
+export function syncWorkbench(opts?: { targetDir?: string; kitRoot?: string }): {
+  root: string;
+  lock: KitLock;
+  preserved: string[];
+} {
+  const root = findWorkbenchRoot(opts?.targetDir, opts?.targetDir !== undefined);
+  const kitRoot = opts?.kitRoot ?? findKitRoot();
+  const path = localPath(root, ".workbench/kit-lock.json");
+  if (!existsSync(path) && !existsSync(localPath(root,".workbench/sync-journal")))
+    throw Error("Not an initialized workbench: missing "+path+"; use forge init");
+  return withConfigWriteLock(localPath(root, ".workbench/workbench.yaml"), () => {
+    recoverInstall(root);
+    const previous = JSON.parse(readRequired(path).toString()) as KitLock;
+    return install(root, kitRoot, previous);
   });
-
-  if (prevLock.review_agents_enabled) {
-    installReviewAgentLinks(targetRoot);
-  }
-
-  const headRes = runGit(kitRoot, ["rev-parse", "HEAD"]);
-  const nextLock: KitLock = {
-    ...prevLock,
-    kit_version: manifest.kit.version,
-    kit_root: kitRoot,
-    kit_commit: headRes.code === 0 ? headRes.stdout.trim() : prevLock.kit_commit,
-    updated_at: new Date().toISOString(),
-  };
-  writeFileSync(lockPath, JSON.stringify(nextLock, null, 2) + "\n", "utf8");
-  return { root: targetRoot, lock: nextLock };
 }
 
 function detectRepoCommands(repoDir: string): {
@@ -492,14 +289,12 @@ function detectRepoCommands(repoDir: string): {
     commands.push("`pytest tests/ -q`");
   }
   if (existsSync(join(repoDir, "package.json"))) {
-    const usesBun =
-      existsSync(join(repoDir, "bun.lock")) || existsSync(join(repoDir, "bun.lockb"));
-    stack.push(usesBun ? "TypeScript/Bun" : "Node/JS");
+    stack.push("JavaScript/TypeScript (Bun)");
     try {
       const pkg = JSON.parse(readFileSync(join(repoDir, "package.json"), "utf8")) as {
         scripts?: Record<string, string>;
       };
-      const runner = usesBun ? "bun run" : "npm run";
+      const runner = "bun run";
       for (const key of ["check", "lint", "typecheck", "test", "build"]) {
         if (pkg.scripts?.[key]) commands.push(`\`${runner} ${key}\``);
       }
@@ -537,11 +332,11 @@ function detectRepoCommands(repoDir: string): {
  * the lock on process crash/SIGKILL and never steals a lock from a paused live holder.
  */
 function withConfigWriteLock<T>(yamlPath: string, fn: () => T): T {
-  const lockDbPath = join(dirname(yamlPath), "ledger", "config-lock.sqlite");
+  const lockDbPath = localPath(dirname(yamlPath), "ledger/config-lock.sqlite");
   mkdirSync(dirname(lockDbPath), { recursive: true });
   const db = new Database(lockDbPath, { create: true });
   try {
-    db.exec("PRAGMA busy_timeout = 3000;");
+    db.exec("PRAGMA busy_timeout = 60000;");
     db.exec("BEGIN IMMEDIATE;");
     try {
       const result = fn();
@@ -585,10 +380,7 @@ function updateReposInWorkbenchYaml(yamlPath: string, repoName: string): boolean
     writeFileSync(tmp, next, "utf8");
     renameSync(tmp, yamlPath);
 
-    const verify = (Bun.YAML.parse(readFileSync(yamlPath, "utf8")) ?? {}) as Record<
-      string,
-      unknown
-    >;
+    const verify = (Bun.YAML.parse(readFileSync(yamlPath, "utf8")) ?? {}) as Record<string, unknown>;
     const verifiedList = Array.isArray(verify.repos) ? verify.repos.map(String) : [];
     if (!verifiedList.includes(repoName)) {
       throw new Error(`Failed to persist repo "${repoName}" into ${yamlPath}`);
@@ -597,11 +389,11 @@ function updateReposInWorkbenchYaml(yamlPath: string, repoName: string): boolean
   });
 }
 
-export function addRepo(opts: {
-  repoPath: string;
-  workbenchDir?: string;
-  force?: boolean;
-}): { repoName: string; cardPath: string; registered: boolean } {
+export function addRepo(opts: { repoPath: string; workbenchDir?: string; force?: boolean }): {
+  repoName: string;
+  cardPath: string;
+  registered: boolean;
+} {
   const absRepo = realpathSync(opts.repoPath);
   const gitEntry = join(absRepo, ".git");
   if (!existsSync(gitEntry)) {
@@ -612,7 +404,8 @@ export function addRepo(opts: {
       `${absRepo} is a linked git worktree (.git is a file, not a directory). Register the primary repository instead.`,
     );
   }
-  const root = findWorkbenchRoot(opts.workbenchDir ?? dirname(absRepo));
+  const root = findWorkbenchRoot(opts.workbenchDir ?? dirname(absRepo), opts.workbenchDir !== undefined);
+  checkMigration(root);
   const rel = relative(root, absRepo);
   if (rel === "" || rel.startsWith("..") || rel.includes("/")) {
     throw new Error(
@@ -633,15 +426,11 @@ export function addRepo(opts: {
       "",
       "## 本地命令",
       "",
-      ...(info.commands.length
-        ? info.commands.map((c) => `- ${c}`)
-        : ["- 待补充构建、测试与生成命令"]),
+      ...(info.commands.length ? info.commands.map((c) => `- ${c}`) : ["- 待补充构建、测试与生成命令"]),
       "",
       "## CI / 部署",
       "",
-      ...(info.workflows.length
-        ? info.workflows.map((w) => `- \`${w}\``)
-        : ["- 暂无 `.github/workflows`"]),
+      ...(info.workflows.length ? info.workflows.map((w) => `- \`${w}\``) : ["- 暂无 `.github/workflows`"]),
       "",
       "## 仓库专属边界与约定",
       "",
@@ -653,9 +442,7 @@ export function addRepo(opts: {
   }
 
   const yamlPath = join(root, ".workbench", "workbench.yaml");
-  const registered = existsSync(yamlPath)
-    ? updateReposInWorkbenchYaml(yamlPath, repoName)
-    : false;
+  const registered = existsSync(yamlPath) ? updateReposInWorkbenchYaml(yamlPath, repoName) : false;
 
   return { repoName, cardPath, registered };
 }
@@ -671,29 +458,73 @@ export function doctorWorkbench(targetDir?: string): {
   root: string;
   issues: DoctorIssue[];
 } {
-  const root = findWorkbenchRoot(targetDir);
+  let root = resolve(targetDir ?? process.cwd());
+  try {
+    root = findWorkbenchRoot(targetDir, targetDir !== undefined);
+    return inspectWorkbench(root);
+  } catch (e) {
+    return {
+      root,
+      ok: false,
+      issues: [
+        {
+          level: "error",
+          check: "configuration",
+          message: String(e) + "; repair the indicated path and retry",
+        },
+      ],
+    };
+  }
+}
+
+function inspectWorkbench(root: string) {
   const issues: DoctorIssue[] = [];
 
-  // 1. AGENTS.md size check (Codex default project_doc_max_bytes = 32768)
-  const agentsPath = join(root, "AGENTS.md");
-  if (!existsSync(agentsPath)) {
-    issues.push({ level: "error", check: "agents-md", message: "Missing AGENTS.md" });
-  } else {
-    const bytes = readFileSync(agentsPath).byteLength;
-    if (bytes > 32_768) {
+  for (const [name, mode] of [
+    ["forge", constants.X_OK],
+    ["cli.js", constants.R_OK],
+  ] as const) {
+    const path = localPath(root, ".workbench/bin/" + name);
+    try {
+      const st = statSync(path);
+      if (!st.isFile() || !(st.mode & (mode === constants.X_OK ? 0o111 : 0o444))) throw Error("permissions");
+      accessSync(path, mode);
+    } catch {
       issues.push({
         level: "error",
-        check: "agents-md",
-        message: `AGENTS.md is ${bytes} bytes (> 32 KiB Codex default cap)`,
-      });
-    } else if (bytes > 12_288) {
-      issues.push({
-        level: "warn",
-        check: "agents-md",
-        message: `AGENTS.md is ${bytes} bytes (> 12 KiB recommended budget)`,
+        check: "bins",
+        message: "Missing or inaccessible " + path + "; run forge sync",
       });
     }
   }
+  try {
+    checkMigration(root);
+    const effective = resolveInstance(root, findKitRoot());
+    visitSkillFiles(effective, (path, src) => {
+      const dest = localPath(root, path);
+      if (!existsSync(dest) || !readRequired(dest).equals(readRequired(src))) {
+        issues.push({
+          level: "error",
+          check: "skills",
+          message: dest + " differs from " + src + "; run forge sync",
+        });
+      }
+    });
+  } catch (err) {
+    issues.push({
+      level: "error",
+      check: String(err).includes("ship-policy") ? "ship-policy" : "configuration",
+      message: String(err),
+    });
+    return { ok: false, root, issues };
+  }
+  const agentsPath = localPath(root, "AGENTS.md");
+  if (!existsSync(agentsPath) || readRequired(agentsPath).length >= 8000)
+    issues.push({
+      level: "error",
+      check: "agents-md",
+      message: agentsPath + " must exist and be under 8000 bytes; run forge sync",
+    });
 
   // 2. Codex config / hooks / agents parse + models.toml consistency checks
   for (const tomlRel of [".codex/config.toml", ".workbench/models.toml"]) {
@@ -739,20 +570,17 @@ export function doctorWorkbench(targetDir?: string): {
 
   const models = loadModelsConfig(root);
   const expectedAgentModel: Record<string, { model: string; effort: string }> = {
-    "dev.toml": models.tiers.standard,
+    "implementer.toml": models.tiers.standard,
     "scanner.toml": models.tiers.mechanical,
     "analyst.toml": models.tiers.deep,
-    "spec-reviewer.toml": models.tiers.deep,
+    "reviewer.toml": models.tiers.deep,
   };
   const agentsDir = join(root, ".codex", "agents");
   if (existsSync(agentsDir)) {
     for (const f of readdirSync(agentsDir)) {
       if (!f.endsWith(".toml")) continue;
       try {
-        const parsed = Bun.TOML.parse(readFileSync(join(agentsDir, f), "utf8")) as Record<
-          string,
-          unknown
-        >;
+        const parsed = Bun.TOML.parse(readFileSync(join(agentsDir, f), "utf8")) as Record<string, unknown>;
         if (!parsed.name || !parsed.description || !parsed.developer_instructions) {
           issues.push({
             level: "error",
@@ -835,51 +663,40 @@ export function doctorWorkbench(targetDir?: string): {
   }
 
   if (resolveDbEnvironmentsPath(root)) {
-    const hosts = collectProdDbHosts(root,loadWorkbenchConfig(root));
+    const hosts = collectProdDbHosts(root, loadWorkbenchConfig(root));
     for (const [name, entry] of Object.entries(loadDbEnvironments(root))) {
       if (entry && isProductionDb(name, entry, hosts) && (!entry.ro?.user || !entry.rw?.user))
-        issues.push({ level: "warn", check: "db-credentials", message: "Migrate production credentials to split ro/rw accounts." });
+        issues.push({
+          level: "warn",
+          check: "db-credentials",
+          message: "Migrate production credentials to split ro/rw accounts.",
+        });
     }
   }
 
-  try { loadShipPolicy(root); } catch (err) { issues.push({level:"error",check:"ship-policy",message:String(err)}); }
-
-  // 5. Binaries & review-agents launchers check
-  for (const binName of ["forge", "ledger", "guard", "ledger-hook", "wb-git", "dbcred", "cmdfmt", "lang-check", "wb-verify", "forge-review", "forge-ship"]) {
-    for (const [name, mode] of [[binName, constants.X_OK], [bundleName(binName), constants.R_OK]] as const) {
-      const path = join(root, ".workbench", "bin", name);
-      try {
-        if (!statSync(path).isFile()) throw Error("Expected a file");
-        accessSync(path, mode);
-      } catch {
-        const required = mode === constants.X_OK ? "executable wrapper" : "readable bundle";
-        issues.push({level: "error", check: "bins", message: "Expected " + required + ": .workbench/bin/" + name});
-      }
-    }
+  try {
+    loadShipPolicy(root);
+  } catch (err) {
+    issues.push({ level: "error", check: "ship-policy", message: String(err) });
   }
-  const lockPath = join(root, ".workbench", "kit-lock.json");
+
+  const lockPath = localPath(root, ".workbench/kit-lock.json");
+  if (!existsSync(lockPath))
+    issues.push({
+      level: "error",
+      check: "lock",
+      message: "Missing " + lockPath + "; initialize the workbench",
+    });
   if (existsSync(lockPath)) {
-    const lock = JSON.parse(readFileSync(lockPath, "utf8")) as KitLock;
-    if (lock.review_agents_enabled) {
-      for (const rb of REVIEW_BINS) {
-        const bp = join(root, "review-agents", "bin", rb);
-        if (!existsSync(bp)) {
-          issues.push({
-            level: "error",
-            check: "review-agents",
-            message: `Missing review-agents launcher: review-agents/bin/${rb}`,
-          });
-        } else {
-          const r = runProcess([bp, "--help"], { cwd: root, timeoutMs: 5000 });
-          if (r.code !== 0) {
-            issues.push({
-              level: "error",
-              check: "review-agents",
-              message: `review-agents/bin/${rb} --help failed (code ${r.code})`,
-            });
-          }
-        }
-      }
+    const lock = JSON.parse(readRequired(lockPath).toString()) as KitLock;
+    for (const [path, expected] of Object.entries(lock.managed_files ?? {})) {
+      const dest = localPath(root, path);
+      if (!existsSync(dest) || hash(readRequired(dest)) !== expected)
+        issues.push({
+          level: "error",
+          check: "projection",
+          message: dest + " differs from installed manifest; inspect and run forge sync",
+        });
     }
     const cfg = loadWorkbenchConfig(root);
     try {
@@ -998,13 +815,55 @@ export async function runForgeCli(): Promise<void> {
     console.log(`forge-kit CLI
 
 Usage:
-  forge init <dir> [--name <name>] [--git-org <org>] [--skip-review-agents] [--force]
+  forge init <dir> [--name <name>] [--git-org <org>] [--force]
   forge add-repo <repo-path> [--workbench <dir>] [--force]
   forge sync [<dir>]
-  forge doctor [<dir>] [--json]`);
+  forge doctor [<dir>] [--json]
+  forge instance list [--json]
+  forge instance show <kind> <id> [--json]
+  forge instance run <stage-id>
+  forge verify | review | ship | ledger | git | guard | ledger-hook | dbcred | cmdfmt | lang-check`);
     return;
   }
 
+  if (cmd === "instance") {
+    const [verb, ...args] = rest.filter((a) => a !== "--json");
+    const root = findWorkbenchRoot(),
+      kit = findKitRoot();
+    checkMigration(root);
+    const c = resolveInstance(root, kit);
+    if (verb === "run" && args.length === 1) {
+      const id=args[0];
+      if (id==="verify" && c.stages.get(id)?.source==="core" && !c.delivery.value.stages.includes(id)) {
+        const {verifyCli}=await import("./wb-verify");
+        const result=verifyCli([]);
+        console.log(JSON.stringify(result));
+        process.exitCode=result.ok?0:1;
+      } else {
+        process.exitCode = runInstanceStage(root, kit, id);
+      }
+      return;
+    }
+    const items = [
+      c.verification,
+      c.delivery,
+      ...c.actions.values(),
+      ...c.stages.values(),
+      ...c.skills.values(),
+    ];
+    if (verb === "list" && !args.length) {
+      console.log(JSON.stringify(items, null, 2));
+      return;
+    }
+    const found = items.find((i) => i.kind === args[0] && i.id === args[1]);
+    if (verb === "show" && args.length === 2 && found) {
+      console.log(JSON.stringify(found, null, 2));
+      return;
+    }
+    throw Error(
+      "Expected forge instance list, show <kind> <id>, or run <stage-id>; check IDs with forge instance list",
+    );
+  }
   if (cmd === "init") {
     const targetDir = rest[0];
     if (!targetDir) throw new Error("Usage: forge init <dir>");
@@ -1013,7 +872,6 @@ Usage:
       options: {
         name: { type: "string" },
         "git-org": { type: "string" },
-        "skip-review-agents": { type: "boolean", default: false },
         force: { type: "boolean", default: false },
       },
     });
@@ -1021,7 +879,6 @@ Usage:
       targetDir,
       name: values.name,
       gitOrg: values["git-org"],
-      skipReviewAgents: Boolean(values["skip-review-agents"]),
       force: Boolean(values.force),
     });
     console.log(JSON.stringify(res, null, 2));

@@ -22,7 +22,7 @@ import { parseArgs } from "node:util";
 
 export async function runLedgerCli(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
-  const USAGE = `Usage: ledger <command> [options]
+  const USAGE = `Usage: forge ledger <command> [options]
 Commands:
   open         --id <id> --title <title> --endpoint <investigation|local|fat|pr|prod> --depth <targeted|full> [--repo <r> --branch <b> --base <sha> --head <sha> --worktree <p>]
   attach       <task_id> --repo <r> --branch <b> [--base <sha> --head <sha> --worktree <p>]
@@ -35,13 +35,14 @@ Commands:
   decide      <task_id> --key <k> --summary <text> [--supersedes <seq>]
   blocker   <task_id> <open|close> --id <bid> --summary <text>
   record    <task_id> --kind <fat|prod|verify|deploy|smoke|manual|note> --status <pass|fail|fallback|info> --summary <text> [--repo <r> --branch <b> --sha <sha> --meta <json>]
+  reviews <task_id>
   review-native --task <id> --repo <repo> --base <ref> [--branch <branch>]
   pr-sync <task_id> --repo <repo> [--pr <number-or-url>] [--branch <branch>]
   review-fallback <task_id> --repo <repo> --role <role> --sha <full-sha>
   exempt    --repo <r> --branch <b> --reason <text> [--sha <sha> --ttl-hours <n>]
   status    [--task <id>] [--repo <r> --branch <b>] [--json]
   query     [--q <fts>] [--repo <r>] [--status <OPEN|HANDED_OFF|CLOSED|CANCELLED>] [--since <iso>] [--json]
-  fast-track prepare <task_id> --to <fat|pr|prod> --paths <globs> [--repos <repos>] [--ttl <minutes>]
+  fast-track prepare <task_id> --to <endpoint> --paths <globs> --runbook <rb-id> [--repos <repos>] [--ttl <minutes>]
   fast-track status [<id>] [--task <task_id>] | revoke <id> [--reason <reason>]
   handoff   <task_id> [--sql host:path ...] [--rollback note]
   resume    <task_id> [--reason note]
@@ -74,8 +75,22 @@ Commands:
     console.log("[]");
     return;
   }
-  const ledger = new Ledger(root, {readonly:telemetry || releaseStatus});
+  const ledger = new Ledger(root, {readonly:telemetry || releaseStatus || cmd === "reviews"});
   try {
+    if (cmd === "reviews") {
+      if (rest.length !== 1 || !ledger.getTask(rest[0])) throw Error("Expected an existing task ID");
+      const records = ledger.getTaskEvents(rest[0]).flatMap(event => {
+        if (event.event_type !== "EVIDENCE_CAPTURED") return [];
+        const evidence = JSON.parse(event.payload_json);
+        if (evidence.kind !== "review") return [];
+        const meta = evidence.meta ?? {};
+        return [{ seq: event.seq, repo: event.repo, branch: event.branch, base: meta.base,
+          head: event.sha, role: meta.role, status: meta.report_status ?? evidence.status,
+          backend: meta.backend, source: evidenceSource(evidence, event.actor), summary: evidence.summary }];
+      });
+      console.log(JSON.stringify(records, null, 2));
+      return;
+    }
     if (telemetry) return telemetryCli(ledger,cmd,rest);
     if (cmd === "fast-track") {
       console.log(JSON.stringify(fastTrackCommand(ledger,rest), null, 2));
@@ -105,8 +120,8 @@ Commands:
         options: {
           id: { type: "string" },
           title: { type: "string" },
-          endpoint: { type: "string", default: "local" },
-          depth: { type: "string", default: "targeted" },
+          endpoint: { type: "string", default: "pr" },
+          depth: { type: "string", default: "full" },
           repo: { type: "string" },
           branch: { type: "string" },
           worktree: { type: "string" },
@@ -145,7 +160,7 @@ Commands:
         },
       });
       if (!task_id || !values.repo || !values.branch) {
-        throw new Error("Usage: ledger attach <task_id> --repo <r> --branch <b>");
+        throw new Error("Usage: forge ledger attach <task_id> --repo <r> --branch <b>");
       }
       const ev = ledger.attachRepo({
         task_id,
@@ -169,7 +184,7 @@ Commands:
         },
       });
       if (!task_id || !values.repo || !values.branch) {
-        throw new Error("Usage: ledger detach <task_id> --repo <r> --branch <b> [--reason <text>]");
+        throw new Error("Usage: forge ledger detach <task_id> --repo <r> --branch <b> [--reason <text>]");
       }
       const ev = ledger.detachRepo({
         task_id,
@@ -192,7 +207,7 @@ Commands:
       });
       if (!task_id) {
         throw new Error(
-          "Usage: ledger reopen <task_id> [--endpoint <ep>] [--depth <d>] [--reason <text>]",
+          "Usage: forge ledger reopen <task_id> [--endpoint <ep>] [--depth <d>] [--reason <text>]",
         );
       }
       const res = ledger.reopenTask({
@@ -214,7 +229,7 @@ Commands:
         },
       });
       if (!task_id || values.endpoint === undefined) {
-        throw new Error("Usage: ledger set-endpoint <task_id> --endpoint <ep> [--reason <text>]");
+        throw new Error("Usage: forge ledger set-endpoint <task_id> --endpoint <ep> [--reason <text>]");
       }
       const res = ledger.updateEndpoint({
         task_id,
@@ -235,7 +250,7 @@ Commands:
       });
       if (!task_id) {
         throw new Error(
-          "Usage: ledger freeze <task_id> [--spec-dir <dir>] [--lock-tests <glob>]...",
+          "Usage: forge ledger freeze <task_id> [--spec-dir <dir>] [--lock-tests <glob>]...",
         );
       }
       const res = ledger.freezeSpec({
@@ -257,7 +272,7 @@ Commands:
       });
       if (!task_id || !values.scope || !values.reason) {
         throw new Error(
-          "Usage: ledger amend <task_id> --scope <requirement|invariant|tech_spec|test_spec> --reason <text>",
+          "Usage: forge ledger amend <task_id> --scope <requirement|invariant|tech_spec|test_spec> --reason <text>",
         );
       }
       const res = ledger.amendSpec({
@@ -269,7 +284,7 @@ Commands:
       console.log(JSON.stringify(res, null, 2));
     } else if (cmd === "spec-status") {
       const task_id = rest[0];
-      if (!task_id) throw new Error("Usage: ledger spec-status <task_id>");
+      if (!task_id) throw new Error("Usage: forge ledger spec-status <task_id>");
       const task = ledger.getTask(task_id);
       if (!task) throw new Error(`Task not found: ${task_id}`);
       console.log(JSON.stringify(ledger.getSpecState(task_id), null, 2));
@@ -285,7 +300,7 @@ Commands:
         },
       });
       if (!task_id || !values.key || !values.summary) {
-        throw new Error("Usage: ledger decide <task_id> --key <k> --summary <text>");
+        throw new Error("Usage: forge ledger decide <task_id> --key <k> --summary <text>");
       }
       const ev = ledger.recordDecision({
         task_id,
@@ -307,7 +322,7 @@ Commands:
         },
       });
       if (!task_id || (action !== "open" && action !== "close") || !values.id || !values.summary) {
-        throw new Error("Usage: ledger blocker <task_id> <open|close> --id <bid> --summary <text>");
+        throw new Error("Usage: forge ledger blocker <task_id> <open|close> --id <bid> --summary <text>");
       }
       const ev = ledger.recordBlocker({
         task_id,
@@ -352,7 +367,7 @@ Commands:
         },
       });
       if (!task_id || !values.kind || !values.summary) {
-        throw new Error("Usage: ledger record <task_id> --kind <k> --status <s> --summary <text>");
+        throw new Error("Usage: forge ledger record <task_id> --kind <k> --status <s> --summary <text>");
       }
       const manualKinds = ["fat", "prod", "verify", "deploy", "smoke", "manual", "note"] as const;
       const kind = manualKinds.find(kind => kind === values.kind);
@@ -382,7 +397,7 @@ Commands:
         },
       });
       if (!values.repo || !values.branch || !values.reason) {
-        throw new Error("Usage: ledger exempt --repo <r> --branch <b> --reason <text>");
+        throw new Error("Usage: forge ledger exempt --repo <r> --branch <b> --reason <text>");
       }
       const rec = ledger.addExemption({
         repo: values.repo,
@@ -487,7 +502,7 @@ Commands:
           actor: { type: "string", default: "agent" },
         },
       });
-      if (!task_id) throw new Error("Usage: ledger close <task_id>");
+      if (!task_id) throw new Error("Usage: forge ledger close <task_id>");
       const res = ledger.closeTask({
         task_id,
         summary: values.summary,
@@ -499,7 +514,7 @@ Commands:
       console.log(JSON.stringify(res, null, 2));
     } else if (cmd === "archive") {
       const task_id = rest[0];
-      if (!task_id) throw new Error("Usage: ledger archive <task_id>");
+      if (!task_id) throw new Error("Usage: forge ledger archive <task_id>");
       const archivePath = ledger.exportArchive(task_id);
       console.log(JSON.stringify({ task_id, archivePath }, null, 2));
     } else if (cmd === "cancel") {
@@ -512,7 +527,7 @@ Commands:
         },
       });
       if (!task_id || !values.reason) {
-        throw new Error("Usage: ledger cancel <task_id> --reason <text>");
+        throw new Error("Usage: forge ledger cancel <task_id> --reason <text>");
       }
       const res = ledger.cancelTask({
         task_id,
@@ -529,7 +544,7 @@ Commands:
         },
       });
       if (!values.before) {
-        throw new Error("Usage: ledger prune --before <days> [--apply]");
+        throw new Error("Usage: forge ledger prune --before <days> [--apply]");
       }
       const days = Number(values.before.replace(/d$/i, ""));
       if (!Number.isFinite(days) || days < 0) {
@@ -540,8 +555,8 @@ Commands:
     } else if (cmd === "runbook") {
       const sub = rest[0];
       if (!sub || sub === "--help" || sub === "-h") {
-        console.log(`Usage: ledger runbook <create|show|list|complete|revoke>
-  create   --title <text> [--id rb-xxxx] [--task <task_id>] [--tag <repo>:<tag>:<sha>]... [--pr <repo>:<num>]... [--sql <host>:<path>]... [--kubectl "<cmd>"]...
+        console.log(`Usage: forge ledger runbook <create|show|list|complete|revoke>
+  create   --title <text> [--id rb-xxxx] [--task <task_id>] [--tag <repo>:<tag>:<sha>]... [--pr <repo>:<num>]... [--sql <host>:<path>]... [--kubectl "<cmd>"]... [--stage <instance-stage>]...
   show     <runbook_id>
   list     [--status <PENDING|APPROVED|COMPLETED|REVOKED>]
   complete <runbook_id>
@@ -560,9 +575,10 @@ Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <ru
             pr: { type: "string", multiple: true },
             sql: { type: "string", multiple: true },
             kubectl: { type: "string", multiple: true },
+            stage: { type: "string", multiple: true },
           },
         });
-        if (!values.title) throw new Error("Usage: ledger runbook create --title <text> ...");
+        if (!values.title) throw new Error("Usage: forge ledger runbook create --title <text> ...");
         const tags: RunbookTagAction[] = (values.tag ?? []).map((spec) => {
           const parts = spec.split(":");
           if (parts.length !== 3) {
@@ -584,9 +600,11 @@ Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <ru
           }
           return { host: spec.slice(0, idx), path: spec.slice(idx + 1), sha256: "" };
         });
+        if (values.stage?.length && !values.task) throw Error("--stage requires --task");
         const rec = ledger.createRunbook({
           runbook_id: values.id,
           task_id: values.task,
+          ...(values.task && {exact_stages: values.stage ?? []}),
           title: values.title,
           actions: {
             tags,
@@ -608,7 +626,7 @@ Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <ru
         );
       } else if (sub === "show") {
         const id = rest[1];
-        if (!id) throw new Error("Usage: ledger runbook show <runbook_id>");
+        if (!id) throw new Error("Usage: forge ledger runbook show <runbook_id>");
         const rec = ledger.getRunbook(id);
         if (!rec) throw new Error(`Runbook not found: ${id}`);
         console.log(JSON.stringify({ ...rec, actions: JSON.parse(rec.actions_json) }, null, 2));
@@ -627,11 +645,11 @@ Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <ru
         );
       } else if (sub === "complete") {
         const id = rest[1];
-        if (!id) throw new Error("Usage: ledger runbook complete <runbook_id>");
+        if (!id) throw new Error("Usage: forge ledger runbook complete <runbook_id>");
         console.log(JSON.stringify(ledger.completeRunbook(id), null, 2));
       } else if (sub === "revoke") {
         const id = rest[1];
-        if (!id) throw new Error("Usage: ledger runbook revoke <runbook_id>");
+        if (!id) throw new Error("Usage: forge ledger runbook revoke <runbook_id>");
         console.log(JSON.stringify(ledger.revokeRunbook(id), null, 2));
       } else {
         throw new Error(`Unknown ledger runbook subcommand: ${sub}`);

@@ -31,6 +31,17 @@ isolateHome();
 
 let target: string;
 
+function copySourceKit(destination: string) {
+  const source = join(import.meta.dir, "..");
+  mkdirSync(destination);
+  for (const item of ["bin", "src", "core", "templates", "kit.toml", "package.json", "dist"]) {
+    cpSync(join(source, item), join(destination, item), { recursive: true });
+  }
+  for (const subdir of ["src","prompts"]) cpSync(join(source,"review-agents",subdir),join(destination,"review-agents",subdir),{recursive:true});
+  symlinkSync(join(source,"review-agents/node_modules"),join(destination,"review-agents/node_modules"));
+  symlinkSync(join(source, "node_modules"), join(destination, "node_modules"));
+}
+
 beforeEach(() => {
   target = mkdtempSync(join(tmpdir(), "forge-cli-test-"));
 });
@@ -43,12 +54,11 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
   test("init refuses to overwrite existing unmanaged AGENTS.md without --force", () => {
     writeFileSync(join(target, "AGENTS.md"), "# Legacy\n");
     expect(() =>
-      initWorkbench({ targetDir: target, skipReviewAgents: true }),
+      initWorkbench({ targetDir: target }),
     ).toThrow("existing unmanaged files");
 
     const forced = initWorkbench({
       targetDir: target,
-      skipReviewAgents: true,
       force: true,
     });
     expect(existsSync(join(forced.root, ".workbench", "kit-lock.json"))).toBe(true);
@@ -59,17 +69,15 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
       targetDir: target,
       name: "acme-garage",
       gitOrg: "acme",
-      skipReviewAgents: true,
     });
     expect(existsSync(join(res.root, ".workbench", "env", ".gitignore"))).toBe(true);
     expect(existsSync(join(res.root, ".workbench", "ledger", ".gitignore"))).toBe(true);
     expect(existsSync(join(res.root, ".agents", "skills", "ready", "SKILL.md"))).toBe(true);
     expect(existsSync(join(res.root, ".agents", "skills", "grill", "SKILL.md"))).toBe(true);
-    expect(existsSync(join(res.root, ".codex", "agents", "spec-reviewer.toml"))).toBe(true);
-    expect(existsSync(join(res.root, ".workbench", "bin", "lang-check"))).toBe(true);
+    expect(existsSync(join(res.root, ".codex", "agents", "reviewer.toml"))).toBe(true);
+    expect(existsSync(join(res.root, ".workbench", "bin", "cli.js"))).toBe(true);
 
-    for (const name of ["wb-verify", "forge-review"])
-      expect(lstatSync(join(res.root, ".workbench/bin", name)).mode & 0o111).toBeTruthy();
+    expect(lstatSync(join(res.root, ".workbench/bin/forge")).mode & 0o111).toBeTruthy();
 
     const defaults = readFileSync(join(res.root, ".codex/config.toml"), "utf8");
     expect(defaults).toContain('model = "gpt-6.2-astra"');
@@ -110,20 +118,20 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
       "backend",
     ]);
 
-    // Sync renders updated models.toml into .codex/agents/dev.toml while preserving private files!
+    // Sync renders updated models.toml into .codex/agents/implementer.toml while preserving private files!
     syncWorkbench({ targetDir: res.root });
-    expect(readFileSync(join(res.root, ".codex", "agents", "dev.toml"), "utf8")).toContain(
+    expect(readFileSync(join(res.root, ".codex", "agents", "implementer.toml"), "utf8")).toContain(
       'model_reasoning_effort = "high"',
     );
     expect(readFileSync(join(res.root, "AGENTS.local.md"), "utf8")).toBe(
       "# My Private Local Rules\n",
     );
 
-    for (const bin of ["forge-review", "wb-verify"]) {
-      const check = Bun.spawnSync([join(res.root, ".workbench/bin", bin), "--task", "absent"],
+    for (const bin of ["review", "verify"]) {
+      const check = Bun.spawnSync([join(res.root, ".workbench/bin/forge"), bin, "--task", "absent"],
         { cwd:res.root, env:{...process.env,BUN_BIN:process.execPath} });
       expect(check.exitCode).toBe(1);
-      expect(JSON.parse(check.stdout.toString()).ok).toBe(false);
+      expect(check.stdout.toString()+check.stderr.toString()).toMatch(/attached checkout/);
     }
     const doc = doctorWorkbench(res.root);
     expect(doc.ok).toBe(true);
@@ -136,17 +144,20 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const forge = join(kit, "bin/forge");
     const run = (exe: string, args: string[]) =>
       Bun.spawnSync([exe, ...args], { cwd: target, env: { ...process.env, BUN_BIN: process.execPath } });
-    const init = run(forge, ["init", bench, "--skip-review-agents"]);
+    const init = run(forge, ["init", bench]);
     expect(init.exitCode, init.stderr.toString()).toBe(0);
     const skills = readdirSync(join(bench, ".agents/skills"));
     const retired = ["form-ux", "dbop", "comm-lark", "work-communication"];
     for (const name of retired) expect(skills).not.toContain(name);
+    for (const path of ["AGENTS.md", ...skills.map((name) => `.agents/skills/${name}/SKILL.md`)]) {
+      expect(readFileSync(join(bench, path), "utf8"), path).not.toMatch(/form-ux|comm-lark|work-communication|\bdbop\b|qa-polling\.md/);
+    }
     const help = run(join(bench, ".workbench/bin/forge"), ["--help"]);
     expect(help.exitCode).toBe(0);
     expect(help.stdout.toString()).toContain("forge init");
     expect(help.stdout.toString()).not.toMatch(/--packs|form-ux|dbop|comm-lark|work-communication/);
     const requested = join(target, "requested");
-    const legacy = run(forge, ["init", requested, "--packs", "dbop,comm-lark", "--skip-review-agents"]);
+    const legacy = run(forge, ["init", requested, "--packs", "dbop,comm-lark"]);
     if (legacy.exitCode === 0) {
       const installed = readdirSync(join(requested, ".agents/skills"));
       for (const name of retired) expect(installed).not.toContain(name);
@@ -174,10 +185,17 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
   });
 
   test("sync preserves edited domain skills and instance data from a v0.4 pack install", () => {
-    initWorkbench({ targetDir: target, skipReviewAgents: true });
-    const lockPath = join(target, ".workbench/kit-lock.json");
+    const source = join(import.meta.dir, "..");
+    const previousKit = join(target, "previous-kit");
+    const bench = join(target, "bench");
+    copySourceKit(previousKit);
+    const previousForm = join(previousKit, "core/.agents/skills/form-ux");
+    mkdirSync(previousForm, { recursive: true });
+    writeFileSync(join(previousForm, "SKILL.md"), "old managed form conventions");
+    initWorkbench({ targetDir: bench, kitRoot: source });
+    const lockPath = join(bench, ".workbench/kit-lock.json");
     const lock = JSON.parse(readFileSync(lockPath, "utf8"));
-    writeFileSync(lockPath, JSON.stringify({ ...lock, kit_version: "0.4.1", packs: ["dbop", "comm-lark"] }));
+    writeFileSync(lockPath, JSON.stringify({ ...lock, kit_version: "0.4.1", kit_root: previousKit, packs: ["dbop", "comm-lark"] }));
     const files = {
       ".agents/skills/form-ux/SKILL.md": "local form conventions",
       ".agents/skills/dbop/SKILL.md": "local database conventions",
@@ -187,14 +205,17 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
       "AGENTS.local.md": "private configuration",
     };
     for (const [path, content] of Object.entries(files)) {
-      const file = join(target, path);
+      const file = join(bench, path);
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, content, { mode: 0o600 });
     }
     for (let pass = 0; pass < 2; pass++) {
-      syncWorkbench({ targetDir: target });
+      const sync = Bun.spawnSync([join(source, "bin/forge"), "sync", bench], {
+        cwd: target, env: { ...process.env, BUN_BIN: process.execPath },
+      });
+      expect(sync.exitCode, sync.stderr.toString()).toBe(0);
       for (const [path, content] of Object.entries(files)) {
-        expect(readFileSync(join(target, path), "utf8"), path).toBe(content);
+        expect(readFileSync(join(bench, path), "utf8"), path).toBe(content);
       }
     }
   });
@@ -211,28 +232,15 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
       expect(result.exitCode, result.stderr.toString()).toBe(exitCode);
       return JSON.parse(result.stdout.toString());
     };
-    run(join(kit, "bin/forge"), ["init", root, "--skip-review-agents"]);
-    for (const name of [
-      "forge",
-      "ledger",
-      "ledger-hook",
-      "guard",
-      "wb-git",
-      "dbcred",
-      "cmdfmt",
-      "lang-check",
-      "wb-verify",
-      "forge-review",
-      "forge-ship",
-    ]) {
-      expect(lstatSync(join(bin, name)).mode & 0o111, name).toBeTruthy();
-    }
+    run(join(kit, "bin/forge"), ["init", root]);
+    expect(readdirSync(bin).sort()).toEqual(["cli.js","forge"]);
+    expect(lstatSync(join(bin,"forge")).mode & 0o111).toBeTruthy();
     const triagePath = ".agents/skills/pr-triage/SKILL.md";
     const triage = readFileSync(join(kit, "core", triagePath), "utf8");
     expect(readFileSync(join(root, triagePath), "utf8")).toBe(triage);
     rmSync(join(root, triagePath));
     const forge = join(bin, "forge");
-    run(forge, ["init", join(target, "second"), "--skip-review-agents"]);
+    run(forge, ["init", join(target, "second")]);
     const policy = join(root, ".workbench/ship-policy.yaml");
     const defaults = readFileSync(join(kit, "templates/ship-policy.yaml"), "utf8");
     expect(readFileSync(policy, "utf8")).toBe(defaults);
@@ -240,66 +248,64 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     writeFileSync(policy, custom);
     const agents = join(root, "AGENTS.md"),
       skill = join(root, ".agents/skills/ship/SKILL.md"),
-      bundle = join(bin, "forge-ship.js");
+      bundle = join(bin, "cli.js");
     const rendered = readFileSync(agents, "utf8");
-    expect(rendered).toContain("HANDED_OFF");
-    for (const path of [agents, skill, bundle]) writeFileSync(path, "stale");
-    run(forge, ["sync", root]);
+    expect(rendered).toContain("移交");
+    writeFileSync(skill,"private edit");
+    expect(()=>syncWorkbench({targetDir:root})).toThrow("Ownership conflict");
+    expect(readFileSync(skill,"utf8")).toBe("private edit");
+    for (const path of [agents,skill,bundle]) rmSync(path);
+    run(join(kit,"bin/forge"), ["sync", root]);
     expect(readFileSync(join(root, triagePath), "utf8")).toBe(triage);
     expect(readFileSync(agents, "utf8")).toBe(rendered);
     expect(readFileSync(skill, "utf8")).toBe(readFileSync(join(kit, "core/.agents/skills/ship/SKILL.md"), "utf8"));
-    expect(readFileSync(bundle).equals(readFileSync(join(kit, "dist/forge-ship.js")))).toBe(true);
+    expect(readFileSync(bundle).byteLength).toBeGreaterThan(0);
     expect(readFileSync(policy, "utf8")).toBe(custom);
-    expect(run(forge, ["doctor", root, "--json"]).ok).toBe(true);
+    expect(run(join(kit,"bin/forge"), ["doctor", root, "--json"]).ok).toBe(true);
     writeFileSync(policy, "fast_track: {}");
-    expect(run(forge, ["doctor", root, "--json"], 1).issues).toContainEqual(
+    expect(run(join(kit,"bin/forge"), ["doctor", root, "--json"], 1).issues).toContainEqual(
       expect.objectContaining({ check: "ship-policy" }),
     );
     writeFileSync(policy, custom);
-    chmodSync(join(bin, "forge-ship"), 0o644);
-    expect(run(forge, ["doctor", root, "--json"], 1).issues).toContainEqual(
+    chmodSync(join(bin, "forge"), 0o644);
+    expect(run(join(kit,"bin/forge"), ["doctor", root, "--json"], 1).issues).toContainEqual(
       expect.objectContaining({
         check: "bins",
-        message: expect.stringContaining("executable wrapper: .workbench/bin/forge-ship"),
+        message: expect.stringContaining(".workbench/bin/forge"),
       }),
     );
-    chmodSync(join(bin, "forge-ship"), 0o755);
+    chmodSync(join(bin, "forge"), 0o755);
     rmSync(bundle);
-    expect(run(forge, ["doctor", root, "--json"], 1).issues).toContainEqual(
+    expect(run(join(kit,"bin/forge"), ["doctor", root, "--json"], 1).issues).toContainEqual(
       expect.objectContaining({
         check: "bins",
-        message: expect.stringContaining("readable bundle: .workbench/bin/forge-ship.js"),
+        message: expect.stringContaining(".workbench/bin/cli.js"),
       }),
     );
     rmSync(policy);
-    rmSync(join(bin, "forge-ship"));
-    const missing = run(forge, ["doctor", root, "--json"], 1).issues;
+    rmSync(join(bin, "forge"));
+    const missing = run(join(kit,"bin/forge"), ["doctor", root, "--json"], 1).issues;
     expect(missing).toContainEqual(expect.objectContaining({ check: "ship-policy" }));
     expect(missing).toContainEqual(
-      expect.objectContaining({ check: "bins", message: expect.stringContaining("forge-ship") }),
+      expect.objectContaining({ check: "bins", message: expect.stringContaining(".workbench/bin/forge") }),
     );
   });
 
   test("one source-checkout sync upgrades an older workbench even with a stale dist CLI", () => {
     const kit = join(target, "kit"),
       bench = join(target, "bench");
-    const source = join(import.meta.dir, "..");
-    mkdirSync(kit);
-    for (const item of ["bin", "src", "core", "templates", "kit.toml", "package.json", "dist"])
-      cpSync(join(source, item), join(kit, item), { recursive: true });
-    symlinkSync(join(source, "node_modules"), join(kit, "node_modules"));
-    initWorkbench({ targetDir: bench, kitRoot: kit, skipReviewAgents: true });
+    copySourceKit(kit);
+    initWorkbench({ targetDir: bench, kitRoot: kit });
     const wb = join(bench, ".workbench"),
       lockPath = join(wb, "kit-lock.json");
     const lock = JSON.parse(readFileSync(lockPath, "utf8"));
-    lock.kit_version = "0.3.0";
+    lock.kit_version = "0.4.1";
     writeFileSync(lockPath, JSON.stringify(lock));
     writeFileSync(join(bench, "AGENTS.local.md"), "operator edits");
-    for (const file of ["ship-policy.yaml", "bin/forge", "bin/forge-ship", "bin/forge-ship.js"])
+    for (const file of ["bin/forge", "bin/cli.js"])
       rmSync(join(wb, file));
-    // A v0.3 checkout has a built CLI and no forge-ship bundle. This sentinel makes accidental old-code dispatch observable.
-    writeFileSync(join(kit, "dist/cli.js"), 'throw Error("stale management CLI");');
-    rmSync(join(kit, "dist/forge-ship.js"));
+    // A source checkout must dispatch and install its current program even when dist is stale.
+    writeFileSync(join(kit,"dist/cli.js"), 'throw Error("stale management CLI");');
     const run = (exe: string, ...args: string[]) =>
       Bun.spawnSync([exe, ...args], { cwd: kit, env: { ...process.env, BUN_BIN: process.execPath } });
     const sync = run(join(kit, "bin/forge"), "sync", bench);
@@ -315,16 +321,15 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const doctor = run(join(wb, "bin/forge"), "doctor", bench, "--json");
     expect(doctor.exitCode, doctor.stderr.toString()).toBe(0);
     expect(JSON.parse(doctor.stdout.toString()).ok).toBe(true);
-    const ship = run(join(wb, "bin/forge-ship"), "unknown");
+    const ship = run(join(wb, "bin/forge"), "ship","unknown");
     expect(ship.exitCode).toBe(1);
-    expect(ship.stderr.toString() + ship.stdout.toString()).toContain("Expected forge-ship");
+    expect(ship.stderr.toString() + ship.stdout.toString()).toMatch(/ship/i);
   });
 
   test("doctor catches plaintext API keys and absolute symlinks", () => {
     const res = initWorkbench({
       targetDir: target,
       name: "bad-garage",
-      skipReviewAgents: true,
     });
     writeFileSync(
       join(res.root, "AGENTS.local.md"),
@@ -349,7 +354,6 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const res = initWorkbench({
       targetDir: target,
       name: "wt-check",
-      skipReviewAgents: true,
     });
     const repo = join(res.root, "main-svc");
     mkdirSync(repo, { recursive: true });
@@ -372,7 +376,6 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const res = initWorkbench({
       targetDir: target,
       name: "trust-check",
-      skipReviewAgents: true,
     });
     const fakeCodexHome = mkdtempSync(join(tmpdir(), "forge-codex-home-"));
     try {
@@ -410,17 +413,16 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const res = initWorkbench({
       targetDir: target,
       name: "role-check",
-      skipReviewAgents: true,
     });
-    const ledgerBin = join(res.root, ".workbench", "bin", "ledger");
+    const ledgerBin = join(res.root, ".workbench", "bin", "forge");
     const opened = Bun.spawnSync(
-      [ledgerBin, "open", "--id", "role-test-1", "--title", "Role test", "--endpoint", "local", "--depth", "targeted"],
+      [ledgerBin, "ledger", "open", "--id", "role-test-1", "--title", "Role test", "--endpoint", "local", "--depth", "targeted"],
       { env: process.env, cwd: res.root },
     );
     expect(opened.exitCode).toBe(0);
 
     const record = (kind: string, extra: string[] = []) => Bun.spawnSync(
-      [ledgerBin, "record", "role-test-1", "--kind", kind, "--status", "pass", "--summary", "x", ...extra], { env: process.env, cwd: res.root });
+      [ledgerBin, "ledger", "record", "role-test-1", "--kind", kind, "--status", "pass", "--summary", "x", ...extra], { env: process.env, cwd: res.root });
     for (const kind of ["test", "build", "lint", "review", "hurl"]) {
       const proc = record(kind);
       expect(proc.exitCode).not.toBe(0);

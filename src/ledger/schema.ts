@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { withImmediateTx } from "./transactions";
 import { computeEntryHash, type LedgerReader, type TaskRecord } from "./types";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 export function ensureInitialized(db: Database): void {
   const versionRow = db.query("PRAGMA user_version;").get() as {
@@ -58,6 +58,18 @@ function initSchema(db: Database): void {
         freeze_seq INTEGER NOT NULL, base_shas_json TEXT NOT NULL, policy_hash TEXT NOT NULL, scope_hash TEXT NOT NULL,
         run_token TEXT, ttl_minutes INTEGER NOT NULL, approved_session_id TEXT, approved_at TEXT, expires_at TEXT, degraded_reason TEXT,
         redeemed_at TEXT, redeemed_runbook_id TEXT REFERENCES runbooks(runbook_id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS exact_ship_envelopes (
+        envelope_id TEXT PRIMARY KEY REFERENCES fast_track_envelopes(envelope_id),
+        runbook_id TEXT NOT NULL UNIQUE REFERENCES runbooks(runbook_id),
+        actions_hash TEXT NOT NULL, endpoint TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS ship_action_receipts (
+        envelope_id TEXT NOT NULL REFERENCES exact_ship_envelopes(envelope_id),
+        action_index INTEGER NOT NULL, action_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('claimed','confirmed')), owner_pid INTEGER NOT NULL,
+        created_at TEXT NOT NULL, confirmed_at TEXT, observation TEXT,
+        PRIMARY KEY(envelope_id,action_index)
       );
       CREATE TABLE IF NOT EXISTS task_handoffs (
         task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,

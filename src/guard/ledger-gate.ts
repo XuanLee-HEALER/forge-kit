@@ -4,7 +4,9 @@ import { isApprovedTagPushRefspec, parseDeliverySegment } from "./git-gh";
 import { type ApprovedRunbookEntry } from "./runbook-state";
 import { getSpecState } from "../ledger/spec";
 import { handedOffBranches, handedOffOwner, Ledger } from "../ledger/store";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { usesV05 } from "../ledger/types";
 import {
   ghDefaultMatchesOrigin,
   parseGhPrCreateArgs,
@@ -67,6 +69,9 @@ export function checkLedgerGate(
   if (!cfg.ledger.enabled) return null;
   const registeredRepos = new Set(cfg.repos);
   if (registeredRepos.size === 0) return null;
+  const lockPath = join(workbenchRoot, ".workbench", "kit-lock.json");
+  const currentInstall = existsSync(lockPath) &&
+    /^0\.5(?:\.|$)/.test(JSON.parse(readFileSync(lockPath, "utf8")).kit_version ?? "");
   const segments = splitShellSegments(cmd);
   let ledger: Ledger | null = null;
   try {
@@ -216,6 +221,8 @@ export function checkLedgerGate(
         const openTasks = deliveryDetached
           ? ledger.findOpenTasksByRepoCommits(loc.repo, getHeadAndParents(loc.checkoutDir))
           : ledger.findOpenTasksByRepoBranch(loc.repo, deliveryBranch);
+        // Physical high-risk checks run independently. Ordinary development is observed by PostToolUse.
+        if (currentInstall && openTasks.every(task => usesV05(ledger!, task.task_id))) continue;
         const exemption = deliveryDetached
           ? null
           : ledger.findActiveExemption(loc.repo, deliveryBranch);
@@ -233,14 +240,14 @@ export function checkLedgerGate(
           const allOpen = ledger.listOpenTasks();
           const attachHint =
             allOpen.length > 0
-              ? `\n  2) 归属已有跨仓任务：.workbench/bin/ledger attach <task_id> --repo ${loc.repo} --branch ${deliveryBranch}（当前 OPEN：${allOpen.map((t) => t.task_id).join(", ")}）`
+              ? `\n  2) 归属已有跨仓任务：.workbench/bin/forge ledger attach <task_id> --repo ${loc.repo} --branch ${deliveryBranch}（当前 OPEN：${allOpen.map((t) => t.task_id).join(", ")}）`
               : "";
 
           if (!eligibility.eligible) {
             return (
               `账本门禁：业务仓 ${loc.repo} (${deliveryBranch}) 即将提交（${eligibility.files.length} 文件 / ${eligibility.changedLines} 行：${eligibility.reason}），不可沿用或静默豁免。\n` +
               `请选择：\n` +
-              `  1) 新开账本：.workbench/bin/ledger open --id <YYYYMMDD-slug> --title "<标题>" --endpoint <local|fat|pr> --depth <targeted|full> --repo ${loc.repo} --branch ${deliveryBranch}${attachHint}\n` +
+              `  1) 新开账本：.workbench/bin/forge ledger open --id <YYYYMMDD-slug> --title "<标题>" --endpoint <local|fat|pr> --depth <targeted|full> --repo ${loc.repo} --branch ${deliveryBranch}${attachHint}\n` +
               `  3) 若确认完全不涉及逻辑/设定，拿不准请先询问用户确认。`
             );
           }
@@ -248,8 +255,8 @@ export function checkLedgerGate(
           return (
             `账本门禁：业务仓 ${loc.repo} (${deliveryBranch}) 尚未绑定开发账本。\n` +
             `请选择：\n` +
-            `  1) 新开账本：.workbench/bin/ledger open --id <YYYYMMDD-slug> --title "<标题>" --endpoint <local|fat|pr> --depth <targeted|full> --repo ${loc.repo} --branch ${deliveryBranch}${attachHint}\n` +
-            `  3) 若为不涉及逻辑/设定的极小改动（纯文档/注释/typo）：.workbench/bin/ledger exempt --repo ${loc.repo} --branch ${deliveryBranch} --reason "<原因>"`
+            `  1) 新开账本：.workbench/bin/forge ledger open --id <YYYYMMDD-slug> --title "<标题>" --endpoint <local|fat|pr> --depth <targeted|full> --repo ${loc.repo} --branch ${deliveryBranch}${attachHint}\n` +
+            `  3) 若为不涉及逻辑/设定的极小改动（纯文档/注释/typo）：.workbench/bin/forge ledger exempt --repo ${loc.repo} --branch ${deliveryBranch} --reason "<原因>"`
           );
         }
 

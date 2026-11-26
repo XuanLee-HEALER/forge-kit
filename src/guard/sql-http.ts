@@ -52,19 +52,16 @@ function isAllowedDbcredSubstitution(
   const trimmed = inner.trim();
   if (!trimmed || /[;|&`<>()\n\r\0'"]/.test(trimmed)) return false;
   const parts = trimmed.split(/[ \t]+/).filter(Boolean);
-  const [bin, envArg, ...flags] = parts;
+  const [bin, subcommand, envArg, ...flags] = parts;
+  if (subcommand !== "dbcred") return false;
   if (!envArg || !/^[A-Za-z0-9._/-]+$/.test(bin)) return false;
   if (flags.length && !(flags.length === 1 && flags[0] === "--ro")) {
-    if (flags[0] !== "--rw" || flags[1] !== "--runbook" || flags[2] !== runbook.record.runbook_id) return false;
-    if (flags.length !== 3 && !(flags.length === 5 && flags[3] === "--session" &&
-        /^[A-Za-z0-9._-]+$/.test(flags[4]) && flags[4] === runbook.record.approved_session_id)) return false;
-    const destinations = normalizeDbHosts(loadDbEnvironments(workbenchRoot)[envArg]?.host ?? "");
-    if (!host || !destinations.every(destination => destination === host)) return false;
+    return false;
   }
   if (!/^[A-Za-z0-9._-]+$/.test(envArg)) return false;
   // Never permit bare `dbcred` resolved via PATH; must be an explicit relative/absolute path
   if (!bin.includes("/")) return false;
-  const expectedReal = canonicalizeOsPath(workbenchRoot, ".workbench/bin/dbcred");
+  const expectedReal = canonicalizeOsPath(workbenchRoot, ".workbench/bin/forge");
   const candidateReal = canonicalizeOsPath(workdir, bin);
   if (!expectedReal || !candidateReal) return false;
   return candidateReal === expectedReal;
@@ -241,9 +238,9 @@ export function checkProdDb(cmd: string, prodHosts: string[], toolWorkdir = proc
   const host = productionHost(cmd, prodHosts.map(h => h.toLowerCase()));
   if (!host) return null;
   const argv = tokenizeSimpleShellCommand(cmd);
-  const ledgerPath = canonicalizeOsPath(workbenchRoot, ".workbench/bin/ledger");
+  const ledgerPath = canonicalizeOsPath(workbenchRoot, ".workbench/bin/forge");
   if (ledgerPath && argv?.[0]?.includes("/") && canonicalizeOsPath(toolWorkdir, argv[0]) === ledgerPath
-      && /^(runbook|open|close|record|decide|blocker|status|query|attach|detach|reopen|set-endpoint|cancel|verify)$/.test(argv[1])) return null;
+      && argv[1] === "ledger" && /^(runbook|open|close|record|decide|blocker|status|query|attach|detach|reopen|set-endpoint|cancel|verify)$/.test(argv[2])) return null;
   const binaryBody = /(?:^|\s)--data-binary(?:=|\s)/.test(cmd);
   const readQuery = binaryBody ? literalCurlRead(cmd) :
     /(?:[?&]query=|(?:-d|--data(?:-raw)?)\s+['"]?)select\b/i.test(cmd) && !SQL_WRITE_RE.test(cmd);

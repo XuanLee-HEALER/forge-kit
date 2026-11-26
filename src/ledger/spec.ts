@@ -1,3 +1,4 @@
+import { usesV05 } from "./types";
 import { canonicalRepoPath } from "../config";
 import { scanLockedTests } from "./locked-tests";
 import { appendEventInTx, withImmediateTx } from "./transactions";
@@ -84,21 +85,15 @@ export function freezeSpec(ledger: LedgerReader, params: {
       throw new Error(`Spec directory must reside inside workbench root: ${rawDir}`);
     }
 
-    const fileNames = {
-      ssot: "ssot.md",
-      tech_spec: "tech-spec.md",
-      test_spec: "test-spec.md",
-    } as const;
-    const files = {
-      ssot: `${relDir}/${fileNames.ssot}`,
-      tech_spec: `${relDir}/${fileNames.tech_spec}`,
-      test_spec: `${relDir}/${fileNames.test_spec}`,
-    };
-    const hashes = { ssot: "", tech_spec: "", test_spec: "" };
-
-    for (const [key, fname] of Object.entries(fileNames) as Array<
-      [keyof typeof fileNames, string]
-    >) {
+    const previous = ledger.getSpecState(params.task_id);
+    const lightweight = previous.files ? Object.hasOwn(previous.files, "scope")
+      : task.verification_depth === "targeted" && usesV05(ledger, params.task_id);
+    const fileNames: Record<string, string> = lightweight ? { scope: "scope.md" }
+      : { ssot: "ssot.md", tech_spec: "tech-spec.md", test_spec: "test-spec.md" };
+    const files: Record<string, string> = {};
+    const hashes: Record<string, string> = {};
+    for (const [key, fname] of Object.entries(fileNames)) {
+      files[key] = relDir + "/" + fname;
       const absFile = join(realDir, fname);
       if (!existsSync(absFile)) {
         throw new Error(`Missing required spec document: ${files[key]}`);
@@ -124,7 +119,7 @@ export function freezeSpec(ledger: LedgerReader, params: {
       hashes[key] = digest;
     }
 
-    const prevSpec = ledger.getSpecState(params.task_id);
+    const prevSpec = previous;
     const lockedGlobs =
       params.locked_test_globs !== undefined
         ? [...new Set(params.locked_test_globs.map((g) => g.trim()).filter(Boolean))]
@@ -137,7 +132,7 @@ export function freezeSpec(ledger: LedgerReader, params: {
         );
       }
       const changedDocs: string[] = [];
-      for (const key of ["ssot", "tech_spec", "test_spec"] as const) {
+      for (const key of Object.keys(files)) {
         if (prevSpec.hashes && hashes[key] !== prevSpec.hashes[key]) {
           changedDocs.push(files[key]);
         }
@@ -313,8 +308,8 @@ export function getSpecState(ledger: LedgerReader, task_id: string, options: { m
   let freezeSeq: number | null = null;
   let amendSeq: number | null = null;
   let specDir: string | null = null;
-  let files: { ssot: string; tech_spec: string; test_spec: string } | null = null;
-  let hashes: { ssot: string; tech_spec: string; test_spec: string } | null = null;
+  let files: Record<string, string> | null = null;
+  let hashes: Record<string, string> | null = null;
   let lockedFiles: Record<string, string> | undefined;
   let gitlinks: LockedGitlinks = {};
   let freezeRefs: Record<string, string[]> = {};
@@ -426,7 +421,7 @@ export function getSpecState(ledger: LedgerReader, task_id: string, options: { m
         }
       }
     }
-    for (const key of ["ssot", "tech_spec", "test_spec"] as const) {
+    for (const key of Object.keys(files)) {
       const relPath = files[key];
       const expectedHash = hashes[key];
       const absFile = resolve(wbReal, relPath);

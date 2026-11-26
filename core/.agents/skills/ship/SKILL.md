@@ -1,53 +1,31 @@
 ---
 name: ship
-description: 交付已验证的功能至 FAT、PR 或生产，按授权选择单线程交付、PR 移交与批量发布，或使用预授权快轨。
+description: 将已验证的版本交付到授权终点，核验回执并关账；支持 PR 移交、批次和精确预授权快轨。
 ---
 
-# 按授权终点交付
+# 交付与归档
 
-在工作台根目录执行 `export PATH="$PWD/.workbench/bin:$PATH"`。先核对任务、仓库卡、分支、终点和待交付的 SHA。
-每个挂载分支分别进入其干净功能工作树运行 `wb-verify` 和 `forge-review`；也可在根目录为两条命令都指定 `--task <task_id> --cwd <工作树绝对路径>`。
+**输入**为任务、冻结规格、各挂载仓与分支、待交付 SHA、实际验证和审查证据、实例终点及授权。用 `forge instance list --json` 确定阶段，用 `forge ledger status` 核对任务；缺省交付终点为 PR 合入 main。
 
-| 当前情况 | 模式 | 谁负责收尾 |
-|---|---|---|
-| 一个线程负责本次功能的全部交付 | A 单线程 | 功能线程验收到授权终点并关账 |
-| 功能线程在 PR 停止，多个任务一起发版 | B 移交与发布列车 | 发布线程按批次核验并关账 |
-| 操作者愿意提前批准冻结规格内的有限改动 | C 预授权快轨 | 同一会话兑现一次性授权，按终点接续 |
+## 单任务
 
-## A · 单线程交付
+1. 确认冻结摘要、锁定测试和干净工作树；核对静态、执行、集成验证及独立审查均属于当前冻结周期和目标 SHA。当前范围仍有 blocked、error、incomplete 的已执行角色或未关闭 blocker 时暂停。历史结果保持原始归属。
+2. 按实例阶段创建或更新 PR。通过 `forge ledger pr-sync <task-id> --repo <repo> --branch <branch>` 核对远端 HEAD，将 `forge ledger tip <task-id>` 的见证附入 PR。外部意见用 pr-triage。检查目标分支、固定 HEAD 及必需 CI。
+3. 需要受保护动作时，先用 `forge ledger runbook create` 登记精确动作。向用户展示仓、远端、资源、版本、内容摘要和适用时效。主会话单独发送 `批准 <rb-id>` 或 `approve <rb-id>` 后方可兑现。若由人工合并，等待远端结果并核对。
+4. 核验远端 main 包含待交付提交或相应受核验的合并结果，再登记回执。实例另有终点时按已授权的阶段、顺序和版本继续，记录实际外部状态。到达本次终点后执行 `forge ledger close <task-id>`。
 
-1. 在干净工作树运行 `wb-verify` 和 `forge-review`，核对证据对应当前 SHA。
-2. FAT 用 `wb-git fat-merge <repo> <branch> --task <task_id>`。记录功能与 FAT SHA，跟踪部署，验收后在功能 SHA 登记 FAT 结果。
-3. PR 核对目标分支、推送并创建 PR，正文附 `ledger tip <task_id>` 的见证。对每个挂载分支运行 `ledger pr-sync <task_id> --repo <repo> --branch <branch>` 核对远端 HEAD。
-4. 生产用 `ledger runbook create` 登记精确 PR、tag/SHA、SQL 主机与文件或 kubectl 命令，向用户展示范围及回滚方案。用户在主会话单独发送 `批准 <rb-id>`。
-5. 执行已批准动作，跟踪部署并只读回查。完成运行手册，按功能 SHA 用 `ledger record` 登记实际验收结果。
+## 功能线程移交与发布批次
 
-**完成条件**　授权终点的证据齐全，`ledger close <task_id>` 成功。
+功能线程完成验证及 PR 分诊，逐仓同步 HEAD 后执行 `forge ledger handoff <task-id>`，把 Forge-Task、Verified-Head、Ledger-Tip 见证附入 PR，止于 HANDED_OFF。需改实现时先 `forge ledger resume <task-id>`，复验后重新移交。
 
-## B · PR 移交与批量发布
+发布线程用 `forge ledger release create --title "<title>" --from-handoffs` 或显式任务列表建批，`forge ledger release verify <rel-id>` 核验实时 PR。出现版本漂移时暂停相应批次并退回功能线程。使用 `forge ledger release runbook <rel-id>` 汇集确定的动作，在主会话取得精确批准。逐项兑现并记录回执，核验远端目标引用，再完成 runbook 及 release。
 
-**功能线程**
+## Fast-Track
 
-1. 运行 `wb-verify`、`forge-review`，推送并创建 PR。用 `ledger pr-sync <task_id> --repo <repo> --branch <branch>` 逐个同步挂载分支的 PR。
-2. 功能线程负责实现和评审意见。有外部意见时先用 pr-triage 完成裁决和已确认的修复，验证并同步最终 HEAD。确认 PR 已就绪可发版，再执行 `ledger handoff <task_id> [--sql <host>:<path>] [--rollback "<note>"]`，将输出的 `Forge-Task`、`Verified-Head`、`Ledger-Tip` 三条见证贴入对应 PR。
-3. 状态为 `HANDED_OFF` 后停止。若需按评审修改代码，先 `ledger resume <task_id>`，再验证新 HEAD 并重新移交。
+从实例交付配置中读取有序阶段。用 `forge ledger runbook create --task "$TASK" --title "$TITLE" --pr "$REPO:$PR"` 登记精确合并；有自定义上线步骤时按声明顺序重复传入 `--stage <stage-id>`。登记时解析目标版本、动作参数及脚本摘要。把返回的具体目标和内容提供给批准人。
 
-**发布线程**
+规格冻结后，使用 `forge ledger fast-track prepare <task-id> --to <endpoint> --paths <globs> --runbook <rb-id>` 绑定终点、范围和精确 runbook。向用户展示逐项资源、动作、版本和时效。用户在主会话单独发送 `快轨批准 <ft-id>` 或 `快轨撤销 <ft-id>`。快轨可覆盖整个实例交付路径。
 
-接手者负责把已就绪的 PR 随批次发布。HEAD 漂移或新发现的问题需要改实现时，暂停受影响批次并退回功能线程，待重新移交后再发版。
+在同一获批会话运行 `forge ship evaluate --envelope <ft-id>` 后用 `forge ship run --envelope <ft-id>` 兑现。每一步核对策略、时效、冻结范围、版本、CI、评审与外部状态。只执行已确定动作；超界、漂移、后来才确定的动作或异常均须在调用前停止。重试前读取逐项回执，外部结果不确定时交还人工核实。存量授权缺精确绑定时重新登记并批准。
 
-1. 用 `ledger release create --title "<title>" --from-handoffs` 选取全部尚未被发布批次占用的 `HANDED_OFF` 任务。要指定批次成员，将 `--from-handoffs` 换成 `--tasks <id1>,<id2>`。再运行 `ledger release verify <rel-id>`。复用已移交的验证证据，通过实时 `gh pr view` 核对 SHA；出现 `STALE_PR` 时停止发布。
-2. 用 `ledger release runbook <rel-id> [--tag <repo>:<tag>:<sha>]` 将 PR、移交的 SQL 和发布标签汇入同一运行手册。用户单独发送 `批准 <rb-id>`。
-3. 执行输出的固定 HEAD 合并命令及获批动作。对 SQL、tag、kubectl 在对应任务的移交 SHA 登记 prod 回执，元数据含 `runbook_id` 和 `execution_actions` 给出的 `action_id`；生产任务另记部署验收。
-4. PR 远端合并后，在每个相关仓库执行 `git fetch origin` 更新目标引用，再执行 `ledger runbook complete <rb-id>` 和 `ledger release complete <rel-id>`。批次关闭后用 `wb-git sweep` 预览清理范围。
-
-**完成条件**　功能线程止于有见证的移交；发布线程完成批次，所有子任务原子关闭。
-
-## C · 预授权快轨
-
-1. 执行 `ledger freeze <task_id>`，按只读策略 `.workbench/ship-policy.yaml` 选择终点和路径。运行 `ledger fast-track prepare <task_id> --to <pr|fat|prod> --paths '<globs>' [--ttl <min>]`。
-2. 用户在主会话单独发送 `快轨批准 <ft-id>` 或 `fast-track approve <ft-id>`。`快轨撤销 <ft-id>` 可撤销 `PENDING` 或 `ACTIVE` 信封。生产信封一旦 `REDEEMED`，用 `ledger runbook revoke <rb-id>` 撤销运行手册中尚未执行的生产动作。
-3. 编码后在干净工作树运行 `wb-verify` 和 `forge-review`。PR 或生产终点须先推送已验证的 HEAD，创建或更新对应 PR，让远端 HEAD 与本地一致；生产还须等待必需 CI 通过。
-4. PR 快轨兑现会直接移交，功能线程先确认已有评审意见均有结论，PR 已就绪。评估前在各相关功能工作树执行 `git fetch origin` 更新目标引用。在批准会话执行 `forge-ship evaluate --envelope <ft-id>`，得到 `ELIGIBLE` 后运行 `forge-ship run --envelope <ft-id>`。越界、禁区、改动量超限、规格漂移或生产 CI 失败会进入 `DEGRADED`，交由人工接管；过期状态为 `EXPIRED`。
-
-**完成条件**　信封为 `REDEEMED`。FAT 检查推送回执，PR 自动移交至模式 B，停止前将返回的 `trailers`（`Forge-Task`、`Verified-Head`、`Ledger-Tip`）贴入对应 PR 正文；生产生成精确 SHA 的已批准运行手册，按其执行并记录验收。
+**输出与完成条件**为每仓版本、终点、远端观测结果、回执和账本状态。移交要有可核验的见证；中断保留已完成项与待人工处理的具体条件。

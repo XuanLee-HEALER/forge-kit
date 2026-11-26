@@ -464,7 +464,7 @@ export function runWbGitCli(): void {
   const [cmd, ...rest] = process.argv.slice(2);
   const root = findWorkbenchRoot();
   if (!cmd || cmd === "--help" || cmd === "-h") {
-    console.log(`Usage: wb-git <status|sweep|fat-merge> [options]
+    console.log(`Usage: forge git <status|sweep|fat-merge> [options]
   fat-merge <repo> <feature-branch> [--task ID] [--fat-branch fat] [--cherry-pick] [--no-push] [--verify-cmd COMMAND]
   status [--prs] [--json] [--repo <name>] [--all-discovered]
   sweep  [--apply] [--repo <name>] [--keep <regex>] [--no-fetch] [--all-discovered]`);
@@ -514,7 +514,7 @@ export function runWbGitCli(): void {
       includeUnregistered: Boolean(values["all-discovered"]),
     });
   } else {
-    console.error(`Unknown wb-git command: ${cmd}`);
+    console.error(`Unknown forge git command: ${cmd}`);
     process.exit(1);
   }
 }

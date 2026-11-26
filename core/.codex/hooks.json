@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/guard\"",
+            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/forge\" guard",
             "timeout": 10
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/ledger-hook\"",
+            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/forge\" ledger-hook",
             "timeout": 10
           }
         ]
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/ledger-hook\"",
+            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/forge\" ledger-hook",
             "timeout": 10
           }
         ]
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/ledger-hook\"",
+            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/forge\" ledger-hook",
             "timeout": 10
           }
         ]
@@ -49,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/ledger-hook\"",
+            "command": "\"{{WORKBENCH_ROOT}}/.workbench/bin/forge\" ledger-hook",
             "timeout": 10
           }
         ]

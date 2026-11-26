@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { executorFixture } from "./helpers/executor";
 const f = executorFixture();
-const verify = (kind: string, ...cmd: string[]) => f.cli("wb-verify", ["--kind", kind, "--", ...cmd]);
+const verify = (kind: string, ...cmd: string[]) => f.cli("verify", ["--kind", kind, "--", ...cmd]);
 test("pinned tool passes count for readiness and a failing command supersedes a pass", () => {
   writeFileSync(join(f.repo, "app.ts"), "export const answer = 42;");
   writeFileSync(
@@ -23,12 +23,12 @@ test("pinned tool passes count for readiness and a failing command supersedes a 
     meta: { review_task_id: "task", review_floor_seq: 0, exit_code: 0 },
   });
   expect(ready()).toBe(true);
-  expect(f.cli("wb-verify", ["--kind", "test", "--", "bun", "test"], { TEST_FAILURE: "yes" }).exitCode).toBe(1);
+  expect(f.cli("verify", ["--kind", "test", "--", "bun", "test"], { TEST_FAILURE: "yes" }).exitCode).toBe(1);
   expect(f.evidence().at(-1)).toMatchObject({ status: "fail", meta: { exit_code: 1 } });
   expect(ready()).toBe(false);
 });
 test("rejects dirty trees, changed HEAD, post-check edits, skipped phases and informational Hurl", () => {
-  expect(f.cli("wb-verify", ["--mode", "all"]).exitCode).toBe(1);
+  expect(f.cli("verify", ["--mode", "all"]).exitCode).toBe(1);
   expect(verify("hurl", "hurl", "--version").exitCode).toBe(1);
   for(const args of [["-b","-d"],["--all"],["-BUILD","--d"],["--B","-DRY"],["-?"],["-listFilesOnly"]])
     expect(verify("build","tsc",...args).exitCode).toBe(1);
@@ -87,11 +87,11 @@ test("default language checks credit each executed phase at the attached worktre
   );
   const tsc = join(linked, "node_modules/.bin/tsc");
   mkdirSync(join(linked, "node_modules/.bin"), { recursive: true });
-  writeFileSync(tsc, '#!/bin/sh\nprintf "\\377"\n', { mode: 0o755 });
+  writeFileSync(tsc, '#!/usr/bin/env bun\nprocess.stdout.write(Uint8Array.of(255));\n', { mode: 0o755 });
   writeFileSync(join(linked, ".gitignore"), "node_modules/\n");
   f.git("-C", linked, "add", ".");
   f.git("-C", linked, "commit", "-m", "checks");
-  const r = f.cli("wb-verify", ["--task", "task", "--repo", "service", "--mode", "all"]);
+  const r = f.cli("verify", ["--task", "task", "--repo", "service", "--mode", "all"]);
   expect(r.exitCode, r.stdout.toString()).toBe(0);
   expect(f.evidence().map((e) => e.kind)).toEqual(["lint", "test"]);
   expect(f.evidence()[0].meta.output_sha256).toBe(
@@ -142,7 +142,7 @@ test("empty Bun suite earns no explicit or dynamic verification credit", () => {
   f.git("add", ".");
   f.git("commit", "-m", "empty suite");
   expect(verify("test", "bun", "test").exitCode).toBe(1);
-  expect(f.cli("wb-verify", ["--mode", "dynamic"]).exitCode).toBe(1);
+  expect(f.cli("verify", ["--mode", "dynamic"]).exitCode).toBe(1);
   expect(f.evidence()).toEqual([]);
 });
 
@@ -155,24 +155,24 @@ test("Go package and pytest collection results distinguish skipped tests from ex
   writeFileSync(join(f.repo, "go.mod"), "module example");
   f.git("add", ".");
   f.git("commit", "-m", "module");
-  const dynamic = () => f.cli("wb-verify", ["--mode", "dynamic"], env);
+  const dynamic = () => f.cli("verify", ["--mode", "dynamic"], env);
   expect(dynamic().exitCode).toBe(1);
   expect(f.evidence()).toEqual([]);
   writeFileSync(go, "#!/bin/sh\nprintf '?  example/a [no test files]\\nok  example/b 0.01s\\n'\n");
-  expect(f.cli("wb-verify", ["--mode", "dynamic"], {...env, GOFLAGS: "-n"}).exitCode).toBe(1);
+  expect(f.cli("verify", ["--mode", "dynamic"], {...env, GOFLAGS: "-n"}).exitCode).toBe(1);
   expect(f.evidence().map(e => e.status)).toEqual(["fail"]);
   const settings = join(f.root, "go-env");
   writeFileSync(settings, "GOFLAGS='-n'\n");
   writeFileSync(go, "#!/bin/sh\nif [ \"$1\" = env ]; then sed -n 's/^GOFLAGS=//p' \"$GOENV\"; else echo 'ok  example/b 0.01s'; fi\n");
   const saved = {...env, GOENV: settings, GOFLAGS: ""};
-  expect(f.cli("wb-verify", ["--kind", "test", "--", go, "test", "./..."], saved).exitCode).toBe(1);
-  expect(f.cli("wb-verify", ["--mode", "dynamic"], saved).exitCode).toBe(1);
+  expect(f.cli("verify", ["--kind", "test", "--", go, "test", "./..."], saved).exitCode).toBe(1);
+  expect(f.cli("verify", ["--mode", "dynamic"], saved).exitCode).toBe(1);
   expect(f.evidence().map(e => e.status)).toEqual(["fail", "fail"]);
   writeFileSync(go, "#!/bin/sh\nif [ \"$1\" != env ]; then echo 'ok  example/b 0.01s'; fi\n");
   expect(dynamic().exitCode).toBe(0);
-  expect(f.cli("wb-verify", ["--kind", "test", "--", go, "test", "-n=false", "./..."], env).exitCode).toBe(0);
+  expect(f.cli("verify", ["--kind", "test", "--", go, "test", "-n=false", "./..."], env).exitCode).toBe(0);
   writeFileSync(join(bin, "pytest"), "#!/bin/sh\nexit 5\n", { mode: 0o755 });
-  expect(f.cli("wb-verify", ["--kind", "test", "--", "pytest"], env).exitCode).toBe(1);
+  expect(f.cli("verify", ["--kind", "test", "--", "pytest"], env).exitCode).toBe(1);
   expect(f.evidence().map(e => e.status)).toEqual(["fail", "fail", "pass", "pass"]);
 });
 
@@ -181,8 +181,8 @@ test("empty Bun output through a package script earns no credit", () => {
   writeFileSync(join(f.repo, "package.json"), JSON.stringify({ scripts: { test: "bun test" } }));
   f.git("add", ".");
   f.git("commit", "-m", "empty delegated suite");
-  expect(verify("test", "npm", "run", "test").exitCode).toBe(1);
-  expect(f.cli("wb-verify", ["--mode", "dynamic"]).exitCode).toBe(1);
+  expect(verify("test", "bun", "run", "test").exitCode).toBe(1);
+  expect(f.cli("verify", ["--mode", "dynamic"]).exitCode).toBe(1);
   expect(f.evidence()).toEqual([]);
 });
 
@@ -191,21 +191,12 @@ test("named package scripts execute and a passing suite may mention 0 tests", ()
   writeFileSync(join(f.repo,"app.ts"),"export const docs = 1;");
   writeFileSync(join(f.repo,"package.json"), JSON.stringify({scripts:{test:"bun test",testIntegration:"bun test",buildDocs:"bun build app.ts"}}));
   f.git("add","."); f.git("commit","-m","named scripts");
-  expect(verify("test","npm","run","testIntegration","-v").exitCode).toBe(1);
+  expect(verify("test", "npm", "run", "test").exitCode).toBe(1);
   expect(f.evidence()).toEqual([]);
-  expect(verify("test","npm","--no-usage=false","run","test").exitCode).toBe(1);
-  expect(f.evidence()).toEqual([]);
-  expect(verify("test", "npm", "--prefix", f.root, "run", "test").exitCode).toBe(1);
-  expect(f.evidence()).toEqual([]);
-  expect(verify("test", "npm", "--prefix", ".", "run", "test").exitCode).toBe(0);
-  expect(verify("test","npm","--dry-run=false","run","test").exitCode).toBe(0);
-  expect(verify("test","npm","--dry-run","false","run","test").exitCode).toBe(0);
-  expect(verify("test","npm","--dry-run","--no-dry-run","run","test").exitCode).toBe(0);
-  expect(verify("test","npm","--no-color","run","testIntegration","--loglevel=verbose").exitCode).toBe(0);
-  expect(verify("test","npm","--ignore-scripts","run","test").exitCode).toBe(0);
-  expect(verify("build","npm","run","buildDocs").exitCode).toBe(0);
-  expect(f.cli("wb-verify",["--mode","dynamic"]).exitCode).toBe(0);
-  expect(f.evidence().map(e=>e.kind)).toEqual(["test","test","test","test","test","test","build","test"]);
+  expect(verify("test", "bun", "run", "testIntegration").exitCode).toBe(0);
+  expect(verify("build", "bun", "run", "buildDocs").exitCode).toBe(0);
+  expect(f.cli("verify", ["--mode", "dynamic"]).exitCode).toBe(0);
+  expect(f.evidence().map(e => e.kind)).toEqual(["test", "build", "test"]);
 });
 
 test("Go JSON package results count passing and skipped packages", () => {
@@ -248,7 +239,7 @@ test("inherited collection-only pytest options earn no explicit or automatic tes
   writeFileSync(join(bin,"pytest"),"#!/bin/sh\nprintf '1 test collected in 0.01s\\n'\n",{mode:0o755});
   const env={PATH:bin+":"+process.env.PATH,PYTEST_ADDOPTS:"--co"};
   for (const args of [["--kind","test","--","pytest"],["--mode","dynamic"]]) {
-    expect(f.cli("wb-verify",args,env).exitCode).toBe(1);
+    expect(f.cli("verify",args,env).exitCode).toBe(1);
   }
   expect(f.evidence()).toEqual([]);
 });
@@ -260,27 +251,18 @@ test("package scripts collecting pytest tests never credit the task", () => {
   writeFileSync(join(bin,"pytest"),"#!/bin/sh\nprintf '1/2 tests collected (1 deselected) in 0.01s\\n'\n",{mode:0o755});
   f.git("add",".");f.git("commit","-m","delegated test runner");
   const env={PATH:bin+":"+process.env.PATH,PYTEST_ADDOPTS:"--collectonly"};
-  for (const args of [["--kind","test","--","npm","--no-color","run","test"],["--mode","dynamic"]]) {
-    expect(f.cli("wb-verify",args,env).exitCode).toBe(1);
+  for (const args of [["--kind","test","--","bun","run","test"],["--mode","dynamic"]]) {
+    expect(f.cli("verify",args,env).exitCode).toBe(1);
   }
   expect(f.evidence()).toEqual([]);
 });
 
-test("automatic npm verification refuses usage-only configuration", () => {
+test("automatic and explicit Bun verification run the declared test script", () => {
   writeFileSync(join(f.repo, "package.json"), JSON.stringify({ scripts: { test: "exit 1" } }));
-  f.git("add", ".");
-  f.git("commit", "-m", "package tests");
-  expect(f.cli("wb-verify", ["--mode", "dynamic"], {npm_config_usage: "true"}).exitCode).toBe(1);
-  expect(f.evidence().map(e => e.status)).toEqual(["fail"]);
-});
-
-test("npm verification executes the selected script despite project usage configuration", () => {
-  writeFileSync(join(f.repo, ".npmrc"), "usage=true\n");
-  writeFileSync(join(f.repo, "package.json"), JSON.stringify({ scripts: { test: "exit 1" } }));
-  f.git("add", ".");
-  f.git("commit", "-m", "npm project configuration");
-  for (const args of [["--mode", "dynamic"], ["--kind", "test", "--", "npm", "run", "test"]]) {
-    expect(f.cli("wb-verify", args).exitCode).toBe(1);
+  f.git("add", "--", "package.json");
+  f.git("commit", "-m", "declared tests");
+  for (const args of [["--mode", "dynamic"], ["--kind", "test", "--", "bun", "run", "test"]]) {
+    expect(f.cli("verify", args).exitCode).toBe(1);
   }
   expect(f.evidence().map(e => e.status)).toEqual(["fail", "fail"]);
 });
@@ -296,8 +278,8 @@ test("package scripts execute delegated Go tests with direct and saved dry-run s
   f.git("commit", "-m", "delegated Go suite");
   for (const flags of ["-n", "'-n'", '"-n"', ""]) {
     const env = {GOFLAGS: flags, GOENV: settings, PATH:f.root + ":" + process.env.PATH};
-    for (const args of [["--mode", "dynamic"], ["--kind", "test", "--", "npm", "run", "test"]]) {
-      expect(f.cli("wb-verify", args, env).exitCode).toBe(1);
+    for (const args of [["--mode", "dynamic"], ["--kind", "test", "--", "bun", "run", "test"]]) {
+      expect(f.cli("verify", args, env).exitCode).toBe(1);
     }
   }
   expect(f.evidence().map(e => e.status)).toEqual(Array(8).fill("fail"));
@@ -311,8 +293,8 @@ test("pytest version output from project configuration earns no test credit", ()
   writeFileSync(runner, "#!/bin/sh\ngrep -q -- -VV pytest.ini || exit 2\necho 'This is pytest version 9.0, imported from /fixture/pytest/__init__.py'\n", {mode: 0o755});
   f.git("add", ".");
   f.git("commit", "-m", "verbose pytest installation query");
-  for (const args of [["--kind", "test", "--", runner], ["--mode", "dynamic"], ["--kind", "test", "--", "npm", "run", "test"]]) {
-    expect(f.cli("wb-verify", args, {PATH:f.root + ":" + process.env.PATH}).exitCode).toBe(1);
+  for (const args of [["--kind", "test", "--", runner], ["--mode", "dynamic"], ["--kind", "test", "--", "bun", "run", "test"]]) {
+    expect(f.cli("verify", args, {PATH:f.root + ":" + process.env.PATH}).exitCode).toBe(1);
   }
   expect(f.evidence()).toEqual([]);
 });
@@ -343,18 +325,18 @@ else:
   f.git("add", ".");
   f.git("commit", "-m", "quiet pytest collection");
   const env = {PATH:f.root + ":" + process.env.PATH};
-  const commands = [["--kind", "test", "--", runner], ["--mode", "dynamic"], ["--kind", "test", "--", "npm", "run", "test"]];
-  for (const args of commands) expect(f.cli("wb-verify", args, env).exitCode).toBe(1);
+  const commands = [["--kind", "test", "--", runner], ["--mode", "dynamic"], ["--kind", "test", "--", "bun", "run", "test"]];
+  for (const args of commands) expect(f.cli("verify", args, env).exitCode).toBe(1);
   expect(f.evidence()).toEqual([]);
   writeFileSync(join(f.repo, "pytest.ini"), "[pytest]\naddopts = -qq\n");
   f.git("commit", "-am", "execute tests quietly");
-  for (const args of commands) expect(f.cli("wb-verify", args, env).exitCode).toBe(0);
+  for (const args of commands) expect(f.cli("verify", args, env).exitCode).toBe(0);
   expect(f.evidence().map(e=>e.status)).toEqual(["pass", "pass", "pass"]);
   const outside = join(f.root, "test_sibling.py");
   writeFileSync(outside, "def test_sibling(): pass\n");
   const mixed = {...env, TEST_ITEMS:"test_sample.py," + outside};
-  expect(f.cli("wb-verify", ["--kind","test","--",runner], mixed).exitCode).toBe(1);
-  expect(f.cli("wb-verify", ["--kind","test","--","npm","run","test","--",outside], env).exitCode).toBe(1);
+  expect(f.cli("verify", ["--kind","test","--",runner], mixed).exitCode).toBe(1);
+  expect(f.cli("verify", ["--kind","test","--","bun","run","test","--",outside], env).exitCode).toBe(1);
   expect(f.evidence().slice(-2).map(e=>e.status)).toEqual(["fail","fail"]);
 });
 
@@ -371,14 +353,14 @@ test("tsc implicit project discovery must stay inside the checkout", () => {
   const tsc = join(import.meta.dir, "../node_modules/.bin/tsc");
   writeFileSync(join(f.root, "tsconfig.json"), JSON.stringify({files:["parent.ts"]}));
   writeFileSync(join(f.root, "parent.ts"), "export const valid = true;");
-  writeFileSync(join(f.repo, "package.json"), JSON.stringify({scripts:{typecheck:"tsc --noEmit", lint:"npm run typecheck"}}));
+  writeFileSync(join(f.repo, "package.json"), JSON.stringify({scripts:{typecheck:"tsc --noEmit", lint:"bun run typecheck"}}));
   f.git("add", "."); f.git("commit", "-m", "delegated compiler");
   const env = {PATH:join(import.meta.dir, "../node_modules/.bin") + ":" + process.env.PATH};
   expect(verify("lint", tsc, "--noEmit").exitCode).toBe(1);
   expect(verify("lint", tsc, "-p", "../tsconfig.json").exitCode).toBe(1);
   expect(f.evidence()).toEqual([]);
   for (const script of ["typecheck", "lint"])
-    expect(f.cli("wb-verify", ["--kind","lint","--","npm","run",script], env).exitCode).toBe(1);
+    expect(f.cli("verify", ["--kind","lint","--","bun","run",script], env).exitCode).toBe(1);
   expect(f.evidence().map(e=>e.status)).toEqual(["fail","fail"]);
   writeFileSync(join(f.repo, "app.ts"), "export const valid = true;");
   f.git("add", "app.ts");
@@ -386,7 +368,7 @@ test("tsc implicit project discovery must stay inside the checkout", () => {
   expect(verify("lint", tsc, "--noEmit", "app.ts").exitCode).toBe(0);
   writeFileSync(join(f.repo, "tsconfig.json"), JSON.stringify({files:["app.ts"]}));
   f.git("add", "."); f.git("commit", "-m", "local compiler configuration");
-  expect(f.cli("wb-verify", ["--kind","lint","--","npm","run","lint"], env).exitCode).toBe(0);
+  expect(f.cli("verify", ["--kind","lint","--","bun","run","lint"], env).exitCode).toBe(0);
   expect(f.evidence().map(e=>e.status)).toEqual(["fail","fail","pass","pass"]);
 });
 
@@ -406,13 +388,13 @@ if sys.argv[1] == "metadata":
   f.git("add",".");
   f.git("commit","-m","delegated cargo tests");
   const env = {PATH:f.root + ":" + process.env.PATH};
-  const delegated = [["--kind","test","--","npm","run","test"], ["--mode","dynamic"]];
+  const delegated = [["--kind","test","--","bun","run","test"], ["--mode","dynamic"]];
   writeFileSync(join(f.root, "Cargo.toml"), "[workspace]\n");
   for (const args of [[], ["--manifest-path", "../Cargo.toml"], ["--manifest-path=../Cargo.toml"]]) {
     expect(verify("test", runner, "test", ...args).exitCode).toBe(1);
   }
   expect(f.evidence()).toEqual([]);
-  for (const args of delegated) expect(f.cli("wb-verify", args, env).exitCode).toBe(1);
+  for (const args of delegated) expect(f.cli("verify", args, env).exitCode).toBe(1);
   expect(f.evidence().map(e=>e.status)).toEqual(["fail","fail"]);
   writeFileSync(join(f.repo, "Cargo.toml"), "# outside member\n");
   f.git("add", "."); f.git("commit", "-m", "workspace");
@@ -421,7 +403,7 @@ if sys.argv[1] == "metadata":
   writeFileSync(join(f.repo, "Cargo.toml"), "[package]\nname = 'local'\nversion = '0.1.0'\n");
   f.git("commit", "-am", "local crate");
   expect(verify("test", runner, "test", "--manifest-path", "Cargo.toml").exitCode).toBe(0);
-  for (const args of delegated) expect(f.cli("wb-verify", args, env).exitCode).toBe(0);
+  for (const args of delegated) expect(f.cli("verify", args, env).exitCode).toBe(0);
   expect(f.evidence().map(e=>e.status)).toEqual(["fail","fail","pass","pass","pass"]);
 });
 
@@ -430,21 +412,21 @@ test("explicit test inputs stay in the pinned checkout", () => {
   mkdirSync(sibling);
   const outside = join(sibling, "other_test.py");
   writeFileSync(outside, "def test_other(): pass\n");
-  writeFileSync(join(f.repo, "local.test.js"), 'require("node:test").test("local", () => {});');
+  writeFileSync(join(f.repo, "local.test.js"), 'import {test} from "bun:test"; test("local", () => {});');
   symlinkSync(sibling, join(f.repo, "linked"));
   f.git("add","."); f.git("commit","-m","test inputs");
   const marker = join(f.root, "launched");
-  for (const [bin, prefix] of [["pytest", []], ["jest", []], ["vitest", ["run"]], ["bun", ["test"]], ["node", ["--test"]]] as const) {
+  for (const [bin, prefix] of [["pytest", []], ["jest", []], ["vitest", ["run"]], ["bun", ["test"]]] as const) {
     const runner = join(f.root, bin);
     writeFileSync(runner, "#!/bin/sh\ntouch \"$MARKER\"\n", {mode:0o755});
     for (const input of [outside, "linked/other_test.py", "../sibling"]) {
       const args = ["--kind","test","--",runner,...prefix,input + (bin === "pytest" && input === outside ? "::test_other" : "")];
-      expect(f.cli("wb-verify", args, {MARKER:marker}).exitCode).toBe(1);
+      expect(f.cli("verify", args, {MARKER:marker}).exitCode).toBe(1);
     }
   }
   expect(existsSync(marker)).toBe(false);
   expect(f.evidence()).toEqual([]);
-  expect(verify("test", "node", "--test", "--test-name-pattern", "local", "local.test.js").exitCode).toBe(0);
+  expect(verify("test", "bun", "test", "--test-name-pattern", "local", "local.test.js").exitCode).toBe(0);
   expect(f.evidence()[0]).toMatchObject({kind:"test",status:"pass"});
 });
 
@@ -479,18 +461,13 @@ test("Go and Cargo require an executed test across the suite", () => {
   const go = join(f.root,"go"), cargo = join(f.root,"cargo");
   writeFileSync(go, '#!/bin/sh\n[ "$1" = env ] || printf "%s\\n" "$SUITE"\n', {mode:0o755});
   writeFileSync(cargo, '#!/bin/sh\nif [ "$1" = metadata ]; then printf \'{"packages":[{"manifest_path":"%s/Cargo.toml"}]}\\n\' "$PWD"; else printf "%s\\n" "$SUITE"; fi\n', {mode:0o755});
-  const verifySuite = (bin:string, output:string) => f.cli("wb-verify",["--kind","test","--",bin,"test"],{SUITE:output});
+  const verifySuite = (bin:string, output:string) => f.cli("verify",["--kind","test","--",bin,"test"],{SUITE:output});
   const emptyGo = "ok  example/unused  0.01s [no tests to run]";
   const emptyCargo = "running 0 tests\ntest result: ok. 0 passed; 0 failed";
   expect(verifySuite(go, emptyGo).exitCode).toBe(1);
-  expect(f.cli("wb-verify", ["--mode","dynamic"], {SUITE:emptyGo, PATH:f.root + ":" + process.env.PATH}).exitCode).toBe(1);
+  expect(f.cli("verify", ["--mode","dynamic"], {SUITE:emptyGo, PATH:f.root + ":" + process.env.PATH}).exitCode).toBe(1);
   const ignored = "running 1 test\ntest result: ok. 0 passed; 0 failed; 1 ignored";
   expect(verifySuite(cargo, ignored).exitCode).toBe(1);
-  const node = join(f.root, "node");
-  writeFileSync(node, '#!/bin/sh\nprintf "%s\\n" "$SUITE"\n', {mode:0o755});
-  for (const summary of ["# tests 0", "# pass 0\n# fail 0"]) {
-    expect(f.cli("wb-verify",["--kind","test","--",node,"--test"],{SUITE:summary}).exitCode).toBe(1);
-  }
   expect(verifySuite(cargo, emptyCargo).exitCode).toBe(1);
   expect(verifySuite(cargo, "0 passed; 0 failed").exitCode).toBe(1);
   expect(f.evidence()).toEqual([]);

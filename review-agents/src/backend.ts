@@ -23,7 +23,7 @@ function upstreamCode(events: string): string | undefined {
     try { event = JSON.parse(line); } catch { continue; }
     if (event?.type !== "turn.failed") continue;
     const info = event.error?.codex_error_info ?? event.error?.codexErrorInfo;
-    if (info === "usage_limit_exceeded" || info === "server_overloaded") return info;
+    if (["usage_limit_exceeded", "usageLimitExceeded", "server_overloaded", "serverOverloaded"].includes(info)) return info;
     const status = info?.http_connection_failed?.http_status_code ?? info?.httpConnectionFailed?.httpStatusCode;
     if (status === 429 || (Number.isInteger(status) && status >= 500 && status <= 599)) return "upstream_http_" + status;
     // Some Codex releases expose only a formatted transport error in turn.failed.

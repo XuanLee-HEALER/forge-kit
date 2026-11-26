@@ -6,7 +6,7 @@ import { runGit } from "../../src/git";
 import { Ledger } from "../../src/ledger";
 import { isolateHome } from "./hermetic";
 
-export function executorFixture() {
+export function executorFixture(version: "0.4" | "0.5" = "0.4") {
   isolateHome();
   let root: string, repo: string, head: string, ledger: Ledger;
   function git(...args: string[]) {
@@ -15,7 +15,7 @@ export function executorFixture() {
     return res.stdout.trim();
   }
   function cli(bin: string, args: string[], env: Record<string, string | undefined> = {}) {
-    return Bun.spawnSync([process.execPath, join(import.meta.dir, "../../src/bin", bin + ".ts"), ...args], {
+    return Bun.spawnSync([process.execPath, join(import.meta.dir, "../../src/bin/cli.ts"), bin, ...args], {
       cwd: repo,
       env: { ...process.env, FORGE_WORKBENCH_ROOT: root, ...env },
     });
@@ -38,6 +38,7 @@ export function executorFixture() {
     head = git("rev-parse", "HEAD");
     ledger = new Ledger(root);
     ledger.openTask({
+      workflow_version: version,
       task_id: "task",
       title: "Verification",
       endpoint: "local",

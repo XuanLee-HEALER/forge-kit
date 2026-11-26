@@ -35,7 +35,7 @@ beforeEach(() => {
   const wtActive = join(wb, "demo.worktrees", "active-fresh");
   runGit(repo, ["worktree", "add", "-b", "feat/active-fresh", wtActive, "main"]);
   const ledger = new Ledger(wb);
-  ledger.openTask({
+  ledger.openTask({ workflow_version: "0.4",
     task_id: "20261121-fresh",
     title: "Just claimed task",
     endpoint: "local",
@@ -124,7 +124,7 @@ for (const scenario of ["merge", "full-static-only", "same-tree", "no-checks", "
     const previous = git("rev-parse","fat"), head = git("rev-parse","feat/wip");
     const ledger = new Ledger(wb);
     try {
-      ledger.openTask({task_id:"integrate",repo:"demo",branch:"feat/wip",head_sha:head,base_sha:git("rev-parse","main"),title:"integration",endpoint:"fat",depth:scenario === "full-static-only" ? "full" : "targeted"});
+      ledger.openTask({ workflow_version: "0.4",task_id:"integrate",repo:"demo",branch:"feat/wip",head_sha:head,base_sha:git("rev-parse","main"),title:"integration",endpoint:"fat",depth:scenario === "full-static-only" ? "full" : "targeted"});
       if (scenario !== "unverified") ledger.recordEvidence({task_id:"integrate",repo:"demo",sha:head,kind:"test",source:"tool",status:"pass",summary:"pass"});
       if (scenario === "full-static-only") {
         ledger.recordEvidence({task_id:"integrate",repo:"demo",sha:head,kind:"lint",source:"tool",status:"pass",summary:"feature lint"});
@@ -133,7 +133,7 @@ for (const scenario of ["merge", "full-static-only", "same-tree", "no-checks", "
       const args = scenario === "cherry-pick" ? ["--cherry-pick"] : scenario.startsWith("no-push") ? ["--no-push"] : [];
       if (["merge", "cherry-pick", "no-push-verified"].includes(scenario)) args.push("--verify-cmd", "test -f fat.txt && test -f wip.txt");
       if (scenario === "failed-command") args.push("--verify-cmd", "test ! -f wip.txt");
-      const cli = Bun.spawnSync([process.execPath,join(import.meta.dir,"../src/bin/wb-git.ts"),"fat-merge","demo","feat/wip",...args],
+      const cli = Bun.spawnSync([process.execPath,join(import.meta.dir,"../src/bin/cli.ts"),"git","fat-merge","demo","feat/wip",...args],
         {cwd:wb,env:{...process.env,...(scenario === "go-dry-run" && {GOFLAGS:"-n"}),...((scenario === "go-saved-flags" || scenario === "go-script") && {GOENV:goEnv, GOFLAGS:"", PATH:wb+":"+process.env.PATH}),...(scenario === "npm-usage" && {npm_config_usage:"true"}),FORGE_WORKBENCH_ROOT:wb}});
       expect(git("worktree","list","--porcelain")).not.toContain("fat-merge-");
       const remote = git("--git-dir="+origin,"rev-parse","refs/heads/fat");

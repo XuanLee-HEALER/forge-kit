@@ -77,8 +77,8 @@ test("guard denies secret/raw, tunnels and release API writes and permits ordina
 
 describe("Tier 1 Physical Fuses & Fail-Closed", () => {
   test("guard binary fails closed on malformed JSON stdin", async () => {
-    const guardSrc = join(import.meta.dir, "..", "src", "bin", "guard.ts");
-    const proc = Bun.spawn([process.execPath, guardSrc], {
+    const guardSrc = join(import.meta.dir, "..", "src", "bin", "cli.ts");
+    const proc = Bun.spawn([process.execPath, guardSrc, "guard"], {
       env: process.env,
       stdin: new Response("{broken json"),
       stdout: "pipe",
@@ -286,7 +286,7 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     const owner = new Ledger(wb);
     const task_id = "docs-exemption";
     try {
-      owner.openTask({ task_id, title: "Docs", endpoint: "local", depth: "targeted", repo: "app-api", branch: "feat/demo" });
+      owner.openTask({ workflow_version: "0.4", task_id, title: "Docs", endpoint: "local", depth: "targeted", repo: "app-api", branch: "feat/demo" });
       const specs = join(wb, ".workbench/specs", task_id);
       mkdirSync(specs, { recursive: true });
       for (const name of ["ssot", "tech-spec", "test-spec"]) writeFileSync(join(specs, name + ".md"), name);
@@ -349,7 +349,7 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     const head = runGit(repoDir, ["rev-parse", "HEAD"]).stdout.trim(), task_id = "detached-checkout";
     const ledger = new Ledger(wb);
     try {
-      ledger.openTask({ task_id, title: task_id, endpoint: "fat", depth: "targeted", repo: "app-api", branch: "feat/demo", head_sha: head });
+      ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, endpoint: "fat", depth: "targeted", repo: "app-api", branch: "feat/demo", head_sha: head });
       const docs = join(wb, ".workbench/specs", task_id); mkdirSync(docs, { recursive: true });
       for (const name of ["ssot", "tech-spec", "test-spec"]) writeFileSync(join(docs, name + ".md"), name);
       ledger.freezeSpec({ task_id, locked_test_globs: [rel] });
@@ -380,7 +380,7 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     const featSha = runGit(repoDir, ["rev-parse", "HEAD"]).stdout.trim();
 
     const ledger = new Ledger(wb);
-    ledger.openTask({
+    ledger.openTask({ workflow_version: "0.4",
       task_id: "20261121-fat-flow",
       title: "FAT detached merge test",
       endpoint: "fat",
@@ -720,7 +720,7 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     writeFileSync(join(repoDir, "tests", "api.hurl"), "GET http://localhost/health\nHTTP 200\n");
 
     const ledger = new Ledger(wb);
-    ledger.openTask({
+    ledger.openTask({ workflow_version: "0.4",
       task_id: "20261123-spec",
       title: "Spec lock guard test",
       endpoint: "local",
@@ -884,7 +884,7 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
     writeFileSync(join(specDir, "test-spec.md"), "# Test\nok\n");
 
     const ledger = new Ledger(wb);
-    ledger.openTask({
+    ledger.openTask({ workflow_version: "0.4",
       task_id: "20261123-wt",
       title: "Worktree & shell mutation lock test",
       endpoint: "local",

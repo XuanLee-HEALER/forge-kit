@@ -1,0 +1,305 @@
+{
+  "AGENTS.md": {
+    "c2bf60b9276d9ab00da870aab0c664276c85506d7a684f23f9f32d2eef018bf5": [
+      "3ffe431"
+    ],
+    "bb29eec213de3a0658367f0a7a846bf4319604a9ad9319d18e0211d79525245d": [
+      "eb139c1"
+    ],
+    "949d4812600954fc33b627aafe531812c8a6dd936446b78f33c102663ba4c7b3": [
+      "9b156b4"
+    ],
+    "2ebbb6d24493bb928d382e3497b0bd96b175e79613f83ee7bb78c9d67442d014": [
+      "ce6afae"
+    ]
+  },
+  ".agents/skills/ready/SKILL.md": {
+    "3eac1050bd76d94e4034b132e659f60642510b8de13e34f0854c43f630ae5566": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "11eaf862d8c66a03f15ad0371db0a0b0c51eeef884451b4b0387d990ecad4238": [
+      "9b156b4"
+    ]
+  },
+  ".agents/skills/grill/SKILL.md": {
+    "cc975d703696953078fb4df23f80f6702ee98db4727cc9a97da9b651b7475226": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".agents/skills/test-environment/SKILL.md": {
+    "c2e6067369f00a70b2e42ebecca46cd8ac6c06097aff381f1d490369476e7325": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".agents/skills/test-environment/references/container-lifecycle.md": {
+    "e6bec3d57df45cf263769b3082b6540fd124f51e81a4634c83c3f8131e9fad62": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".agents/skills/test-environment/references/persistence.md": {
+    "cc723bc1125e96b90b1a07397f150692001105f29d06e77018caf2fd249b3e77": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".agents/skills/form-ux/SKILL.md": {
+    "3dccd80c72a45ba1b5a7cc2ddf1a8ac9bf91ebdfc1124d15da8f32b22345d64a": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4"
+    ]
+  },
+  ".agents/skills/wrapup/SKILL.md": {
+    "80d68650ec4bd46047386adf07eccb1068ac141f7273336174759d20ee9f2748": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".agents/skills/business-analysis/SKILL.md": {
+    "92a396326bd7475c8eecb8cb632575abd68e91f8baebc523deba443a68988010": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".agents/skills/feature/SKILL.md": {
+    "58409c64c5c3669bab961e462dbe0330638af59f71cf82e5b38bccb342cdc4d3": [
+      "3ffe431",
+      "eb139c1"
+    ],
+    "34adba462242eb84cd5ce6fe8e39a8b841798eecc6fb0996d32e1db3999dfaf0": [
+      "9b156b4"
+    ],
+    "4aed9cef686b0e023101dbc1f6b05752d180a8fe07adf6fc317b3231c95e911a": [
+      "ce6afae"
+    ]
+  },
+  ".agents/skills/ship/SKILL.md": {
+    "3fb7e84c9790ef439acba0489aa009d9aa41aa66ff50bd481ae184b8cc0ad45b": [
+      "3ffe431"
+    ],
+    "ba922eafe7416c8709b679554f22ab42a6ff43a86b84cb3e525a04e80e1f8c20": [
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".agents/skills/bugfix/SKILL.md": {
+    "f654a6a348a5c781c9a18c963c8dbb2e4b0523d9337da99c206d0f15ca9ee933": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "e7aea5c2160ebdb58b71d0049b8b8c0bab22de83933d98431b9b85440ff454e8": [
+      "9b156b4"
+    ]
+  },
+  ".codex/hooks.json": {
+    "e9b5fa3a25e498cc1c25b3efd0c391bd1764a287e8c8fea97b8e95e748a46e8b": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".codex/config.toml": {
+    "c4357790080c15ff15abb9c58b205063e83844b511f1c8a81ff985f25001615f": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".codex/agents/spec-reviewer.toml": {
+    "531efabae72c7152864e88271aae7973c2a74833e2b801004260021bb9e8a706": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".codex/agents/scanner.toml": {
+    "2073a252242abfec84f76144f6339797cc21c61a63e97208dba7d655d1135e27": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".codex/agents/analyst.toml": {
+    "1f63dc247b4805f6b869ff54082181b10671a1be9966bc7d81a32274d59bad36": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  },
+  ".codex/agents/dev.toml": {
+    "e56f65f025db395a48ba925087bc886e08eb2e5ec9e278233401aee0663ce81a": [
+      "3ffe431",
+      "eb139c1"
+    ],
+    "1b0ae5ea4818f6fb00bed8bb82d0d6147ba584a93d7179fadfa2a1602e9a656f": [
+      "9b156b4"
+    ],
+    "f4b64ee55cfd7afbf139a65aaacf4ece48a6d345a6a36a5b069fed9a84a47355": [
+      "ce6afae"
+    ]
+  },
+  ".agents/skills/work-communication/SKILL.md": {
+    "db2b0d135205f6c5c90826585adf50ab794a285f2ff9de4e98f3d3c0ac1d2582": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4"
+    ]
+  },
+  ".agents/skills/work-communication/references/qa-polling.md": {
+    "92c39b3917ac860ec25509585f30aa54e23177336fcaf5eb576341bf6172a258": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4"
+    ]
+  },
+  ".agents/skills/dbop/SKILL.md": {
+    "fce806e0e546ee9e72ab9d08a127543be1599ef37fe4ff9c44d96d0731ca6e13": [
+      "3ffe431",
+      "eb139c1",
+      "9b156b4"
+    ]
+  },
+  ".workbench/bin/forge-ship.js": {
+    "d82274f9a9ee83df0f3df961b899ca6e1fe8707fa3727672118d7b35877f37a1": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "deb7f194f419897b07a7fa088c112e75892c807e56acd825e069d5f35f3dc39d": [
+      "9b156b4"
+    ]
+  },
+  ".workbench/bin/ledger.js": {
+    "dd9bfe54d65187413002bffb0e1feac1f360814e60b0a48e6e56c37a3fa13afe": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "52770a55c51517c9cfc9e533ee45d1c7ba0fc87f46d1e715b71efd8c75e40e9d": [
+      "9b156b4"
+    ]
+  },
+  ".workbench/bin/wb-verify.js": {
+    "1649a67a43bc7a43e8fd43dbd21e5da2521d34c584544587757bc8b614390a74": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "dd98c1bd12a7c4d9c7c3970df2381dfd0fd663f948ce18c9ef4f5e8d43c3d9ef": [
+      "9b156b4"
+    ]
+  },
+  ".workbench/bin/ledger-hook.js": {
+    "a7f5bc00136522fb042dd05927f24c55fa08dea018eb0310b35850e98142deb8": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "514720be99448233911338b9d40f0a93576cbb181b433f894d5a46b12a3b169e": [
+      "9b156b4"
+    ]
+  },
+  ".workbench/bin/forge-review.js": {
+    "1e244b4f3de037955be753a07e0c669491e30e7ceb544d022040ec6f472664f8": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "746abe509c648060827c77db1e8a374a4f5f1cee7ac354d50898dfd915da31f8": [
+      "9b156b4"
+    ]
+  },
+  ".workbench/bin/lang-check.js": {
+    "814890cfd5af1005bb8ecd7a8c3fe17a1ffdb9876e659e609dc9ac856dd58bc4": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "22902f0e55c3118e083ecdb5807a8f07a8ed4f6312656aba5d49fb6996247c21": [
+      "9b156b4"
+    ]
+  },
+  ".workbench/bin/cli.js": {
+    "4942f07b4f4f95255bf7fe5df626876b023ad8219baadbe10efad970c7ec8b21": [
+      "3ffe431",
+      "eb139c1"
+    ],
+    "70d8fa32c77a86a17d2d240f9751b66f336637931b03005a36a8725dc8766dbe": [
+      "9b156b4"
+    ],
+    "8b3cd61036b55cee5e45bbc3be1f5117112bd8fc9f66fd98a3cec164dca75452": [
+      "ce6afae"
+    ]
+  },
+  ".workbench/bin/cmdfmt.js": {
+    "75db8ad179872cadae9a170ab7165a6f4d41b98c47170bf9af18a608e265a3cd": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "55a117287bc77d0bcc7718b9ce2ae0bfa0003d252298f3000a6e5fdf641659ed": [
+      "9b156b4"
+    ]
+  },
+  ".workbench/bin/guard.js": {
+    "dbf8fe78d77a7f24a2bea99e82a7a824183f20b7bb963e4feba627016f6b44a2": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "089965804cbc656bc7fe34ae64f96a1811d8eae1dc0fb9a39dfe54be7ad43000": [
+      "9b156b4"
+    ]
+  },
+  ".workbench/bin/wb-git.js": {
+    "5fd0d49e953331609892d5bebd9da4831e9c0d3bad6588911b9b6bfc7e8a6584": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "47b70cbd57e7da3ff44580f3fec226f60ba6697f59bf1bd6e6f397d6b9cfe20b": [
+      "9b156b4"
+    ]
+  },
+  ".workbench/bin/dbcred.js": {
+    "9414976aedbf5b062433e3834dc747e0508e89f3f82395e4fa22f6fd141acad4": [
+      "3ffe431",
+      "eb139c1",
+      "ce6afae"
+    ],
+    "59106e2dca2c87c5399d9546cea8b17c6089cee277e0ed98d304a408e6789acc": [
+      "9b156b4"
+    ]
+  },
+  ".agents/skills/pr-triage/SKILL.md": {
+    "8f83a928d2c27e0572f5a18cf7349a91dc5f3d105eb55b121260cabda9dd19c3": [
+      "eb139c1",
+      "9b156b4",
+      "ce6afae"
+    ]
+  }
+}

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { canonicalRepoPath, loadModelsConfig } from "../config";
 import { checkoutEnvironment, runGit, runProcess } from "../git";
-import type { RunbookRecord } from "./types";
+import { usesV05, type RunbookRecord } from "./types";
 import { inspectPr, verifiedPr } from "./pr";
 import { prRemoteRefs, reachableFromRefs, resolveTaskCheckout } from "./checkout";
 import { coversReviewBase } from "./review-range";
@@ -87,6 +87,17 @@ export function reviewNative(ledger: Ledger, task: string, repo: string, baseRef
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 }
 
+function mainContainsHead(dir:string, url:string, head:string):string {
+  const pr=new URL(url), repo=pr.pathname.split("/").slice(1,3).join("/");
+  const api=(path:string,jq:string)=>runProcess([process.env.FORGE_GH_BIN || "gh","api","--hostname",pr.host,"repos/"+repo+"/"+path,"--jq",jq],{cwd:dir,env:checkoutEnvironment()});
+  const result=api("git/ref/heads/main",".object.sha"), tip=result.stdout.trim();
+  if(result.code || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(tip)) throw Error("Cannot verify current remote main");
+  if(head===tip || runGit(dir,["merge-base","--is-ancestor",head,tip]).code===0) return tip;
+  const comparison=api("compare/"+head+"..."+tip,".status");
+  if(comparison.code || !["identical","ahead"].includes(comparison.stdout.trim())) throw Error("Remote main does not contain the verified PR head");
+  return tip;
+}
+
 export function syncPr(ledger: Ledger, task: string, repo: string, pr?: string, branch?: string, beforeRecord?:()=>void) {
   const attachment = attached(ledger, task, repo, branch);
   const { dir } = resolveTaskCheckout(ledger.workbenchRoot, attachment);
@@ -100,6 +111,8 @@ export function syncPr(ledger: Ledger, task: string, repo: string, pr?: string, 
   }
   const head = currentHead(attachment);
   const data = verifiedPr(dir, attachment.branch, head, pr);
+  const mergedMain = usesV05(ledger,task) && data.state==="MERGED" && data.baseRefName==="main"
+    ? mainContainsHead(dir,data.url,head) : null;
   return ledger.db.transaction(() => {
     beforeRecord?.();
     const live = attached(ledger, task, repo, attachment.branch);
@@ -107,7 +120,7 @@ export function syncPr(ledger: Ledger, task: string, repo: string, pr?: string, 
     ledger.db.query("UPDATE task_repos SET head_sha = ? WHERE task_id = ? AND canonical_repo(repo) = canonical_repo(?) AND branch = ?")
       .run(head, task, repo, attachment.branch);
     return ledger.recordEvidence({ task_id: task, repo, branch: attachment.branch, sha: head, kind: "pr",
-      source: "tool", actor: "tool", status: "pass", summary: data.url, meta: { state: data.state, pr_url: data.url, pr_head_oid: data.headRefOid } });
+      source: "tool", actor: "tool", status: "pass", summary: data.url, meta: { state: data.state, pr_url: data.url, pr_head_oid: data.headRefOid, ...(mergedMain && {base_branch:"main",target_oid:mergedMain}) } });
   }).immediate();
 }
 

@@ -43,3 +43,20 @@ guard:
   custom_block_patterns: []
   block_shared_worktree_ops: true
   block_ledger_direct_edits: true
+
+# Optional instance extensions. Paths are relative to this workbench.
+# Omit extensions to verify a clean checkout and deliver via PR merge to main.
+# extensions:
+#   actions:
+#     smoke-check:
+#       argv: ["bun", "-e", "console.log('smoke ok')"]
+#       cwd: "."
+#       purpose: verify
+#   stages:
+#     smoke:
+#       action: smoke-check
+#   verification:
+#     environment: isolated
+#     stages: [smoke]
+#   skills:
+#     ready: .workbench/overrides/ready

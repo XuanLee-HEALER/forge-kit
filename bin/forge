@@ -2,8 +2,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUN="${BUN_BIN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
-# Source checkouts dispatch with the current sync rules even when dist predates a kit update.
-if [[ -f "$ROOT/src/bin/cli.ts" && ( "${1:-}" == sync || ! -f "$ROOT/dist/cli.js" ) ]]; then
+# Git checkouts use the current sources. Installed packages ship the Bun bundle.
+if [[ -f "$ROOT/src/bin/cli.ts" ]]; then
   exec "$BUN" "$ROOT/src/bin/cli.ts" "$@"
 fi
 exec "$BUN" "$ROOT/dist/cli.js" "$@"

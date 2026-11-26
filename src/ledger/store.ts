@@ -1,3 +1,4 @@
+import { usesV05 } from "./types";
 import {
   availableHandoffs,
   currentHandoff,
@@ -117,6 +118,7 @@ export class Ledger {
   }
 
   openTask(params: {
+    workflow_version?: "0.4" | "0.5";
     task_id: string;
     title: string;
     endpoint: DeliveryEndpoint;
@@ -176,6 +178,7 @@ export class Ledger {
         payload: {
           title: params.title,
           endpoint: params.endpoint,
+          ...(params.workflow_version !== "0.4" && { workflow_version: "0.5" }),
           verification_depth: params.depth,
           base_sha: base,
         },
@@ -898,7 +901,9 @@ export class Ledger {
     }
 
     params = {...params, repo:canonicalRepoPath(this.workbenchRoot,params.repo)};
+    const currentWorkflow = usesV05(this, params.task_id);
     const specState = getSpecState(this, params.task_id, { delivery: params, closing });
+    if (currentWorkflow && specState.state === "NONE") missing.push("A confirmed frozen specification is required for delivery");
     if (specState.drifted_locked_tests.length) {
       hasExplicitFailure = true;
       missing.push("冻结测试文件发生漂移 (" + specState.drifted_locked_tests.join(", ") + ")，请恢复测试文件或执行 ledger amend --scope test_spec 后重新 freeze");
@@ -979,8 +984,10 @@ export class Ledger {
           status?: string;
           meta?: {
             pr_head_oid?: string;
+            state?: string; base_branch?: string; target_oid?: string;
             pr_url?: string;
             role?: string;
+            mode?: string; freeze_seq?: number; review_task_id?: string;
             started_at?: string;
             review_floor_seq?: number;
             base?: string;
@@ -988,6 +995,11 @@ export class Ledger {
         };
         if (!p.kind || !p.status) continue;
         if (EXECUTABLE_EVIDENCE.has(p.kind) && evidenceSource(p, ev.actor) === "manual") continue;
+        if (currentWorkflow && p.kind === "verify" && p.meta?.mode === "all" &&
+            p.meta.review_task_id === params.task_id && p.meta.freeze_seq === specState.freeze_seq &&
+            evidenceSource(p, ev.actor) === "tool" && ev.seq >= Math.max(floors.lint, floors.test)) {
+          evidence.checks.set("verify", p.status);
+        }
         if (p.kind === "lint") {
           if (ev.seq >= floors.lint) evidence.checks.set("lint", p.status);
         } else if (p.kind === "test" || p.kind === "build") {
@@ -996,12 +1008,14 @@ export class Ledger {
           if (ev.seq >= floors.test) evidence.checks.set("hurl", p.status);
         }
         if (p.kind === "review") {
+          if (currentWorkflow && (evidenceSource(p, ev.actor) !== "tool" ||
+              p.meta?.review_task_id !== params.task_id || p.meta.review_floor_seq !== floors.review)) continue;
           if (ev.seq < floors.review || !reviewMeetsFloor(p.status, p.meta, params.task_id, floors.review, reviewFloor?.ts, evidenceSource(p, ev.actor))) continue;
           const historical = branch ? [attachedAtEvent.get(branch)] : [...attachedAtEvent.values()];
           const current = branch ? repoAttachments.filter((r) => r.branch === branch) : [];
           const covered = (row: ReviewAttachment | undefined) =>
             !!row && coversReviewBase(this.workbenchRoot, row, p.meta?.base);
-          if (p.status === "fail" || (historical.length > 0 && historical.every(covered) && current.every(covered))) {
+          if ((!currentWorkflow && p.status === "fail") || (historical.length > 0 && historical.every(covered) && current.every(covered))) {
             const roleKey = normalizeReviewRole(p.meta?.role);
             evidence.reviews.set(roleKey, p.status);
           }
@@ -1014,6 +1028,13 @@ export class Ledger {
         ) {
           if (p.kind === "pr" && p.status === "pass" &&
               (p.meta?.pr_head_oid !== params.head_sha || !p.meta.pr_url)) continue;
+          if (currentWorkflow && p.kind==="pr" && p.status==="pass") {
+            if (evidenceSource(p,ev.actor)!=="tool") continue;
+            if (p.meta?.state!=="MERGED" || p.meta.base_branch!=="main" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(p.meta.target_oid??"")) {
+              evidence.endpoint=undefined;
+              continue;
+            }
+          }
           const endpointFloor = task.endpoint === "fat" ? floors.fat : 0;
           if (ev.seq >= endpointFloor && (p.status === "pass" || p.status === "fail")) {
             evidence.endpoint = p.status;
@@ -1056,10 +1077,12 @@ export class Ledger {
       missing.push(
         `latest ${[...failedKinds].join("/")} failed for ${params.repo}@${params.head_sha.slice(0, 8)}`,
       );
-    } else if (task.verification_depth === "full") {
+    } else if (currentWorkflow && latestByKind.get("verify") === "pass") {
+      // The configured verification sequence completed at this freeze and SHA.
+    } else if (currentWorkflow || task.verification_depth === "full") {
       if (latestByKind.get("lint") !== "pass") {
         missing.push(
-          `full verification requires passing static check (lint) evidence for ${params.repo}@${params.head_sha.slice(0, 8)} (run .workbench/bin/wb-verify --task ${params.task_id} --repo ${params.repo} --mode static)`,
+          `full verification requires passing static check (lint) evidence for ${params.repo}@${params.head_sha.slice(0, 8)} (run .workbench/bin/forge verify --task ${params.task_id} --repo ${params.repo} --mode static)`,
         );
       }
       if (!hasPassingExecVerify) {
@@ -1078,6 +1101,8 @@ export class Ledger {
       missing.push(
         `latest review failed (${[...failedRoles].join(", ")}) for ${params.repo}@${params.head_sha.slice(0, 8)}`,
       );
+    } else if (currentWorkflow) {
+      if (!passingRoles.size) missing.push("Independent review evidence required for this delivery version");
     } else if (task.verification_depth === "targeted") {
       // Targeted depth requires at least one independent review pass/fallback before delivery/close
       if (params.checkEndpoint && passingRoles.size === 0) {
@@ -1500,6 +1525,7 @@ export class Ledger {
     task_id?: string | null;
     title: string;
     actions: Partial<RunbookActions>;
+    exact_stages?: string[];
   }): RunbookRecord {
     return createRunbook(this, params);
   }

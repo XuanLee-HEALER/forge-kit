@@ -53,7 +53,7 @@ export function checkSpecAndTestLocks(
     type UnboundWorktreeMatcher = { worktreesDir: string; branch: string };
     type ResolvedLock = {
       task_id: string;
-      lockedSpecFiles: Array<{ kind: "ssot" | "tech_spec" | "test_spec"; abs: string; rel: string }>;
+      lockedSpecFiles: Array<{ kind: "ssot" | "tech_spec" | "test_spec" | "scope"; abs: string; rel: string }>;
       lockedTestGlobs: string[];
       explicitRoots: string[];
       unboundWorktrees: UnboundWorktreeMatcher[];
@@ -66,8 +66,8 @@ export function checkSpecAndTestLocks(
       const unlockedTest = unlockedSsot || scopes.has("test_spec");
 
       const lockedSpecFiles: ResolvedLock["lockedSpecFiles"] = [];
-      for (const kind of ["ssot", "tech_spec", "test_spec"] as const) {
-        if (!st.files || { ssot: unlockedSsot, tech_spec: unlockedTech, test_spec: unlockedTest }[kind]) continue;
+      for (const kind of ["ssot", "tech_spec", "test_spec", "scope"] as const) {
+        if (!st.files?.[kind] || { ssot: unlockedSsot, tech_spec: unlockedTech, test_spec: unlockedTest, scope: scopes.size > 0 }[kind]) continue;
         const rel = st.files[kind];
         lockedSpecFiles.push({ kind, rel, abs: canonicalizeMaybePath(resolve(wbReal, rel)) });
       }
@@ -136,10 +136,10 @@ export function checkSpecAndTestLocks(
         for (const sf of lock.lockedSpecFiles) {
           if (absTarget === sf.abs) {
             const suggestedScope =
-              sf.kind === "ssot" ? "requirement|invariant" : sf.kind;
+              sf.kind === "ssot" || sf.kind === "scope" ? "requirement|invariant" : sf.kind;
             return (
               `物理锁（冻结 Spec 保护）：任务 ${lock.task_id} 的 ${sf.rel} 处于周期冻结态，禁止直接修改。\n` +
-              `如确需变更，请先经用户确认并执行：ledger amend ${lock.task_id} --scope ${suggestedScope} --reason "<变更原因>"`
+              `如确需变更，请先经用户确认并执行 forge ledger amend ${lock.task_id} --scope ${suggestedScope} --reason "<变更原因>"`
             );
           }
         }
@@ -152,7 +152,7 @@ export function checkSpecAndTestLocks(
           ) {
             return (
               `物理锁（冻结测试防篡改）：任务 ${lock.task_id} 已锁定测试文件 (${relFromWb})，实现/修 bug 阶段禁止私自修改测试断言迎合代码。\n` +
-              `如确认是测试用例本身有误，请经用户确认后执行：ledger amend ${lock.task_id} --scope test_spec --reason "<原因>"`
+              `如确认是测试用例本身有误，请经用户确认后执行 forge ledger amend ${lock.task_id} --scope test_spec --reason "<原因>"`
             );
           }
         }

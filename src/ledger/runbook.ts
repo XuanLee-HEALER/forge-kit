@@ -1,3 +1,4 @@
+import { buildPlan } from "./ship-actions";
 import { checkedActions, requireActionReceipts, detail, inspect, observe, type ReleaseLedger } from "./release-inspection";
 import { runGit, withinProcessDeadline } from "../git";
 import { tagTargetIsCurrent } from "./pr";
@@ -39,6 +40,7 @@ export function createRunbook(ledger: LedgerReader, params: {
   task_id?: string | null;
   title: string;
   actions: Partial<RunbookActions>;
+  exact_stages?: string[];
 }): RunbookRecord {
   const title = params.title.trim();
   if (!title) throw new Error("Runbook title is required");
@@ -123,7 +125,7 @@ export function createRunbook(ledger: LedgerReader, params: {
     tags.length === 0 &&
     prs.length === 0 &&
     sql_files.length === 0 &&
-    kubectl_commands.length === 0
+    !params.exact_stages?.length && kubectl_commands.length === 0
   ) {
     throw new Error(
       "Runbook must include at least one action (--tag, --pr, --sql, or --kubectl)",
@@ -131,7 +133,14 @@ export function createRunbook(ledger: LedgerReader, params: {
   }
 
   const normalized: RunbookActions = { tags, prs, sql_files, kubectl_commands };
-  const actions_json = canonicalJson(normalized);
+  const exact = params.exact_stages && params.task_id ? buildPlan(ledger,params.task_id,normalized,params.exact_stages) : undefined;
+  for(const action of exact?.actions ?? []) {
+    if(action.kind==="pr") {
+      const pr=normalized.prs.find(pr=>pr.repo===action.repo && pr.number===action.number)!;
+      pr.pin={url:action.url,head:action.head,branch:exact!.pins.find(p=>p.repo===pr.repo)!.branch,base:action.base,base_oid:action.baseOid};
+    }
+  }
+  const actions_json = canonicalJson(exact ? {...normalized,exact} : normalized);
   const actions_hash = sha256String(actions_json);
   const ts = nowIso();
 
@@ -250,8 +259,12 @@ export function listActiveApprovedRunbooks(
     )
     .all(sid, now) as RunbookRecord[];
   const out: Array<{ record: RunbookRecord; actions: RunbookActions }> = [];
+  const hasExactBindings=!!ledger.db.query("SELECT 1 FROM sqlite_master WHERE name='exact_ship_envelopes'").get();
   for (const r of rows) {
     if (sha256String(r.actions_json) !== r.actions_hash) continue;
+    // The exact executor owns this authorization. It cannot be used as a
+    // generic grant by shell hooks or an unrelated database session.
+    if (hasExactBindings && ledger.db.query("SELECT 1 FROM exact_ship_envelopes WHERE runbook_id=?").get(r.runbook_id)) continue;
     try {
       const actions = JSON.parse(r.actions_json) as RunbookActions;
       // The push guard reads the authorized remote only after matching the local repository and tag.

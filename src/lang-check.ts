@@ -1,7 +1,6 @@
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { runVerificationProcess } from "./verification-process";
-import { hasNonExecutingNpmFlags } from "./shared/pkg-manager";
 import { hasNonExecutingGoFlags } from "./shared/go";
 import { splitShellTokens } from "./shared/shell";
 import { parseArgs } from "node:util";
@@ -135,7 +134,7 @@ export function isPytestInfoSwitch(arg: string): boolean {
 }
 
 export function zeroTestRun(bin: string, code: number, output: string) {
-  const delegated = ["npm","pnpm","yarn","bun"].includes(bin);
+  const delegated = bin === "bun";
   // In delegated runs use the underlying runner's summary, not just the manager's name.
   const collected = /^\s*(?:=+\s*)?(?:no|\d+(?:\/\d+)?)\s+tests?\s+collected(?:\s+in|\s+\(|\s*=+\s*$|\s*$)/im.test(output);
   const pytestInfo = /^(?:This is pytest version \S+, imported from .+|pytest \d+\.\d+\S*|usage: (?:pytest|py\.test) \[options\].*)$/m.test(output);
@@ -159,7 +158,7 @@ export function zeroTestRun(bin: string, code: number, output: string) {
     const ran = /^\s*running [1-9]\d* tests?\b/m.test(output);
     if (zero || ran) return zero && !ran;
   }
-  if (bin === "node" || delegated) {
+  if (delegated) {
     if (/^# tests 0\s*$/m.test(output) || (/^# pass 0\s*$/m.test(output) && /^# fail 0\s*$/m.test(output))) return true;
   }
   if (bin === "go" || delegated) {
@@ -185,6 +184,7 @@ export function zeroTestRun(bin: string, code: number, output: string) {
 type OutputObserver = (phase: "static" | "dynamic", stdout: Uint8Array, stderr: Uint8Array) => void;
 
 function executeCheck(
+  baseEnv: NodeJS.ProcessEnv | undefined,
   onOutput: OutputObserver | undefined,
   language: CheckLanguage,
   phase: "static" | "dynamic",
@@ -195,8 +195,7 @@ function executeCheck(
   timeoutMs = 120_000,
 ): LangCheckItem {
   const bin = basename(argv[0]);
-  const blocked = (bin === "npm" && hasNonExecutingNpmFlags()) ||
-    (bin === "go" && hasNonExecutingGoFlags(argv[0], cwd, argv.slice(1)));
+  const blocked = (bin === "go" && hasNonExecutingGoFlags(argv[0], cwd, argv.slice(1)));
   if (blocked) {
     return {
       language, phase, name, command: argv.join(" "), status: "fail", exit_code: null,
@@ -206,6 +205,7 @@ function executeCheck(
   const started = Date.now();
   const res = runVerificationProcess(argv, phase === "dynamic", {
     cwd,
+    baseEnv,
     env: extraEnv,
     timeoutMs,
     onOutput: (stdout, stderr) => onOutput?.(phase, stdout, stderr),
@@ -225,8 +225,8 @@ function executeCheck(
   };
 }
 
-function bindCheck(observer?: OutputObserver) {
-  return executeCheck.bind(null, observer);
+function bindCheck(observer?: OutputObserver, baseEnv?: NodeJS.ProcessEnv) {
+  return executeCheck.bind(null, baseEnv, observer);
 }
 
 function runGoChecks(targetDir: string, mode: CheckMode, execCheck: ReturnType<typeof bindCheck>): LangCheckItem[] {
@@ -281,11 +281,14 @@ function runTsChecks(targetDir: string, mode: CheckMode, execCheck: ReturnType<t
   }
 
   if (mode === "static" || mode === "all") {
-    if (existsSync(join(targetDir, "tsconfig.json"))) {
+    const declared = ["check", "typecheck", "lint"].find(name => pkg?.scripts?.[name]?.trim());
+    if (declared) {
+      items.push(execCheck("ts", "static", declared, [process.execPath, "--bun", "run", declared], targetDir));
+    } else if (existsSync(join(targetDir, "tsconfig.json"))) {
       const localTsc = join(targetDir, "node_modules", ".bin", "tsc");
       const tscBin = existsSync(localTsc) ? localTsc : whichBin("tsc", targetDir);
       if (tscBin) {
-        items.push(execCheck("ts", "static", "tsc-noEmit", [tscBin, "--noEmit"], targetDir));
+        items.push(execCheck("ts", "static", "tsc-noEmit", [process.execPath, tscBin, "--noEmit"], targetDir));
       } else {
         items.push({
           language: "ts",
@@ -315,40 +318,35 @@ function runTsChecks(targetDir: string, mode: CheckMode, execCheck: ReturnType<t
       ].some((f) => existsSync(join(targetDir, f)));
       const localEslint = join(targetDir, "node_modules", ".bin", "eslint");
       if (hasEslintCfg && existsSync(localEslint)) {
-        items.push(execCheck("ts", "static", "eslint", [localEslint, "."], targetDir));
+        items.push(execCheck("ts", "static", "eslint", [process.execPath, localEslint, "."], targetDir));
       }
     }
   }
 
   if (mode === "dynamic" || mode === "all") {
     const strictNodeEnv = { NODE_OPTIONS: "--unhandled-rejections=throw" };
-    const isBunProject =
-      existsSync(join(targetDir, "bun.lock")) ||
-      existsSync(join(targetDir, "bun.lockb")) ||
-      existsSync(join(targetDir, "bunfig.toml"));
     const hasTestFiles = hasFileMatching(
       targetDir,
       (n) => /\.(test|spec)\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/.test(n),
       3,
     );
-    const bunBin = whichBin("bun", targetDir);
-    const npmBin = whichBin("npm", targetDir);
+    const bunBin = process.execPath;
     const testScript = pkg?.scripts?.["test:unit"] ?? pkg?.scripts?.test ?? "";
     const hasRealTestScript =
       Boolean(testScript.trim()) && !testScript.includes("no test specified");
 
-    if (isBunProject && bunBin && hasTestFiles) {
+    if (bunBin && hasTestFiles && !hasRealTestScript) {
       items.push(
         execCheck("ts", "dynamic", "bun-test-strict", [bunBin, "test"], targetDir, strictNodeEnv),
       );
-    } else if (hasRealTestScript && npmBin) {
+    } else if (hasRealTestScript && bunBin) {
       const scriptName = pkg?.scripts?.["test:unit"] ? "test:unit" : "test";
       items.push(
         execCheck(
           "ts",
           "dynamic",
-          `npm-${scriptName}-strict`,
-          [npmBin, "run", scriptName],
+          `bun-${scriptName}-strict`,
+          [bunBin, "--bun", "run", scriptName],
           targetDir,
           strictNodeEnv,
         ),
@@ -426,6 +424,7 @@ export function runLangChecks(opts: {
   mode?: CheckMode;
   lang?: "auto" | CheckLanguage;
   onOutput?: OutputObserver;
+  baseEnv?: NodeJS.ProcessEnv;
 }): LangCheckReport {
   const mode: CheckMode = opts.mode ?? "all";
   const resolvedDir = existsSync(opts.targetDir)
@@ -441,7 +440,7 @@ export function runLangChecks(opts: {
       : detectRepoLanguages(resolvedDir);
 
   const checks: LangCheckItem[] = [];
-  const execCheck = bindCheck(opts.onOutput);
+  const execCheck = bindCheck(opts.onOutput, opts.baseEnv);
   for (const lang of detected) {
     if (lang === "go") checks.push(...runGoChecks(resolvedDir, mode, execCheck));
     else if (lang === "ts") checks.push(...runTsChecks(resolvedDir, mode, execCheck));

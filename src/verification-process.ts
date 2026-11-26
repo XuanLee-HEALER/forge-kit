@@ -6,7 +6,6 @@ import { basename, delimiter, join } from "node:path";
 import { checkoutEnvironment, runProcess } from "./git";
 import { delegatedGoEnvironment } from "./shared/go";
 import { tscProjectPreload } from "./shared/tsc";
-import { npmExecutionOptions } from "./shared/pkg-manager";
 
 // Pytest's call-phase report distinguishes test execution from collection and setup-only modes,
 // even when project addopts suppress the terminal summary.
@@ -39,13 +38,13 @@ export function cargoProjectInCheckout(bin: string, args: string[], dir: string)
   }).exitCode === 0;
 }
 
-type Options = NonNullable<Parameters<typeof runProcess>[1]> & { cwd: string };
+type Options = NonNullable<Parameters<typeof runProcess>[1]> & { cwd: string; baseEnv?: NodeJS.ProcessEnv };
 
 export function runVerificationProcess(argv: string[], dynamic: boolean, options: Options) {
   const bin = basename(argv[0]);
-  const env: Record<string, string | undefined> = { ...checkoutEnvironment(), ...npmExecutionOptions, ...delegatedGoEnvironment(bin, options.cwd), ...options.env };
-  const observe = dynamic && ["pytest", "npm", "pnpm", "yarn", "bun"].includes(bin);
-  const delegated = ["npm", "pnpm", "yarn", "bun", "make"].includes(bin);
+  const env: Record<string, string | undefined> = { ...checkoutEnvironment(options.baseEnv), ...delegatedGoEnvironment(bin, options.cwd), ...options.env };
+  const observe = dynamic && ["pytest", "bun"].includes(bin);
+  const delegated = ["bun", "make"].includes(bin);
   const cargo = delegated ? Bun.which("cargo", {PATH: env.PATH, cwd: options.cwd}) : null;
   if (!observe && !delegated) return { ...runProcess(argv, {...options, env}), noPytestCalls: false };
 

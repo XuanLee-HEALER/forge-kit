@@ -1,6 +1,6 @@
 import { parse as parseStrictYaml } from "yaml";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 
 export interface ProdDbTarget {
@@ -110,13 +110,15 @@ const DEFAULT_GUARD: GuardConfig = {
   block_ledger_direct_edits: true,
 };
 
-export function findWorkbenchRoot(startDir?: string): string {
+export function findWorkbenchRoot(startDir?: string, explicitTarget = false): string {
   const explicit = process.env.FORGE_WORKBENCH_ROOT;
-  if (explicit && existsSync(explicit)) {
+  if (!explicitTarget && explicit && existsSync(explicit)) {
     return realpathSync(explicit);
   }
 
   let cur = resolve(startDir ?? process.cwd());
+  if (explicitTarget && !statSync(cur,{throwIfNoEntry:false})?.isDirectory())
+    throw Error("Workbench target is not a directory: "+cur);
   if (existsSync(cur)) {
     try {
       cur = realpathSync(cur);
@@ -140,10 +142,10 @@ export function findWorkbenchRoot(startDir?: string): string {
   // Fallback: script located at <workbench>/.workbench/bin/*.js
   const scriptDir = import.meta.dir;
   const candidate = resolve(scriptDir, "../..");
-  if (
+  if (!explicitTarget && (
     existsSync(join(candidate, ".workbench", "workbench.yaml")) ||
     existsSync(join(candidate, ".workbench", "kit-lock.json"))
-  ) {
+  )) {
     return realpathSync(candidate);
   }
 

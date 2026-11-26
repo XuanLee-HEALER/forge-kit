@@ -12,7 +12,7 @@ import { isolateHome } from "./helpers/hermetic";
 
 isolateHome();
 let root: string, repo: string, bin: string, base: string, ledger: Ledger;
-const cli = join(import.meta.dir, "../src/bin/ledger.ts");
+const cli = join(import.meta.dir, "../src/bin/cli.ts");
 function git(...args: string[]) {
   const result = runGit(repo, args);
   if (result.code) throw new Error(result.stderr);
@@ -28,11 +28,11 @@ function tool(name: string, body: string) {
   chmodSync(file, 0o755);
 }
 function invoke(args: string[], extra: Record<string, string> = {}) {
-  return Bun.spawnSync([process.execPath, cli, ...args], { cwd: root, env: { ...process.env,
+  return Bun.spawnSync([process.execPath, cli, "ledger", ...args], { cwd: root, env: { ...process.env,
     FORGE_WORKBENCH_ROOT: root, PATH: bin + ":" + process.env.PATH, TEST_ATTACHED: repo, TEST_BUN: process.execPath, TEST_LEDGER: cli, ...extra } });
 }
 function open(endpoint: "pr" | "local", worktree?: string) {
-  ledger.openTask({ task_id: "fix", title: "Review delivery", repo: "svc", branch: "feature", endpoint,
+  ledger.openTask({ workflow_version: "0.4", task_id: "fix", title: "Review delivery", repo: "svc", branch: "feature", endpoint,
     depth: "targeted", base_sha: base, head_sha: git("rev-parse", "feature"), worktree });
 }
 function verification(head: string) {
@@ -54,8 +54,8 @@ beforeEach(() => {
   ledger = new Ledger(root);
   tool("codex", `case "$FIX_ACTION" in
 advance) git -C "$TEST_ATTACHED" commit --allow-empty -qm concurrent ;;
-amend) "$TEST_BUN" "$TEST_LEDGER" amend fix --scope requirement --reason changed >/dev/null
-       "$TEST_BUN" "$TEST_LEDGER" freeze fix >/dev/null ;;
+amend) "$TEST_BUN" "$TEST_LEDGER" ledger amend fix --scope requirement --reason changed >/dev/null
+       "$TEST_BUN" "$TEST_LEDGER" ledger freeze fix >/dev/null ;;
 esac
 while [ "$1" != "-o" ]; do shift; done
 printf '%s' '{"passed":true,"report":"validated pinned diff"}' > "$2"`);
@@ -64,8 +64,7 @@ afterEach(() => { ledger.closeDb(); rmSync(root, { recursive: true, force: true 
 const native = (ref: string, action = "") => invoke(["review-native", "--task", "fix", "--repo", "svc", "--base", ref], { FIX_ACTION: action });
 
 test("review range and launch floor bind primary, fallback and native evidence", () => {
-  const opened = invoke(["open", "--id", "fix", "--title", "Review delivery", "--repo", "svc", "--branch", "feature"]);
-  expect(opened.exitCode).toBe(0);
+  open("local");
   expect(ledger.getTaskRepos("fix")[0].base_sha).toBe(base);
   const middle = commit("middle");
   ledger.detachRepo({ task_id: "fix", repo: "svc", branch: "feature", reason: "temporary" });
@@ -167,113 +166,17 @@ test("tracked contracts inside pruned dependency fixtures remain locked by wildc
   expect(readiness(head).missing.join(" ")).toContain(rel);
 });
 
-test("provider error from before a refreeze retains its launch time through the real role runner and hook", async () => {
-  const head = commit("reviewed change");
+test("an older review completion cannot satisfy an amended freeze", () => {
   open("local");
-  ledger.freezeSpec({ task_id: "fix" });
-  writeFileSync(join(root, ".workbench/workbench.yaml"), "name: fixture\nrepos:\n  - svc\n");
-  writeFileSync(join(root, "provider.toml"), '[openai]\napi_key="fixture-key"');
-  const realGit = Bun.which("git")!;
-  tool("git", `if mkdir "$MARKER" 2>/dev/null; then
-    "$TEST_BUN" "$TEST_LEDGER" amend fix --scope requirement --reason changed >/dev/null
-    "$TEST_BUN" "$TEST_LEDGER" freeze fix >/dev/null
-  fi
-  exec "$REAL_GIT" "$@"`);
-  function replaceTask() {
-    ledger.cancelTask({ task_id: "fix", reason: "replaced specification" });
-    ledger.openTask({ task_id: "replacement", repo: "svc", branch: "feature", title: "replacement", endpoint: "local", depth: "targeted", base_sha: base, head_sha: head });
-    const docs = join(root, ".workbench/specs/replacement");
-    mkdirSync(docs, { recursive: true });
-    for (const name of ["ssot", "tech-spec", "test-spec"]) writeFileSync(join(docs, name + ".md"), "replacement");
-    const replacement = ledger.freezeSpec({ task_id: "replacement" }).spec;
-    expect(replacement.evidence_floor_seq.review).toBe(initialFloor);
-  }
-  const initialFloor = ledger.getSpecState("fix").evidence_floor_seq.review;
-  let resumed = false, changeOwner = false;
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
-    if (resumed) {
-      if (changeOwner) { replaceTask(); changeOwner = false; }
-      const report = { status: "pass", summary: "complete", findings: [], checked: ["diff"], limitations: [] };
-      return Response.json({ id: "resp_test", object: "response", status: "completed", model: "gpt-6.1-sol",
-        output: [{ type: "message", role: "assistant", id: "msg", status: "completed",
-          content: [{ type: "output_text", text: JSON.stringify(report), annotations: [] }] }], usage: { total_tokens: 10 } });
-    }
-    verification(head);
-    ledger.recordEvidence({ task_id: "fix", repo: "svc", branch: "feature", sha: head, kind: "review",
-      status: "pass", source: "tool", summary: "current quality review", meta: { role: "quality", base,
-      review_task_id: "fix", review_floor_seq: ledger.getSpecState("fix").evidence_floor_seq.review } });
-    return Response.json({ error: { code: "credit_balance_exhausted", message: "fixture exhausted" } },
-      { status: 429, headers: { "x-should-retry": "false" } });
-  } });
-  try {
-    const args = ["--repo", repo, "--base", base, "--head", head, "--config", join(root, "provider.toml")];
-    const runner = join(import.meta.dir, "../review-agents/src/quality.ts");
-    const clock = join(root, "clock.ts");
-    writeFileSync(clock, "const iso = Date.prototype.toISOString; Date.prototype.toISOString = function() { return iso.call(new Date(+this + 86400000)); };");
-    const proc = Bun.spawn([process.execPath, "--preload", clock, runner, ...args], { cwd: root, env: { ...process.env,
-      OPENAI_BASE_URL: server.url.href, REAL_GIT: realGit, MARKER: join(root, "started"),
-      TEST_BUN: process.execPath, TEST_LEDGER: cli, FORGE_WORKBENCH_ROOT: root, PATH: bin + ":" + process.env.PATH },
-      stdout: "pipe", stderr: "pipe" });
-    const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-    expect(code).toBe(2);
-    const result = handleLedgerHook(root, { hook_event_name: "PostToolUse", cwd: root, tool_name: "exec_command",
-      tool_input: { command: ["review-quality", ...args].join(" "), workdir: root },
-      tool_response: { exit_code: code, output: stdout + "\n" + stderr } });
-    expect(result.recorded).toBe(0);
-    const reportData = JSON.parse(stdout);
-    const floor = ledger.getSpecState("fix").evidence_floor_seq.review;
-    expect(reportData.reviewTaskId).toBe("fix");
-    expect(reportData.errorCode).toBe("credit_balance_exhausted");
-    expect(reportData.reviewFloorSeq).toBeLessThan(floor);
-    expect(readiness(head).ready).toBe(true);
-    ledger.recordEvidence({ task_id: "fix", repo: "svc", sha: head, kind: "review", status: "fail", source: "tool",
-      summary: "current review found a problem", meta: { role: "quality", base, review_task_id: "fix", review_floor_seq: floor } });
-    resumed = true;
-    const resumeArgs = ["--resume", JSON.parse(stdout).task, "--config", join(root, "provider.toml")];
-    const retry = Bun.spawn([process.execPath, runner, ...resumeArgs], { cwd: root, env: { ...process.env,
-      OPENAI_BASE_URL: server.url.href, FORGE_REVIEW_FLOOR_SEQ: String(floor) }, stdout: "pipe", stderr: "pipe" });
-    const [exit, report, receipt] = await Promise.all([retry.exited, new Response(retry.stdout).text(), new Response(retry.stderr).text()]);
-    expect(exit, report).toBe(0);
-    expect(JSON.parse(report).reviewTaskId).toBe("fix");
-    expect(JSON.parse(report).reviewFloorSeq).toBe(reportData.reviewFloorSeq);
-    expect(handleLedgerHook(root, { hook_event_name: "PostToolUse", cwd: root, tool_name: "exec_command",
-      tool_input: { command: ["review-quality", ...resumeArgs].join(" "), workdir: root },
-      tool_response: { exit_code: exit, output: report + "\n" + receipt } }).recorded).toBe(0);
-    expect(readiness(head).ready).toBe(false);
-    // Start another genuine role review under A; change ownership inside its provider call.
-    changeOwner = true;
-    const last = Bun.spawn([process.execPath, runner, ...args], { cwd: root, env: { ...process.env,
-      OPENAI_BASE_URL: server.url.href }, stdout: "pipe", stderr: "pipe" });
-    const [status, body, lastReceipt] = await Promise.all([last.exited, new Response(last.stdout).text(), new Response(last.stderr).text()]);
-    expect(status, body).toBe(0);
-    expect(JSON.parse(body).reviewTaskId).toBe("fix");
-    const wrongArgs = [...args, "--task-id", "fix"];
-    const rejected = Bun.spawnSync([process.execPath, runner, ...wrongArgs], { cwd: root });
-    expect(rejected.exitCode).toBe(2);
-    expect(JSON.parse(rejected.stdout.toString())).toMatchObject({ reviewTaskId: "fix", reviewStarted: false });
-    expect(handleLedgerHook(root, { hook_event_name: "PostToolUse", cwd: root, tool_name: "exec_command",
-      tool_input: { command: ["review-quality", ...wrongArgs].join(" "), workdir: root },
-      tool_response: { exit_code: rejected.exitCode, output: rejected.stdout.toString() } }).recorded).toBe(0);
-    // Also replay the first review, whose sequence exactly matches the replacement task.
-    expect(handleLedgerHook(root, { hook_event_name: "PostToolUse", cwd: root, tool_name: "exec_command",
-      tool_input: { command: ["review-quality", ...args].join(" "), workdir: root },
-      tool_response: { exit_code: status, output: body + "\n" + lastReceipt } }).recorded).toBe(0);
-    expect(handleLedgerHook(root, { hook_event_name: "PostToolUse", cwd: root, tool_name: "exec_command",
-      tool_input: { command: ["review-quality", ...resumeArgs].join(" "), workdir: root },
-      tool_response: { exit_code: exit, output: report + "\n" + receipt } }).recorded).toBe(0);
-    const checkpointPath = join(resumeArgs[1], "state.json");
-    const oldCheckpoint = JSON.parse(readFileSync(checkpointPath, "utf8"));
-    delete oldCheckpoint.reviewTaskId;
-    delete oldCheckpoint.result.reviewTaskId;
-    writeFileSync(checkpointPath, JSON.stringify(oldCheckpoint));
-    const legacy = Bun.spawnSync([process.execPath, runner, ...resumeArgs], { cwd: root });
-    expect(legacy.exitCode).toBe(2);
-    expect(JSON.parse(legacy.stdout.toString())).toMatchObject({ reviewStarted: false, summary: expect.stringContaining("fresh review") });
-    ledger.recordEvidence({ task_id: "replacement", repo: "svc", sha: head, kind: "review", status: "pass",
-      source: "tool", summary: "old task receipt", meta: { review_task_id: reportData.reviewTaskId, review_floor_seq: reportData.reviewFloorSeq, base, role: "quality" } });
-    expect(ledger.checkPushReadiness({ task_id: "replacement", repo: "svc", head_sha: head }).recordedReviewRoles).toEqual([]);
-  } finally { server.stop(true); }
-}, 20000);
+  const before = ledger.freezeSpec({ task_id: "fix" }).spec;
+  ledger.amendSpec({ task_id: "fix", scope: "requirement", reason: "changed invariant" });
+  const after = ledger.freezeSpec({ task_id: "fix" }).spec;
+  expect(after.evidence_floor_seq.review).toBeGreaterThan(before.evidence_floor_seq.review);
+  ledger.recordEvidence({ task_id: "fix", repo: "svc", branch: "feature", sha: base,
+    kind: "review", status: "pass", source: "tool", summary: "old execution", meta: {
+      base, role: "quality", review_task_id: "fix", review_floor_seq: before.evidence_floor_seq.review } });
+  expect(readiness(base).recordedReviewRoles).not.toContain("quality");
+});
 
 test("a replacement task at floor zero requires its own role review", () => {
   const head = commit("shared revision");
@@ -288,15 +191,9 @@ test("a replacement task at floor zero requires its own role review", () => {
   expect(capture("fix")).toBe(0);
   ledger.cancelTask({ task_id: "fix", reason: "new task" });
   const task_id = "replacement";
-  ledger.openTask({ task_id, title: task_id, repo: "svc", branch: "feature", base_sha: base, head_sha: head, endpoint: "local", depth: "full" });
+  ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, repo: "svc", branch: "feature", base_sha: base, head_sha: head, endpoint: "local", depth: "full" });
   expect(capture("fix")).toBe(0);
   expect(capture()).toBe(0);
-  const checkpoint = join(root, "old-review");
-  mkdirSync(checkpoint);
-  writeFileSync(join(checkpoint, "state.json"), JSON.stringify({ version: 1, reviewFloorSeq: 0, result: report }));
-  const legacy = Bun.spawnSync([process.execPath, join(import.meta.dir, "../review-agents/src/quality.ts"), "--resume", checkpoint], { cwd: root });
-  expect(legacy.exitCode).toBe(2);
-  expect(JSON.parse(legacy.stdout.toString())).toMatchObject({ reviewStarted: false, summary: expect.stringContaining("fresh review") });
   for (const review_task_id of [undefined, "fix"]) {
     ledger.recordEvidence({ task_id, repo: "svc", sha: head, kind: "review", source: "hook", status: "pass",
       summary: "legacy receipt", meta: { role: "quality", base, review_floor_seq: 0, review_task_id } });
@@ -404,11 +301,11 @@ test("checkout-relative base and role floor follow the feature branch across a w
   expect(ledger.getTaskRepos("fix")[0].base_sha).toBe(head);
   const floor = ledger.freezeSpec({ task_id: "fix" }).spec.evidence_floor_seq.review;
   git("worktree", "move", first, moved);
-  const runner = join(import.meta.dir, "../review-agents/src/quality.ts");
-  const result = Bun.spawnSync([process.execPath, runner, "--repo", moved, "--base", "missing", "--head", head],
-    { cwd: root, env: { ...process.env, FORGE_WORKBENCH_ROOT: root } });
-  expect(result.exitCode).toBe(2);
-  expect(JSON.parse(result.stdout.toString())).toMatchObject({ reviewFloorSeq: floor, status: "error" });
+  const result = invoke(["reviews", "fix"]);
+  expect(result.exitCode).toBe(0);
+  expect(JSON.parse(result.stdout.toString())).toEqual([]);
+  expect(resolveTaskCheckout(root, ledger.getTaskRepos("fix")[0]).dir).toBe(realpathSync(moved));
+  expect(ledger.getSpecState("fix").evidence_floor_seq.review).toBe(floor);
 });
 
 test("attaching an initialized submodule uses its working tree", () => {
@@ -417,7 +314,7 @@ test("attaching an initialized submodule uses its working tree", () => {
   git("-c", "protocol.file.allow=always", "submodule", "add", child, "module");
   const nested = new Ledger(repo);
   try {
-    nested.openTask({ task_id: "submodule", title: "module", endpoint: "local", depth: "targeted", repo: "module", branch: "feature", base_sha: "HEAD" });
+    nested.openTask({ workflow_version: "0.4", task_id: "submodule", title: "module", endpoint: "local", depth: "targeted", repo: "module", branch: "feature", base_sha: "HEAD" });
     expect(nested.getTaskRepos("submodule")[0].worktree).toBe(git("-C", "module", "rev-parse", "--show-toplevel"));
   } finally { nested.closeDb(); }
 });
@@ -513,4 +410,26 @@ test("PR lookup reports silent failures and obeys the caller's remaining deadlin
   const start = Date.now();
   expect(() => withinProcessDeadline(start + 400, view)).toThrow(/timed out/);
   expect(Date.now() - start).toBeLessThan(2500);
+});
+
+test("a v0.5 task can close at the PR endpoint only with confirmed membership in remote main", () => {
+  const head = commit("change");
+  ledger.openTask({task_id:"fix",title:"Ship reviewed revision",repo:"svc",branch:"feature",endpoint:"pr",depth:"targeted",base_sha:base,head_sha:head});
+  writeFileSync(join(root, ".workbench/specs/fix/scope.md"), "Fix one covered behavior.");
+  ledger.freezeSpec({task_id:"fix"});
+  tool("gh", 'if [ "$1" = pr ]; then printf "%s" "$TEST_PR"; elif [ "$6" = .object.sha ]; then printf "%s" "$MAIN_OID"; else printf "%s" "$COMPARISON"; fi');
+  const url="https://github.com/acme/svc/pull/23";
+  const sync=(state:string,target:string,tip:string,comparison="behind")=>invoke(["pr-sync","fix","--repo","svc","--pr","23"],{
+    MAIN_OID:tip,COMPARISON:comparison,TEST_PR:JSON.stringify({url,state,baseRefName:target,headRefName:"feature",headRefOid:head,isCrossRepository:false,headRepository:{name:"svc"},headRepositoryOwner:{login:"acme"}}),
+  });
+  const lacksEndpoint=()=>readiness(head).missing.some(reason=>reason.includes('endpoint "pr"'));
+  expect(sync("OPEN","main",base).exitCode).toBe(0);
+  expect(lacksEndpoint()).toBe(true);
+  expect(sync("MERGED","integration",head).exitCode).toBe(0);
+  expect(lacksEndpoint()).toBe(true);
+  expect(sync("MERGED","main",base).exitCode).not.toBe(0);
+  expect(lacksEndpoint()).toBe(true);
+  expect(sync("MERGED","main",head).exitCode).toBe(0);
+  expect(lacksEndpoint()).toBe(false);
+  expect(JSON.parse(ledger.getTaskEvents("fix").at(-1)!.payload_json).meta).toMatchObject({base_branch:"main",target_oid:head,state:"MERGED"});
 });

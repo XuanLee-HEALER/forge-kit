@@ -25,10 +25,12 @@
 
 ### L0 标准扩展点
 
-核心层向实例层开放三类覆写点：
+核心层向实例层开放四类覆写点。
+
 1. **集成验证环境与验证手段**：测试执行环境（如远端集成环境、容器环境、本地沙箱）及验证命令。
 2. **交付终点与 CI/CD 环节**：主分支合并之外的多环境部署、标签发布、数据变更与线上验收步骤。
 3. **阶段级工具与配置**：各开发阶段可挂载的自定义工具、模型档位与策略配置。
+4. **整份核心技能**：按稳定 ID 指向实例私有的技能目录。发现描述、执行正文及相对资源来自同一有效版本，工作线程可以查询其来源。
 
 ### L2 核心组件
 
@@ -95,7 +97,8 @@ flowchart TD
 - 保持代码模块化与清晰逻辑层级，控制单文件与单次迭代变更边界。
 
 #### 3. 四维独立 Review
-工作 thread 根据实际改动通过 `forge review` 按需触发：
+工作 thread 在每次调用评审 CLI 前先运行 `forge ledger reviews <task-id>`。根据实际改动、历史版本和已有结果选择角色，随后通过 `forge review` 运行以下维度。
+
 1. **业务对齐**：验证实现与 SSOT 或修改范围一致。
 2. **实现层 Bug**：按目标语言特性排查常见缺陷与边界错误。
 3. **Simplify**：平衡性能与实现简洁度。
@@ -110,10 +113,11 @@ flowchart TD
 
 ## 正交模式：快速通道（同意前置）
 
-快速通道是叠加在开发主线之上的**授权前置模式**，而非独立交付分支：
-- 在前期确认实现内容与风险边界后，将后续原本分散在流程中的人工确认前置。
+快速通道把已确定的交付动作在执行前一起提交主会话批准。
+
+- runbook 逐项绑定目标资源、动作与内容摘要、适用版本、有效会话和期限。只有主会话整句批准才激活相应授权。
 - Codex 按既定主线自动连续推进，直至完成该任务的最终交付终点（包含实例定义的上线环节）。
-- 仅在遭遇真实外部阻拦（CI 失败、合并冲突、环境异常）或超出确认边界时中断并交还人工处理。
+- 未确定的动作、漂移的目标版本、授权过期或撤销、评审及 CI 失败，均在该步执行前停止。保留已确认的回执，对外部结果不确定的步骤交由人工核实。
 
 ---
 
@@ -121,7 +125,6 @@ flowchart TD
 
 ```bash
 # 1. 构建工作台工具集并运行测试
-git submodule update --init --recursive
 bun install --frozen-lockfile
 bun run build
 bun run test:all
@@ -141,10 +144,77 @@ git clone <repo-url> ~/work/my-workbench/backend
 ### 在本仓库自举
 
 ```bash
-git submodule update --init --recursive
 bun install --frozen-lockfile
-(cd review-agents && bun install --frozen-lockfile)
+bun run build
 ./bin/forge init . --name forge-kit
 ./bin/forge add-repo . --workbench .
 ./bin/forge doctor .
 ```
+
+## 实例配置示例
+
+在已初始化的工作台根目录，创建私有文件 `.workbench/overrides/ready/SKILL.md`，写入以下全文。
+
+```markdown
+---
+name: ready
+description: 检查本实例的 smoke 验证阶段是否可用。
+---
+
+输入是当前工作台。运行 `forge instance show stage smoke --json`，返回动作 ID 和来源后完成。
+```
+
+在现有的 `.workbench/workbench.yaml` 增加下列配置。只配置验证动作时可省略 skills 一项。
+
+```yaml
+extensions:
+  actions:
+    smoke-check:
+      argv: ["bun", "-e", "console.log('smoke ok')"]
+      cwd: "."
+      purpose: verify
+  stages:
+    smoke:
+      action: smoke-check
+  verification:
+    environment: isolated
+    stages: [smoke]
+  skills:
+    ready: .workbench/overrides/ready
+```
+
+在实例根执行以下命令。最后一个命令打印 `smoke ok`。以后升级时，私有源文件与本地配置继续保留。
+
+```bash
+export PATH="$PWD/.workbench/bin:$PATH"
+forge sync .
+forge doctor . --json
+forge instance list --json
+forge instance show skill ready --json
+forge instance run smoke
+```
+
+## 升级到 v0.5
+
+从新的发行目录运行 `./bin/forge sync <实例目录>`，再执行 `./bin/forge doctor <实例目录> --json`。对比迁移报告中的路径，遇到已改动的受管文件或归属不明的同名文件时，先保留内容，按实际归属迁入私有位置后再重试。账本、旧见证与私有脚本原位保留。旧实例的 `review-agents/` 可含私有修改，升级后使用新发行附带的引擎。
+
+实例自己的脚本按下表迁移。受管命令统一通过 `.workbench/bin/forge` 提供。
+
+| v0.4 入口 | v0.5 调用 |
+| --- | --- |
+| wb-git | forge git |
+| wb-verify | forge verify |
+| forge-review | forge review |
+| forge-ship | forge ship |
+| ledger | forge ledger |
+| guard | forge guard |
+| ledger-hook | forge ledger-hook |
+| dbcred | forge dbcred |
+| cmdfmt | forge cmdfmt |
+| lang-check | forge lang-check |
+
+默认技能为 ready、grill、feature、bugfix、review、verify、pr-triage 和 ship。原业务取舍方法并入 grill，收尾拆给 review、verify 和 ship，四个专项评审统一由 review 选角色。环境配方与专业技能由实例维护。代理按 scanner、analyst、implementer 和 reviewer 四种专长委派，后两者分别承接原 dev 与 spec-reviewer 的任务。独立引擎的四个评审维度由引擎参数选择。
+
+## 信任边界
+
+执行器记录当前 SHA 的实际验证和评审结果。账本通过 SQLite 事务和追加事件摘要保存历史，外部保留的 Ledger-Tip 可以核验相应前缀。同一系统用户的文件权限由操作系统控制。守卫识别高危操作并核对授权，远端分支保护、数据库授权、凭据作用域和必需 CI 检查由部署方设置。通用阶段使用最小权限，受控写操作在匹配精确授权后单独兑现。

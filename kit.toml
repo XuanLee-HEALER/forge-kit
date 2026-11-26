@@ -1,6 +1,6 @@
 [kit]
 name = "forge-kit"
-version = "0.4.1"
+version = "0.5.0"
 runtime = "codex"
 
 [managed]
@@ -10,50 +10,10 @@ rendered_files = [
   ".codex/hooks.json",
 ]
 
-copied_dirs = [
-  ".codex/agents",
-  ".agents/skills/ready",
-  ".agents/skills/grill",
-  ".agents/skills/feature",
-  ".agents/skills/bugfix",
-  ".agents/skills/wrapup",
-  ".agents/skills/ship",
-  ".agents/skills/pr-triage",
-  ".agents/skills/business-analysis",
-  ".agents/skills/test-environment",
-]
-
-copied_files = [
-  ".codex/config.toml",
-]
-
-bin_bundles = [
-  "cli.js",
-  "ledger.js",
-  "guard.js",
-  "ledger-hook.js",
-  "wb-git.js",
-  "dbcred.js",
-  "cmdfmt.js",
-  "lang-check.js",
-  "wb-verify.js",
-  "forge-review.js",
-  "forge-ship.js",
-]
-
-bin_wrappers = [
-  "forge",
-  "ledger",
-  "guard",
-  "ledger-hook",
-  "wb-git",
-  "dbcred",
-  "cmdfmt",
-  "lang-check",
-  "wb-verify",
-  "forge-review",
-  "forge-ship",
-]
+agent_files = ["scanner.toml", "analyst.toml", "implementer.toml", "reviewer.toml"]
+copied_files = [".codex/config.toml"]
+bin_bundles = ["cli.js"]
+bin_wrappers = ["forge"]
 
 [private]
 # Created ONLY on `forge init` if missing; `forge sync` NEVER overwrites these.

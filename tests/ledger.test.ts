@@ -49,7 +49,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       ledger.recordEvidence({ task_id, repo, sha, branch, kind: "test", status, source: "hook", summary: "test" });
     const ready = () => ledger.checkPushReadiness({ task_id, repo, branch: "feat", head_sha: sha }).ready;
     try {
-      ledger.openTask({ task_id, title: task_id, endpoint: "local", depth: "targeted", repo, branch: "feat", head_sha: sha });
+      ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, endpoint: "local", depth: "targeted", repo, branch: "feat", head_sha: sha });
       record(null, "fail");
       expect(ready()).toBe(false);
       record("feat", "pass");
@@ -73,7 +73,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
     const ledger = new Ledger(dir);
     const task_id = "manual-only";
     try {
-      ledger.openTask({ task_id, title: task_id, endpoint: "local", depth: "full", repo: "svc", branch: "feat", head_sha: "abcdef00" });
+      ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, endpoint: "local", depth: "full", repo: "svc", branch: "feat", head_sha: "abcdef00" });
       for (const kind of ["lint", "test", "hurl", "build", "review"] as const) {
         ledger.recordEvidence({ task_id, kind, actor: "hook", repo: "svc", sha: "abcdef00", status: "pass", summary: "attested" });
       }
@@ -112,7 +112,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       let head = commit("initial");
       const reviewBase = head;
       writeFileSync(join(repo, "new-contract.hurl"), "pending\r\n");
-      ledger.openTask({ task_id, title: task_id, endpoint: "local", depth: "targeted", repo: "svc", worktree: repo, branch: "feat", head_sha: head });
+      ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, endpoint: "local", depth: "targeted", repo: "svc", worktree: repo, branch: "feat", head_sha: head });
       const docs = join(dir, ".workbench/specs", task_id);
       mkdirSync(docs, { recursive: true });
       for (const doc of ["ssot", "tech-spec", "test-spec"]) writeFileSync(join(docs, doc + ".md"), doc);
@@ -199,7 +199,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
     const canvas = fixtureHistory("canvas", "fix/audio-billing"), web = fixtureHistory("web-app", "fix/audio-billing");
     const ledger = new Ledger(dir);
     try {
-      const opened = ledger.openTask({
+      const opened = ledger.openTask({ workflow_version: "0.4",
         task_id: "20261121-audio-billing",
         title: "Audio billing settlement fix",
         endpoint: "fat",
@@ -214,7 +214,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
 
       // Second OPEN task cannot claim the SAME (repo, branch)!
       expect(() =>
-        ledger.openTask({
+        ledger.openTask({ workflow_version: "0.4",
           task_id: "20261121-conflict",
           title: "Conflicting owner",
           endpoint: "local",
@@ -381,7 +381,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       }
 
       // Zero-repo dev task cannot close without --force-incomplete
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261121-empty-dev",
         title: "Empty dev task",
         endpoint: "pr",
@@ -420,7 +420,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
   test("investigation task can close without build/test; force-incomplete requires reason", () => {
     const ledger = new Ledger(dir);
     try {
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261121-inv",
         title: "Root cause analysis",
         endpoint: "investigation",
@@ -430,7 +430,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         "CLOSED",
       );
 
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261121-partial",
         title: "Partial close test",
         endpoint: "local",
@@ -458,7 +458,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
   test("DB trigger blocks UPDATE and verify() catches raw tampering", () => {
     const ledger = new Ledger(dir);
     try {
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261121-tamper-test",
         title: "Tamper check",
         endpoint: "local",
@@ -485,7 +485,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
   test("per-task hash chains allow physical pruning without breaking active chains", () => {
     const ledger = new Ledger(dir);
     try {
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20250101-old-task",
         title: "Old investigation",
         endpoint: "investigation",
@@ -496,7 +496,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         .query("UPDATE tasks SET closed_at = '2025-01-02T00:00:00.000Z' WHERE task_id = ?")
         .run("20250101-old-task");
 
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261121-active-task",
         title: "Current open task",
         endpoint: "pr",
@@ -517,7 +517,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
     const other = new Ledger(dir);
     try {
       for (const id of ["old-closed", "old-reopened"]) {
-        ledger.openTask({ task_id: id, title: id, endpoint: "investigation", depth: "targeted" });
+        ledger.openTask({ workflow_version: "0.4", task_id: id, title: id, endpoint: "investigation", depth: "targeted" });
         ledger.closeTask({ task_id: id, archive: false });
       }
       ledger.db.exec("UPDATE tasks SET closed_at = '2000-01-01'");
@@ -538,7 +538,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
 
   test("concurrent subprocess writes serialize cleanly under SQLite WAL", async () => {
     const ledger = new Ledger(dir);
-    ledger.openTask({
+    ledger.openTask({ workflow_version: "0.4",
       task_id: "20261121-concurrent",
       title: "Concurrency stress",
       endpoint: "local",
@@ -546,12 +546,13 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
     });
     ledger.closeDb();
 
-    const ledgerSrc = join(import.meta.dir, "..", "src", "bin", "ledger.ts");
+    const ledgerSrc = join(import.meta.dir, "..", "src", "bin", "cli.ts");
     const procs = Array.from({ length: 8 }, (_, i) =>
       Bun.spawn(
         [
           process.execPath,
           ledgerSrc,
+          "ledger",
           "record",
           "20261121-concurrent",
           "--kind",
@@ -596,7 +597,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
 
     const ledger = new Ledger(dir);
     try {
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261121-live",
         title: "Live HEAD close check",
         endpoint: "local",
@@ -639,7 +640,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       );
 
       // Missing/unresolvable live branch on an existing repo MUST ALSO fail closed!
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261121-missing-branch",
         title: "Missing branch close check",
         endpoint: "fat",
@@ -684,7 +685,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       );
 
       // Local Hurl verifies the revision. FAT acceptance has its own latest result.
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261121-fat-revoke",
         title: "FAT failure revokes earlier pass",
         endpoint: "fat",
@@ -751,7 +752,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
     try {
       const specDir = join(dir, ".workbench", "specs", "20261123-cycle");
       Bun.spawnSync(["mkdir", "-p", specDir]);
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261123-cycle",
         title: "Spec-driven dev cycle",
         endpoint: "fat",
@@ -909,7 +910,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       Bun.spawnSync(["mkdir", "-p", specDir]);
       writeFileSync(join(dir, "AGENTS.md"), "# Workbench Agents\n");
 
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261123-hard",
         title: "Freeze hardening checks",
         endpoint: "local",
@@ -1100,7 +1101,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
 
     const ledger = new Ledger(dir);
     try {
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261124-retry",
         title: "Retry fix",
         endpoint: "local",
@@ -1192,9 +1193,9 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       expect(() =>
         ledger.reopenTask({ task_id: "20261124-retry", endpoint: "" as never }),
       ).toThrow("Invalid endpoint");
-      const ledgerCli = join(import.meta.dir, "..", "src", "bin", "ledger.ts");
+      const ledgerCli = join(import.meta.dir, "..", "src", "bin", "cli.ts");
       for (const badFlag of ["--depth=", "--endpoint="]) {
-        const proc = Bun.spawnSync([process.execPath, ledgerCli, "reopen", "20261124-retry", badFlag], {
+        const proc = Bun.spawnSync([process.execPath, ledgerCli, "ledger", "reopen", "20261124-retry", badFlag], {
           env: { ...process.env, FORGE_WORKBENCH_ROOT: dir },
           stdout: "pipe",
           stderr: "pipe",
@@ -1258,7 +1259,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       const cherryFatSha = run(["rev-parse", "HEAD"]);
       expect(cherryFatSha).not.toBe(featSha);
 
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261124-cherry",
         title: "Divergent cherry-pick FAT delivery",
         endpoint: "fat",
@@ -1368,7 +1369,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       run(["fetch", "origin"]);
       run(["fetch", "fork"]);
       run(["checkout", "main"]);
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261124-tag-only",
         title: "Local tag, origin feature branch, & fork/fat must fail closed for FAT",
         endpoint: "fat",
@@ -1403,7 +1404,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       run(["checkout", "-b", "feat/downgrade-guard", baseSha]);
       const dgSha = run(["rev-parse", "HEAD"]);
       run(["checkout", "main"]);
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261124-dg",
         title: "Downgrade guard test",
         endpoint: "prod",
@@ -1437,7 +1438,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       run(["checkout", "-b", "feat/local-del"]);
       const localSha = run(["rev-parse", "HEAD"]);
       run(["checkout", "main"]);
-      ledger.openTask({
+      ledger.openTask({ workflow_version: "0.4",
         task_id: "20261124-local-del",
         title: "Local deleted branch",
         endpoint: "local",

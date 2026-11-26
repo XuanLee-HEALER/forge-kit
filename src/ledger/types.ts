@@ -31,8 +31,8 @@ export type LockedGitlinks = Record<string, LockedTreeEntry[]>;
 
 export interface SpecFrozenPayload {
   spec_dir: string;
-  files: { ssot: string; tech_spec: string; test_spec: string };
-  hashes: { ssot: string; tech_spec: string; test_spec: string };
+  files: Record<string, string>;
+  hashes: Record<string, string>;
   locked_test_globs: string[];
   locked_test_modes: Record<string, string>;
   locked_test_blobs: Record<string, string>;
@@ -54,8 +54,8 @@ export interface TaskSpecState {
   freeze_seq: number | null;
   amend_seq: number | null;
   spec_dir: string | null;
-  files: { ssot: string; tech_spec: string; test_spec: string } | null;
-  hashes: { ssot: string; tech_spec: string; test_spec: string } | null;
+  files: Record<string, string> | null;
+  hashes: Record<string, string> | null;
   locked_test_globs: string[];
   locked_test_files: Record<string, string>;
   amend_scope: SpecAmendScope | null;
@@ -256,4 +256,12 @@ export interface LedgerReader {
   getRunbook(runbook_id: string): RunbookRecord | null;
   getSpecState(task_id: string): TaskSpecState;
   listOpenTasks(): TaskRecord[];
+}
+
+/** Existing ledgers keep the rules under which their opening event was recorded. */
+export function usesV05(ledger: LedgerReader, taskId: string): boolean {
+  const row = ledger.db.query<{ version: string | null }, [string]>(
+    "SELECT json_extract(payload_json, '$.workflow_version') AS version FROM events WHERE task_id=? AND event_type='TASK_OPENED' ORDER BY seq LIMIT 1"
+  ).get(taskId);
+  return row?.version === "0.5";
 }

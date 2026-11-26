@@ -6,3 +6,11 @@ dist/
 *.sqlite-shm
 .workbench/ledger/
 .workbench/env/environments.json
+
+# Local workbench generated when forge-kit hosts its own development.
+/.agents/
+/.codex/
+/.workbench/
+/AGENTS.md
+/AGENTS.local.md
+/one-off-scripts/

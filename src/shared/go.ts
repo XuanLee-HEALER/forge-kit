@@ -50,7 +50,7 @@ export function hasNonExecutingGoFlags(bin: string, cwd: string, args: string[])
 }
 
 export function delegatedGoEnvironment(bin: string, cwd: string): Record<string, string> {
-  if (!["npm", "pnpm", "yarn", "bun", "make"].includes(bin)) return {};
+  if (!["bun", "make"].includes(bin)) return {};
   const effective = effectiveFlags("go", cwd);
   // A nonempty whitespace value means zero flags and overrides saved Go settings.
   const flags = effective === null ? null : parseGoFlags(effective);

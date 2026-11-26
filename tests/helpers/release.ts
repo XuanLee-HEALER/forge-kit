@@ -34,14 +34,14 @@ else if(group==="pr" && cmd==="view"){
 } else process.exit(1);`,
       { mode: 0o755 },
     );
-    const dist = join(root, "review-agents/dist");
-    mkdirSync(dist, { recursive: true });
-    writeFileSync(
-      join(dist, "review-quality.js"),
-      `const a=process.argv.slice(2),get=k=>a[a.indexOf(k)+1];
-await Bun.write(get("--out"),JSON.stringify({role:"quality",repo:get("--repo"),base:get("--base"),head:get("--head"),
-reviewTaskId:get("--task-id"),reviewFloorSeq:Number(get("--floor-seq")),status:"pass",findings:[]}));`,
-    );
+    writeFileSync(join(bin, "codex"), [
+      "#!/usr/bin/env bun",
+      'const args = process.argv.slice(2);',
+      'if (!args.includes("--ephemeral") || args[args.indexOf("-s")+1] !== "read-only") process.exit(2);',
+      'await Bun.write(args[args.indexOf("-o")+1], JSON.stringify({status:"pass",summary:"Reviewed fixed release range",checked:[],limitations:[],findings:[]}));',
+    ].join("\n"), {mode:0o755});
+    const tsc=require.resolve("typescript/bin/tsc");
+    writeFileSync(join(bin,"tsc"),"#!/usr/bin/env bun\nimport "+JSON.stringify(tsc)+";\n",{mode:0o755});
     ledger = new Ledger(root);
   });
   afterEach(() => {
@@ -52,9 +52,9 @@ reviewTaskId:get("--task-id"),reviewFloorSeq:Number(get("--floor-seq")),status:"
 }
 
 function cli(name: string, args: string[], ok = true) {
-  const p = Bun.spawnSync([process.execPath, join(import.meta.dir, "../../src/bin", name + ".ts"), ...args], {
+  const p = Bun.spawnSync([process.execPath, join(import.meta.dir, "../../src/bin/cli.ts"), name, ...args], {
     cwd: root,
-    env: { ...process.env, FORGE_WORKBENCH_ROOT: root, FORGE_REVIEW_AGENTS_DIR: join(root, "review-agents") },
+    env: { ...process.env, FORGE_WORKBENCH_ROOT: root, FORGE_CODEX_BIN: join(bin, "codex") },
   });
   const output = p.stdout.toString() + p.stderr.toString();
   expect(p.exitCode, output).toBe(ok ? 0 : 1);
@@ -88,6 +88,7 @@ export function feature(repo: string, n: number) {
       join(dir, "example.test.ts"),
       'import {test,expect} from "bun:test";test("value",()=>expect(2+2).toBe(4));',
     );
+    writeFileSync(join(dir,"value.js"),"export const value = 2 + 2;\n");
     writeFileSync(join(dir, "tracked.sql"), "SELECT 1;");
     git(dir, "add", ".");
     git(dir, "commit", "-m", "base");
@@ -128,9 +129,16 @@ export function feature(repo: string, n: number) {
 }
 export type Feature = ReturnType<typeof feature>;
 export function verifyFeature(f: Feature) {
+  if (ledger.getSpecState(f.task).state!=="FROZEN") {
+    const spec=join(root,".workbench/specs",f.task);
+    mkdirSync(spec,{recursive:true});
+    writeFileSync(join(spec,"scope.md"),"The local release fixture changes the feature branch. Existing baseline tests cover arithmetic; verify target and review receipt.");
+    ledger.freezeSpec({task_id:f.task});
+  }
   const target = ["--task", f.task, "--cwd", f.wt];
-  cli("wb-verify", [...target, "--kind", "test", "--", process.execPath, "test"]);
-  cli("forge-review", [...target, "--roles", "quality"]);
+  cli("verify",[...target,"--kind","lint","--","tsc","--noEmit","--allowJs","--checkJs","--skipLibCheck","value.js"]);
+  cli("verify", [...target, "--kind", "test", "--", process.execPath, "test", "./example.test.ts"]);
+  cli("review", [...target, "--roles", "quality"]);
 }
 export function merge(f: Feature) {
   git(f.dir, "merge", "--no-edit", f.branch);

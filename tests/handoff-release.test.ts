@@ -111,7 +111,8 @@ test("SQL release requires a runbook even for a PR child; stale approval cannot 
     expect(() => credentials()).toThrow();
     remote(f.n, { headRefOid: f.head });
     approve(book);
-    expect(credentials()).toBe("writer:");
+    expect(ledger.getRunbook(book)?.status).toBe("APPROVED");
+    expect(credentials).toThrow(/authorized ship executor/);
   } finally {
     if (previous === undefined) delete process.env.FORGE_SESSION_ID;
     else process.env.FORGE_SESSION_ID = previous;
@@ -129,7 +130,7 @@ test("local branch drift blocks approval, verification and close; deleted merged
   f.head = git(f.wt, "rev-parse", "HEAD");
   const spec = join(root, ".workbench/specs", f.task);
   mkdirSync(spec, { recursive: true });
-  for (const name of ["ssot.md", "tech-spec.md", "test-spec.md"]) writeFileSync(join(spec, name), "spec");
+  for (const name of ["scope.md"]) writeFileSync(join(spec, name), "spec");
   const freeze = ledger.freezeSpec({ task_id: f.task, locked_test_globs: ["example.test.ts"] });
   const legacy = JSON.parse(freeze.event.payload_json);
   for (const k of [
@@ -295,7 +296,7 @@ test("ordinary handoff requires passing executable evidence on each same-SHA bra
     [
       'import { expect, test } from "bun:test";',
       'test("receipt", () => {',
-      '  expect(process.env.FORGE_REGRESSION_FAIL).not.toBe("yes");',
+      '  expect(1 + 1).toBe(3);',
       "});",
     ].join("\n"),
   );
@@ -320,7 +321,8 @@ test("ordinary handoff requires passing executable evidence on each same-SHA bra
   const failed = Bun.spawnSync(
     [
       process.execPath,
-      join(import.meta.dir, "../src/bin/wb-verify.ts"),
+      join(import.meta.dir, "../src/bin/cli.ts"),
+      "verify",
       "--cwd",
       a.wt,
       "--task",
@@ -330,8 +332,9 @@ test("ordinary handoff requires passing executable evidence on each same-SHA bra
       "--",
       process.execPath,
       "test",
+      "./receipt.test.ts",
     ],
-    { cwd: root, env: { ...process.env, FORGE_WORKBENCH_ROOT: root, FORGE_REGRESSION_FAIL: "yes" } },
+    { cwd: root, env: { ...process.env, FORGE_WORKBENCH_ROOT: root } },
   );
   expect(failed.exitCode).toBe(1);
   sync(b);

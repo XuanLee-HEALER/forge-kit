@@ -3,7 +3,7 @@ import { hasNonExecutingGoFlags } from "./shared/go";
 import { hasNonExecutingTscFlags, tscTargets } from "./shared/tsc";
 import { lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { hasNonExecutingNpmFlags, parsePkgManagerInvocation } from "./shared/pkg-manager";
+import { parsePkgManagerInvocation } from "./shared/pkg-manager";
 import { testInputsInCheckout } from "./shared/test-inputs";
 import { extractMakeDirs, hasBuildTarget, hasMakeNonExecArgs } from "./shared/make";
 import { runGit } from "./git";
@@ -118,11 +118,9 @@ export function isVerificationCommand(kind: VerificationKind, argv: string[], di
     return !flags.some((f) => f && hasMakeNonExecArgs(f.split(/\s+/), true));
   }
   const pm = parsePkgManagerInvocation(argv);
-  const runnerArgs = pm?.manager === "npm" ? pm.forwarded : args;
-  if (runnerArgs.some((a) => infoFlags.has(a.split("=")[0].toLowerCase()) || ["-h", "-V", "-C"].includes(a)))
+  if (args.some((a) => infoFlags.has(a.split("=")[0].toLowerCase()) || ["-h", "-V", "-C"].includes(a)))
     return false;
-  if (kind === "test" && ["pytest","vitest","jest","node"].includes(bin) && !testInputsInCheckout(bin,args,dir)) return false;
-  if (bin === "node") return kind === "test";
+  if (kind === "test" && ["pytest","vitest","jest"].includes(bin) && !testInputsInCheckout(bin,args,dir)) return false;
   if (bin === "pytest" && args.some(isPytestInfoSwitch)) return false;
   if (kind === "hurl") return bin === "hurl" && hurlInputs(args, dir, head);
   if (bin === "lang-check") {
@@ -137,20 +135,18 @@ export function isVerificationCommand(kind: VerificationKind, argv: string[], di
   if (bin === "cargo")
     return (kind === "lint" ? ["clippy", "check"].includes(cmd) : cmd === kind && !args.includes("--no-run")) &&
       cargoProjectInCheckout(argv[0], args, dir);
-  if (["bun", "npm", "pnpm", "yarn"].includes(bin)) {
-    if (!pm || pm.invalidDirFlag || pm.hasAmbiguousFilter || pm.useWorkspaceRoot) return false;
+  if (bin === "bun") {
+    if (!pm || pm.invalidDirFlag || pm.hasAmbiguousFilter) return false;
     let projectDir = dir;
     for (const offset of pm.dirOffsets) {
       projectDir = realpathSync.native(isAbsolute(offset) ? offset : dir + sep + offset);
       if (projectDir !== dir && !projectDir.startsWith(dir + sep)) return false;
     }
-    if (bin === "npm") {
-      if (hasNonExecutingNpmFlags(pm.managerFlags)) return false;
-    } else if (pm.managerFlags.some(flag => /^-[^-]*[hvV?H]/.test(flag))) return false;
+    if (pm.managerFlags.some(flag => /^-[^-]*[hvV?H]/.test(flag))) return false;
     if (bin === "bun" && !pm.bunScript && pm.subcmd === kind && (kind === "test" || kind === "build"))
       return kind === "build" || testInputsInCheckout("bun", pm.rest, projectDir);
     const name = pm.scriptName;
-    if (!name || (pm.subcmd !== "run" && bin === "npm" && name !== "test")) return false;
+    if (!name) return false;
     const pattern =
       kind === "lint" ? /^(lint|check|typecheck)$/ : kind === "test" ? /^test/ : /^build/;
     if (!pattern.test(name)) return false;

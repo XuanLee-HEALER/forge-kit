@@ -3,11 +3,12 @@ import { join } from "node:path";
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { collectProdDbHosts, loadWorkbenchConfig } from "../src/config";
 import { checkProdDb } from "../src/guard/sql-http";
-import { doctorWorkbench } from "../src/cli";
+import { doctorWorkbench, initWorkbench } from "../src/cli";
 import { formatDbCred } from "../src/dbcred";
 import { executorFixture } from "./helpers/executor";
 const f = executorFixture();
 test("credentials select the requested account, protect production aliases and warn on legacy entries", () => {
+  initWorkbench({targetDir:f.root});
   const ro = { user: "reader", password: "a@b" },
     rw = { user: "writer", password: "x:y" };
   writeFileSync(
@@ -60,17 +61,17 @@ test("credentials select the requested account, protect production aliases and w
   update("APPROVED", new Date(0).toISOString());
   expect(get("alias", ...args).exitCode).toBe(1);
   update("APPROVED", future);
-  expect(get("alias", ...args).stdout.toString()).toBe("writer:x%3Ay");
-  expect(get("alias", ...args.slice(0, 3)).exitCode).toBe(0);
-  expect(f.cli("dbcred", ["alias", ...args], {FORGE_SESSION_ID:undefined, CODEX_SESSION_ID:"session"}).exitCode).toBe(0);
+  expect(get("alias", ...args).stdout.length).toBe(0);
+  expect(get("alias", ...args.slice(0, 3)).exitCode).toBe(1);
+  expect(f.cli("dbcred", ["alias", ...args], {FORGE_SESSION_ID:undefined, CODEX_SESSION_ID:"session"}).exitCode).toBe(1);
   expect(f.cli("dbcred", ["alias", ...args], {FORGE_SESSION_ID:undefined, CODEX_SESSION_ID:undefined}).exitCode).toBe(1);
-  expect(f.cli("dbcred", ["alias", ...args], {FORGE_SESSION_ID:"", CODEX_SESSION_ID:"session"}).exitCode).toBe(0);
+  expect(f.cli("dbcred", ["alias", ...args], {FORGE_SESSION_ID:"", CODEX_SESSION_ID:"session"}).exitCode).toBe(1);
   expect(get("failover", "--rw").exitCode).toBe(1);
   expect(get("failover", ...args).exitCode).toBe(1);
   f.ledger.createRunbook({runbook_id:"rb-both", title:"failover", actions:{sql_files:
     ["live.db","standby.db"].map(host => ({host, path:sql, sha256:""}))}});
   update("APPROVED", future);
-  expect(get("failover", "--rw", "--runbook", "rb-both").stdout.toString()).toBe("writer:x%3Ay");
+  expect(get("failover", "--rw", "--runbook", "rb-both").stdout.length).toBe(0);
   expect(get("alias", ...args.slice(0, -1), "other").exitCode).toBe(1);
   expect(get("prodBad", ...args).exitCode).toBe(1);
   expect(
