@@ -1,0 +1,26 @@
+[
+  {
+    "id": "business", "role": "business", "spec": "The discount begins at 10 items, including exactly 10 items.",
+    "before": "export const discount = (count: number) => count >= 10;",
+    "after": "export const discount = (count: number) => count > 10;",
+    "line": 1, "concept": "10|ten|十"
+  },
+  {
+    "id": "quality", "role": "quality", "spec": "Return the arithmetic mean of 1 to 10,000 integer examination scores. Each score is in the closed range 0 through 100.",
+    "before": "export const mean = (xs: number[]) => xs.reduce((a,b) => a+b, 0) / xs.length;",
+    "after": "export const mean = (xs: number[]) => xs.reduce((a,b) => a+b, 0) / (xs.length - 1);",
+    "line": 1, "concept": "length|denominator|divi|分母|除"
+  },
+  {
+    "id": "simplify", "role": "simplify", "spec": "Count distinct ids in one pass. Inputs routinely contain 100,000 unique keys.",
+    "before": "export const count = (ids: string[]) => new Set(ids).size;",
+    "after": "export const count = (ids: string[]) => ids.filter((id,i) => ids.indexOf(id) === i).length;",
+    "line": 1, "concept": "indexOf|quadratic|平方|二次|O\\(n"
+  },
+  {
+    "id": "comments", "role": "comments", "spec": "The public function and its API documentation must agree on the required input unit, seconds.",
+    "before": "/** Convert seconds to milliseconds. */\nexport const toMillis = (seconds: number) => seconds * 1000;",
+    "after": "/** Accepts milliseconds and returns seconds. */\nexport const toMillis = (seconds: number) => seconds * 1000;",
+    "line": 1, "concept": "millis|seconds|毫秒|秒"
+  }
+]
