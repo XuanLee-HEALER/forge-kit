@@ -265,9 +265,13 @@ function reconcileStage(
     trackEvent(ledger, e, "SHIP_STAGE_SUBMISSION_INTENT", { index, action_id: actionId });
   });
   const env = { ...stageEnvironment(actionId, plan.endpoint, versions), FORGE_ACTIVE_STAGE: a.stage };
-  runProcess(a.execute.argv, { cwd: a.execute.cwd, env, timeoutMs: 60_000 });
+  const submission = runProcess(a.execute.argv, { cwd: a.execute.cwd, env, timeoutMs: 60_000 });
   const receipt = observe();
   if (receipt) return receipt;
+  if (submission.code !== 0)
+    throw Error(
+      `Stage ${a.stage} submission exited with code ${submission.code}; target reports action ${actionId} absent. Inspect the submitter and target before manual recovery.`,
+    );
   throw new WaitingForTarget(index);
 }
 function perform(

@@ -335,6 +335,6 @@ export function requireActionReceipts(ledger: ReleaseLedger, releaseId: string, 
           rb.runbook_id +
           " action " +
           action_id +
-          "; record the result with ledger record --kind prod --meta containing runbook_id and action_id",
+          "; record the result with forge ledger record --kind prod --meta containing runbook_id and action_id",
       );
 }

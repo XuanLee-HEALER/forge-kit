@@ -27,7 +27,9 @@ test("custom delivery and verification keep the configured receipts and each rev
     git("config", "user.name", "Fixture");
     git("config", "user.email", "fixture@example.invalid");
     const revisions = ["base", "middle", "head"].map(message => {
-      git("commit", "--allow-empty", "-m", message);
+      writeFileSync(join(repo, "change.txt"), message);
+      git("add", "--", "change.txt");
+      git("commit", "-m", message, "--", "change.txt");
       return git("rev-parse", "HEAD");
     });
     const [base, middle, head] = revisions;
@@ -41,13 +43,27 @@ test("custom delivery and verification keep the configured receipts and each rev
       const bind = { task_id: task.task_id, repo: "service", branch: "feature", sha: head, source: "tool" as const, actor: "tool", summary: "fixture" };
       const check = (checkEndpoint = false) => db.checkPushReadiness({ ...bind, head_sha: head, checkEndpoint });
       const review = (base: string, status: "pass" | "fail") => db.recordEvidence({ ...bind, kind: "review", status,
-        meta: { role: "quality", base, review_task_id: task.task_id, review_floor_seq: spec.freeze_seq } });
-      review(base, "pass");
+        meta: { role: "quality", base, review_task_id: task.task_id, freeze_seq: spec.freeze_seq, review_floor_seq: spec.evidence_floor_seq.review } });
+      review(middle, "pass");
       for (const kind of ["lint", "test"] as const) db.recordEvidence({ ...bind, kind, status: "pass" });
       expect(check().ready).toBe(false);
-      const policy = verificationPolicy(installedInstance(s.work)!);
+      const policy = verificationPolicy(s.work, "service", head, installedInstance(s.work)!);
       db.recordEvidence({ ...bind, kind: "verify", status: "pass", meta: {
         mode: "all", policy_sha256: policy, freeze_seq: spec.freeze_seq, review_task_id: task.task_id } });
+      expect(check().missing.join(" ")).toContain("baseline-to-HEAD");
+      db.recordEvidence({ ...bind, kind: "review", status: "pass", meta: {
+        role: "quality", base, review_task_id: task.task_id, review_floor_seq: spec.evidence_floor_seq.review, freeze_seq: 0 } });
+      expect(check().ready).toBe(false);
+      review(base, "pass");
+      expect(check().ready).toBe(true);
+      db.recordEvidence({ ...bind, kind: "review", status: "fail", meta: {
+        role: "business", base: middle, report_status: "incomplete", attempts: [], backend: null, missing_materials: ["spec"],
+        review_task_id: task.task_id, freeze_seq: spec.freeze_seq, review_floor_seq: spec.evidence_floor_seq.review } });
+      review(middle, "pass");
+      expect(check().ready).toBe(false);
+      db.recordEvidence({ ...bind, kind: "review", status: "pass", meta: {
+        role: "business", base: middle, review_task_id: task.task_id, freeze_seq: spec.freeze_seq,
+        review_floor_seq: spec.evidence_floor_seq.review } });
       expect(check().ready).toBe(true);
       review(middle, "fail");
       review(base, "pass");
@@ -65,11 +81,23 @@ test("custom delivery and verification keep the configured receipts and each rev
       const next = git("rev-parse", "HEAD");
       const secondCheck = () => db.checkPushReadiness({ ...bind, branch: "feature", head_sha: next });
       db.recordEvidence({ ...bind, sha: next, kind: "review", status: "pass", meta: {
-        role: "quality", base, review_task_id: task.task_id, review_floor_seq: spec.freeze_seq } });
+        role: "quality", base, review_task_id: task.task_id, freeze_seq: spec.freeze_seq, review_floor_seq: spec.evidence_floor_seq.review } });
       db.recordEvidence({ ...bind, sha: next, kind: "verify", status: "pass", meta: {
-        mode: "all", policy_sha256: verificationPolicy(installedInstance(s.work)!),
+        mode: "all", policy_sha256: verificationPolicy(s.work, "service", next, installedInstance(s.work)!),
         freeze_seq: spec.freeze_seq, review_task_id: task.task_id } });
       expect(secondCheck().ready).toBe(true);
+      // A previous executor could pass a range of distinct commit IDs with identical trees.
+      git("revert", "--no-commit", head, middle);
+      git("commit", "-m", "restore baseline");
+      const empty = git("rev-parse", "HEAD");
+      expect(git("diff", "--name-only", base, empty)).toBe("");
+      db.recordEvidence({ ...bind, sha: empty, kind: "verify", status: "pass", meta: {
+        mode: "all", policy_sha256: verificationPolicy(s.work, "service", empty, installedInstance(s.work)!),
+        freeze_seq: spec.freeze_seq, review_task_id: task.task_id } });
+      db.recordEvidence({ ...bind, sha: empty, kind: "review", status: "pass", meta: {
+        role: "quality", base, review_task_id: task.task_id, freeze_seq: spec.freeze_seq,
+        review_floor_seq: spec.evidence_floor_seq.review } });
+      expect(db.checkPushReadiness({ ...bind, head_sha: empty }).missing.join(" ")).toContain("baseline-to-HEAD");
       delete yaml.extensions.verification;
       writeFileSync(file, stringify(yaml));
       expect(secondCheck().ready).toBe(false);

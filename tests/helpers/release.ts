@@ -101,7 +101,11 @@ export function feature(repo: string, n: number) {
   const wt = join(root, repo + ".worktrees", String(n));
   git(dir, "worktree", "add", "-b", branch, wt, "main");
   const base = git(wt, "rev-parse", "HEAD");
-  git(wt, "commit", "--allow-empty", "-m", "feature");
+  const path = `src/feature-${n}.ts`;
+  mkdirSync(join(wt, "src"), { recursive: true });
+  writeFileSync(join(wt, path), `export const feature = ${n};\n`);
+  git(wt, "add", "--", path);
+  git(wt, "commit", "-m", "feature", "--", path);
   const head = git(wt, "rev-parse", "HEAD"),
     url = "https://github.com/acme/" + basename(repo) + "/pull/" + n;
   ledger.openTask({

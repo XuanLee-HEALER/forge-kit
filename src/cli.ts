@@ -493,7 +493,9 @@ function inspectWorkbench(root: string) {
       issues.push({
         level: "error",
         check: "bins",
-        message: "Missing or inaccessible " + path + "; run forge sync",
+        message: "Missing or inaccessible " + path +
+          ". If the file exists but cannot be read, restore read permission or move it aside. " +
+          "From the forge-kit release directory, run ./bin/forge sync " + Bun.$.escape(root),
       });
     }
   }

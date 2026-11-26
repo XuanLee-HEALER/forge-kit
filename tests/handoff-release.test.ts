@@ -351,7 +351,7 @@ test("automatic batches and session hints select only unreserved handoffs", () =
   cmd("handoff", b.task);
   const context = () => handleLedgerHook(root, { hook_event_name: "SessionStart", cwd: root }).sessionContext;
   expect(context()).toContain(
-    'Handoffs awaiting release: 1 (run ledger release create --from-handoffs --title "<title>")',
+    'Handoffs awaiting release: 1 (run forge ledger release create --from-handoffs --title "<title>")',
   );
   expect(rejects("release", "create", "--tasks", a.task, "--title", "dup")).toContain(first);
   expect(rejects("release", "create", "--prs", "api#1", "--title", "dup")).toContain(first);

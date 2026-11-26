@@ -115,7 +115,7 @@ test("PR follow-up requires remote confirmation for the new branch head", () => 
       sha: next, payload: { kind: "pr", status: "pass", summary: "legacy PR" } });
   }
   expect(readiness(next).ready).toBe(false);
-  expect(() => ledger.closeTask({ task_id: "fix" })).toThrow("ledger pr-sync");
+  expect(() => ledger.closeTask({ task_id: "fix" })).toThrow("forge ledger pr-sync");
   expect(sync(next).exitCode).toBe(0);
   expect(JSON.parse(ledger.getTaskEvents("fix").at(-1)!.payload_json).meta).toMatchObject({ pr_url: "https://github.com/acme/svc/pull/23", pr_head_oid: next });
   expect(ledger.getTaskRepos("fix")[0].head_sha).toBe(next);

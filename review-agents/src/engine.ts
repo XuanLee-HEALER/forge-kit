@@ -15,7 +15,7 @@ type Finding = ReturnType<typeof validateReport>["findings"][number];
 type Attempt = { backend: Backend; status: Status; reason?: string };
 type RoleReport = {
   role: Role; base: string; head: string; status: Status; backend: Backend | null;
-  findings: Finding[]; summary: string; attempts: Attempt[];
+  missing_materials?: string[]; findings: Finding[]; summary: string; attempts: Attempt[];
 };
 
 export const reviewOptions = {
@@ -75,6 +75,7 @@ export async function runReview(params: Option & {
   const repo = new Repo(params.repo, params.base, params.head);
   const { base, head } = repo;
   repo.git(["merge-base", "--is-ancestor", base, head]);
+  if (!repo.files.length && !repo.excludedFiles.length) throw Error("Empty review diff; select a range containing changes");
   const material = materials(repo);
   let context: ReturnType<Repo["context"]> | undefined;
   if (!material.missing.length) {
@@ -93,7 +94,7 @@ export async function runReview(params: Option & {
     const common = { role, base, head };
     const missing = [...material.missing];
     if (role === "business" && !spec) missing.push("spec");
-    if (missing.length) return { ...common, backend: null, findings: [], attempts: [], summary: "Missing review material: " + missing.join(", "), status: "incomplete" };
+    if (missing.length) return { ...common, backend: null, missing_materials: missing, findings: [], attempts: [], summary: "Missing review material: " + missing.join(", "), status: "incomplete" };
     const prompt = JSON.stringify({ role, base, head, instructions: instructions(role, repo.files), spec: spec ?? null, diff: material.diff, context });
     const model = params.models?.[role] ?? params.model ?? { model: process.env.REVIEW_MODEL || "gpt-6.2-sol", effort: "medium" };
     const attempts: Attempt[] = [];

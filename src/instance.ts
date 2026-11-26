@@ -274,18 +274,23 @@ export function resolveInstance(root: string, kitRoot: string) {
 
 // Configured paths use the workbench namespace. Only paths belonging to the
 // target repository are projected into its isolated checkout.
-export function verificationStageCwd(root: string, repo: string, checkout: string, cwd: string, repos: string[]) {
+export function verificationDirectory(root: string, repo: string, cwd: string, repos: string[]) {
   const configured = localPath(root, cwd);
-  if (configured === root) return checkout;
+  if (configured === root) return { target: "checkout", path: "." } as const;
   const path = relative(root, configured);
   const owner = [repo, ...repos].map(r => relative(root, localPath(root, r)))
     .filter(r => r && (path === r || path.startsWith(r + "/")))
     .sort((a, b) => b.length - a.length)[0];
   const target = relative(root, localPath(root, repo));
   if (owner && owner !== target) throw Error("Verification cwd belongs to another repository: " + cwd);
-  if (!owner && (target || path === ".workbench" || path.startsWith(".workbench/"))) return configured;
-  const subdir = relative(localPath(root, repo), configured);
-  const mapped = subdir ? localPath(checkout, subdir) : checkout;
+  if (!owner && (target || path === ".workbench" || path.startsWith(".workbench/"))) return { target: "instance", path: configured } as const;
+  return { target: "checkout", path: relative(localPath(root, repo), configured) || "." } as const;
+}
+
+export function verificationStageCwd(root: string, repo: string, checkout: string, cwd: string, repos: string[]) {
+  const directory = verificationDirectory(root, repo, cwd, repos);
+  if (directory.target === "instance") return directory.path;
+  const mapped = localPath(checkout, directory.path);
   if (!statSync(mapped, { throwIfNoEntry: false })?.isDirectory())
     throw Error("Verification cwd missing from the selected commit: " + cwd);
   return mapped;

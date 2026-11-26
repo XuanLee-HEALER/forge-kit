@@ -184,7 +184,7 @@ for (const [path, content, why] of [
 test("rename checks source and destination; gitlinks are outside file budget", () => {
   const f = feature("api", 1),
     policy = loadShipPolicy(root).policy;
-  mkdirSync(join(f.wt, "src"));
+  mkdirSync(join(f.wt, "src"), { recursive: true });
   git(f.wt, "mv", "tracked.sql", "src/renamed.ts");
   git(f.wt, "commit", "-m", "rename");
   expect(() =>

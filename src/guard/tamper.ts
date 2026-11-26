@@ -60,7 +60,7 @@ export function checkLedgerTamper(
     const abs = resolve(baseWorkdir, rawPath);
     if (input.tool_name !== "Read" && canonicalizeMaybePath(abs) === policyPath) return "ship-policy.yaml requires an operator edit.";
     if (cfg.guard.block_ledger_direct_edits && (abs === ledgerDir || abs.startsWith(ledgerDir + "/"))) {
-      return "物理保险丝：禁止直接修改 .workbench/ledger/ 下的账本文件，请使用 ledger CLI。";
+      return "物理保险丝：禁止直接修改 .workbench/ledger/ 下的账本文件，请使用 forge ledger CLI。";
     }
   }
 
@@ -100,14 +100,14 @@ export function checkLedgerTamper(
       if (!SQL_WRITE_RE.test(seg) && !hasUnquotedRedirect(seg, ">") && !/\bpragma\b/i.test(seg)) {
         continue;
       }
-      return "物理保险丝：禁止通过 sqlite3 写/修改 .workbench/ledger/ 账本数据库，请使用 ledger CLI。";
+      return "物理保险丝：禁止通过 sqlite3 写/修改 .workbench/ledger/ 账本数据库，请使用 forge ledger CLI。";
     }
 
     const hasMutation =
       /\b(rm|mv|cp|truncate|chmod|python3?|perl|sed|awk|tee|dd|bun|node)\b/.test(seg) ||
       hasUnquotedRedirect(seg, ">");
     if (hasMutation) {
-      return "物理保险丝：禁止通过 Shell 直接修改或删除 .workbench/ledger/ 原始文件，请使用 ledger CLI（如 ledger prune）。";
+      return "物理保险丝：禁止通过 Shell 直接修改或删除 .workbench/ledger/ 原始文件，请使用 forge ledger CLI（如 forge ledger prune）。";
     }
   }
   return null;

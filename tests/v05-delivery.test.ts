@@ -165,7 +165,7 @@ await Bun.write(args[args.indexOf("-o")+1],JSON.stringify({status:"pass",summary
   return {ledger, repo, head, base, bare, state, ci, calls};
 }
 
-type RolloutMode = "success" | "failure" | "pending" | "wrong-version";
+type RolloutMode = "success" | "failure" | "pending" | "wrong-version" | "rejected";
 
 function configureStage(localRollout: RolloutMode, head: string, base: string, endpoint: string, stage: string) {
   const cfgPath = join(s.work, ".workbench/workbench.yaml");
@@ -175,6 +175,7 @@ function configureStage(localRollout: RolloutMode, head: string, base: string, e
 const plan = await Bun.file("release-plan.json").json();
 const mode = process.argv[3];
 appendFileSync("stage-effects", plan.head+"\\n");
+if (mode==="rejected") process.exit(17);
 const ticket = {action_id:process.env.FORGE_ACTION_ID, endpoint:process.env.FORGE_ENDPOINT,
   state:mode==="pending"?"pending":mode==="failure"?"failed":"completed",
   versions:[{repo:plan.repo,head:mode==="wrong-version"?process.argv[4]:plan.head}]};
@@ -366,6 +367,22 @@ for (const mode of ["success", "failure"] as const) {
     expect(after.receipts).toEqual(report.receipts);
   }, 90_000);
 }
+
+test("T11 rejected submission with absent target degrades immediately and cannot replay", () => {
+  const f = delivery("rejected");
+  f.approve();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const run = s.run(f.shipArgs);
+    expect(run.code, run.out + run.err).not.toBe(0);
+    const report = JSON.parse(run.out || run.err);
+    expect(report.status).toBe("DEGRADED");
+    expect(report.reason.message).toContain("rollout submission exited with code 17");
+    expect(report.reason.message).toContain(f.envelope + "/1 absent");
+    expect(report.receipts.map((item: {status:string}) => item.status)).toEqual(["confirmed", "claimed"]);
+    expect(existsSync(f.targetState)).toBe(false);
+    expect(readFileSync(f.receipt, "utf8")).toBe(f.head + "\n");
+  }
+}, 90_000);
 
 for (const change of ["script", "arguments", "later-stage", "declared-input"]) {
   test(`T11 exact stage preflight stops all effects after ${change} changes`, () => {

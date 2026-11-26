@@ -23,9 +23,12 @@ function oldInstance() {
     writeFileSync(join(dir, "SKILL.md"), "legacy review material " + id);
   }
   writeFileSync(join(legacy, "review-agents/package.json"), JSON.stringify({name: "local-review-fixture", private: true, scripts: {build: "true"}}));
-  s.privateFile(".workbench/models.toml", '[tiers.standard]\nmodel = "fixture-standard"\neffort = "high"\n');
+  s.privateFile(".workbench/models.toml", '[tiers.standard]\nmodel = "previous-standard"\neffort = "low"\n');
   const init = JSON.parse(s.ok([join(legacy, "bin/forge"), "init", s.work, "--packs", "dbop,comm-lark"]));
   expect(init.lock.kit_version).toBe("0.4.1");
+  expect(s.read(".codex/config.toml")).toContain('model = "previous-standard"');
+  // The private change has not gone through v0.4 sync yet.
+  s.privateFile(".workbench/models.toml", '[tiers.standard]\nmodel = "fixture-standard"\neffort = "high"\n');
   const ledger = (...args: string[]) => s.ok([join(s.work, ".workbench/bin/ledger"), ...args]);
   s.privateFile("app/tests/example.test.ts", 'import {expect,test} from "bun:test"; test("fixture", ()=>expect(2+2).toBe(4));\n');
   s.git(join(s.work, "app"), "init", "-b", "active");
@@ -143,6 +146,18 @@ for (const invalid of [false, true]) {
     const old = snapshot();
     const preserved = privateState(privateFiles);
     if (invalid) {
+      const config = join(s.work, ".codex/config.toml");
+      const original = readFileSync(config, "utf8");
+      const oldLock = readFileSync(join(s.work, ".workbench/kit-lock.json"));
+      for (const edited of [original.replace("previous-standard", "manual-model"), original + "# local change\n"]) {
+        writeFileSync(config, edited);
+        const conflict = s.run([bootstrap, "sync", s.work]);
+        expect(conflict.code).not.toBe(0);
+        expect(conflict.err + conflict.out).toContain("Ownership conflict");
+        expect(readFileSync(config, "utf8")).toBe(edited);
+        expect(readFileSync(join(s.work, ".workbench/kit-lock.json"))).toEqual(oldLock);
+      }
+      writeFileSync(config, original);
       writeFileSync(file, "extensions: [\n");
       const broken = privateState([file]);
       const result = s.run([bootstrap, "sync", s.work]);
@@ -164,6 +179,7 @@ for (const invalid of [false, true]) {
       expect(snapshot(old.schema)).toEqual(old);
       expect(privateState(privateFiles)).toEqual(preserved);
       expect(readFileSync(file)).toEqual(good);
+      expect(Bun.TOML.parse(s.read(".codex/config.toml"))).toMatchObject({model: "fixture-standard", model_reasoning_effort: "high"});
       for (const [agent, model, effort] of [
         ["implementer", "fixture-standard", "high"],
         ["scanner", "gpt-6.1-terra", "medium"],

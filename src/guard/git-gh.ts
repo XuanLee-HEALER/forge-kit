@@ -328,7 +328,7 @@ export function checkGitPhysicalFuse(
           ) {
             continue;
           }
-          return `物理保险丝：禁止未批准推送生产发布 tag (${refspec})，请先用 \`ledger runbook create\` 生成发版单并经用户在对话中回复「批准 <runbook_id>」后再推送。`;
+          return `物理保险丝：禁止未批准推送生产发布 tag (${refspec})，请先用 \`forge ledger runbook create\` 生成发版单并经用户在对话中回复「批准 <runbook_id>」后再推送。`;
         }
         if (protectedBranches.has(cleanRef)) {
           return `物理保险丝：禁止直接推送到受保护主分支 (${cleanRef})，请提 PR 由用户合并。`;

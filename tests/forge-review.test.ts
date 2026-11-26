@@ -11,6 +11,8 @@ beforeEach(() => {
   for (const name of ["scope", "ssot", "tech-spec", "test-spec"]) writeFileSync(join(docs, name + ".md"), "Fixture requirements");
   const frozen = f.cli("ledger", [ "freeze", "task"]);
   expect(frozen.exitCode, frozen.stderr.toString()).toBe(0);
+  writeFileSync(join(f.repo, "code.txt"), "updated");
+  f.git("commit", "-m", "implement fixture", "--", "code.txt");
   codex = join(f.root, "test-codex");
   writeFileSync(codex, [
     "#!/usr/bin/env bun",
@@ -34,7 +36,7 @@ test("ordered review records only actual roles against the pinned task and versi
   expect(records).toHaveLength(2);
   for (const record of records) {
     expect(record.source).toBe("tool");
-    expect(record.meta.head).toBe(f.head);
+    expect(record.meta.head).toBe(f.git("rev-parse", "HEAD"));
     expect(record.meta.review_task_id).toBe("task");
     expect(record.meta.report_status).toBe("pass");
     expect(record.meta.backend).toBe("codex");
@@ -42,7 +44,7 @@ test("ordered review records only actual roles against the pinned task and versi
 });
 test("a dirty checkout during review produces no trusted evidence", () => {
   const r = run(["--roles", "quality"], { MUTATE_REPO: f.repo });
-  expect(r.exitCode).not.toBe(0);
+  expect(r.exitCode).toBe(2);
   expect(f.evidence().filter(e => e.kind === "review")).toHaveLength(0);
 });
 test("an invalid explicit version cannot start a review", () => {

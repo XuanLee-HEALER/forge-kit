@@ -115,7 +115,7 @@ export function checkLedgerGate(
         const destinations = parsedPush.refspecs.map(ref =>
           ref.replace(/^\+/, "").split(":").at(-1)!.replace(/^refs\/heads\//, ""));
         if ((handedOff.size && parsedPush.hasPrune) || destinations.some(branch => handedOff.has(branch)))
-          return "分支已交接，修改远端目标前请先执行 ledger resume。";
+          return "分支已交接，修改远端目标前请先执行 forge ledger resume <task_id>。";
         if (reason) return `账本门禁：${reason}`;
         if (parsedPush.hasAllOrMirror) {
           return "账本门禁（fail-closed）：禁止 `git push --all` / `--branches` / `--mirror` 或批量 refspec，请显式指定目标分支。";
@@ -217,7 +217,7 @@ export function checkLedgerGate(
         const deliveryDetached = target.isDetached;
 
         const owner = !deliveryDetached && handedOffOwner(ledger,loc.repo,deliveryBranch);
-        if (owner) return "分支已交接，继续开发请执行 ledger resume " + owner.task_id;
+        if (owner) return "分支已交接，继续开发请执行 forge ledger resume " + owner.task_id;
         const openTasks = deliveryDetached
           ? ledger.findOpenTasksByRepoCommits(loc.repo, getHeadAndParents(loc.checkoutDir))
           : ledger.findOpenTasksByRepoBranch(loc.repo, deliveryBranch);
@@ -287,7 +287,7 @@ export function checkLedgerGate(
           if (openTasks.length === 0) {
             return (
               `账本门禁：${loc.repo} (${deliveryBranch}${deliveryDetached ? " detached" : ""}) 尚未绑定有效开发账本（或豁免未绑定当前 SHA ${deliverySha.slice(0, 8)}），禁止直接执行 ${isGitPush ? "git push" : "gh pr create"}。\n` +
-              `请先绑定账本（跨仓或独立 FAT 分支可用 ledger attach；极小无逻辑改动须登记当前 SHA 的合规 exempt）。`
+              `请先绑定账本（跨仓或独立 FAT 分支可用 forge ledger attach；极小无逻辑改动须登记当前 SHA 的合规 exempt）。`
             );
           }
           if (openTasks.length > 1) {

@@ -87,7 +87,7 @@ Commands:
         const meta = evidence.meta ?? {};
         return [{ seq: event.seq, repo: event.repo, branch: event.branch, base: meta.base,
           head: event.sha, role: meta.role, status: meta.report_status ?? evidence.status,
-          backend: meta.backend, source: evidenceSource(evidence, event.actor), summary: evidence.summary }];
+          backend: meta.backend, attempts: meta.attempts, missing_materials: meta.missing_materials, source: evidenceSource(evidence, event.actor), summary: evidence.summary }];
       });
       console.log(JSON.stringify(records, null, 2));
       return;
@@ -372,7 +372,7 @@ Commands:
       }
       const manualKinds = ["fat", "prod", "verify", "deploy", "smoke", "manual", "note"] as const;
       const kind = manualKinds.find(kind => kind === values.kind);
-      if (!kind) throw new Error("ledger record accepts manual attestations only; run the actual verification or review tool for executable evidence.");
+      if (!kind) throw new Error("forge ledger record accepts manual attestations only; run the actual verification or review tool for executable evidence.");
       const parsedMeta = values.meta ? JSON.parse(values.meta) : {};
       const ev = ledger.recordEvidence({
         task_id,
@@ -664,7 +664,7 @@ Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <ru
         if (!id) throw new Error("Usage: forge ledger runbook revoke <runbook_id>");
         console.log(JSON.stringify(ledger.revokeRunbook(id), null, 2));
       } else {
-        throw new Error(`Unknown ledger runbook subcommand: ${sub}`);
+        throw new Error(`Unknown forge ledger runbook subcommand: ${sub}`);
       }
     } else {
       throw new Error(`Unknown ledger command: ${cmd}`);

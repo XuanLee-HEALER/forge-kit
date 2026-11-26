@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
 import { executorFixture } from "./helpers/executor";
@@ -51,8 +51,9 @@ test("custom and core stages execute in declaration order against one isolated r
   const output = join(f.root, "adapter-result.json");
   writeFileSync(join(adapters, "check.ts"),
     "#!/usr/bin/env bun\nawait Bun.write(" + JSON.stringify(output) + ", JSON.stringify({cwd:process.cwd(), checkout:process.env.FORGE_VERIFY_CHECKOUT, environment:process.env.FORGE_VERIFY_ENVIRONMENT}));", {mode:0o755});
+  writeFileSync(join(adapters, "rules.txt"), "fixture input\n");
   config.extensions.actions.first.cwd = "service";
-  config.extensions.actions.last = { cwd: ".workbench/actions", argv: ["./check.ts"], purpose: "verify" };
+  config.extensions.actions.last = { cwd: ".workbench/actions", argv: ["./check.ts"], inputs: ["rules.txt"], purpose: "verify" };
   config.extensions.verification.environment = "fixture-lab";
   writeFileSync(file, stringify(config));
   const custom = f.cli("verify", []);
@@ -65,6 +66,15 @@ test("custom and core stages execute in declaration order against one isolated r
   expect(lastFirst[1]).toBe(adapter.checkout);
   expect(existsSync(adapter.checkout)).toBe(false);
 
+  const readiness = () => f.ledger.checkPushReadiness({ task_id: "task", repo: "service", branch: "feature", head_sha: f.git("rev-parse", "HEAD") }).missing;
+  for (const file of ["check.ts", "rules.txt"]) {
+    const old = f.evidence().at(-1).meta.policy_sha256;
+    appendFileSync(join(adapters, file), "\n// local change\n");
+    expect(readiness().join(" ")).toContain("Missing completed verification");
+    expect(f.cli("verify", []).exitCode).toBe(0);
+    expect(f.evidence().at(-1).meta.policy_sha256).not.toBe(old);
+    expect(readiness().join(" ")).not.toContain("Missing completed verification");
+  }
   const before = f.evidence().at(-1);
   const executable = join(adapters, "check.ts");
   renameSync(executable, executable + ".saved");
@@ -74,7 +84,6 @@ test("custom and core stages execute in declaration order against one isolated r
     startup_failure: true, failed_phase: "instance configuration", freeze_seq: before.meta.freeze_seq,
   } });
   renameSync(executable + ".saved", executable);
-  const readiness = () => f.ledger.checkPushReadiness({ task_id: "task", repo: "service", branch: "feature", head_sha: f.git("rev-parse", "HEAD") }).missing;
   expect(readiness().join(" ")).toContain("latest verify failed");
   expect(f.cli("verify", []).exitCode).toBe(0);
   expect(readiness().join(" ")).not.toContain("latest verify failed");
@@ -83,4 +92,47 @@ test("custom and core stages execute in declaration order against one isolated r
   writeFileSync(file, stringify(config));
   expect(f.cli("verify", []).exitCode).toBe(1);
   expect(f.evidence().at(-1)).toMatchObject({ kind: "verify", status: "fail", meta: { stages: [{ stage: "before", exit_code: 9 }] } });
+});
+
+test("an isolated Bun install uses the designated cache after the private fixture registry stops", async () => {
+  const pkg = join(f.root, "fixture-package");
+  const cache = join(f.root, "dependency-cache");
+  mkdirSync(pkg);
+  const manifest = { name: "forge-fixture-parser", version: "1.0.0", main: "index.js" };
+  writeFileSync(join(pkg, "package.json"), JSON.stringify(manifest));
+  writeFileSync(join(pkg, "index.js"), "export default 17;");
+  const archive = join(f.root, "fixture.tgz");
+  const pack = Bun.spawnSync([process.execPath, "pm", "pack", "--ignore-scripts", "--filename", archive], {cwd: pkg});
+  expect(pack.exitCode, pack.stderr.toString()).toBe(0);
+  const tarball = readFileSync(archive);
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
+    if (request.url.endsWith(".tgz")) return new Response(tarball);
+    return Response.json({ name: manifest.name, "dist-tags": {latest: "1.0.0"}, versions: {"1.0.0": {
+      ...manifest, dist: {tarball: new URL("/fixture.tgz", request.url).href},
+    }}});
+  }});
+  try {
+    writeFileSync(join(f.repo, "package.json"), JSON.stringify({ dependencies: { [manifest.name]: "1.0.0" } }));
+    writeFileSync(join(f.repo, "bunfig.toml"), '[install]\nregistry = ' + JSON.stringify(server.url.href) + '\n');
+    writeFileSync(join(f.repo, ".gitignore"), "node_modules/");
+    writeFileSync(join(f.repo, "cached.test.ts"), [
+      'import {test,expect} from "bun:test"; import value from "forge-fixture-parser";',
+      'test("isolated dependency", () => { expect(value).toBe(17); expect(process.env.SYNTHETIC_OPERATOR_TOKEN).toBeUndefined(); expect(process.env.BUN_INSTALL_CACHE_DIR).toBeUndefined(); });',
+    ].join("\n"));
+    const install = Bun.spawn([process.execPath, "install", "--cache-dir", cache, "--ignore-scripts"], {cwd: f.repo, stdout: "ignore", stderr: "pipe"});
+    const [code, text] = await Promise.all([install.exited, new Response(install.stderr).text()]);
+    expect(code, text).toBe(0);
+  } finally { server.stop(true); }
+  f.git("add", "--", ".gitignore", "package.json", "bunfig.toml", "cached.test.ts", "bun.lock");
+  f.git("commit", "-m", "offline fixture");
+  const docs = join(f.root, ".workbench/specs/task");
+  mkdirSync(docs, { recursive: true });
+  writeFileSync(join(docs, "scope.md"), "Exercise preloaded packages.");
+  f.ledger.freezeSpec({ task_id: "task" });
+  const args = ["--kind", "test", "--", "bun", "test"];
+  const result = f.cli("verify", args, { BUN_INSTALL_CACHE_DIR: cache, SYNTHETIC_OPERATOR_TOKEN: "fixture" });
+  expect(result.exitCode, result.stderr.toString() + result.stdout.toString()).toBe(0);
+  const empty = f.cli("verify", args, { BUN_INSTALL_CACHE_DIR: join(f.root, "empty-cache") });
+  expect(empty.exitCode).not.toBe(0);
+  expect(empty.stderr.toString()).toContain("Cannot install locked verification dependencies");
 });

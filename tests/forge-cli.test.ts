@@ -34,7 +34,7 @@ let target: string;
 function copySourceKit(destination: string) {
   const source = join(import.meta.dir, "..");
   mkdirSync(destination);
-  for (const item of ["bin", "src", "core", "templates", "kit.toml", "package.json", "dist"]) {
+  for (const item of ["bin", "src", "core", "templates", "kit.toml", "package.json"]) {
     cpSync(join(source, item), join(destination, item), { recursive: true });
   }
   for (const subdir of ["src","prompts"]) cpSync(join(source,"review-agents",subdir),join(destination,"review-agents",subdir),{recursive:true});
@@ -258,6 +258,10 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     expect(()=>syncWorkbench({targetDir:root})).toThrow("Ownership conflict");
     expect(readFileSync(skill,"utf8")).toBe("private edit");
     for (const path of [agents,skill,bundle]) rmSync(path);
+    const broken = doctorWorkbench(root);
+    expect(broken.issues).toContainEqual(expect.objectContaining({
+      check:"bins",message:expect.stringContaining("From the forge-kit release directory, run ./bin/forge sync " + Bun.$.escape(broken.root)),
+    }));
     run(join(kit,"bin/forge"), ["sync", root]);
     expect(readFileSync(join(root, triagePath), "utf8")).toBe(triage);
     expect(readFileSync(agents, "utf8")).toBe(rendered);
@@ -308,6 +312,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     for (const file of ["bin/forge", "bin/cli.js"])
       rmSync(join(wb, file));
     // A source checkout must dispatch and install its current program even when dist is stale.
+    mkdirSync(join(kit, "dist"), {recursive: true});
     writeFileSync(join(kit,"dist/cli.js"), 'throw Error("stale management CLI");');
     const run = (exe: string, ...args: string[]) =>
       Bun.spawnSync([exe, ...args], { cwd: kit, env: { ...process.env, BUN_BIN: process.execPath } });

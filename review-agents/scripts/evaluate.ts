@@ -6,7 +6,7 @@ import { runReview } from "../src/engine";
 
 if (!process.argv.includes("--live")) {
   const p = Bun.spawnSync([process.execPath, "test", "tests/engine.test.ts"], { cwd: join(import.meta.dir, ".."), stdout: "inherit", stderr: "inherit" });
-  process.exit(p.exitCode);
+  process.exit(p.exitCode ?? 1);
 }
 
 const onlySample = process.argv.find(arg => arg.startsWith("--sample="))?.slice(9);
@@ -20,7 +20,7 @@ try {
     function git(...args: string[]) {
       const p = Bun.spawnSync(["git", "-C", repo, "-c", "user.name=Review fixture", "-c", "user.email=review@example.invalid", "-c", "commit.gpgsign=false", ...args], {
         env: { ...process.env, GIT_AUTHOR_DATE: "2024-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2024-01-01T00:00:00Z" } });
-      if (p.exitCode) throw Error(p.stderr.toString());
+      if (p.exitCode !== 0) throw Error(p.stderr.toString());
       return p.stdout.toString().trim();
     }
     git("init", "-q");

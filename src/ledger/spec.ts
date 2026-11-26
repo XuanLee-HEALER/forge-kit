@@ -128,7 +128,7 @@ export function freezeSpec(ledger: LedgerReader, params: {
     if (prevSpec.state === "FROZEN") {
       if (prevSpec.spec_dir && relDir !== prevSpec.spec_dir) {
         throw new Error(
-          `Cannot change spec_dir from ${prevSpec.spec_dir} to ${relDir} while spec is FROZEN; run \`ledger amend ${params.task_id} --scope requirement --reason "..."\` first`,
+          `Cannot change spec_dir from ${prevSpec.spec_dir} to ${relDir} while spec is FROZEN; run \`forge ledger amend ${params.task_id} --scope requirement --reason "..."\` first`,
         );
       }
       const changedDocs: string[] = [];
@@ -139,14 +139,14 @@ export function freezeSpec(ledger: LedgerReader, params: {
       }
       if (changedDocs.length > 0) {
         throw new Error(
-          `Cannot re-freeze drifted spec document(s) (${changedDocs.join(", ")}) without an explicit amendment; restore files or run \`ledger amend ${params.task_id} --scope ... --reason "..."\` first`,
+          `Cannot re-freeze drifted spec document(s) (${changedDocs.join(", ")}) without an explicit amendment; restore files or run \`forge ledger amend ${params.task_id} --scope ... --reason "..."\` first`,
         );
       }
       if (params.locked_test_globs !== undefined) {
         const dropped = prevSpec.locked_test_globs.filter((g) => !lockedGlobs.includes(g));
         if (dropped.length > 0) {
           throw new Error(
-            `Cannot remove locked test glob(s) (${dropped.join(", ")}) while spec is FROZEN; run \`ledger amend ${params.task_id} --scope test_spec --reason "..."\` first`,
+            `Cannot remove locked test glob(s) (${dropped.join(", ")}) while spec is FROZEN; run \`forge ledger amend ${params.task_id} --scope test_spec --reason "..."\` first`,
           );
         }
       }
@@ -172,7 +172,7 @@ export function freezeSpec(ledger: LedgerReader, params: {
       }
       if (unauthorizedDocs.length > 0) {
         throw new Error(
-          `Cannot re-freeze: out-of-scope spec document(s) changed (${unauthorizedDocs.join(", ")}) outside amend scope(s) [${[...scopes].join(", ")}]; restore them or add an authorizing \`ledger amend\``,
+          `Cannot re-freeze: out-of-scope spec document(s) changed (${unauthorizedDocs.join(", ")}) outside amend scope(s) [${[...scopes].join(", ")}]; restore them or add an authorizing \`forge ledger amend\``,
         );
       }
       if (!scopes.has("test_spec") && !scopes.has("invariant") && params.locked_test_globs !== undefined) {
@@ -186,7 +186,7 @@ export function freezeSpec(ledger: LedgerReader, params: {
     }
 
     if (prevSpec.drifted_locked_tests.length) {
-      throw new Error("冻结测试文件发生漂移 (" + prevSpec.drifted_locked_tests.join(", ") + ")，请恢复测试文件或执行 ledger amend --scope test_spec 后重新 freeze");
+      throw new Error("冻结测试文件发生漂移 (" + prevSpec.drifted_locked_tests.join(", ") + ")，请恢复测试文件或执行 forge ledger amend " + params.task_id + " --scope test_spec --reason <原因> 后重新运行 forge ledger freeze " + params.task_id);
     }
     const testsUnlocked = prevSpec.amend_scopes.some(scope => scope === "test_spec" || scope === "invariant");
     const snapshot = scanLockedTests(ledger, params.task_id, lockedGlobs, { amendedSnapshot: testsUnlocked });
@@ -265,7 +265,7 @@ export function amendSpec(ledger: LedgerReader, params: {
     );
   }
   if (!params.reason?.trim()) {
-    throw new Error("ledger amend requires a non-empty --reason");
+    throw new Error("forge ledger amend requires a non-empty --reason");
   }
 
   const ev = withImmediateTx(ledger.db, () => {
@@ -276,7 +276,7 @@ export function amendSpec(ledger: LedgerReader, params: {
     }
     const cur = getSpecState(ledger, params.task_id, { metadataOnly: true });
     if (cur.state === "NONE") {
-      throw new Error(`Task ${params.task_id} has no frozen spec yet; run ledger freeze first`);
+      throw new Error(`Task ${params.task_id} has no frozen spec yet; run forge ledger freeze ${params.task_id} first`);
     }
 
     const payload: SpecAmendedPayload = {

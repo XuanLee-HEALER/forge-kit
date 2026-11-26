@@ -97,7 +97,7 @@ export class Ledger {
       )
       .all(repo, branch, allowedTaskId) as Array<{ task_id: string; status: string }>;
     if (conflicts[0]?.status === "HANDED_OFF") {
-      throw Error("Branch " + repo + ":" + branch + " is owned by a handed-off task; run ledger resume " + conflicts[0].task_id);
+      throw Error("Branch " + repo + ":" + branch + " is owned by a handed-off task; run forge ledger resume " + conflicts[0].task_id);
     }
     if (conflicts.length > 0) {
       throw new Error(
@@ -435,7 +435,7 @@ export class Ledger {
       if (isDowngrade) {
         if (params.endpoint === "investigation") {
           throw new Error(
-            `Cannot downgrade development task ${params.task_id} (${task.endpoint}) to investigation; use 'ledger cancel --reason ...' or 'ledger close --force-incomplete --reason ...'`,
+            `Cannot downgrade development task ${params.task_id} (${task.endpoint}) to investigation; use 'forge ledger cancel ${params.task_id} --reason ...' or 'forge ledger close ${params.task_id} --force-incomplete --reason ...'`,
           );
         }
         if (!params.reason?.trim()) {
@@ -910,21 +910,21 @@ export class Ledger {
     const config = currentWorkflow ? installedInstance(this.workbenchRoot) : undefined;
     const customVerification = config && (config.verification.source !== "core" ||
       config.verification.value.stages.some(id => config.stages.get(id)?.source !== "core"));
-    const expectedPolicy = config ? verificationPolicy(config) : undefined;
+    const expectedPolicy = config ? verificationPolicy(this.workbenchRoot, params.repo, params.head_sha, config) : undefined;
     const specState = getSpecState(this, params.task_id, { delivery: params, closing });
     if (currentWorkflow && specState.state === "NONE") missing.push("A confirmed frozen specification is required for delivery");
     if (specState.drifted_locked_tests.length) {
       hasExplicitFailure = true;
-      missing.push("冻结测试文件发生漂移 (" + specState.drifted_locked_tests.join(", ") + ")，请恢复测试文件或执行 ledger amend --scope test_spec 后重新 freeze");
+      missing.push("冻结测试文件发生漂移 (" + specState.drifted_locked_tests.join(", ") + ")，请恢复测试文件或执行 forge ledger amend " + params.task_id + " --scope test_spec --reason <原因> 后重新运行 forge ledger freeze " + params.task_id);
     }
     if (specState.state === "AMENDED") {
       missing.push(
-        `spec is in AMENDED state (scope=${specState.amend_scope ?? "unknown"}); finish revisions and run \`ledger freeze ${params.task_id}\` before delivery`,
+        `spec is in AMENDED state (scope=${specState.amend_scope ?? "unknown"}); finish revisions and run \`forge ledger freeze ${params.task_id}\` before delivery`,
       );
     } else if (specState.state === "FROZEN" && specState.drifted_files.length > 0) {
       hasExplicitFailure = true;
       missing.push(
-        `frozen spec drifted on disk (${specState.drifted_files.join(", ")}); restore files or run \`ledger amend ${params.task_id} --scope ... --reason "..."\` then re-freeze`,
+        `frozen spec drifted on disk (${specState.drifted_files.join(", ")}); restore files or run \`forge ledger amend ${params.task_id} --scope ... --reason "..."\` then re-freeze`,
       );
     }
 
@@ -956,12 +956,12 @@ export class Ledger {
     if (unresolved) missing.push("Specify the attached branch to verify delivery evidence");
     if (task.verification_depth === "full" || (task.verification_depth === "targeted" && params.checkEndpoint)) {
       for (const r of attachments) if (!r.base_sha) {
-        missing.push(`review baseline missing: ledger attach ${params.task_id} --repo ${r.repo} --branch ${r.branch} --base <original-start-sha>`);
+        missing.push(`review baseline missing: forge ledger attach ${params.task_id} --repo ${r.repo} --branch ${r.branch} --base <original-start-sha>`);
       }
     }
     type BranchEvidence = {
       checks: Map<string, string>;
-      reviews: Map<string, {role: string; status: string}>;
+      reviews: Map<string, {role: string; status: string; baseline: boolean}>;
       endpoint?: string;
     };
     const byBranch = new Map<string | null, BranchEvidence>();
@@ -1021,15 +1021,16 @@ export class Ledger {
         }
         if (p.kind === "review") {
           if (currentWorkflow && (evidenceSource(p, ev.actor) !== "tool" ||
-              p.meta?.review_task_id !== params.task_id || p.meta.review_floor_seq !== floors.review)) continue;
+              p.meta?.review_task_id !== params.task_id || p.meta.freeze_seq !== specState.freeze_seq || p.meta.review_floor_seq !== floors.review)) continue;
           if (ev.seq < floors.review || !reviewMeetsFloor(p.status, p.meta, params.task_id, floors.review, reviewFloor?.ts, evidenceSource(p, ev.actor))) continue;
           const historical = branch ? [attachedAtEvent.get(branch)] : [...attachedAtEvent.values()];
           const current = branch ? repoAttachments.filter((r) => r.branch === branch) : [];
           const covered = (row: ReviewAttachment | undefined) =>
             !!row && coversReviewBase(this.workbenchRoot, row, p.meta?.base);
-          if (currentWorkflow || p.status === "fail" || (historical.length > 0 && historical.every(covered) && current.every(covered))) {
+          const coversBase = historical.length > 0 && historical.every(covered) && current.every(covered);
+          if (currentWorkflow || p.status === "fail" || coversBase) {
             const roleKey = normalizeReviewRole(p.meta?.role);
-            evidence.reviews.set(currentWorkflow ? JSON.stringify([p.meta?.base, roleKey]) : roleKey, { role: roleKey, status: p.status });
+            evidence.reviews.set(currentWorkflow ? JSON.stringify([p.meta?.base, roleKey]) : roleKey, { role: roleKey, status: p.status, baseline: coversBase && current.length > 0 });
           }
         }
         if (
@@ -1064,6 +1065,7 @@ export class Ledger {
     const failedRoles = new Set<string>();
     const latestByKind = new Map<string, string>();
     const passingRoles = new Set<string>();
+    let baselinePassed = false;
     let latestEndpointStatus: string | undefined;
     for (const [branch, evidence] of byBranch) {
       const eligible = attachments.length === 1 && branch === attachments[0].branch;
@@ -1071,9 +1073,12 @@ export class Ledger {
         if (status === "fail") failedKinds.add(kind);
         if (eligible && status === "pass") latestByKind.set(kind, status);
       }
-      for (const {role, status} of evidence.reviews.values()) {
+      for (const {role, status, baseline} of evidence.reviews.values()) {
         if (status === "fail") failedRoles.add(role);
-        if (eligible && (status === "pass" || status === "fallback")) passingRoles.add(role);
+        if (eligible && (status === "pass" || status === "fallback")) {
+          passingRoles.add(role);
+          if (baseline) baselinePassed = true;
+        }
       }
       if (evidence.endpoint === "fail" || (eligible && latestEndpointStatus !== "fail" && evidence.endpoint)) {
         latestEndpointStatus = evidence.endpoint;
@@ -1117,7 +1122,11 @@ export class Ledger {
         `latest review failed (${[...failedRoles].join(", ")}) for ${params.repo}@${params.head_sha.slice(0, 8)}`,
       );
     } else if (currentWorkflow) {
-      if (!passingRoles.size) missing.push("Independent review evidence required for this delivery version");
+      // Older executors could record a pass even for distinct commits with identical trees.
+      const base = attachments[0]?.base_sha;
+      if (!baselinePassed || !base || runGit(join(this.workbenchRoot, params.repo),
+        ["--no-replace-objects", "diff", "--quiet", "--no-ext-diff", "--ignore-submodules=none", base, params.head_sha, "--"]).code !== 1)
+        missing.push("Independent review evidence required for the nonempty task baseline-to-HEAD diff at the current freeze");
     } else if (task.verification_depth === "targeted") {
       // Targeted depth requires at least one independent review pass/fallback before delivery/close
       if (params.checkEndpoint && passingRoles.size === 0) {
@@ -1148,7 +1157,7 @@ export class Ledger {
       } else if (latestEndpointStatus !== "pass") {
         missing.push(
           `endpoint "${task.endpoint}" requires recorded ${task.endpoint} delivery evidence for ${params.repo}@${params.head_sha.slice(0, 8)}` +
-          (task.endpoint === "pr" ? `; run ledger pr-sync ${params.task_id} --repo ${params.repo} to verify the remote PR head` : ""),
+          (task.endpoint === "pr" ? `; run forge ledger pr-sync ${params.task_id} --repo ${params.repo} to verify the remote PR head` : ""),
         );
       }
     }
@@ -1220,7 +1229,7 @@ export class Ledger {
                   continue;
                 }
                 allMissing.push(
-                  `${r.repo}:${r.branch} live branch refs/heads/${r.branch} could not be resolved on disk (and recorded ${r.head_sha.slice(0, 8)} lacks full evidence; detach obsolete branch with 'ledger detach' if abandoned)`,
+                  `${r.repo}:${r.branch} live branch refs/heads/${r.branch} could not be resolved on disk (and recorded ${r.head_sha.slice(0, 8)} lacks full evidence; detach obsolete branch with 'forge ledger detach' if abandoned)`,
                   ...deliveredCheck.missing,
                 );
                 continue;
@@ -1228,7 +1237,7 @@ export class Ledger {
               // Fail closed: repo exists on disk, so an unresolvable/missing branch MUST NOT
               // silently close using unverified/stale stored head_sha!
               allMissing.push(
-                `${r.repo}:${r.branch} live branch refs/heads/${r.branch} could not be resolved on disk (if renamed/abandoned, run 'ledger detach ${params.task_id} --repo ${r.repo} --branch ${r.branch}')`,
+                `${r.repo}:${r.branch} live branch refs/heads/${r.branch} could not be resolved on disk (if renamed/abandoned, run 'forge ledger detach ${params.task_id} --repo ${r.repo} --branch ${r.branch}')`,
               );
               continue;
             }
@@ -1456,7 +1465,7 @@ export class Ledger {
     const quiet = count
       ? "Handoffs awaiting release: " +
         count +
-        ' (run ledger release create --from-handoffs --title "<title>")'
+        ' (run forge ledger release create --from-handoffs --title "<title>")'
       : "";
     if (!open.length) return quiet;
     const lines: string[] = ["[Workbench Active Task Ledgers]"];

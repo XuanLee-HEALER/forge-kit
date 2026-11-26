@@ -1,7 +1,7 @@
 import { verificationPolicy } from "./workflow-config";
 import { createHash } from "node:crypto";
 import { runVerificationProcess } from "./verification-process";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { mkdtempSync, mkdirSync, existsSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { runGit, runProcess } from "./git";
@@ -77,7 +77,10 @@ export function verifyCli(args: string[]) {
       const checkout = runGit(dir, ["-c", "advice.detachedHead=false", "checkout", "--detach", snap.head]);
       if (checkout.code) throw Error("Cannot select verification version: " + checkout.stderr);
       if (existsSync(join(dir, "bun.lock")) || existsSync(join(dir, "bun.lockb"))) {
-        const install = runProcess([process.execPath, "install", "--frozen-lockfile", "--ignore-scripts"], { cwd: dir, env: baseEnv, timeoutMs: 120_000 });
+        const cache = process.env.BUN_INSTALL_CACHE_DIR;
+        const installArgs = [process.execPath, "install", "--frozen-lockfile", "--ignore-scripts"];
+        if (cache) installArgs.push("--cache-dir", resolve(cache), "--offline", "--backend=copyfile");
+        const install = runProcess(installArgs, { cwd: dir, env: baseEnv, timeoutMs: 120_000 });
         if (install.code) throw Error("Cannot install locked verification dependencies: " + install.stderr);
       }
     }
@@ -104,7 +107,7 @@ export function verifyCli(args: string[]) {
       phase = "instance configuration";
       const config = modern ? resolveInstance(ledger.workbenchRoot, findKitRoot()) : undefined;
       environment = config?.verification.value.environment;
-      if (config) policyDigest = verificationPolicy(config);
+      if (config) policyDigest = verificationPolicy(ledger.workbenchRoot, snap.repo, snap.head, config);
       const stages = config?.verification.value.stages ?? ["verify"];
       if (config) {
         for (const id of stages) {
@@ -160,6 +163,11 @@ export function verifyCli(args: string[]) {
       const changes = runGit(dir, ["status", "--porcelain", "--untracked-files=no"]);
       if (current.code || current.stdout.trim() !== snap.head || changes.code || changes.stdout)
         throw Error("Verification changed the isolated checkout revision or tracked inputs");
+    }
+    if (policyDigest) {
+      const current = resolveInstance(ledger.workbenchRoot, findKitRoot());
+      if (verificationPolicy(ledger.workbenchRoot, snap.repo, snap.head, current) !== policyDigest)
+        throw Error("Configured verification inputs changed during this run");
     }
     recordAborted = undefined;
     const ok = !skipped && results.length > 0 && results.every(r => !r.exit_code);

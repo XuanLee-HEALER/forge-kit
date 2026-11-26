@@ -48,7 +48,7 @@ export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback
         .findLast(
           ({ event, payload }) => payload.kind === "pr" && evidenceSource(payload, event.actor) !== "manual",
         );
-      const hint = "Run ledger pr-sync " + task_id + " --repo " + repo + " --branch " + branch;
+      const hint = "Run forge ledger pr-sync " + task_id + " --repo " + repo + " --branch " + branch;
       if (
         receipt?.event.sha !== head ||
         receipt.payload.status !== "pass" ||
@@ -88,7 +88,7 @@ export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback
   });
   return withImmediateTx(ledger.db, () => {
     if (JSON.stringify(candidates()) !== JSON.stringify(initial))
-      throw Error("Handoff changed; repeat ledger pr-sync");
+      throw Error("Handoff changed; repeat forge ledger pr-sync");
     callbacks?.beforeRecord(items);
     const sql_owners: NonNullable<Snapshot["sql_owners"]> = [];
     const sql_files = sql.map((spec) => {

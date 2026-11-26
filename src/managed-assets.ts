@@ -102,6 +102,19 @@ function state(path: string) {
   if (!st.isFile()) return "directory";
   return hash(readRequired(path));
 }
+// v0.4 rendered each of these two files from the same tier but did not retain its values.
+const tierPeer: Record<string, string> = {
+  ".codex/config.toml": ".codex/agents/dev.toml",
+  ".codex/agents/dev.toml": ".codex/config.toml",
+  ".codex/agents/analyst.toml": ".codex/agents/spec-reviewer.toml",
+  ".codex/agents/spec-reviewer.toml": ".codex/agents/analyst.toml",
+};
+function tierTemplate(source: string, tier: string, model: string, effort: string) {
+  return source
+    .replace('model = "' + model + '"', 'model = "{{' + tier + '_MODEL}}"')
+    .replace('model_reasoning_effort = "' + effort + '"', 'model_reasoning_effort = "{{' + tier + '_EFFORT}}"');
+}
+
 function oldOwner(
   root: string,
   rel: string,
@@ -140,13 +153,25 @@ function oldOwner(
       : /analyst|spec-reviewer/.test(rel)
         ? "DEEP"
         : "STANDARD";
-    for (const [line, key] of [
-      ["model", tier + "_MODEL"],
-      ["model_reasoning_effort", tier + "_EFFORT"],
-    ]) {
-      source = source.replace(line + ' = "' + vars[key] + '"', line + ' = "{{' + key + '}}"');
+    if (matches(hash(tierTemplate(source, tier, vars[tier + "_MODEL"], vars[tier + "_EFFORT"])))) return true;
+    const peer = tierPeer[rel];
+    if (!peer) return false;
+    const peerPath = managedPath(root, peer);
+    if (!lstatSync(peerPath, { throwIfNoEntry: false })?.isFile()) return false;
+    const peerSource = readRequired(peerPath).toString();
+    // The private mapping can be newer than the last sync. Accept the previous values only
+    // when both complete projections reproduce their templates from the same supported release.
+    let values: Record<string, unknown>;
+    try {
+      values = Bun.TOML.parse(source) as Record<string, unknown>;
+    } catch {
+      return false;
     }
-    return matches(hash(source));
+    const { model, model_reasoning_effort: effort } = values;
+    if (typeof model !== "string" || typeof effort !== "string") return false;
+    const selfRevs = versions[hash(tierTemplate(source, tier, model, effort))];
+    const peerRevs = legacy[peer]?.[hash(tierTemplate(peerSource, tier, model, effort))];
+    return installedRevisions(lock).some(rev => selfRevs?.includes(rev) && peerRevs?.includes(rev));
   }
   return false;
 }

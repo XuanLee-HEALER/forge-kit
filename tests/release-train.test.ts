@@ -83,7 +83,7 @@ test("handoff, resume and batch release bind evidence, SQL, approvals and sweep 
   for (const hook_event_name of ["SessionStart", "PostCompact"]) {
     const res = handleLedgerHook(root, { hook_event_name, cwd: root });
     expect(res.sessionContext ?? res.compactMessage).toBe(
-      'Handoffs awaiting release: 1 (run ledger release create --from-handoffs --title "<title>")',
+      'Handoffs awaiting release: 1 (run forge ledger release create --from-handoffs --title "<title>")',
     );
   }
   expect(() =>

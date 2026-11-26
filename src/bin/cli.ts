@@ -4,8 +4,9 @@ import { emitPreToolUseDeny } from "../hook-io";
 import { GUARD_BUDGET_MS, GUARD_TIMEOUT_MESSAGE } from "../guard/evaluate";
 import { spawnSync } from "node:child_process";
 
+const [command, ...args] = process.argv.slice(2);
+
 async function main() {
-  const [command, ...args] = process.argv.slice(2);
   if (!["ledger", "review", "verify", "git", "ship", "guard", "ledger-hook", "dbcred", "cmdfmt", "lang-check"].includes(command)) {
     return runForgeCli();
   }
@@ -58,5 +59,5 @@ async function main() {
 
 main().catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
+  process.exitCode = command === "review" ? 2 : 1;
 });

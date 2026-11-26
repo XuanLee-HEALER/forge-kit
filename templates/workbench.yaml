@@ -44,7 +44,8 @@ guard:
   block_shared_worktree_ops: true
   block_ledger_direct_edits: true
 
-# Optional instance extensions. Paths are relative to this workbench.
+# Action cwd and skill override directories are relative to this workbench.
+# Each action input is relative to that action's cwd.
 # Omit extensions to verify a clean checkout and deliver via PR merge to main.
 # extensions:
 #   actions:

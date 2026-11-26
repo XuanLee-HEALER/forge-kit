@@ -38,13 +38,13 @@ export async function reviewCli(args: string[]) {
     ledger.db.transaction(() => {
       recheckExecution(ledger, snap);
       for (const result of report.roles) {
-        if (!result.attempts.length) continue;
         ledger.recordEvidence({
           task_id: snap.task_id, repo: snap.repo, branch: snap.branch, sha: head, actor: "tool", source: "tool",
           kind: "review", status: result.status === "pass" ? "pass" : "fail", summary: result.summary,
           meta: {
             role: result.role, base, head, execution_id: execution, started_at: started,
             review_task_id: snap.task_id, review_floor_seq: snap.floors.review, freeze_seq: snap.freeze_seq,
+            ...(result.missing_materials ? { missing_materials: result.missing_materials } : {}),
             backend: result.backend, attempts: result.attempts, report_status: result.status,
             findings: result.findings, findings_count: result.findings.length, fallback_used: result.attempts.length > 1,
           },

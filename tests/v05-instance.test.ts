@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { parse, stringify } from "yaml";
 import { kit, sandbox, type Sandbox } from "./v05-sandbox";
 
@@ -132,8 +132,27 @@ for (const error of ["yaml", "reference", "permissions"]) {
 
 test("T05/T12 portable distribution self-bootstraps outside the checkout", () => {
   const archive = join(s.root, "distribution.tgz");
-  s.ok(["bun", "pm", "pack", "--quiet", "--ignore-scripts", "--filename", archive], kit);
+  const source = join(s.root, "distribution-source");
+  // Build the working sources in isolation so neither package can reuse a previous bundle.
+  const paths = s.git(kit, "ls-files", "--cached", "--others", "--exclude-standard", "-z");
+  for (const path of paths.split("\0").filter(Boolean)) {
+    const input = join(kit, path);
+    if (!existsSync(input) || statSync(input).isDirectory()) continue;
+    const output = join(source, path);
+    mkdirSync(dirname(output), {recursive: true});
+    cpSync(input, output, {verbatimSymlinks: true});
+  }
+  for (const workspace of [".", "review-agents"]) {
+    const deps = join(workspace, "node_modules");
+    if (existsSync(join(kit, deps))) symlinkSync(join(kit, deps), join(source, deps));
+  }
+  mkdirSync(join(source, ".workbench"));
+  writeFileSync(join(source, ".workbench/private-marker"), "synthetic instance file");
+  s.ok(["bun", "run", "build"], source);
+  s.ok(["bun", "pm", "pack", "--quiet", "--ignore-scripts", "--filename", archive], source);
   const files = s.ok(["tar", "-tzf", archive], s.root).trim().split("\n");
+  expect(files).toContain("package/dist/cli.js");
+  expect(files).toContain("package/review-agents/dist/review.js");
   for (const path of files) {
     expect(path).not.toMatch(/^package\/(?:\.workbench|\.codex|\.agents|packs)(?:\/|$)/);
     expect(path).not.toMatch(/(?:^package\/AGENTS\.local\.md|v0\.5-requirements\.md|work-communication|form-ux\/|qa-polling)/);
