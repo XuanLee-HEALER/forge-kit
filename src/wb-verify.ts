@@ -8,7 +8,6 @@ import { tmpdir } from "node:os";
 import { runGit, runProcess } from "./git";
 import { usesV05 } from "./ledger/types";
 import { resolveInstance, runInstanceStage, verificationStageCwd } from "./instance";
-import { findKitRoot } from "./kit-root";
 import { isVerificationCommand, type VerificationKind as Kind } from "./verify-command";
 import { parseArgs } from "node:util";
 import { findWorkbenchRoot } from "./config";
@@ -25,6 +24,7 @@ export function verifyCli(args: string[]) {
     options: {
       ...targetOptions,
       mode: { type: "string" },
+      offline: { type: "boolean" },
       kind: { type: "string" },
     },
   });
@@ -82,7 +82,8 @@ export function verifyCli(args: string[]) {
       if (existsSync(join(dir, "bun.lock")) || existsSync(join(dir, "bun.lockb"))) {
         const cache = process.env.BUN_INSTALL_CACHE_DIR;
         const installArgs = [process.execPath, "install", "--frozen-lockfile", "--ignore-scripts"];
-        if (cache) installArgs.push("--cache-dir", resolve(cache), "--offline", "--backend=copyfile");
+        if (cache) installArgs.push("--cache-dir", resolve(cache), "--backend=copyfile");
+        if (values.offline) installArgs.push("--offline");
         const install = runProcess(installArgs, { cwd: dir, env: baseEnv, timeoutMs: 120_000 });
         if (install.code) throw Error("Cannot install locked verification dependencies: " + install.stderr);
       }
@@ -108,7 +109,7 @@ export function verifyCli(args: string[]) {
       else result(kind, argv, child.code, hash.digest("hex"));
     } else {
       phase = "instance configuration";
-      const config = modern ? resolveInstance(ledger.workbenchRoot, findKitRoot()) : undefined;
+      const config = modern ? resolveInstance(ledger.workbenchRoot) : undefined;
       environment = config?.verification.value.environment;
       if (config) policyDigest = verificationPolicy(ledger.workbenchRoot, snap.repo, snap.head, config);
       const stages = config?.verification.value.stages ?? ["verify"];
@@ -126,7 +127,7 @@ export function verifyCli(args: string[]) {
           const action = config.actions.get(custom.value.action);
           if (!action) throw Error("Missing verification action for stage " + stage);
           const hash = createHash("sha256");
-          const code = runInstanceStage(ledger.workbenchRoot, findKitRoot(), stage, { checkout: dir, head: snap.head, repo: snap.repo, config },
+          const code = runInstanceStage(ledger.workbenchRoot, stage, { checkout: dir, head: snap.head, repo: snap.repo, config },
             (stdout, stderr) => { hash.update(stdout).update(stderr); });
           results.push({ kind: "verify", stage, action: custom.value.action, command: ["forge", "instance", "run", stage],
             options_sha256: createHash("sha256").update(JSON.stringify([action.value, custom.value.options])).digest("hex"),
@@ -168,7 +169,7 @@ export function verifyCli(args: string[]) {
         throw Error("Verification changed the isolated checkout revision or tracked inputs");
     }
     if (policyDigest) {
-      const current = resolveInstance(ledger.workbenchRoot, findKitRoot());
+      const current = resolveInstance(ledger.workbenchRoot);
       if (verificationPolicy(ledger.workbenchRoot, snap.repo, snap.head, current) !== policyDigest)
         throw Error("Configured verification inputs changed during this run");
     }

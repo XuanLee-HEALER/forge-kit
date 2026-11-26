@@ -1,26 +1,53 @@
 [
   {
-    "id": "business", "role": "business", "spec": "The discount begins at 10 items, including exactly 10 items.",
+    "id": "business",
+    "role": "business",
+    "spec": "The discount begins at 10 items, including exactly 10 items.",
     "before": "export const discount = (count: number) => count >= 10;",
     "after": "export const discount = (count: number) => count > 10;",
-    "line": 1, "concept": "10|ten|十"
+    "line": 1,
+    "concepts": [
+      "\\b(?:10|ten)\\b|十件",
+      "discount|折扣|优惠",
+      "exclud|inclus|includ|qualif|miss(?:es|ing)?|los(?:e|es|t)|den(?:y|ied)|reject|fails? to|does not|>=\\s*10|不享受|漏掉|未覆盖|包含|不符合"
+    ]
   },
   {
-    "id": "quality", "role": "quality", "spec": "Return the arithmetic mean of 1 to 10,000 integer examination scores. Each score is in the closed range 0 through 100.",
+    "id": "quality",
+    "role": "quality",
+    "spec": "Return the arithmetic mean of 1 to 10,000 integer examination scores. Each score is in the closed range 0 through 100.",
     "before": "export const mean = (xs: number[]) => xs.reduce((a,b) => a+b, 0) / xs.length;",
     "after": "export const mean = (xs: number[]) => xs.reduce((a,b) => a+b, 0) / (xs.length - 1);",
-    "line": 1, "concept": "length|denominator|divi|分母|除"
+    "line": 1,
+    "concepts": [
+      "denominator|divid|divis|分母|除以|除零",
+      "(?:one|1) (?:fewer|less)|length\\s*-\\s*1|off.by.one|by zero|by 0\\b|number of (?:elements|scores)|single (?:score|element)|少一|减一|除零|元素个数"
+    ]
   },
   {
-    "id": "simplify", "role": "simplify", "spec": "Count distinct ids in one pass. Inputs routinely contain 100,000 unique keys.",
+    "id": "simplify",
+    "role": "simplify",
+    "spec": "Count distinct ids in one pass. Inputs routinely contain 100,000 unique keys.",
     "before": "export const count = (ids: string[]) => new Set(ids).size;",
     "after": "export const count = (ids: string[]) => ids.filter((id,i) => ids.indexOf(id) === i).length;",
-    "line": 1, "concept": "indexOf|quadratic|平方|二次|O\\(n"
+    "line": 1,
+    "concepts": [
+      "indexof|nested (?:scan|loop)|repeated (?:linear )?scan|重复扫描|嵌套",
+      "quadratic|\\bo\\(\\s*n\\s*(?:\\^\\s*2|²|\\*\\s*n)\\s*\\)|each (?:element|id)|every (?:element|id)|per (?:element|id)|平方|二次复杂度|每个元素"
+    ]
   },
   {
-    "id": "comments", "role": "comments", "spec": "The public function and its API documentation must agree on the required input unit, seconds.",
+    "id": "comments",
+    "role": "comments",
+    "spec": "The public function and its API documentation must agree on the required input unit, seconds.",
     "before": "/** Convert seconds to milliseconds. */\nexport const toMillis = (seconds: number) => seconds * 1000;",
     "after": "/** Accepts milliseconds and returns seconds. */\nexport const toMillis = (seconds: number) => seconds * 1000;",
-    "line": 1, "concept": "millis|seconds|毫秒|秒"
+    "line": 1,
+    "concepts": [
+      "\\bmilliseconds?\\b|毫秒",
+      "\\bseconds?\\b|(?<!毫)秒",
+      "\\b(?:comment|documentation|documented|docstring)\\b|文档|注释",
+      "revers|mismatch|contradict|incorrect|mislead|wrong|instead|requires seconds|seconds as (?:the )?input|seconds (?:to|into) milliseconds|相反|矛盾|错误|不一致|秒转毫秒"
+    ]
   }
 ]

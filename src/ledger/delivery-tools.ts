@@ -1,10 +1,10 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { canonicalRepoPath, loadModelsConfig } from "../config";
+import { canonicalRepoPath, loadModelsConfig, repoCardPath } from "../config";
 import { checkoutEnvironment, runGit, runProcess } from "../git";
-import { usesV05, type RunbookRecord } from "./types";
-import { inspectPr, verifiedPr } from "./pr";
+import { usesV05 } from "./types";
+import { verifiedPr } from "./pr";
 import { prRemoteRefs, reachableFromRefs, resolveTaskCheckout } from "./checkout";
 import { coversReviewBase } from "./review-range";
 import { getSpecState } from "./spec";
@@ -41,7 +41,7 @@ export function reviewNative(ledger: Ledger, task: string, repo: string, baseRef
   const started_at = new Date().toISOString();
   const spec = getSpecState(ledger, task, { metadataOnly: true });
   const context = [join(ledger.workbenchRoot, "AGENTS.md"), join(ledger.workbenchRoot, "AGENTS.local.md"),
-    join(ledger.workbenchRoot, ".workbench/repos", repo + ".md"), ...(spec.spec_dir ? [join(ledger.workbenchRoot, spec.spec_dir)] : [])]
+    repoCardPath(ledger.workbenchRoot, canonicalRepoPath(ledger.workbenchRoot, repo)), ...(spec.spec_dir ? [join(ledger.workbenchRoot, spec.spec_dir)] : [])]
     .filter(path => existsSync(path));
   const model = loadModelsConfig(ledger.workbenchRoot).tiers.standard;
   const tmp = mkdtempSync(join(tmpdir(), "forge-native-review-"));
@@ -122,46 +122,4 @@ export function syncPr(ledger: Ledger, task: string, repo: string, pr?: string, 
     return ledger.recordEvidence({ task_id: task, repo, branch: attachment.branch, sha: head, kind: "pr",
       source: "tool", actor: "tool", status: "pass", summary: data.url, meta: { state: data.state, pr_url: data.url, pr_head_oid: data.headRefOid, ...(mergedMain && {base_branch:"main",target_oid:mergedMain}) } });
   }).immediate();
-}
-
-export function matchesReleasePr(
-  root: string,
-  book: RunbookRecord,
-  repo: string,
-  pin: { url: string; head: string; branch: string; base: string; base_oid?: string; merged_oid?: string },
-) {
-  try {
-    const ledger = new Ledger(root);
-    let worktree: string | null = null;
-    try {
-      const release = ledger.db.query<{ release_id: string }, [string]>(
-        "SELECT release_id FROM releases WHERE runbook_id=?",
-      ).get(book.runbook_id);
-      const task = release
-        ? ledger.db.query<{ task_id: string }, [string, string, string, string, string]>(
-            `SELECT task_id FROM release_items
-             WHERE release_id=? AND repo=? AND branch=? AND expected_head_sha=? AND pr_url=?`,
-          ).get(release.release_id, repo, pin.branch, pin.head, pin.url)?.task_id
-        : book.task_id;
-      if (release && !task) return false;
-      if (task) {
-        const row = ledger.getTaskRepos(task).find((r) => r.repo === repo && r.branch === pin.branch);
-        if (!row) return false;
-        worktree = row.worktree;
-      }
-    } finally {
-      ledger.closeDb();
-    }
-    const { dir } = resolveTaskCheckout(root, { repo, branch: pin.branch, worktree });
-    const pr = inspectPr(dir, pin.branch, pin.url, process.env, 2500, { baseOid: !!pin.base_oid });
-    return (
-      !pin.merged_oid &&
-      pr.state === "OPEN" &&
-      pr.headRefOid === pin.head &&
-      pr.baseRefName === pin.base &&
-      (!pin.base_oid || pr.baseRefOid === pin.base_oid)
-    );
-  } catch {
-    return false;
-  }
 }

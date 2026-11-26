@@ -166,6 +166,10 @@ export function parseTomlFile<T>(filePath: string): T | null {
   return Bun.TOML.parse(raw) as T;
 }
 
+export function repoCardPath(root: string, repo: string): string {
+  return repo === "." ? join(root, ".workbench/root-repo.md") : join(root, ".workbench/repos", repo + ".md");
+}
+
 export function canonicalRepoPath(root: string, repo: string): string {
   const path = resolve(root, repo);
   return existsSync(path) ? relative(realpathSync(root),realpathSync(path)) || "." : relative(resolve(root),path) || ".";

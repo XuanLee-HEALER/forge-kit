@@ -1,5 +1,6 @@
 import { checkStagePin, observeStage, stageEnvironment } from "./stage-observation";
-import { mergePinnedHead } from "./conditional-merge";
+import { requireAtomicHost, mergeHostedPr } from "./atomic-pr";
+import { mergePinnedFat } from "./conditional-merge";
 import { diffScope, inspectMerge, deliveryDiff, git } from "./ship-diff";
 import { parseArgs } from "node:util";
 import { readFileSync } from "node:fs";
@@ -53,6 +54,7 @@ function checkEvidence(ledger: Ledger, e: Envelope, row: TaskRepoRecord, dir: st
 }
 type PrAction = Extract<ShipAction, { kind: "pr" }>;
 function checkedPr(dir: string, branch: string, a: PrAction) {
+  if (!isOid(a.tree)) throw Error("Runbook lacks the approved merge tree; register and approve a new runbook");
   const gh = process.env.FORGE_GH_BIN || "gh";
   const pr = inspectPr(dir, branch, String(a.number), process.env, undefined, {
     bin: gh,
@@ -93,12 +95,13 @@ function checkedPr(dir: string, branch: string, a: PrAction) {
   if (target.stdout.trim() !== oid)
     throw Error("Remote target changed after merge; inspect its ancestry before continuing");
   if (oid === a.head) {
+    if (git(dir, ["rev-parse", a.head + "^{tree}"]).trim() !== a.tree) throw Error("Fast-forward tree differs from approved merge tree");
     if (runGit(dir, ["merge-base", "--is-ancestor", a.baseOid, a.head]).code)
       throw Error("Fast-forward did not include approved base");
   } else {
-    const parents = api("git/commits/" + oid, '[.parents[].sha] | join(" ")');
-    if (parents.code || parents.stdout.trim() !== a.baseOid + " " + a.head)
-      throw Error("Merge parents differ from approved base and head");
+    const commit = api("git/commits/" + oid, '[.tree.sha, .parents[].sha] | join(" ")');
+    if (commit.code || commit.stdout.trim() !== [a.tree, a.baseOid, a.head].join(" "))
+      throw Error("Remote merge tree or parents differ from approved result");
   }
   return { merged: true, oid: String(oid) };
 }
@@ -178,9 +181,10 @@ function preflight(ledger: Ledger, e: Envelope) {
       throw Error("Expected one exact CI target per attached branch; recreate the runbook");
     const pr = merges[0],
       observation = checkedPr(dir, row.branch, pr);
-    if (!observation.merged) inspectMerge(row.repo, dir, pr.baseOid, pin.head, check);
-    else if (observation.oid === pin.head) check(row.repo, dir, pr.baseOid, pin.head);
-    else inspectMerge(row.repo, dir, pr.baseOid, pin.head, check);
+    if (!observation.merged && plan.actions.some(a => a.kind === "pr" && a.repo === row.repo))
+      requireAtomicHost(dir, pr);
+    if (inspectMerge(row.repo, dir, pr.baseOid, pin.head, check) !== pr.tree)
+      throw Error("Scope evaluation did not inspect the approved merge tree");
   }
   for (const a of plan.actions) {
     if (a.kind === "stage") checkStagePin(ledger.workbenchRoot, a);
@@ -287,9 +291,8 @@ function perform(
   if (a.kind === "fat") {
     const dir = dirs.get(a.repo)!;
     const diff = deliveryDiff(validateScope(ledger, e), JSON.parse(e.allowed_path_globs_json));
-    mergePinnedHead(
+    mergePinnedFat(
       dir,
-      "fat",
       a.baseOid,
       a.head,
       (sha, env) => {
@@ -309,16 +312,7 @@ function perform(
   if (a.kind === "pr" || a.kind === "tag") {
     const dir = dirs.get(a.repo)!;
     if (a.kind === "pr") {
-      const diff = deliveryDiff(validateScope(ledger, e), JSON.parse(e.allowed_path_globs_json));
-      mergePinnedHead(
-        dir,
-        a.base,
-        a.baseOid,
-        a.head,
-        (target, env) => diff(a.repo, dir, a.baseOid, target, env),
-        () => checkAuthorization(ledger, e.envelope_id),
-        plan.pins.find((pin) => pin.repo === a.repo)!.originHash,
-      );
+      mergeHostedPr(dir, a, () => checkAuthorization(ledger, e.envelope_id));
     } else {
       checkAuthorization(ledger, e.envelope_id);
       const result = runProcess(["git", "push", "--no-follow-tags", "origin", a.head + ":refs/tags/" + a.tag], {

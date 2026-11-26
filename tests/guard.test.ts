@@ -65,12 +65,17 @@ test("guard denies secret/raw, tunnels and release API writes and permits ordina
     "kubectl port-forward service/db 8000:8000",
     "gh api -X PATCH repos/acme/svc/git/refs/heads/test", "gh api repos/acme/svc/releases -f tag_name=v1",
     "gh api repos/acme/svc/pulls/42/merge -f body=value",
+    "gh api -X PUT repos/acme/svc/forge/atomic-pr/v1/pulls/42/merge",
+    "gh api --hostname git.example repos/acme/svc/forge/atomic-pr/v1/pulls/42/merge -f head=fixture",
+    "gh api -X POST https://git.example/api/v3/repos/acme/svc/forge/atomic-pr/v1/pulls/42/merge",
+    'gh api -X POST "$TARGET_ENDPOINT"', 'env -S "gh api -X POST repos/acme/app/issues"',
     "gh api -X POST https://git.example/api/v3/repos/acme/svc/releases", "gh api -p sample -X DELETE repos/acme/svc/releases/1", "gh api --preview sample -X POST repos/acme/releases/releases", "gh api graphql -f 'query=mutation { mergePullRequest(input: {}) { clientMutationId } }'",
     "gh api repos/acme/svc/releases/1 -iX DELETE", "gh api -iXDELETE repos/acme/svc/releases/1",
     "gh api -iF tag=v1 repos/acme/svc/releases", "gh api repos/acme/svc/releases -if tag=v1",
     "gh api -iZ repos/acme/svc/releases", "gh api repos/acme/svc/pulls/42/merge -X PUT",
     "gh api /api/graphql -F query=@missing", "gh api -X POST repos/acme/app/releases", "example-admin purge", "redis-cli FLUSHALL"]) expect(evaluatePreToolUse(wb, shellInput(cmd))).toBeTruthy();
-  for (const cmd of ["gh api repos/acme/svc/pulls/42/merge", "gh api https://api.github.com/repos/acme/svc/pulls/1/merge", "gh api repos/acme/svc/releases/1 -iX GET", "gh api -iH 'Accept: application/json' repos/acme/svc/releases",
+  for (const cmd of ['env -S "gh api -X GET repos/acme/app/issues"', "gh api --hostname git.example repos/acme/svc/forge/atomic-pr/v1/pulls/42/merge",
+    "gh api -X HEAD repos/acme/svc/forge/atomic-pr/v1/pulls/42/merge", "gh api repos/acme/svc/pulls/42/merge", "gh api https://api.github.com/repos/acme/svc/pulls/1/merge", "gh api repos/acme/svc/releases/1 -iX GET", "gh api -iH 'Accept: application/json' repos/acme/svc/releases",
     "gh api -X GET repos/acme/svc/pulls/42/merge", "gh api -iXHEAD repos/acme/svc/pulls/42/merge", "kubectl get pods", "gh api repos/acme/svc/releases", "gh api -X POST repos/acme/releases/issues", "gh api -X GET repos/acme/app/releases -f per_page=1", "gh api graphql -f 'query=query { viewer { login } }'", "gh api graphql -f 'query=query Repo($name: String!) { repository(name: $name, owner: \"acme\") { id } }' -f name=app", "gh api graphql -f 'query=query { search(query: \"subscription\", type: ISSUE, first: 1) { issueCount } }'", "gh api graphql -f 'query=query Nodes($ids: [ID!]!) { nodes(ids: $ids) { id } }' -F 'ids[]=abc'", "redis-cli PING"])
     expect(evaluatePreToolUse(wb, shellInput(cmd))).toBeNull();
 });

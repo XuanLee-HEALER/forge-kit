@@ -16,7 +16,7 @@
     "templates",
     "review-agents/README.md",
     "review-agents/evals/paired.json",
-    "review-agents/scripts/evaluate.ts",
+    "review-agents/scripts",
     "review-agents/tests",
     "bun.lock",
     "review-agents/tsconfig.json"

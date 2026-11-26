@@ -65,6 +65,18 @@ test("custom delivery and verification keep the configured receipts and each rev
         role: "business", base: middle, review_task_id: task.task_id, freeze_seq: spec.freeze_seq,
         review_floor_seq: spec.evidence_floor_seq.review } });
       expect(check().ready).toBe(true);
+      const priorFormat = JSON.parse(s.ok([s.forge, "ledger", "reviews", task.task_id]));
+      expect(priorFormat.filter((row: {kind: string}) => row.kind === "review_selection")).toHaveLength(1);
+      const stats = JSON.parse(s.ok([s.forge, "ledger", "stats", "--json"]));
+      expect(stats.reviews.business).toMatchObject({ pass: 1, fail: 0 });
+      db.recordEvidence({ ...bind, kind: "review_selection", status: "info", meta: {
+        role: "quality", base: middle, report_status: "incomplete", backend: null, attempts: [],
+        missing_materials: ["diff"], review_task_id: task.task_id, freeze_seq: spec.freeze_seq, review_floor_seq: spec.evidence_floor_seq.review } });
+      review(base, "pass");
+      expect(check().missing.join(" ")).toContain("Selected review incomplete (quality)");
+      expect(check().missing.join(" ")).not.toContain("latest review failed");
+      review(middle, "pass");
+      expect(check().ready).toBe(true);
       review(middle, "fail");
       review(base, "pass");
       expect(check().ready).toBe(false);

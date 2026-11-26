@@ -2,7 +2,6 @@ import { statSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkoutEnvironment, runGit, runProcess } from "./git";
-import { parseGitRemoteRepo, repoOrigin } from "./shared/gh-remote";
 import { git } from "./ship-diff";
 import { canonicalJson, sha256String } from "./ledger/types";
 
@@ -69,20 +68,21 @@ function withMergeObject<T>(
 export function prospectiveMerge(dir: string, base: string, head: string) {
   return withMergeObject(dir, base, head, (target) => target);
 }
-export function mergePinnedHead(
+export function prospectiveMergeTree(dir: string, base: string, head: string) {
+  return withMergeObject(dir, base, head, (target, env) =>
+    git(dir, ["rev-parse", target + "^{tree}"], env).trim(),
+  );
+}
+export function mergePinnedFat(
   dir: string,
-  branch: string,
   base: string,
   head: string,
   validate: (target: string, env: Record<string, string | undefined>) => void,
   authorize: () => void,
   expectedOrigin?: string,
 ) {
-  if (
-    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(base) ||
-    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(head) ||
-    runGit(dir, ["check-ref-format", "refs/heads/" + branch]).code
-  )
+  const branch = "fat";
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(base) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(head))
     throw Error("Invalid pinned Git reference");
   const temp = mkdtempSync(join(tmpdir(), "forge-conditional-push-"));
   try {
@@ -90,19 +90,7 @@ export function mergePinnedHead(
     const fetchUrl = git(dir, ["remote", "get-url", "--all", "origin"]).trim();
     if (expectedOrigin && sha256String(canonicalJson([fetchUrl, url])) !== expectedOrigin)
       throw Error("Approved remote changed before conditional update");
-    const destination = parseGitRemoteRepo(url),
-      source = repoOrigin(dir);
-    const sameTransport = branch === "fat" && url === fetchUrl && !url.includes("\n");
-    if (
-      !sameTransport &&
-      (!source ||
-        !destination ||
-        url.includes("\n") ||
-        destination.host !== source.host ||
-        destination.owner !== source.owner ||
-        destination.repo !== source.repo)
-    )
-      throw Error("Push transport must identify the exact approved PR repository");
+    if (url !== fetchUrl || url.includes("\n")) throw Error("Cannot verify exact FAT destination");
     const hook = git(dir, ["rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"]).trim();
     return withMergeObject(dir, base, head, (target, env) => {
       validate(target, env);
@@ -139,7 +127,7 @@ export function mergePinnedHead(
       );
       if (push.code)
         throw Error(
-          "Conditional PR update refused. Check the live base, existing hooks and remote branch protection; manual delivery may be required.",
+          "Conditional FAT update refused. Check the live base, existing hooks and remote branch protection; manual delivery may be required.",
         );
       return target;
     });

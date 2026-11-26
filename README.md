@@ -107,7 +107,7 @@ flowchart TD
 #### 4. 集成验证与交付
 - 集成验证在实例覆写指定的验证环境中运行集成测试、冒烟测试（按需含性能测试），修复直至 bug-free。
 - 默认交付终点为 PR 合并至主分支（`main`）；支持功能 thread 止于带见证的 PR 移交、由发布 thread 批量合并收口。
-- 多环境部署、发版标签、数据迁移等 CI/CD 流程由实例层挂载；高风险动作在确认精确 Runbook 后自动推进。
+- 多环境部署、发版标签、数据迁移等 CI/CD 流程由实例层挂载。PR 自动合并要求托管端在同一事务核验获批的 PR 状态、版本、合并内容与分支保护。公有 GitHub 的标准合并接口无法同时锁定目标分支 SHA，执行器在写入前转人工。[GitHub 合并接口参数](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
 
 ---
 
@@ -194,6 +194,8 @@ forge instance show skill ready --json
 forge instance run smoke
 ```
 
+技能查询读取实例上次成功同步的受管副本。修改或撤销私有技能覆写后，先运行同步再查询。原发行目录移动后，实例仍可查询和使用已交付的技能；下次同步从所需发行目录运行。
+
 ## 升级到 v0.5
 
 从新的发行目录运行 `./bin/forge sync <实例目录>`，再执行 `./bin/forge doctor <实例目录> --json`。对比迁移报告中的路径，遇到已改动的受管文件或归属不明的同名文件时，先保留内容，按实际归属迁入私有位置后再重试。账本、旧见证与私有脚本原位保留。旧实例的 `review-agents/` 可含私有修改，升级后使用新发行附带的引擎。
@@ -209,11 +211,11 @@ forge instance run smoke
 | ledger | forge ledger |
 | guard | forge guard |
 | ledger-hook | forge ledger-hook |
-| dbcred | 生产读用 `forge dbcred <env> --ro`。原先用 `dbcred --rw` 获取生产写凭据的脚本，改为登记精确 SQL 并由已获批准的 `forge ship` 执行。非生产环境继续使用 `forge dbcred <env> --ro` 或 `--rw`。 |
+| dbcred | 生产读用 `forge dbcred <env> --ro`。内建生产写入支持 PostgreSQL。按唯一主机登记精确 SQL，配置 database 和 rw.user，并在执行环境安装 psql，由获批的 `forge ship` 执行。其他数据库沿用实例提供的受控交付路径。非生产环境继续使用 `forge dbcred <env> --ro` 或 `--rw`。 |
 | cmdfmt | forge cmdfmt |
 | lang-check | forge lang-check |
 
-迁移评审脚本时，将旧 `--roles perf` 或 `--roles performance` 改为 `--roles simplify`，该角色同时检查性能与简洁性。原先同时选择 performance、simplify 的脚本只传一次 simplify。需要锁定后端时，用 `--backend codex` 或 `--backend api` 替换 `--no-fallback`。默认 `auto` 先运行独立 Codex 会话，上游服务异常时尝试 API。自动化从报告的 `roles` 数组读取每个已选角色的结果。`attempts` 为空表示该角色未启动，可查看 `missing_materials` 确认缺什么材料。整体退出码为 0（通过）、1（阻断）、2（执行错误）和 3（未完成）。
+迁移评审脚本时，将旧 `--roles perf` 或 `--roles performance` 改为 `--roles simplify`，该角色同时检查性能与简洁性。若升级时 v0.4 任务仍有未解决的 performance 失败，可在原基线、HEAD 和评审周期显式单选 `--roles performance`，复核结果会关联这条旧记录。其他情况下，原先同时选择两个角色的脚本只传一次 simplify。需要锁定后端时，用 `--backend codex` 或 `--backend api` 替换 `--no-fallback`。默认 `auto` 先运行独立 Codex 会话，上游服务异常时尝试 API。自动化从报告的 `roles` 数组读取每个已选角色的结果。`attempts` 为空表示该角色未启动，可查看 `missing_materials` 确认缺什么材料。整体退出码为 0（通过）、1（阻断）、2（执行错误）和 3（未完成）。
 
 默认技能为 ready、grill、feature、bugfix、review、verify、pr-triage 和 ship。原业务取舍方法并入 grill，收尾拆给 review、verify 和 ship，四个专项评审统一由 review 选角色。环境配方与专业技能由实例维护。代理按 scanner、analyst、implementer 和 reviewer 四种专长委派，后两者分别承接原 dev 与 spec-reviewer 的任务。独立引擎的四个评审维度由引擎参数选择。
 

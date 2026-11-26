@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parse, stringify } from "yaml";
 import { kit, sandbox, type Sandbox } from "./v05-sandbox";
@@ -158,8 +158,18 @@ test("T05/T12 portable distribution self-bootstraps outside the checkout", () =>
     expect(path).not.toMatch(/(?:^package\/AGENTS\.local\.md|v0\.5-requirements\.md|work-communication|form-ux\/|qa-polling)/);
   }
   s.ok(["tar", "-xzf", archive], s.root);
-  s.ok([join(s.root, "package/bin/forge"), "init", s.work], s.root);
-  s.ok([s.forge, "doctor", s.work, "--json"]);
+  s.git(s.root, "clone", "--local", "--", kit, s.work);
+  expect(s.git(s.work, "status", "--porcelain")).toBe("");
+  const forge = join(s.root, "package/bin/forge");
+  s.ok([forge, "init", "."]);
+  s.ok([forge, "add-repo", ".", "--workbench", "."]);
+  s.ok([forge, "add-repo", ".", "--workbench", "."]);
+  expect(parse(s.read(".workbench/workbench.yaml")).repos).toEqual(["."]);
+  expect(s.read(".workbench/root-repo.md")).toContain("`.`");
+  const doctor = JSON.parse(s.ok([forge, "doctor", ".", "--json"]));
+  expect(doctor.ok).toBe(true);
+  expect(doctor.issues.filter((issue: {check: string}) => issue.check === "repos")).toEqual([]);
+  s.ok([s.forge, "doctor", "."]);
   expect(existsSync(s.probeLog)).toBe(false);
 }, 60_000);
 
@@ -193,3 +203,74 @@ for (const incident of [
     } finally { await server.stop(true); }
   }, 30_000);
 }
+
+test("installed skills use the delivered release across source changes, removal and override rollback", () => {
+  const source = join(s.root, "source");
+  mkdirSync(source);
+  for (const path of ["core", "templates", "kit.toml", "dist"]) cpSync(join(kit,path), join(source,path), {recursive:true});
+  const release = ["bun", join(source, "dist/cli.js")];
+  s.ok([...release, "init", s.work]);
+  const show = [s.forge, "instance", "show", "skill", "ready", "--json"];
+  const projection = ".agents/skills/ready/SKILL.md";
+  const original = JSON.parse(s.ok(show));
+  expect(original.value.path).toBe(join(realpathSync(s.work), projection));
+  const sourceSkill = join(source, "core", projection);
+  const next = '---\nname: ready\ndescription: Second release\n---\nSecond release body\n';
+  writeFileSync(sourceSkill, next);
+  expect(JSON.parse(s.ok(show))).toEqual(original);
+  s.ok([s.forge, "doctor", s.work, "--json"]);
+  const relocated = join(s.root, "relocated");
+  renameSync(source, relocated);
+  expect(JSON.parse(s.ok(show))).toEqual(original);
+  s.ok([s.forge, "doctor", s.work, "--json"]);
+  const sync = ["bun", join(relocated, "dist/cli.js"), "sync", s.work];
+  const lockFile = ".workbench/kit-lock.json";
+  const before = s.read(lockFile);
+  const previousFormat = JSON.parse(before);
+  delete previousFormat.skill_overrides;
+  writeFileSync(join(s.work, lockFile), JSON.stringify(previousFormat));
+  expect(JSON.parse(s.ok(show))).toMatchObject({source:original.value.path,value:original.value});
+  writeFileSync(join(s.work, lockFile), before);
+  configure({verification: {environment: null}});
+  expect(s.run(sync).code).not.toBe(0);
+  expect(s.read(lockFile)).toBe(before);
+  expect(s.read(projection)).toContain(original.value.description);
+  configure({});
+  s.ok(sync);
+  expect(JSON.parse(s.ok(show)).value.description).toBe("Second release");
+  const override = ".workbench/private-ready";
+  const privateFile = s.privateFile(override + "/SKILL.md", next.replaceAll("Second release","Private override"));
+  configure({skills:{ready:override}});
+  expect(s.run(show).code).not.toBe(0);
+  s.ok(sync);
+  expect(JSON.parse(s.ok(show))).toMatchObject({source:realpathSync(privateFile), value:{description:"Private override",path:join(realpathSync(s.work),projection)}});
+  const privateBytes = readFileSync(privateFile);
+  configure({});
+  expect(s.run(show).code).not.toBe(0);
+  expect(s.run([s.forge, "doctor", s.work, "--json"]).code).not.toBe(0);
+  s.ok(sync);
+  expect(JSON.parse(s.ok(show))).toMatchObject({source:"core",value:{description:"Second release",path:join(realpathSync(s.work),projection)}});
+  expect(readFileSync(privateFile)).toEqual(privateBytes);
+  writeFileSync(join(realpathSync(s.work), projection), next.replaceAll("Second release","Local edit"));
+  expect(s.run(show).code).not.toBe(0);
+  expect(s.run([s.forge, "doctor", s.work, "--json"]).out).toContain("move the edited file aside");
+  expect(s.run(sync).code).not.toBe(0);
+}, 60_000);
+
+test("explicit null is invalid for extension fields with defaults", () => {
+  s.fresh();
+  const before = s.read(".workbench/kit-lock.json");
+  for (const [extensions,field] of [
+    [{ actions: { inspect: { argv:["bun","--version"], purpose:"diagnose", cwd:null } } }, "actions.inspect.cwd"],
+    [{ verification: {environment:null} }, "verification.environment"],
+    [{ delivery: {endpoint:null} }, "delivery.endpoint"],
+  ] as const) {
+    configure(extensions);
+    for (const args of [["doctor",s.work,"--json"], ["sync",s.work], ["instance","list","--json"]]) {
+      const result = s.run([s.forge,...args]);
+      expect(result.code).not.toBe(0);
+      expect(result.err + result.out).toContain(field);
+    }
+    expect(s.read(".workbench/kit-lock.json")).toEqual(before);
+  }
+});

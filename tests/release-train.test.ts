@@ -242,7 +242,7 @@ test("handoff, resume and batch release bind evidence, SQL, approvals and sweep 
   remote(1, { headRefOid: first.head, baseRefName: "other" });
   expect(mergeGuard("--merge " + pin)).toContain("gh pr merge");
   remote(1, { baseRefName: "main" });
-  expect(mergeGuard("--merge " + pin)).toBeNull();
+  expect(mergeGuard("--merge " + pin)).toContain("gh pr merge");
   expect(rejects("release", "create", "--tasks", first.task, "--title", "bypass")).toContain(id);
   expect(rejects("runbook", "complete", fresh.runbook_id)).toContain("production execution receipt");
   recordProd(second, fresh);

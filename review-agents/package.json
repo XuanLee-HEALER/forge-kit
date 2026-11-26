@@ -25,7 +25,7 @@
     "dist/review.js",
     "src",
     "prompts",
-    "scripts/evaluate.ts",
+    "scripts",
     "evals/paired.json",
     "tests",
     "tsconfig.json"

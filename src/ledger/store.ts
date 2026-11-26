@@ -31,6 +31,7 @@ import {
   type EvidenceSource,
   ledgerDbPath,
   normalizeReviewRole,
+  reviewFactKind,
   nowIso,
   VALID_DEPTHS,
   VALID_ENDPOINTS,
@@ -579,6 +580,7 @@ export class Ledger {
       | "test"
       | "lint"
       | "review"
+      | "review_selection"
       | "hurl"
       | "pr"
       | "fat"
@@ -631,7 +633,7 @@ export class Ledger {
       const event_type =
         params.kind === "commit" ? "COMMIT_RECORDED" : "EVIDENCE_CAPTURED";
       const normalizedMeta =
-        params.kind === "review" && params.meta && typeof params.meta.role === "string"
+        (params.kind === "review" || params.kind === "review_selection") && params.meta && typeof params.meta.role === "string"
           ? { ...params.meta, role: normalizeReviewRole(params.meta.role) }
           : params.meta;
       const ev = appendEventInTx(this.db, {
@@ -864,6 +866,7 @@ export class Ledger {
    * - If spec package is frozen: zero silent disk drift and not left in un-refrozen AMENDED state;
    * - Latest post-amend status of each executed verification kind (test/build/lint/hurl) for this exact
    *   (repo, head_sha) must not be `fail`;
+   * - Unstarted review selections require a subsequent tool pass for the same role and range;
    * - For `targeted`: at least one of test/build/lint/hurl must be `pass`;
    * - For `full`: static check (`lint`) MUST be `pass`, at least one of test/build/hurl MUST be `pass`,
    *   and latest review status must be `pass` or `fallback`.
@@ -963,6 +966,7 @@ export class Ledger {
     }
     type BranchEvidence = {
       checks: Map<string, string>;
+      pendingSelections: Map<string, string>;
       reviews: Map<string, {role: string; status: string; baseline: boolean}>;
       endpoint?: string;
     };
@@ -985,7 +989,7 @@ export class Ledger {
       if (params.branch && branch && branch !== params.branch) continue;
       let evidence = byBranch.get(branch);
       if (!evidence) {
-        evidence = { checks: new Map(), reviews: new Map() };
+        evidence = { checks: new Map(), reviews: new Map(), pendingSelections: new Map() };
         byBranch.set(branch, evidence);
       }
       try {
@@ -994,6 +998,7 @@ export class Ledger {
           kind?: string;
           status?: string;
           meta?: {
+            report_status?: string; backend?: unknown; attempts?: unknown;
             stage_receipts?: { stage: string; state: string; endpoint: string; versions: { repo: string; head: string }[] }[];
             pr_head_oid?: string;
             state?: string; base_branch?: string; target_oid?: string;
@@ -1022,18 +1027,25 @@ export class Ledger {
         } else if (p.kind === "hurl") {
           if (ev.seq >= floors.test) evidence.checks.set("hurl", p.status);
         }
-        if (p.kind === "review") {
+        const fact = reviewFactKind(p);
+        if (fact) {
           if (currentWorkflow && (evidenceSource(p, ev.actor) !== "tool" ||
               p.meta?.review_task_id !== params.task_id || p.meta.freeze_seq !== specState.freeze_seq || p.meta.review_floor_seq !== floors.review)) continue;
           if (ev.seq < floors.review || !reviewMeetsFloor(p.status, p.meta, params.task_id, floors.review, reviewFloor?.ts, evidenceSource(p, ev.actor))) continue;
+          const roleKey = normalizeReviewRole(p.meta?.role);
+          const rangeKey = JSON.stringify([p.meta?.base, roleKey]);
+          if (fact === "review_selection") {
+            if (evidenceSource(p, ev.actor) === "tool") evidence.pendingSelections.set(rangeKey, roleKey);
+            continue;
+          }
+          if (p.status === "pass" && evidenceSource(p, ev.actor) === "tool") evidence.pendingSelections.delete(rangeKey);
           const historical = branch ? [attachedAtEvent.get(branch)] : [...attachedAtEvent.values()];
           const current = branch ? repoAttachments.filter((r) => r.branch === branch) : [];
           const covered = (row: ReviewAttachment | undefined) =>
             !!row && coversReviewBase(this.workbenchRoot, row, p.meta?.base);
           const coversBase = historical.length > 0 && historical.every(covered) && current.every(covered);
           if (currentWorkflow || p.status === "fail" || coversBase) {
-            const roleKey = normalizeReviewRole(p.meta?.role);
-            evidence.reviews.set(currentWorkflow ? JSON.stringify([p.meta?.base, roleKey]) : roleKey, { role: roleKey, status: p.status, baseline: coversBase && current.length > 0 });
+            evidence.reviews.set(currentWorkflow ? rangeKey : roleKey, { role: roleKey, status: p.status, baseline: coversBase && current.length > 0 });
           }
         }
         if (
@@ -1070,6 +1082,7 @@ export class Ledger {
     // A detached merge must honor failures at its own SHA before trying a verified parent.
     // Positive evidence is credited only to the selected attachment or its unambiguous legacy receipts.
     const failedKinds = new Set<string>();
+    const incompleteRoles = new Set<string>();
     const failedRoles = new Set<string>();
     const latestByKind = new Map<string, string>();
     const passingRoles = new Set<string>();
@@ -1081,6 +1094,7 @@ export class Ledger {
         if (status === "fail") failedKinds.add(kind);
         if (eligible && status === "pass") latestByKind.set(kind, status);
       }
+      for (const role of evidence.pendingSelections.values()) incompleteRoles.add(role);
       for (const {role, status, baseline} of evidence.reviews.values()) {
         if (status === "fail") failedRoles.add(role);
         if (eligible && (status === "pass" || status === "fallback")) {
@@ -1124,6 +1138,10 @@ export class Ledger {
       );
     }
 
+    if (incompleteRoles.size > 0) {
+      hasExplicitFailure = true;
+      missing.push(`Selected review incomplete (${[...incompleteRoles].join(", ")}) for ${params.repo}@${params.head_sha.slice(0, 8)}`);
+    }
     if (failedRoles.size > 0) {
       hasExplicitFailure = true;
       missing.push(

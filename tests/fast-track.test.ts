@@ -1,4 +1,4 @@
-import { mergePinnedHead } from "../src/conditional-merge";
+import { mergePinnedFat } from "../src/conditional-merge";
 import { diffScope, deliveryDiff } from "../src/ship-diff";
 import { fastTrackCommand } from "../src/ledger/fast-track";
 import { beforeEach, test, expect } from "bun:test";
@@ -205,6 +205,7 @@ test("conditional Git merge protects the advertised base and preserves divergent
   // Both the intervening commit and the authorized head fast-forward the
   // target. Ordinary non-forced Git push alone would accept the stale plan.
   git(f.wt, "push", bare, f.head + ":refs/heads/intermediate");
+  git(bare, "update-ref", "refs/heads/fat", f.base);
   const binary = Bun.which("git")!;
   writeFileSync(
     join(root, "bin/git"),
@@ -219,31 +220,29 @@ const result=Bun.spawnSync([${JSON.stringify(binary)},...args],{stdin:"inherit",
     { mode: 0o755 },
   );
   expect(() =>
-    mergePinnedHead(
+    mergePinnedFat(
       f.wt,
-      "main",
       f.base,
       head,
       () => {},
       () => {
-        git(bare, "update-ref", "refs/heads/main", f.head, f.base);
+        git(bare, "update-ref", "refs/heads/fat", f.head, f.base);
       },
     ),
-  ).toThrow("Conditional PR update refused");
-  expect(git(bare, "rev-parse", "main")).toBe(f.head);
+  ).toThrow("Conditional FAT update refused");
+  expect(git(bare, "rev-parse", "fat")).toBe(f.head);
   git(f.dir, "commit", "--allow-empty", "-m", "independent main change");
   const diverged = git(f.dir, "rev-parse", "main");
   git(f.dir, "push", bare, diverged + ":refs/heads/staging");
-  git(bare, "update-ref", "refs/heads/main", diverged, f.head);
-  const target = mergePinnedHead(
+  git(bare, "update-ref", "refs/heads/fat", diverged, f.head);
+  const target = mergePinnedFat(
     f.wt,
-    "main",
     diverged,
     head,
     () => {},
     () => {},
   );
-  expect(git(bare, "rev-parse", "main")).toBe(target);
+  expect(git(bare, "rev-parse", "fat")).toBe(target);
   expect(git(bare, "show", "-s", "--format=%P", target)).toBe(diverged + " " + head);
   expect(git(f.wt, "rev-parse", "HEAD")).toBe(head);
 }, 30_000);

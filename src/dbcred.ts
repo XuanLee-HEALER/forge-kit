@@ -36,7 +36,7 @@ export function formatDbCred(
     return encodeURIComponent(pair.user) + ":" + encodeURIComponent(pair.password ?? "");
   } catch {
     throw Error(
-      "Credentials unavailable or access denied. Production writes require the authorized ship executor.",
+      "Credentials unavailable or access denied. The authorized ship executor supports exact production SQL for PostgreSQL.",
     );
   }
 }

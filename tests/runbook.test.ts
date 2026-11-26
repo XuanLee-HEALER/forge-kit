@@ -240,9 +240,9 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         tool_name: "Bash",
         tool_input: { command: "gh pr merge 355 --squash" },
       }),
-    ).toBeNull();
+    ).toContain("gh pr merge");
 
-    expect(checkPr("gh -R acme/svc pr merge 355")).toBeNull();
+    expect(checkPr("gh -R acme/svc pr merge 355")).toContain("gh pr merge");
     const ghConfig = join(repoDir, "config", "gh");
     mkdirSync(ghConfig, { recursive: true });
     const configFile = join(ghConfig, "hosts.yml");
@@ -250,21 +250,21 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
     writeFileSync(configFile, "ghe.example:\n  user: demo\n");
     expect(checkPr(mergeWithConfig)).toContain("gh pr merge");
     writeFileSync(configFile, "ghe.example: {}\ngithub.com: {}\n");
-    expect(checkPr(mergeWithConfig)).toBeNull();
+    expect(checkPr(mergeWithConfig)).toContain("gh pr merge");
     for (const command of [
       "gh -R evil-org/svc pr merge 355", "GH_REPO=evil-org/svc gh pr merge 355",
       "GH_HOST=ghe.internal gh pr merge -R acme/svc 355", "GH_HOST=ghe.internal gh pr merge 355",
     ]) expect(checkPr(command)).toContain("gh pr merge");
-    expect(checkPr("GH_REPO=acme/svc gh pr merge 355")).toBeNull();
+    expect(checkPr("GH_REPO=acme/svc gh pr merge 355")).toContain("gh pr merge");
     const oldRepo = process.env.GH_REPO;
     const oldGhHost = process.env.GH_HOST;
     try {
       process.env.GH_REPO = "evil-org/svc";
       expect(checkPr("gh pr merge 355")).toContain("gh pr merge");
-      expect(checkPr("env -u GH_REPO gh pr merge 355")).toBeNull();
+      expect(checkPr("env -u GH_REPO gh pr merge 355")).toContain("gh pr merge");
       process.env.GH_HOST = "ghe.internal";
       expect(checkPr("gh pr merge -R acme/svc 355")).toContain("gh pr merge");
-      expect(checkPr("env -i gh pr merge 355")).toBeNull();
+      expect(checkPr("env -i gh pr merge 355")).toContain("gh pr merge");
     } finally {
       if (oldRepo === undefined) delete process.env.GH_REPO;
       else process.env.GH_REPO = oldRepo;
@@ -281,11 +281,11 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
     git(repoDir, ["config", "remote.origin.gh-resolved", "base"]);
     expect(checkPr("gh pr merge 355")).toContain("gh pr merge");
     git(repoDir, ["config", "--unset", "remote.upstream.gh-resolved"]);
-    expect(checkPr("gh pr merge 355")).toBeNull();
+    expect(checkPr("gh pr merge 355")).toContain("gh pr merge");
     git(repoDir, ["config", "--unset", "remote.origin.gh-resolved"]);
     expect(checkPr("gh pr merge 355")).toContain("gh pr merge");
-    expect(checkPr("gh pr merge -R acme/svc 355")).toBeNull();
-    expect(checkPr("gh pr merge https://github.com/acme/svc/pull/355")).toBeNull();
+    expect(checkPr("gh pr merge -R acme/svc 355")).toContain("gh pr merge");
+    expect(checkPr("gh pr merge https://github.com/acme/svc/pull/355")).toContain("gh pr merge");
     git(repoDir, ["remote", "set-url", "upstream", "https://ghe.example/acme/svc.git"]);
     git(repoDir, ["config", "remote.upstream.gh-resolved", "github.com/acme/svc"]);
     expect(checkPr("gh pr merge 355")).toContain("gh pr merge");
@@ -298,9 +298,9 @@ describe("Release Runbook approval via UserPromptSubmit + Guard enforcement", ()
         "https://github.com/evil-org/svc/pull/355", "https://ghe.internal/acme/svc/pull/355",
         "-R ghe.internal/acme/svc 355", "-R evil-org/svc 355",
       ]) expect(merge(target)).toContain("gh pr merge");
-      expect(merge("https://github.com/acme/svc/pull/355")).toBeNull();
-      expect(merge("-R github.com/acme/svc 355")).toBeNull();
-      expect(merge("https://github.com:443/acme/svc/pull/355")).toBeNull();
+      expect(merge("https://github.com/acme/svc/pull/355")).toContain("gh pr merge");
+      expect(merge("-R github.com/acme/svc 355")).toContain("gh pr merge");
+      expect(merge("https://github.com:443/acme/svc/pull/355")).toContain("gh pr merge");
       expect(merge("-R github.com:8443/acme/svc 355")).toContain("gh pr merge");
       expect(merge("https://github.com:8443/acme/svc/pull/355")).toContain("gh pr merge");
     }

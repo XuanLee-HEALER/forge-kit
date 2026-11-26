@@ -141,6 +141,19 @@ function releaseObservers(ledger: Ledger, release: ReturnType<typeof detail>): R
   return observers;
 }
 
+function latestReceipt(ledger: Ledger, id: string, item: ReturnType<typeof detail>["items"][number],
+  observed: boolean, endpoint: string, runbook: string) {
+  return ledger.db
+    .query<{ seq: number; status: string; observations: string | null }, [string, string, string, string, string, number, string, string]>(
+      `SELECT seq, json_extract(payload_json,'$.status') AS status, json_extract(payload_json,'$.meta.observations') AS observations FROM events WHERE task_id=?
+     AND canonical_repo(repo)=canonical_repo(?) AND branch=? AND sha=? AND event_type='EVIDENCE_CAPTURED'
+     AND json_extract(payload_json,'$.release_id')=?
+     AND (?=0 OR (json_extract(payload_json,'$.source')='tool' AND json_extract(payload_json,'$.meta.delivery_endpoint')=? AND json_extract(payload_json,'$.meta.observed_runbook')=?))
+     AND json_extract(payload_json,'$.kind')='prod' AND json_type(payload_json,'$.meta.action_id') IS NULL AND json_extract(payload_json,'$.status') IN ('pass','fail') ORDER BY seq DESC LIMIT 1`,
+    )
+    .get(item.task_id, item.repo, item.branch, item.expected_head_sha, id, Number(observed), endpoint, runbook);
+}
+
 function observeRelease(ledger: Ledger, id: string) {
   function approved() {
     const release = detail(ledger, id);
@@ -150,19 +163,34 @@ function observeRelease(ledger: Ledger, id: string) {
     const pins = checkedActions(release, rb).release_observers ?? [];
     if (!pins.length || canonicalJson(pins) !== canonicalJson(releaseObservers(ledger, release)))
       throw Error("Missing or changed release observer bindings");
-    return {pins, runbook_id: rb.runbook_id};
+    return {pins, items: release.items, runbook_id: rb.runbook_id};
   }
-  const {pins, runbook_id} = approved();
-  for (const pin of pins) {
-    const observation = observeStage(ledger.workbenchRoot, pin.stage, pin.action_id, pin.endpoint, pin.versions);
-    if (observation?.state !== "completed")
-      throw Error("Target has not confirmed delivery for " + pin.action_id);
-  }
-  return withImmediateTx(ledger.db, () => {
+  const {pins, items, runbook_id} = approved();
+  const reports = items.flatMap(item => {
+    const targets = pins.filter(p => p.task_id === item.task_id && p.repo === item.repo && p.branch === item.branch);
+    if (!targets.length) return [];
+    const latest = () => latestReceipt(ledger, id, item, true, targets[0].endpoint, runbook_id);
+    const before = latest();
+    const states = targets.map(pin => {
+      try {
+        const fact = observeStage(ledger.workbenchRoot, pin.stage, pin.action_id, pin.endpoint, pin.versions);
+        return {action_id:pin.action_id, state:fact?.state ?? null};
+      } catch (error) {
+        return {action_id:pin.action_id, state:null, error:String(error)};
+      }
+    });
+    const status: "pass" | "fail" | null = states.some(row => row.state !== null && row.state !== "completed") ? "fail" :
+      states.every(row => row.state === "completed") ? "pass" : null;
+    return [{item, targets, latest, before, states, status}];
+  });
+  withImmediateTx(ledger.db, () => {
     if (approved().runbook_id !== runbook_id) throw Error("Release runbook changed during observation");
-    for (const item of detail(ledger, id).items) {
-      const targets = pins.filter(p => p.task_id === item.task_id && p.repo === item.repo && p.branch === item.branch);
-      if (!targets.length) continue;
+    for (const {item, targets, latest, before, states, status} of reports) {
+      if (!status) continue;
+      const prior = latest();
+      const observations = states.map(({action_id, state}) => ({action_id, state}));
+      if (prior?.status === status && (status === "pass" || prior.observations === canonicalJson(observations))) continue;
+      if (prior?.seq !== before?.seq) throw Error("Another observation was recorded; observe again");
       ledger.recordEvidence({
         task_id: item.task_id,
         repo: item.repo,
@@ -171,18 +199,20 @@ function observeRelease(ledger: Ledger, id: string) {
         kind: "prod",
         source: "tool",
         actor: "tool",
-        status: "pass",
-        summary: "Target confirmed release delivery",
-        tool_use_id: "release-observe/" + runbook_id + "/" + targets[0].action_id,
+        status,
+        summary: status === "pass" ? "Target confirmed release delivery" : "Target reported delivery incomplete",
         meta: {
           delivery_endpoint: targets[0].endpoint,
           observed_runbook: runbook_id,
           observation_ids: targets.map(p => p.action_id),
+          observations,
         },
       });
     }
-    return {ok:true, release_id:id, runbook_id, observations:pins.length};
   });
+  const unconfirmed = reports.flatMap(report => report.states).find(row => row.state !== "completed");
+  if (unconfirmed) throw Error(unconfirmed.error ?? ("Target has not confirmed delivery for " + unconfirmed.action_id));
+  return {ok:true, release_id:id, runbook_id, observations:pins.length};
 }
 
 export function releaseCommand(ledger: Ledger, argv: string[]) {
@@ -255,10 +285,14 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
       ledger.db
         .query("UPDATE releases SET runbook_id=?,updated_at=? WHERE release_id=?")
         .run(rb.runbook_id, nowIso(), id);
-      const merge_commands = checked.items
-        .filter((i) => i.status !== "MERGED")
-        .map((i) => "gh pr merge " + i.pr_url + " --merge --match-head-commit " + i.expected_head_sha);
-      return { ...rb, actions, release_id: id, execution_actions: productionActions(actions), merge_commands };
+      const human_merges = checked.items.filter(i => i.status !== "MERGED").map(i => ({
+        pr_url: i.pr_url,
+        base_branch: i.base_branch,
+        expected_head_sha: i.expected_head_sha,
+      }));
+      return { ...rb, actions, release_id: id, execution_actions: productionActions(actions), human_merges,
+        ...(human_merges.length && { merge_instructions:
+          "审批后请操作者在托管平台打开所列 PR，核对目标分支、HEAD 及必需检查后手动合并。发布线程随后运行 forge ledger release verify " + id + " 核验远端结果。" }) };
     }
     const prodItems = checked.items.filter((i) => isRolloutEndpoint(ledger.getTask(i.task_id)!.endpoint));
     if ((prodItems.length || checked.sql_files.length) && !release.runbook_id)
@@ -274,15 +308,7 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
       for (const item of prodItems) {
         const endpoint = ledger.getTask(item.task_id)!.endpoint;
         const observed = approvedObservers.some(pin => pin.task_id === item.task_id && pin.repo === item.repo && pin.branch === item.branch);
-        const last = ledger.db
-          .query<{ status: string }, [string, string, string, string, string, number, string, string]>(
-            `SELECT json_extract(payload_json,'$.status') AS status FROM events WHERE task_id=?
-           AND canonical_repo(repo)=canonical_repo(?) AND branch=? AND sha=? AND event_type='EVIDENCE_CAPTURED'
-           AND json_extract(payload_json,'$.release_id')=?
-           AND (?=0 OR (json_extract(payload_json,'$.source')='tool' AND json_extract(payload_json,'$.meta.delivery_endpoint')=? AND json_extract(payload_json,'$.meta.observed_runbook')=?))
-           AND json_extract(payload_json,'$.kind')='prod' AND json_type(payload_json,'$.meta.action_id') IS NULL AND json_extract(payload_json,'$.status') IN ('pass','fail') ORDER BY seq DESC LIMIT 1`,
-          )
-          .get(item.task_id, item.repo, item.branch, item.expected_head_sha, id, Number(observed), endpoint, rb.runbook_id);
+        const last = latestReceipt(ledger, id, item, observed, endpoint, rb.runbook_id);
         if (last?.status !== "pass")
           throw Error(
             "Missing SHA-bound production delivery evidence for " + item.repo + "@" + item.expected_head_sha,

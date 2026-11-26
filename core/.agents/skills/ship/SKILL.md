@@ -18,13 +18,13 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 
 功能线程完成验证及 PR 分诊，逐仓同步 HEAD 后执行 `forge ledger handoff <task-id>`，把 Forge-Task、Verified-Head、Ledger-Tip 见证附入 PR，止于 HANDED_OFF。需改实现时先 `forge ledger resume <task-id>`，复验后重新移交。
 
-发布线程用 `forge ledger release create --title "<title>" --from-handoffs` 或显式任务列表建批，`forge ledger release verify <rel-id>` 核验实时 PR。出现版本漂移时暂停相应批次并退回功能线程。使用 `forge ledger release runbook <rel-id>` 汇集确定的动作，在主会话取得精确批准。逐项兑现并记录回执，核验远端目标引用，再完成 runbook 及 release。
+发布线程用 `forge ledger release create --title "<title>" --from-handoffs` 或显式任务列表建批，`forge ledger release verify <rel-id>` 核验实时 PR。出现版本漂移时暂停相应批次并退回功能线程。使用 `forge ledger release runbook <rel-id>` 汇集确定的动作，在主会话取得精确批准。将返回的 human_merges 清单交给操作者在托管平台核对目标分支、HEAD 和必需检查后合并。发布线程运行 `forge ledger release verify <rel-id>` 核验远端结果，记录其余已批准动作的回执，再完成 runbook 及 release。
 
-命名交付终点会在批次 runbook 的 `actions.release_observers` 中列出各阶段的动作 ID、目标和版本。发布后执行 `forge ledger release observe <rel-id>` 读取目标侧状态。所有观察器确认对应版本已完成后，账本记录工具回执，再执行 `forge ledger release complete <rel-id>`。
+命名交付终点会在批次 runbook 的 `actions.release_observers` 中列出各阶段的动作 ID、目标和版本。发布后执行 `forge ledger release observe <rel-id>` 读取目标侧状态。所有观察器确认对应版本已完成后，账本记录工具回执，再执行 `forge ledger release complete <rel-id>`。重复观察会记录目标状态的变化；若目标回报失败，须等同一批次、动作和版本重新确认完成后方可关账。
 
 ## Fast-Track
 
-从实例交付配置中读取有序阶段。用 `forge ledger runbook create --task "$TASK" --title "$TITLE" --pr "$REPO:$PR"` 登记精确合并；有自定义上线步骤时按声明顺序重复传入 `--stage <stage-id>`。登记时解析目标版本、动作参数及脚本摘要。内建 ship 在实例阶段列表的位置决定精确 PR/tag/SQL 的执行顺序。同名实例实现也按其位置运行。对于精确 PR，执行器只向批准的目标引用提交基于固定 base/head 的快进更新，并核验托管服务的合入回执。目标仓的推送策略若拒绝，交由操作者使用受保护的常规 PR 合并流程。把返回的具体目标和内容提供给批准人。
+从实例交付配置中读取有序阶段。用 `forge ledger runbook create --task "$TASK" --title "$TITLE" --pr "$REPO:$PR"` 登记精确合并；有自定义上线步骤时按声明顺序重复传入 `--stage <stage-id>`。登记时解析目标版本、动作参数及脚本摘要。内建 ship 在实例阶段列表的位置决定精确 PR/tag/SQL 的执行顺序。同名实例实现也按其位置运行。只有受信托管端可原子核验全部获批条件时才自动合并。公有 GitHub 和未提供此能力的实例在写入前转人工，操作者通过托管端的受保护 PR 流程合并。把返回的具体目标和内容提供给批准人。
 
 实例终点为 FAT 时，按每个挂载仓登记 `--fat <repo>:fat`，绑定远端现有的 `refs/heads/fat`、旧 SHA、来源 head 及预期更新 SHA。该 runbook 只允许指定测试引用的条件更新。
 
@@ -36,7 +36,7 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 
 ### 自定义上线阶段的回执
 
-在实例的 `extensions` 下分别登记提交动作和只读观察动作。两者都要列出相对各自工作目录的输入文件，包括脚本隐式读取的部署清单、配置及模块。没有额外输入时显式填写 `inputs: []`。登记时将程序、参数与文件内容绑定到 runbook，调用前重新校验。
+在实例的 `extensions` 下分别登记提交动作和只读观察动作。两者都要列出相对各自工作目录的输入文件，包括脚本隐式读取的部署清单、配置及模块。没有额外输入时显式填写 `inputs: []`。登记时将可执行程序、可识别的解释器入口脚本、参数值与已声明输入的内容绑定到 runbook，调用前重新校验。输出路径以参数值登记，允许工具写入和更新。
 
 ```yaml
 actions:
@@ -54,3 +54,11 @@ delivery: {endpoint: rollout, stages: [ship, rollout]}
 ```
 
 观察程序使用 `absent` 表示目标不存在，`pending` 表示执行中，`failed` 表示失败。初次观察为 absent 时可以提交一次。已经发起提交且目标尚未确认时，在原批准会话使用本次授权编号重跑 `forge ship run --envelope <ft-id>` 查询进度。只有目标返回 `completed` 且动作、终点及全部版本匹配时才记录成功。失败或版本不符时暂停并检查实际目标。
+
+### 托管端原子 PR 合并接口
+
+默认的 `atomic_pr_hosts` 为空。实例运维方在验证自托管平台确实实现以下事务后，可在 `extensions.delivery.atomic_pr_hosts` 列出该平台的确切主机名。授权绑定 HTTPS 仓库、PR 编号、base 分支及 SHA、head SHA、合并结果的 Git tree SHA 和协议版本。
+
+- 在已登记仓库的 REST API 根下，`GET repos/<owner>/<repo>/forge/atomic-pr/v1/capabilities` 返回 `protocol: "forge.atomic-pr.v1"`、`repository`（完整 HTTPS 仓库 URL）及 `preconditions`。列表须包含 `open_pr`、`head_oid`、`base_branch`、`base_oid`、`merge_tree`、`protected_branch_rules` 和 `required_checks`。
+- 唯一写请求为同仓的 `POST repos/<owner>/<repo>/forge/atomic-pr/v1/pulls/<number>/merge`。JSON 字段为 `protocol`、`pull_request`（完整 PR URL）、`expected_state`（OPEN）、`expected_head_oid`、`expected_base_branch`、`expected_base_oid`、`expected_merge_tree` 和 `policy`（protected_branch_rules_and_required_checks）。
+- 平台在发布新提交的同一事务中校验全部前置条件与当前调用者权限，并记录该 PR 已合并。任一条件改变须拒绝写入，保留原目标分支。执行器使用独立的 PR 与 Git 对象读取接口核对实际合并提交、父提交和 tree 后记录回执。托管端不支持此协议或无法确认结果时，检查现有 PR 后手工交付。

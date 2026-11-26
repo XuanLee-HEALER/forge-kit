@@ -1,9 +1,7 @@
-import { matchesReleasePr } from "../ledger/delivery-tools";
 import { type WorkbenchConfig } from "../config";
 import { locateRepo, runGit } from "../git";
 import { type ApprovedRunbookEntry } from "./runbook-state";
-import { resolve } from "node:path";
-import { matchesPinnedMerge, parseGhApi, readOnlyGraphql, extractGhPrSubcommand, parseGhPrMergeTarget, repoOrigin } from "../shared/gh-remote";
+import { parseGhApi, readOnlyGraphql, extractGhPrSubcommand, repoOrigin } from "../shared/gh-remote";
 import {
   effectivePushRepo,
   evaluateFollowTagsSetting,
@@ -33,7 +31,11 @@ import {
 export function parseDeliverySegment(toks: string[]) {
   const prefix = unwrapShellPrefix(toks);
   const words = prefix.ambiguous ? expandEnvSplitStrings(toks) : toks;
-  return { prefix, git: extractGitSubcommand(words), gh: extractGhPrSubcommand(words, prefix) };
+  const ghIndex = words.findIndex(word => word === "gh" || word.endsWith("/gh"));
+  const ghArgs = prefix.bin === "gh" ? prefix.args :
+    prefix.ambiguous && ghIndex !== -1 ? words.slice(ghIndex + 1) : [];
+  const apiIndex = ghArgs.indexOf("api");
+  return { prefix, apiArgs: apiIndex < 0 ? undefined : ghArgs.slice(apiIndex + 1), git: extractGitSubcommand(words), gh: extractGhPrSubcommand(words, prefix) };
 }
 
 export function isApprovedTagPushRefspec(params: {
@@ -166,9 +168,9 @@ export function checkGitPhysicalFuse(
     const toks = splitShellTokens(segments[i]);
     if (!toks || toks.length === 0) continue;
 
-    const { prefix, gh, git } = parseDeliverySegment(toks);
-    if (prefix.bin === "gh" && prefix.args.includes("api")) {
-      const api = parseGhApi(prefix.args.slice(prefix.args.indexOf("api") + 1));
+    const { prefix, apiArgs, gh, git } = parseDeliverySegment(toks);
+    if (apiArgs) {
+      const api = parseGhApi(apiArgs);
       if (!api) return "安全护栏：无法确认 gh api 的请求参数。";
       const { endpoint, method, fields, body } = api;
       let pathname: string;
@@ -179,7 +181,7 @@ export function checkGitPhysicalFuse(
       }
       const resource = pathname.replace(/\/{2,}/g, "/").replace(/^\/api\/v3\//i, "/")
         .replace(/^\/repos\/[^/]+\/[^/]+\//i, "/").replace(/^\//, "");
-      const sensitive = /^(?:pulls|git\/refs|merges|releases)(?:[/?#]|$)/i.test(resource);
+      const sensitive = /^(?:pulls|git\/refs|merges|releases|forge\/atomic-pr\/v1\/pulls)(?:[/?#]|$)/i.test(resource);
       if (/(?:^|\/)graphql\/?$/i.test(pathname)) {
         const queries = fields.filter(f => f.startsWith("query="));
         const query = queries[0]?.slice(6) ?? "";
@@ -190,6 +192,9 @@ export function checkGitPhysicalFuse(
       }
       const effectiveMethod = (method || (fields.length || body ? "POST" : "GET")).toUpperCase();
       const writes = effectiveMethod !== "GET" && effectiveMethod !== "HEAD";
+      if (writes && prefix.ambiguous) return "安全护栏：无法核验 gh api 写操作的 env 参数。";
+      if (writes && splitShellTokensWithMeta(segments[i])?.some(t => t.value === endpoint && t.hasExpansion))
+        return "安全护栏：gh api 写操作必须使用可核验的字面请求路径。";
       if (sensitive && writes) {
         return "安全护栏：禁止通过 gh api 合并 PR 或修改发布资源。";
       }
@@ -199,31 +204,7 @@ export function checkGitPhysicalFuse(
       if (prefix.dirs.some(hasShellExpansion)) return "物理保险丝：检测到未展开的 shell 变量路径。";
     }
     if (gh?.subcmd === "merge") {
-      if (approvedRunbooks.length && prefix.bin === "gh" && !hasPrecedingDynamicCd(segments, i)) {
-        const cwd = resolveSegmentCwd(segments, i, toolWorkdir);
-        const dir = resolveGitDirFlags(cwd, prefix.dirs, true);
-        if (!dir) return "物理保险丝：无法解析 env 工作目录。";
-        const loc = locateRepo(workbenchRoot, dir);
-        const target = parseGhPrMergeTarget(gh.subArgs, loc?.checkoutDir ?? null, gh.prefix.effective, dir);
-        if (
-          target &&
-          approvedRunbooks.some((rb) =>
-            rb.actions.prs.some((p) => {
-              if (p.number !== target.number) return false;
-              if (p.pin) return matchesPinnedMerge(gh.subArgs, p.pin) &&
-                matchesReleasePr(workbenchRoot, rb.record, p.repo, p.pin);
-              const local = loc?.repo.toLowerCase() === p.repo.toLowerCase();
-              if (!target.owner) return local;
-              const origin = repoOrigin(local && loc ? loc.checkoutDir : resolve(workbenchRoot, p.repo));
-              return origin?.repo === target.repo && origin.owner === target.owner &&
-                (!target.host || origin.host === target.host);
-            }),
-          )
-        ) {
-          continue;
-        }
-      }
-      return "物理保险丝：禁止 Agent 直接执行 `gh pr merge`，请由用户合并 PR 或先创建 Runbook 经用户回复「批准 <runbook_id>」后执行。";
+      return "物理保险丝：禁止 Agent 直接执行 gh pr merge。请由操作者在托管平台合并，或使用已批准快轨的 forge ship run。";
     }
     if (!git) continue;
 

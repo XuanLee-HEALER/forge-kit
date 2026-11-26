@@ -33,6 +33,7 @@ import {
   isProductionDb,
   loadDbEnvironments,
   findWorkbenchRoot,
+  repoCardPath,
   loadModelsConfig,
   loadWorkbenchConfig,
   parseTomlFile,
@@ -108,9 +109,10 @@ function visitSkillFiles(
   visit: (dest: string, src: string) => void,
 ) {
   for (const skill of effective.skills.values()) {
-    const base = dirname(skill.value.path);
+    const source = skill.source === "core" ? skill.value.path : skill.source;
+    const base = dirname(source);
     const dest = ".agents/skills/" + skill.id + "/";
-    visit(dest + "SKILL.md", skill.value.path);
+    visit(dest + "SKILL.md", source);
     // Skill authors explicitly reference supporting files; adjacent private materials are never projected.
     const resources = new Set<string>();
     for (const m of skill.value.body.matchAll(
@@ -154,12 +156,15 @@ function managedPlan(kitRoot: string, root: string, manifest: KitManifest) {
     );
   for (const b of manifest.managed.bin_bundles) put(".workbench/bin/" + b, loadBundle(kitRoot, b));
   for (const b of manifest.managed.bin_wrappers) put(".workbench/bin/" + b, wrapper(b), 0o755);
-  return { assets, vars };
+  const skill_overrides = Object.fromEntries([...effective.skills.values()]
+    .filter(skill => skill.source !== "core")
+    .map(skill => [skill.id, relative(root, dirname(skill.source))]));
+  return { assets, vars, skill_overrides };
 }
 
 function install(root: string, kitRoot: string, previous?: KitLock, force = false) {
   const manifest = loadKitManifest(kitRoot);
-  const { assets, vars } = managedPlan(kitRoot, root, manifest);
+  const { assets, vars, skill_overrides } = managedPlan(kitRoot, root, manifest);
   const head = runGit(kitRoot, ["rev-parse", "HEAD"]);
   const lock: KitLock = {
     kit_name: manifest.kit.name,
@@ -167,6 +172,7 @@ function install(root: string, kitRoot: string, previous?: KitLock, force = fals
     kit_root: kitRoot,
     kit_commit: head.code === 0 ? head.stdout.trim() : null,
     workbench_name: vars.WORKBENCH_NAME,
+    skill_overrides,
     updated_at: new Date().toISOString(),
   };
   const preserved = installAssets(root, assets, lock, previous, vars, force);
@@ -407,14 +413,14 @@ export function addRepo(opts: { repoPath: string; workbenchDir?: string; force?:
   const root = findWorkbenchRoot(opts.workbenchDir ?? dirname(absRepo), opts.workbenchDir !== undefined);
   checkMigration(root);
   const rel = relative(root, absRepo);
-  if (rel === "" || rel.startsWith("..") || rel.includes("/")) {
+  if (rel.startsWith("..") || rel.includes("/")) {
     throw new Error(
-      `Repository ${absRepo} must be a direct subdirectory inside workbench root ${root} so guard/ledger/wb-git can track it consistently.`,
+      `Repository ${absRepo} must be the workbench root or a direct subdirectory inside workbench root ${root} so guard/ledger/wb-git can track it consistently.`,
     );
   }
 
-  const repoName = basename(absRepo);
-  const cardPath = join(root, ".workbench", "repos", `${repoName}.md`);
+  const repoName = rel || ".";
+  const cardPath = repoCardPath(root, repoName);
 
   if (!existsSync(cardPath) || opts.force) {
     const info = detectRepoCommands(absRepo);
@@ -499,9 +505,46 @@ function inspectWorkbench(root: string) {
       });
     }
   }
+  const syncCommand = issues.some(issue => issue.check === "bins")
+    ? "./bin/forge sync " + Bun.$.escape(root) + " from the forge-kit release directory"
+    : "forge sync " + Bun.$.escape(root);
+  const agentsPath = localPath(root, "AGENTS.md");
+  const agentsMissing = !existsSync(agentsPath);
+  if (agentsMissing || readRequired(agentsPath).length >= 8000)
+    issues.push({
+      level: "error",
+      check: "agents-md",
+      message: agentsMissing
+        ? "Missing " + agentsPath + "; run " + syncCommand + " to recreate it"
+        : agentsPath + " must be under 8000 bytes; move the edited file aside, then run " + syncCommand + " to recreate it",
+    });
+
+  const lockPath = localPath(root, ".workbench/kit-lock.json");
+  if (!existsSync(lockPath))
+    issues.push({
+      level: "error",
+      check: "lock",
+      message: "Missing " + lockPath + "; initialize the workbench",
+    });
+  if (existsSync(lockPath)) {
+    const lock = JSON.parse(readRequired(lockPath).toString()) as KitLock;
+    for (const [path, expected] of Object.entries(lock.managed_files ?? {})) {
+      const dest = localPath(root, path);
+      const missing = !existsSync(dest);
+      if (missing || hash(readRequired(dest)) !== expected)
+        issues.push({
+          level: "error",
+          check: "projection",
+          message: missing
+            ? "Missing " + dest + "; run " + syncCommand + " to recreate it"
+            : dest + " differs from the installed manifest; move the edited file aside, then run " + syncCommand + " to recreate it",
+        });
+    }
+  }
+
   try {
     checkMigration(root);
-    const effective = resolveInstance(root, findKitRoot());
+    const effective = resolveInstance(root);
     const projectChecks = [...effective.actions.values()].filter(({value}) =>
       isProjectVerification(value, effective.repos) && (value.inputs?.length ||
         (value.argv[0].includes("/") && !isAbsolute(value.argv[0]))));
@@ -542,20 +585,6 @@ function inspectWorkbench(root: string) {
     });
     return { ok: false, root, issues };
   }
-  const syncCommand = issues.some(issue => issue.check === "bins")
-    ? "./bin/forge sync " + Bun.$.escape(root) + " from the forge-kit release directory"
-    : "forge sync " + Bun.$.escape(root);
-  const agentsPath = localPath(root, "AGENTS.md");
-  const agentsMissing = !existsSync(agentsPath);
-  if (agentsMissing || readRequired(agentsPath).length >= 8000)
-    issues.push({
-      level: "error",
-      check: "agents-md",
-      message: agentsMissing
-        ? "Missing " + agentsPath + "; run " + syncCommand + " to recreate it"
-        : agentsPath + " must be under 8000 bytes; move the edited file aside, then run " + syncCommand + " to recreate it",
-    });
-
   // 2. Codex config / hooks / agents parse + models.toml consistency checks
   for (const tomlRel of [".codex/config.toml", ".workbench/models.toml"]) {
     const p = join(root, tomlRel);
@@ -702,29 +731,6 @@ function inspectWorkbench(root: string) {
       });
   }
 
-  const lockPath = localPath(root, ".workbench/kit-lock.json");
-  if (!existsSync(lockPath))
-    issues.push({
-      level: "error",
-      check: "lock",
-      message: "Missing " + lockPath + "; initialize the workbench",
-    });
-  if (existsSync(lockPath)) {
-    const lock = JSON.parse(readRequired(lockPath).toString()) as KitLock;
-    for (const [path, expected] of Object.entries(lock.managed_files ?? {})) {
-      const dest = localPath(root, path);
-      const missing = !existsSync(dest);
-      if (missing || hash(readRequired(dest)) !== expected)
-        issues.push({
-          level: "error",
-          check: "projection",
-          message: missing
-            ? "Missing " + dest + "; run " + syncCommand + " to recreate it"
-            : dest + " differs from the installed manifest; move the edited file aside, then run " + syncCommand + " to recreate it",
-        });
-    }
-  }
-
   if (cfg.guard.require_prod_db_hosts && hosts.length === 0) {
     issues.push({
       level: "error", check: "prod-guard",
@@ -734,11 +740,12 @@ function inspectWorkbench(root: string) {
 
   // 6. Registered repos have cards & exist on disk
   for (const repo of cfg.repos) {
-    if (!existsSync(join(root, ".workbench", "repos", `${repo}.md`))) {
+    const card = repoCardPath(root, repo);
+    if (!existsSync(card)) {
       issues.push({
         level: "warn",
         check: "repos",
-        message: `Registered repo "${repo}" has no repo card at .workbench/repos/${repo}.md`,
+        message: `Registered repo "${repo}" has no repo card at ${relative(root, card)}`,
       });
     }
   }
@@ -841,10 +848,9 @@ Usage:
 
   if (cmd === "instance") {
     const [verb, ...args] = rest.filter((a) => a !== "--json");
-    const root = findWorkbenchRoot(),
-      kit = findKitRoot();
+    const root = findWorkbenchRoot();
     checkMigration(root);
-    const c = resolveInstance(root, kit);
+    const c = resolveInstance(root);
     if (verb === "run" && args.length === 1) {
       const id=args[0];
       if (id==="verify" && c.stages.get(id)?.source==="core" && !c.delivery.value.stages.includes(id)) {
@@ -853,7 +859,7 @@ Usage:
         console.log(JSON.stringify(result));
         process.exitCode=result.ok?0:1;
       } else {
-        process.exitCode = runInstanceStage(root, kit, id);
+        process.exitCode = runInstanceStage(root, id);
       }
       return;
     }

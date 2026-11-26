@@ -1,4 +1,6 @@
-import { accessSync, constants, lstatSync, readFileSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { findKitRoot } from "./kit-root";
+import { accessSync, constants, existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, normalize, relative } from "node:path";
 import { parse } from "yaml";
 import { locateRepo } from "./git";
@@ -101,7 +103,20 @@ interface Effective<T> {
   source: string;
 }
 
-export function resolveInstance(root: string, kitRoot: string) {
+// An explicit release is an installer input. An installed command uses the projections
+// published together with its lock, even when the releasing checkout moves or advances.
+export function resolveInstance(root: string, kitRoot?: string) {
+  const lockPath = localPath(root, ".workbench/kit-lock.json");
+  const installed = !kitRoot && existsSync(lockPath)
+    ? load(lockPath, bytes => {
+        const lock = record(JSON.parse(bytes.toString()), "kit-lock");
+        return {
+          managed_files: record(lock.managed_files, "managed_files"),
+          skill_overrides: lock.skill_overrides === undefined ? undefined : record(lock.skill_overrides, "skill_overrides"),
+        };
+      })
+    : undefined;
+  if (!installed && !kitRoot) kitRoot = findKitRoot();
   const file = localPath(root, ".workbench/workbench.yaml");
   const cfg = load(file, (bytes) => record(parse(bytes.toString(), {prettyErrors:false}), "workbench"));
   if ("name" in cfg) str(cfg.name, file + " name");
@@ -160,7 +175,7 @@ export function resolveInstance(root: string, kitRoot: string) {
       a = record(v, path);
     known(a, ["argv", "cwd", "purpose", "inputs"], path);
     const argv = strings(a.argv, path + ".argv");
-    const cwd = str(a.cwd ?? ".", path + ".cwd");
+    const cwd = str(a.cwd === undefined ? "." : a.cwd, path + ".cwd");
     const purpose = str(a.purpose, path + ".purpose");
     const project = isProjectVerification({ purpose, cwd }, repos);
     const dir = project ? root : localPath(root, cwd);
@@ -241,13 +256,20 @@ export function resolveInstance(root: string, kitRoot: string) {
   const v = section("verification"),
     d = section("delivery");
   known(v, ["environment", "stages"], loc + ".verification");
-  known(d, ["endpoint", "stages"], loc + ".delivery");
+  known(d, ["endpoint", "stages", "atomic_pr_hosts"], loc + ".delivery");
+  const atomicHosts = d.atomic_pr_hosts === undefined ? [] : d.atomic_pr_hosts;
+  if (
+    !Array.isArray(atomicHosts) ||
+    atomicHosts.some(host => typeof host !== "string" || host === "github.com" ||
+      !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*$/.test(host))
+  )
+    throw Error(loc + ".delivery.atomic_pr_hosts must list trusted hostnames supporting the forge.atomic-pr.v1 protocol");
   const verification = {
     kind: "verification",
     id: "default",
     source: ext.verification === undefined ? "core" : file,
     value: {
-      environment: str(v.environment ?? "isolated", loc + ".verification.environment"),
+      environment: str(v.environment === undefined ? "isolated" : v.environment, loc + ".verification.environment"),
       stages: stageRefs(v.stages, ["verify"], "verification"),
     },
   };
@@ -256,8 +278,9 @@ export function resolveInstance(root: string, kitRoot: string) {
     id: "default",
     source: ext.delivery === undefined ? "core" : file,
     value: {
-      endpoint: str(d.endpoint ?? "pr", loc + ".delivery.endpoint"),
+      endpoint: str(d.endpoint === undefined ? "pr" : d.endpoint, loc + ".delivery.endpoint"),
       stages: stageRefs(d.stages, ["ship"], "delivery"),
+      atomic_pr_hosts: atomicHosts as string[],
     },
   };
   const overrides = section("skills");
@@ -267,20 +290,31 @@ export function resolveInstance(root: string, kitRoot: string) {
   const skills = new Map<string, Effective<Skill>>();
   for (const id of CORE_SKILLS) {
     const custom = Object.hasOwn(overrides, id);
-    const dir = custom
-      ? localPath(root, str(overrides[id], loc + ".skills." + id))
-      : localPath(kitRoot, `core/.agents/skills/${id}`);
-    if (custom && (relative(root, dir).startsWith(".agents/") || relative(root, dir).startsWith(".codex/")))
+    const privateDir = custom ? localPath(root, str(overrides[id], loc + ".skills." + id)) : undefined;
+    if (privateDir && (relative(root, privateDir).startsWith(".agents/") || relative(root, privateDir).startsWith(".codex/")))
       throw Error(`${loc}.skills.${id}: keep private skill sources outside managed discovery directories`);
-    const path = localPath(dir, "SKILL.md");
+    const privateFile = privateDir && localPath(privateDir, "SKILL.md");
+    const projection = `.agents/skills/${id}/SKILL.md`;
+    const path = installed ? localPath(root, projection) : privateFile || localPath(kitRoot!, "core/" + projection);
     const value = load(path, (bytes) => {
+      if (installed) {
+        const digest = createHash("sha256").update(bytes).digest("hex");
+        if (installed.managed_files[projection] !== digest)
+          throw Error(path + " differs from the installed manifest; move the edited file aside, then run forge sync");
+        if (privateFile && !readRequired(privateFile).equals(bytes))
+          throw Error(privateFile + " differs from its installed projection; run forge sync to apply the override");
+        if (installed.skill_overrides && installed.skill_overrides[id] !== (privateDir && relative(root, privateDir)))
+          throw Error(loc + ".skills." + id + " changed since installation; run forge sync to apply it");
+      }
       const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/.exec(bytes.toString());
       if (!m) throw Error("Missing YAML front matter");
       const header = record(parse(m[1]), "front matter");
       if (header.name !== id) throw Error(`Expected stable skill name ${id}`);
       return { description: str(header.description, "description"), body: str(m[2], "body"), path };
     });
-    skills.set(id, { kind: "skill", id, source: custom ? path : "core", value });
+    // Earlier v0.5 locks attest the installed bytes but do not identify the original publisher.
+    const source = privateFile || (installed && !installed.skill_overrides ? path : "core");
+    skills.set(id, { kind: "skill", id, source, value });
   }
   return { actions, stages, skills, verification, delivery, repos };
 }
@@ -321,12 +355,11 @@ export function verificationStageCwd(root: string, repo: string, checkout: strin
 
 export function runInstanceStage(
   root: string,
-  kitRoot: string,
   id: string,
   verification?: { checkout: string; head: string; repo: string; config?: ReturnType<typeof resolveInstance> },
   onOutput?: (stdout: Uint8Array, stderr: Uint8Array) => void,
 ) {
-  const cfg = verification?.config ?? resolveInstance(root, kitRoot),
+  const cfg = verification?.config ?? resolveInstance(root),
     stage = cfg.stages.get(id);
   if (!stage) throw Error(`Unknown stage ${id}`);
   const action = cfg.actions.get(stage.value.action);

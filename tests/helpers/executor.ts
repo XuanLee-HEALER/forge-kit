@@ -37,6 +37,15 @@ export function executorFixture(version: "0.4" | "0.5" = "0.4") {
       env: childEnvironment(root, env),
     });
   }
+  async function cliAsync(bin: string, args: string[], env: NodeJS.ProcessEnv = {}) {
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, "../../src/bin/cli.ts"), bin, ...args], {
+      cwd: repo, env: childEnvironment(root, env), stdout: "pipe", stderr: "pipe",
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+    ]);
+    return { exitCode, stdout, stderr };
+  }
   beforeEach(() => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "forge-task-")));
     repo = join(root, "service");
@@ -72,6 +81,7 @@ export function executorFixture(version: "0.4" | "0.5" = "0.4") {
   return {
     git,
     cli,
+    cliAsync,
     get root() {
       return root;
     },

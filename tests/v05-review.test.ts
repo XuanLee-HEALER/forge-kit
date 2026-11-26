@@ -179,19 +179,37 @@ test("ledger reviews preserves selected roles that could not start and their mis
     "--branch", "main", "--base", base, "--depth", "targeted"]);
   Object.assign(s.env, { FORGE_CODEX_BIN: codex, REQUESTS: log, QUALITY: JSON.stringify(modelReport("pass")) });
   const args = [s.forge, "review", "--task", "selection", "--repo", "app", "--roles", "business,quality", "--backend", "codex"];
+  const prior = s.run([s.forge, "review", "--task", "selection", "--repo", "app", "--roles", "quality", "--backend", "codex"], app);
+  expect(prior.code, prior.out + prior.err).toBe(0);
   const result = s.run(args, app);
   expect(result.code, result.out + result.err).toBe(3);
   const reviews = JSON.parse(s.ok([s.forge, "ledger", "reviews", "selection"]));
-  expect(reviews).toHaveLength(2);
-  expect(reviews[0]).toMatchObject({ role: "business", status: "incomplete", backend: null, attempts: [],
+  expect(reviews).toHaveLength(3);
+  expect(reviews[0]).toMatchObject({ kind: "review", role: "quality", status: "pass", base, head });
+  expect(reviews[1]).toMatchObject({ kind: "review_selection", role: "business", status: "incomplete", backend: null, attempts: [],
     missing_materials: ["spec"], base, head });
-  expect(reviews[1]).toMatchObject({ role: "quality", status: "pass", backend: "codex", attempts: [{backend: "codex", status: "pass"}] });
-  expect(readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line).role)).toEqual(["quality"]);
+  expect(reviews[2]).toMatchObject({ kind: "review", role: "quality", status: "pass", backend: "codex", attempts: [{backend: "codex", status: "pass"}] });
+  expect(readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line).role)).toEqual(["quality", "quality"]);
+
+  const ledger = new Ledger(s.work);
+  try {
+    const event = ledger.getTaskEvents("selection").find(event => event.seq === reviews[1].seq)!;
+    const fact = JSON.parse(event.payload_json);
+    expect(fact).toMatchObject({ kind: "review_selection", status: "info", source: "tool" });
+    expect(fact.meta.selection_id).toBeString();
+    expect(fact.meta.execution_id).toBeUndefined();
+  } finally { ledger.closeDb(); }
 
   const empty = s.run([...args, "--base", head], app);
   expect(empty.code).not.toBe(0);
   expect(empty.err + empty.out).toContain("Empty review diff");
   expect(JSON.parse(s.ok([s.forge, "ledger", "reviews", "selection"]))).toEqual(reviews);
+
+  s.env.QUALITY = JSON.stringify(modelReport("incomplete"));
+  expect(s.run(args, app).code).toBe(3);
+  const attempted = JSON.parse(s.ok([s.forge, "ledger", "reviews", "selection"])).at(-1);
+  expect(attempted).toMatchObject({ kind: "review", role: "quality", status: "incomplete", backend: "codex",
+    attempts: [{ backend: "codex", status: "incomplete" }] });
 });
 
 for (const version of ["0.4", "0.5"] as const) test(`v${version} performance retry preserves the original role and range`, () => {

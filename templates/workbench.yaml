@@ -59,5 +59,10 @@ guard:
 #   verification:
 #     environment: isolated
 #     stages: [smoke]
+#   delivery:
+#     endpoint: pr
+#     stages: [ship]
+#     # Only trust hosts implementing the server-side forge.atomic-pr.v1 transaction.
+#     atomic_pr_hosts: []
 #   skills:
 #     ready: .workbench/overrides/ready

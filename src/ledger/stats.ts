@@ -1,5 +1,5 @@
 import { parseArgs } from "node:util";
-import { evidenceSource, type TaskRecord, type EventRecord } from "./types";
+import { evidenceSource, reviewFactKind, type TaskRecord, type EventRecord } from "./types";
 import type { Ledger } from "./store";
 
 function tally(counts: Record<string, number>, key: string) {
@@ -45,7 +45,7 @@ export function ledgerStats(ledger: Ledger, days?: number) {
           .query("SELECT actor,payload_json FROM events WHERE ts>=? AND event_type='EVIDENCE_CAPTURED'")
           .all(since) as EventRecord[]) {
           const p = JSON.parse(row.payload_json);
-          if (!["pass", "fail", "fallback"].includes(p.status)) continue;
+          if (reviewFactKind(p) === "review_selection" || !["pass", "fail", "fallback"].includes(p.status)) continue;
           const status = p.status === "fail" ? "fail" : "pass";
           const sources = (verifications[p.kind] ??= Object.create(null));
           const counts = (sources[evidenceSource(p, row.actor)] ??= { pass: 0, fail: 0 });

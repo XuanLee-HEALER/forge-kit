@@ -65,7 +65,10 @@ export function inspectMerge(
   head: string,
   check: ReturnType<typeof deliveryDiff>,
 ) {
-  if (!runGit(dir, ["merge-base", "--is-ancestor", target, head]).code) return check(repo, dir, target, head);
+  if (!runGit(dir, ["merge-base", "--is-ancestor", target, head]).code) {
+    check(repo, dir, target, head);
+    return git(dir, ["rev-parse", head + "^{tree}"]).trim();
+  }
   const original = git(dir, ["rev-parse", "--path-format=absolute", "--git-path", "objects"]).trim();
   const objects = mkdtempSync(join(tmpdir(), "forge-ship-objects-"));
   try {
@@ -77,6 +80,7 @@ export function inspectMerge(
     const result = git(dir, ["merge-tree", "--write-tree", target, head], env).trim();
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(result)) throw Error("Cannot verify prospective merge tree");
     check(repo, dir, target, result, env);
+    return result;
   } finally {
     rmSync(objects, { recursive: true, force: true });
   }

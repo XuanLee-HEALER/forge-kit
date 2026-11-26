@@ -1,11 +1,13 @@
 // An exact plan is frozen with the runbook. Resolving it again detects changed
 // scripts, endpoints or Git identities before an executor claims an item.
-import { readFileSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
-import { prospectiveMerge } from "../conditional-merge";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
+import { atomicProtocol } from "../atomic-pr";
+import { prospectiveMerge, prospectiveMergeTree } from "../conditional-merge";
 import { loadDbEnvironments, loadWorkbenchConfig } from "../config";
 import { localPath, readRequired, resolveInstance } from "../instance";
 import { runGit } from "../git";
+import { interpreterScript } from "../shared/action-program";
 import { sha256File } from "../shared/path";
 import { resolveTaskCheckout } from "./checkout";
 import { inspectPr } from "./pr";
@@ -58,7 +60,7 @@ export type ShipAction =
       targetOid: string;
       originHash: string;
     }
-  | { kind: "pr"; repo: string; number: number; url: string; head: string; base: string; baseOid: string }
+  | { kind: "pr"; repo: string; number: number; url: string; head: string; base: string; baseOid: string; tree: string; atomicProtocol?: string }
   | { kind: "tag"; repo: string; tag: string; head: string }
   | { kind: "stage"; stage: string; target: string; execute: PinnedCommand; observe: PinnedCommand }
   | { kind: "sql"; target: DbTarget; path: string; sha256: string };
@@ -98,10 +100,6 @@ export function pinCheckouts(ledger: LedgerReader, task: string) {
     })
     .sort((a, b) => a.repo.localeCompare(b.repo) || a.branch.localeCompare(b.branch));
 }
-function instanceFor(root: string) {
-  const lock = JSON.parse(readFileSync(join(root, ".workbench/kit-lock.json"), "utf8"));
-  return resolveInstance(root, lock.kit_root);
-}
 function deliveryStages(cfg: ReturnType<typeof resolveInstance>) {
   return cfg.delivery.value.stages.map((id) => ({
     id,
@@ -113,8 +111,10 @@ function requireTargetObservation(endpoint: string, actions: ShipAction[]) {
     throw Error("A protected delivery endpoint requires a configured stage and independent target observer");
 }
 export function checkDeliveryDefinition(root: string, plan: ExactPlan) {
-  const cfg = instanceFor(root);
+  const cfg = resolveInstance(root);
   requireTargetObservation(plan.endpoint, plan.actions);
+  if (plan.actions.some(a => a.kind === "pr" && a.atomicProtocol && !cfg.delivery.value.atomic_pr_hosts.includes(new URL(a.url).hostname)))
+    throw Error("Approved atomic PR host removed from instance delivery configuration");
   if (
     cfg.delivery.value.endpoint !== plan.endpoint ||
     canonicalJson(deliveryStages(cfg)) !== canonicalJson(plan.stages)
@@ -122,7 +122,7 @@ export function checkDeliveryDefinition(root: string, plan: ExactPlan) {
     throw Error("Delivery endpoint, stage implementation or stage order changed");
 }
 export function stagePin(root: string, id: string): Extract<ShipAction, { kind: "stage" }> {
-  const cfg = instanceFor(root),
+  const cfg = resolveInstance(root),
     stage = cfg.stages.get(id);
   const action = stage && cfg.actions.get(stage.value.action);
   if (!action || !stage || !cfg.delivery.value.stages.includes(id))
@@ -151,10 +151,9 @@ export function stagePin(root: string, id: string): Extract<ShipAction, { kind: 
     argv[0] = realpathSync(executable);
     const files: Record<string, string> = {};
     const paths = new Set(inputs.map((path) => localPath(cwd, path)));
-    for (const arg of argv) {
-      const path = isAbsolute(arg) ? arg : resolve(cwd, arg);
-      if (statSync(path, { throwIfNoEntry: false })?.isFile()) paths.add(path);
-    }
+    paths.add(argv[0]);
+    const script = interpreterScript(args);
+    if (script) paths.add(resolve(cwd, script));
     for (const path of paths) {
       const digest = cache.get(path) ?? new Bun.CryptoHasher("sha256").update(readRequired(path)).digest("hex");
       cache.set(path, digest);
@@ -205,7 +204,7 @@ export function buildPlan(
   fat: string[] = [],
 ): ExactPlan {
   const pins = pinCheckouts(ledger, task);
-  const cfg = instanceFor(ledger.workbenchRoot);
+  const cfg = resolveInstance(ledger.workbenchRoot);
   const sequence = deliveryStages(cfg);
   if (cfg.delivery.value.endpoint === "fat") {
     checkFatProtection(ledger.workbenchRoot);
@@ -286,6 +285,8 @@ export function buildPlan(
       head: pin.head,
       base: String(data.baseRefName),
       baseOid: String(data.baseRefOid),
+      tree: prospectiveMergeTree(dir, data.baseRefOid, pin.head),
+      ...(cfg.delivery.value.atomic_pr_hosts.includes(new URL(data.url).hostname) && {atomicProtocol}),
     };
     ci.push(check);
     if (pr) items.push(check);

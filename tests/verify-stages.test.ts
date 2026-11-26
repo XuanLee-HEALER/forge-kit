@@ -55,10 +55,10 @@ test("custom and core stages execute in declaration order against one isolated r
   mkdirSync(adapters);
   const output = join(f.root, "adapter-result.json");
   writeFileSync(join(adapters, "check.ts"),
-    "#!/usr/bin/env bun\nawait Bun.write(" + JSON.stringify(output) + ", JSON.stringify({cwd:process.cwd(), checkout:process.env.FORGE_VERIFY_CHECKOUT, environment:process.env.FORGE_VERIFY_ENVIRONMENT}));", {mode:0o755});
+    "#!/usr/bin/env bun\nawait Bun.write(process.argv[2], JSON.stringify({cwd:process.cwd(), checkout:process.env.FORGE_VERIFY_CHECKOUT, environment:process.env.FORGE_VERIFY_ENVIRONMENT}));", {mode:0o755});
   writeFileSync(join(adapters, "rules.txt"), "fixture input\n");
   config.extensions.actions.first.cwd = "service";
-  config.extensions.actions.last = { cwd: ".workbench/actions", argv: ["./check.ts"], inputs: ["rules.txt"], purpose: "verify" };
+  config.extensions.actions.last = { cwd: ".workbench/actions", argv: ["./check.ts", output], inputs: ["rules.txt"], purpose: "verify" };
   config.extensions.verification.environment = "fixture-lab";
   writeFileSync(file, stringify(config));
   const custom = f.cli("verify", []);
@@ -93,13 +93,22 @@ test("custom and core stages execute in declaration order against one isolated r
   expect(f.cli("verify", []).exitCode).toBe(0);
   expect(readiness().join(" ")).not.toContain("latest verify failed");
 
+  config.extensions.actions.last.argv = ["bun", "run", "./check.ts", output];
+  writeFileSync(file, stringify(config));
+  expect(f.cli("verify", []).exitCode).toBe(0);
+  const pinnedScript = f.evidence().at(-1).meta.policy_sha256;
+  appendFileSync(executable, "\n// update the verifier entry point");
+  expect(readiness().join(" ")).toMatch(/verification|verify failed/);
+  expect(f.cli("verify", []).exitCode).toBe(0);
+  expect(f.evidence().at(-1).meta.policy_sha256).not.toBe(pinnedScript);
+
   config.extensions.actions.first.argv = ["bun", "-e", "process.exit(9)"];
   writeFileSync(file, stringify(config));
   expect(f.cli("verify", []).exitCode).toBe(1);
   expect(f.evidence().at(-1)).toMatchObject({ kind: "verify", status: "fail", meta: { stages: [{ stage: "before", exit_code: 9 }] } });
-});
+}, 30_000);
 
-test("an isolated Bun install uses the designated cache after the private fixture registry stops", async () => {
+test("the isolated Bun installer fills a cold cache online and reuses it on explicit offline runs", async () => {
   const pkg = join(f.root, "fixture-package");
   const cache = join(f.root, "dependency-cache");
   mkdirSync(pkg);
@@ -110,7 +119,10 @@ test("an isolated Bun install uses the designated cache after the private fixtur
   const pack = Bun.spawnSync([process.execPath, "pm", "pack", "--ignore-scripts", "--filename", archive], {cwd: pkg});
   expect(pack.exitCode, pack.stderr.toString()).toBe(0);
   const tarball = readFileSync(archive);
+  let fetches = 0;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
+    ++fetches;
+    expect(request.headers.get("authorization")).toBeNull();
     if (request.url.endsWith(".tgz")) return new Response(tarball);
     return Response.json({ name: manifest.name, "dist-tags": {latest: "1.0.0"}, versions: {"1.0.0": {
       ...manifest, dist: {tarball: new URL("/fixture.tgz", request.url).href},
@@ -127,19 +139,27 @@ test("an isolated Bun install uses the designated cache after the private fixtur
     const install = Bun.spawn([process.execPath, "install", "--cache-dir", cache, "--ignore-scripts"], {cwd: f.repo, stdout: "ignore", stderr: "pipe"});
     const [code, text] = await Promise.all([install.exited, new Response(install.stderr).text()]);
     expect(code, text).toBe(0);
+    f.git("add", "--", ".gitignore", "package.json", "bunfig.toml", "cached.test.ts", "bun.lock");
+    f.git("commit", "-m", "offline fixture");
+    const docs = join(f.root, ".workbench/specs/task");
+    mkdirSync(docs, { recursive: true });
+    writeFileSync(join(docs, "scope.md"), "Exercise preloaded packages.");
+    f.ledger.freezeSpec({ task_id: "task" });
+    const args = ["--kind", "test", "--", "bun", "test"];
+    const freshCache = join(f.root, "cold-cache");
+    const before = fetches;
+    const online = await f.cliAsync("verify", args, { BUN_INSTALL_CACHE_DIR: freshCache, SYNTHETIC_OPERATOR_TOKEN: "fixture" });
+    expect(online.exitCode, online.stderr + online.stdout).toBe(0);
+    expect(fetches).toBeGreaterThan(before);
+    const after = fetches;
+    const empty = await f.cliAsync("verify", ["--offline", ...args], { BUN_INSTALL_CACHE_DIR: join(f.root, "empty-cache") });
+    expect(empty.exitCode).not.toBe(0);
+    expect(empty.stderr).toContain("Cannot install locked verification dependencies");
+    expect(fetches).toBe(after);
+    server.stop(true);
+    const offline = f.cli("verify", ["--offline", ...args], { BUN_INSTALL_CACHE_DIR: freshCache });
+    expect(offline.exitCode, offline.stderr.toString() + offline.stdout.toString()).toBe(0);
   } finally { server.stop(true); }
-  f.git("add", "--", ".gitignore", "package.json", "bunfig.toml", "cached.test.ts", "bun.lock");
-  f.git("commit", "-m", "offline fixture");
-  const docs = join(f.root, ".workbench/specs/task");
-  mkdirSync(docs, { recursive: true });
-  writeFileSync(join(docs, "scope.md"), "Exercise preloaded packages.");
-  f.ledger.freezeSpec({ task_id: "task" });
-  const args = ["--kind", "test", "--", "bun", "test"];
-  const result = f.cli("verify", args, { BUN_INSTALL_CACHE_DIR: cache, SYNTHETIC_OPERATOR_TOKEN: "fixture" });
-  expect(result.exitCode, result.stderr.toString() + result.stdout.toString()).toBe(0);
-  const empty = f.cli("verify", args, { BUN_INSTALL_CACHE_DIR: join(f.root, "empty-cache") });
-  expect(empty.exitCode).not.toBe(0);
-  expect(empty.stderr.toString()).toContain("Cannot install locked verification dependencies");
 });
 
 test("project verification resolves inputs and programs from the selected linked worktree commit", () => {

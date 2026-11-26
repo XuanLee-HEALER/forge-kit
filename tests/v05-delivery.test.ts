@@ -9,53 +9,7 @@ beforeEach(() => { s = sandbox(); });
 afterEach(() => s.cleanup());
 
 function localTransport(bare: string, calls: string) {
-  const git = Bun.which("git", {PATH: s.env.PATH});
-  if (!git) throw new Error("Git is required for the local transport fixture");
-  const race = join(s.root, "external-update");
-  const gate = join(s.root, "receive-gate");
-  const shellGit = "'" + git.replaceAll("'", "'\\''") + "'";
-  writeFileSync(join(s.bin, "git"), '#!/bin/sh\ncase " $* " in\n  *" push "*) exec "${0%/*}/fixture-push" "$@" ;;\n  *) exec ' + shellGit + ' "$@" ;;\nesac\n', {mode:0o755});
-  writeFileSync(join(s.bin, "fixture-push"), `#!/usr/bin/env bun
-const args = process.argv.slice(2);
-const push = args.indexOf("push");
-const remote = args.findIndex((arg, index) => index > push && ["origin", "https://github.com/fixture/app.git"].includes(arg));
-const git = ${JSON.stringify(git)}, bare = ${JSON.stringify(bare)};
-if (push >= 0 && remote > push) {
-  args[remote] = bare;
-  const race = Bun.file(${JSON.stringify(race)});
-  if (await race.exists()) {
-    const {when, base, other} = await race.json();
-    if (when === "before-advertisement") {
-      const update = Bun.spawnSync([git, "-C", bare, "update-ref", "refs/heads/main", other, base]);
-      if (update.exitCode !== 0) process.exit(7);
-    }
-  }
-}
-const result = Bun.spawnSync([git, ...args], {stdin:"inherit", stdout:"inherit", stderr:"inherit"});
-process.exit(result.exitCode);
-`, {mode:0o755});
-  writeFileSync(join(bare, "hooks/pre-receive"), `#!/usr/bin/env bun
-const updates = await Bun.stdin.text();
-if (!updates.includes("refs/heads/main")) process.exit(0);
-const gate = ${JSON.stringify(gate)};
-if (await Bun.file(gate+".armed").exists()) {
-  await Bun.write(gate+".entered", "1");
-  const deadline = Date.now()+15000;
-  while (!await Bun.file(gate).exists() && Date.now()<deadline) await Bun.sleep(20);
-  if (!await Bun.file(gate).exists()) process.exit(4);
-}
-const race = Bun.file(${JSON.stringify(race)});
-if (await race.exists()) {
-  const {when, base, other} = await race.json();
-  if (when === "before-update") {
-    // An independent target-side writer races after advertisement, outside receive-pack's quarantine.
-    const env = {...process.env};
-    for (const key of Object.keys(env)) if (key.startsWith("GIT_")) delete env[key];
-    const result = Bun.spawnSync([${JSON.stringify(git)}, "-C", ${JSON.stringify(bare)}, "update-ref", "refs/heads/main", other, base], {env});
-    process.exit(result.exitCode);
-  }
-}
-`, {mode:0o755});
+  const race = join(s.root, "external-update"), gate = join(s.root, "receive-gate");
   writeFileSync(join(bare, "hooks/post-receive"), `#!/usr/bin/env bun
 import {appendFileSync} from "node:fs";
 for (const update of (await Bun.stdin.text()).trim().split("\\n")) {
@@ -86,7 +40,7 @@ function preparePullRequest(track: "full" | "targeted" = "full", defect = false,
   const base = commit("example.test.ts", 'import {expect,test} from "bun:test"; import {message} from "./src/feature"; test("ready output", ()=>expect(message.toLowerCase()).toBe("ready"));\n');
   s.git(s.root, "init", "--bare", "-b", "main", bare);
   // Preserve hosted identity for the forge CLI while restricting every Git push to the bare fixture.
-  git("remote", "add", "origin", "https://github.com/fixture/app.git");
+  git("remote", "add", "origin", "https://forge.example.test/fixture/app.git");
   git("push", bare, "main");
   git("switch", "-c", "feature-fixture");
   const config = join(s.work, ".workbench/workbench.yaml");
@@ -110,7 +64,7 @@ function preparePullRequest(track: "full" | "targeted" = "full", defect = false,
   const head = commit("src/feature.ts", 'export const message = "ready";\n');
   git("push", bare, "feature-fixture");
   if (endpoint === "blue-rollout") configureStage("success", head, base, endpoint, "publish");
-  const pr = { url: "https://github.com/fixture/app/pull/1", number: 1, state: "OPEN", baseRefName: "main",
+  const pr = { url: "https://forge.example.test/fixture/app/pull/1", number: 1, state: "OPEN", baseRefName: "main",
     headRefName: "feature-fixture", headRefOid: head, baseRefOid: base, isCrossRepository: false,
     headRepository: {name: "app"}, headRepositoryOwner: {login: "fixture"}, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" };
   const state = join(s.root, "host-pr.json");
@@ -121,6 +75,16 @@ function preparePullRequest(track: "full" | "targeted" = "full", defect = false,
   writeFileSync(ci, "pass");
   Object.assign(s.env, {FORGE_SESSION_ID: "operator", FORGE_WORKBENCH_ROOT: s.work, PR_STATE: state, CI_STATE: ci,
     TARGET_GIT: bare, TARGET_LOG: calls});
+  const hostFixture = join(import.meta.dir,"fixtures","atomic-pr-host.ts");
+  const seed = (ref: string, value: string) => {
+    const file = join(s.root, "fixture-ref");
+    writeFileSync(file,value);
+    const object=s.git(bare,"hash-object","-w",file).trim();
+    s.git(bare,"update-ref",ref,object);
+  };
+  seed("refs/fixture/pr/1/state",JSON.stringify(["OPEN",pr.url,pr.baseRefName,pr.headRefName]));
+  seed("refs/fixture/protection","protected");
+  seed("refs/fixture/checks/"+head,"pass");
   writeFileSync(join(s.bin, "gh"), `#!/usr/bin/env bun
 import {appendFileSync,readFileSync} from "node:fs";
 const args = process.argv.slice(2);
@@ -128,16 +92,22 @@ const selector = args[2] ?? "";
 const file = args[0] === "pr" && /(?:^|\\/)2$/.test(selector) ? process.env.PR_STATE+"-2" : process.env.PR_STATE;
 const pr = await Bun.file(file).json();
 const ref = (name) => Bun.spawnSync(["git", "-C", process.env.TARGET_GIT, "rev-parse", "refs/heads/"+name]).stdout.toString().trim();
-if (args[0] === "api") console.log(ref("main"));
+if (args[0] === "api" && args.some(arg => arg.includes("/forge/atomic-pr/"))) {
+  const route=args.find(arg=>arg.includes("/forge/atomic-pr/"));
+  if(args[args.indexOf("--hostname")+1]!=="forge.example.test" || !route.startsWith("repos/fixture/app/")) process.exit(2);
+  const result=Bun.spawnSync(["bun",${JSON.stringify(hostFixture)},route,...args],{env:process.env,stdout:"inherit",stderr:"inherit"});
+  process.exit(result.exitCode??1);
+}
+else if (args[0] === "api" && args.some(arg => arg.includes("/git/commits/"))) {
+  const oid=args.find(arg => arg.includes("/git/commits/")).split("/").at(-1);
+  if (args.at(-1)!=='[.tree.sha, .parents[].sha] | join(" ")') process.exit(2);
+  const record=Bun.spawnSync(["git","-C",process.env.TARGET_GIT,"show","-s","--format=%T %P",oid]);
+  if(record.exitCode!==0) process.exit(2);
+  console.log(record.stdout.toString().trim());
+}
+else if (args[0] === "api") console.log(ref("main"));
 else if (args[0] === "pr" && args[1] === "list") console.log(JSON.stringify([pr]));
 else if (args[0] === "pr" && args[1] === "view") {
-  const main = ref("main");
-  const updated = readFileSync(process.env.TARGET_LOG, "utf8").split("\\n").includes("merge "+main);
-  const contains = oid => Bun.spawnSync(["git", "-C", process.env.TARGET_GIT, "merge-base", "--is-ancestor", oid, main]).exitCode===0;
-  if (!process.env.WITHHOLD_PR_RECEIPT && pr.state === "OPEN" && updated && contains(pr.headRefOid) && contains(pr.baseRefOid)) {
-    Object.assign(pr,{state:"MERGED",mergedAt:new Date().toISOString(),mergeCommit:{oid:main}});
-    await Bun.write(file,JSON.stringify(pr));
-  }
   console.log(JSON.stringify(pr));
 }
 else if (args[0] === "pr" && args[1] === "checks") console.log(JSON.stringify([{name:"fixture-ci",bucket:await Bun.file(process.env.CI_STATE).text()}]));
@@ -179,26 +149,26 @@ if (mode==="rejected") process.exit(17);
 const ticket = {action_id:process.env.FORGE_ACTION_ID, endpoint:process.env.FORGE_ENDPOINT,
   state:mode==="pending"?"pending":mode==="failure"?"failed":"completed",
   versions:[{repo:plan.repo,head:mode==="wrong-version"?process.argv[4]:plan.head}]};
-await Bun.write("deployment-target.json", JSON.stringify(ticket));
+await Bun.write(process.argv[5], JSON.stringify(ticket));
 // The submitter can acknowledge the request before the target has applied the revision.
 console.log(JSON.stringify({state:"completed",action_id:ticket.action_id,endpoint:ticket.endpoint,versions:JSON.parse(process.env.FORGE_APPROVED_HEADS)}));
 if(mode==="failure") process.exit(3);
 `);
   writeFileSync(join(s.work, "observe-target.ts"), `import {appendFileSync} from "node:fs";
-const target = Bun.file("deployment-target.json");
+const target = Bun.file(process.argv[2]);
 const observation = await target.exists() ? await target.json() : {state:"absent",action_id:process.env.FORGE_ACTION_ID,
   endpoint:process.env.FORGE_ENDPOINT,versions:JSON.parse(process.env.FORGE_APPROVED_HEADS)};
 appendFileSync("target-reads", JSON.stringify(observation)+"\\n");
 console.log(JSON.stringify(observation));
 `);
   cfg.extensions = {actions: {
-    rolloutAction: {purpose: "deliver", cwd: ".", argv: ["bun", "release-stage.ts", head, localRollout, base], inputs:["release-plan.json"]},
-    actualState: {purpose:"observe",cwd:".",argv:["bun","observe-target.ts"],inputs:[]}},
+    rolloutAction: {purpose: "deliver", cwd: ".", argv: ["bun", "release-stage.ts", head, localRollout, base, "deployment-target.json"], inputs:["release-plan.json"]},
+    actualState: {purpose:"observe",cwd:".",argv:["bun","observe-target.ts","deployment-target.json"],inputs:[]}},
     stages: {[stage]: {action: "rolloutAction", observe:"actualState"}}, delivery: {endpoint, stages: [stage]}};
   writeFileSync(cfgPath, stringify(cfg));
 }
 
-function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "prod" : "pr") {
+function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "prod" : "pr", useAtomicHost=true) {
   const prepared = preparePullRequest("full", false, taskEndpoint);
   const {ledger} = prepared;
   const receipt = join(s.work, "stage-effects");
@@ -214,6 +184,12 @@ function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "pro
     writeFileSync(policy, stringify(policyDoc));
     configureStage(localRollout, prepared.head, prepared.base, "prod", "rollout");
   }
+  const cfgPath = join(s.work, ".workbench/workbench.yaml");
+  const cfg=parse(readFileSync(cfgPath,"utf8"));
+  cfg.extensions ??= {};
+  cfg.extensions.delivery ??= {stages:["ship"], endpoint:"pr"};
+  if(useAtomicHost) cfg.extensions.delivery.atomic_pr_hosts=["forge.example.test"];
+  writeFileSync(cfgPath,stringify(cfg));
   const book = JSON.parse(ledger("runbook", "create", "--task", "ship-task", "--title", "local target", "--pr", "app:1",
     ...(localRollout ? ["--stage", "rollout"] : [])));
   const envelope = JSON.parse(ledger("fast-track", "prepare", "ship-task", "--to", localRollout ? "prod" : "pr", "--paths", "src/**", "--runbook", book.runbook_id)).envelope_id;
@@ -319,7 +295,7 @@ test("T13 release keeps both handoff identities across stale-head rejection and 
   s.ok([s.forge, "review", "--task", "second", "--repo", "app", "--cwd", repo, "--base", first.head, "--head", sha,
     "--roles", "quality", "--mode", "serial", "--backend", "codex"]);
   const secondState = first.state + "-2";
-  const record = {...JSON.parse(readFileSync(first.state, "utf8")), url:"https://github.com/fixture/app/pull/2",
+  const record = {...JSON.parse(readFileSync(first.state, "utf8")), url:"https://forge.example.test/fixture/app/pull/2",
     number:2, headRefName:"followup",headRefOid:sha,baseRefOid:first.head};
   writeFileSync(secondState, JSON.stringify(record));
   ledger("pr-sync", "second", "--repo", "app", "--branch", "followup", "--pr", "2");
@@ -413,7 +389,7 @@ for (const change of ["script", "arguments", "later-stage", "declared-input"]) {
   }, 90_000);
 }
 
-for (const when of ["before-advertisement", "before-update"]) {
+for (const when of ["before-host-check", "before-transaction"]) {
   test(`T11 conditional write rejects a main race ${when}`, () => {
     const f = delivery();
     f.approve();
@@ -428,7 +404,20 @@ for (const when of ["before-advertisement", "before-update"]) {
   }, 90_000);
 }
 
-test("T11 a completed Git write cannot supply a withheld PR receipt", () => {
+for (const fault of ["unconfigured","unknown-protocol","closed","head-change"]) {
+  test("T11 hosted atomic preconditions prevent a target write: "+fault, () => {
+    const f=delivery(undefined,"pr",fault!=="unconfigured");
+    f.approve();
+    if(fault==="unknown-protocol") s.env.WITHHOLD_CAPABILITY="1";
+    if(fault==="closed" || fault==="head-change") writeFileSync(f.race,JSON.stringify({when:fault,other:f.base}));
+    const result=s.run(f.shipArgs);
+    expect(result.code,result.out+result.err).not.toBe(0);
+    expect(s.git(f.bare,"rev-parse","refs/heads/main").trim()).toBe(f.base);
+    expect(readFileSync(f.calls,"utf8")).toBe("");
+    expect(JSON.parse(result.out||result.err).receipts.filter((r:{status:string})=>r.status==="confirmed")).toEqual([]);
+  },90_000);
+}
+test("T11 a completed hosted transaction still needs an independently observed PR receipt", () => {
   const f = delivery();
   f.approve();
   s.env.WITHHOLD_PR_RECEIPT = "1";
@@ -577,6 +566,28 @@ for (const endpoint of ["blue-rollout", "prod"]) test(`T13 delegated ${endpoint}
   const meta = JSON.parse(evidence[0].payload_json).meta;
   expect(meta.delivery_endpoint).toBe(endpoint);
   expect(meta.observation_ids).toEqual([observer.action_id]);
+  s.ok(observe);
+  writeFileSync(targetState, JSON.stringify({...record, state:"failed"}));
+  for (let i = 0; i < 2; i++) {
+    const failed = s.run(observe);
+    expect(failed.code).not.toBe(0);
+    expect(failed.err + failed.out).toContain("Target has not confirmed delivery");
+  }
+  const blocked = s.run([s.forge, "ledger", "release", "complete", batch.release_id]);
+  expect(blocked.code).not.toBe(0);
+  expect(blocked.err + blocked.out).toContain("production delivery evidence");
+  writeFileSync(targetState, JSON.stringify(record));
+  s.ok(observe);
+  s.ok(observe);
+  const transitions = JSON.parse(ledger("query", "--q", "prod", "--repo", "app", "--json")).events
+    .map((row: {seq:number; sha:string; payload_json:string}) => ({...row, payload:JSON.parse(row.payload_json)}))
+    .filter((row: {payload:{meta?:{observed_runbook?:string}}}) => row.payload.meta?.observed_runbook === book.runbook_id)
+    .sort((a: {seq:number}, b: {seq:number}) => a.seq - b.seq);
+  expect(transitions).toHaveLength(3);
+  for (const [index, state] of ["completed", "failed", "completed"].entries()) {
+    expect(transitions[index]).toMatchObject({sha:f.head, payload:{release_id:batch.release_id, source:"tool",
+      status:state === "failed" ? "fail" : "pass", meta:{observations:[{action_id:observer.action_id, state}]}}});
+  }
   const accepted = JSON.parse(ledger("release", "complete", batch.release_id, "--summary", "local target reports deployed revision"));
   expect(accepted.task_ids).toEqual(["ship-task"]);
   const open = JSON.parse(ledger("query", "--status", "OPEN", "--json")).tasks;
@@ -650,3 +661,30 @@ test("T11 a stable PR task may authorize an exact production rollout", () => {
   expect(result.code, result.err + result.out).toBe(0);
   expect(readFileSync(f.receipt, "utf8")).toBe(f.head + "\n");
 }, 90_000);
+
+for (const extra of [false, true]) {
+  test("T11 hosted two-parent merge must contain the approved tree: extra file " + extra, () => {
+    const f = delivery();
+    f.approve();
+    const actor = join(s.root, "external-integrator");
+    s.git(s.root,"clone",f.bare,actor);
+    s.git(actor,"switch","--detach",f.head);
+    if (extra) {
+      writeFileSync(join(actor,"external.txt"), "unapproved extra change");
+      s.git(actor,"add","--","external.txt");
+    }
+    const tree = s.git(actor,"write-tree").trim();
+    const oid = s.git(actor,"-c","user.name=Integrator","-c","user.email=test@example.invalid",
+      "commit-tree",tree,"-p",f.base,"-p",f.head,"-m","External integration").trim();
+    s.git(actor,"push",f.bare,oid+":refs/heads/main");
+    const snapshot=JSON.parse(readFileSync(f.state,"utf8"));
+    writeFileSync(f.state,JSON.stringify({...snapshot,state:"MERGED",mergeCommit:{oid}}));
+    const first = s.run(f.shipArgs);
+    expect(first.code===0,first.out+first.err).toBe(!extra);
+    const result = JSON.parse(first.out || first.err);
+    expect(result.receipts.filter((row:{status:string})=>row.status==="confirmed")).toHaveLength(extra?0:1);
+    if(extra) expect(result.reason.message).toContain("Remote merge tree or parents differ");
+    expect(s.git(f.bare,"rev-parse","refs/heads/main").trim()).toBe(oid);
+    expect(readFileSync(f.calls,"utf8")).toBe("merge "+oid+"\n");
+  },90_000);
+}

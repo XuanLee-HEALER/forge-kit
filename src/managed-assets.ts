@@ -50,6 +50,7 @@ export interface InstallLock {
   review_agents_enabled?: boolean;
   updated_at: string;
   managed_files?: Record<string, string>;
+  skill_overrides?: Record<string, string>;
 }
 export function wrapper(name: string) {
   return `#!/usr/bin/env bash

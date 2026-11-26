@@ -14,6 +14,7 @@ export function findKitRoot(): string {
   if (existsSync(lockPath)) {
     const { kit_root } = JSON.parse(readFileSync(lockPath, "utf8")) as { kit_root?: string };
     if (kit_root && existsSync(join(kit_root, "kit.toml"))) return realpathSync(kit_root);
+    throw Error("Forge release source unavailable; run ./bin/forge from the desired release directory for init or sync");
   }
   throw new Error("Cannot locate forge-kit root (missing kit.toml)");
 }

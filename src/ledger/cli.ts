@@ -1,6 +1,6 @@
 import { installedInstance } from "../workflow-config";
 import { existsSync } from "node:fs";
-import { ledgerDbPath } from "./types";
+import { ledgerDbPath, reviewFactKind } from "./types";
 import { fastTrackCommand } from "./fast-track";
 import { releaseCommand } from "./release";
 import { handoff, resume } from "./handoff";
@@ -51,7 +51,8 @@ Commands:
   release   verify|runbook|observe|complete|cancel <release_id> | status [release_id]
             For each executed SQL/tag/kubectl action, record its result on a release item:
             record <task> --kind prod --repo <repo> --branch <branch> --sha <handoff-sha> --status pass --summary <result> --meta '{"runbook_id":"<rb-id>","action_id":"<execution_actions ID>"}'
-            For each prod item, record delivery at its handoff SHA with the same command, omitting --meta.
+            For a release_observers item, run forge ledger release observe <release_id> after the target confirms delivery.
+            For a prod item without an observer, record delivery at its handoff SHA with the same command, omitting --meta.
   stats     [--days N] [--json]
   tip       <task_id>
   verify-tip <task_id>@<hash> | --task <id> --tip <hash>
@@ -83,9 +84,10 @@ Commands:
       const records = ledger.getTaskEvents(rest[0]).flatMap(event => {
         if (event.event_type !== "EVIDENCE_CAPTURED") return [];
         const evidence = JSON.parse(event.payload_json);
-        if (evidence.kind !== "review") return [];
+        const kind = reviewFactKind(evidence);
+        if (!kind) return [];
         const meta = evidence.meta ?? {};
-        return [{ seq: event.seq, repo: event.repo, branch: event.branch, base: meta.base,
+        return [{ kind, seq: event.seq, repo: event.repo, branch: event.branch, base: meta.base,
           head: event.sha, role: meta.role, status: meta.report_status ?? evidence.status,
           backend: meta.backend, attempts: meta.attempts, limitations: meta.limitations, missing_materials: meta.missing_materials, source: evidenceSource(evidence, event.actor), summary: evidence.summary }];
       });

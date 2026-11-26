@@ -5,7 +5,7 @@ import { reviewOptions, runReview } from "../review-agents/src/engine";
 import { canonicalRepoPath, findWorkbenchRoot, loadModelsConfig } from "./config";
 import { runGit } from "./git";
 import { executionSnapshot, recheckExecution, targetOptions } from "./ledger/execution";
-import { evidenceSource, usesV05 } from "./ledger/types";
+import { evidenceSource, reviewFactKind, usesV05 } from "./ledger/types";
 import { reviewMeetsFloor } from "./ledger/review-range";
 import { Ledger } from "./ledger/store";
 
@@ -34,7 +34,7 @@ function performanceFailure(ledger: Ledger, snap: ReturnType<typeof executionSna
         (row.branch ? row.branch !== snap.branch : attachments.length !== 1)) continue;
     const evidence = JSON.parse(row.payload_json);
     const source = evidenceSource(evidence, row.actor);
-    if (evidence.kind !== "review" || evidence.meta?.role !== "performance" || source === "manual" ||
+    if (reviewFactKind(evidence) !== "review" || evidence.meta?.role !== "performance" || source === "manual" ||
         !reviewMeetsFloor(evidence.status, evidence.meta, snap.task_id, floor, floorTime, source)) continue;
     if (evidence.status === "fail" && evidence.meta.base === base) return row.seq;
     break;
@@ -70,18 +70,19 @@ export async function reviewCli(args: string[]) {
       if (priorFailure !== undefined && performanceFailure(ledger, snap, base) !== priorFailure)
         throw Error("Performance review evidence changed during the retry");
       for (const result of report.roles) {
+        const selectedOnly = result.backend === null && result.attempts.length === 0;
         ledger.recordEvidence({
           task_id: snap.task_id, repo: snap.repo, branch: snap.branch, sha: head, actor: "tool", source: "tool",
-          kind: "review", status: result.status === "pass" ? "pass" : "fail", summary: result.summary,
+          kind: selectedOnly ? "review_selection" : "review", status: selectedOnly ? "info" : result.status === "pass" ? "pass" : "fail", summary: result.summary,
           meta: {
             ...(priorFailure !== undefined && { retry_of: priorFailure }),
-            role: result.role, base, head, execution_id: execution, started_at: started,
+            role: result.role, base, head, ...(selectedOnly ? { selection_id: execution } : { execution_id: execution, started_at: started }),
             review_task_id: snap.task_id, review_floor_seq: snap.floors.review, freeze_seq: snap.freeze_seq,
             ...(result.missing_materials ? { missing_materials: result.missing_materials } : {}),
             backend: result.backend, attempts: result.attempts, report_status: result.status,
             limitations: result.limitations, findings: result.findings, findings_count: result.findings.length, fallback_used: result.attempts.length > 1,
           },
-          tool_use_id: "review-execution:" + execution + ":" + result.role,
+          tool_use_id: (selectedOnly ? "review-selection:" : "review-execution:") + execution + ":" + result.role,
         });
       }
     }).immediate();

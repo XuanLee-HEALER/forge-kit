@@ -404,7 +404,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     for (const observe of ["missing", "write", "check"])
       invalid({ ...legal, stages: { ...stages, roll: { action: "write", observe } } }, "roll.observe");
     invalid(
-      { ...legal, actions: { ...actions, missing: { purpose: "verify", argv: ["./absent"] } } },
+      { ...legal, actions: { ...actions, missing: { purpose: "verify", cwd: ".workbench", argv: ["./absent"] } } },
       "missing.argv[0]",
     );
     writeFileSync(join(root, "input.json"), "{}");

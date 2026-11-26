@@ -394,7 +394,7 @@ test("automatic batches and session hints select only unreserved handoffs", () =
   expect(cmd("release", "create", "--from-handoffs", "--title", "requeued").items[0].task_id).toBe(a.task);
 }, 30000);
 
-test("release merge authorization follows the pinned feature worktree origin", () => {
+test("release provides a human merge handoff for the pinned feature worktree origin", () => {
   const f = feature("api", 1);
   git(f.dir, "config", "extensions.worktreeConfig", "true");
   git(f.dir, "config", "--unset-all", "remote.origin.url");
@@ -409,7 +409,10 @@ test("release merge authorization follows the pinned feature worktree origin", (
   git(f.wt, "switch", "-c", "next-task");
   const book = cmd("release", "runbook", id);
   expect(approve(book.runbook_id)).toContain(book.runbook_id);
-  const command = book.merge_commands[0];
+  expect(book.merge_commands).toBeUndefined();
+  expect(book.human_merges).toEqual([{ pr_url: f.url, base_branch: "main", expected_head_sha: f.head }]);
+  expect(book.merge_instructions).toContain("托管平台");
+  const command = "gh pr merge " + f.url + " --merge --match-head-commit " + f.head;
   const gate = (cwd: string, cmd = command, sid = "fixture") =>
     evaluatePreToolUse(root, {
       hook_event_name: "PreToolUse",
@@ -418,8 +421,10 @@ test("release merge authorization follows the pinned feature worktree origin", (
       tool_name: "Bash",
       tool_input: { command: cmd },
     });
-  expect(gate(f.wt)).toBeNull();
-  expect(gate(root)).toBeNull();
+  expect(gate(f.wt)).toContain("gh pr merge");
+  expect(gate(root)).toContain("gh pr merge");
+  expect(gate(f.wt, "gh api -X PUT repos/acme/api/forge/atomic-pr/v1/pulls/1/merge")).toBeTruthy();
+  expect(gate(f.wt, "gh api -X GET repos/acme/api/forge/atomic-pr/v1/pulls/1/merge")).toBeNull();
   expect(gate(f.dir)).toBeTruthy();
   expect(gate(f.wt, command, "other")).toBeTruthy();
   expect(gate(f.wt, command.replace(f.head, "a".repeat(40)))).toBeTruthy();

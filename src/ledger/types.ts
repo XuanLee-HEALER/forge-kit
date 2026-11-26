@@ -9,6 +9,17 @@ export function normalizeReviewRole(role?: string | null): string {
   return raw;
 }
 
+// Older executors stored preflight selections as failed reviews. Project their original
+// receipts at read time so the immutable event chain and genuine v0.4 reviews survive.
+export function reviewFactKind(evidence: { kind?: string; meta?: { report_status?: unknown; backend?: unknown; attempts?: unknown } }) {
+  if (evidence.kind === "review_selection") return "review_selection";
+  if (evidence.kind !== "review") return undefined;
+  const meta = evidence.meta;
+  if (meta?.report_status === "incomplete" && meta.backend === null &&
+      Array.isArray(meta.attempts) && meta.attempts.length === 0) return "review_selection";
+  return "review";
+}
+
 export type EvidenceSource = "tool" | "hook" | "manual";
 
 export function evidenceSource(payload: { source?: unknown }, actor: string): EvidenceSource {

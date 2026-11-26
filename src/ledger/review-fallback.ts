@@ -6,7 +6,7 @@ import { loadModelsConfig } from "../config";
 import { checkoutEnvironment, runGit } from "../git";
 import { getSpecState } from "./spec";
 import { resolveTaskCheckout } from "./checkout";
-import { evidenceSource } from "./types";
+import { evidenceSource, reviewFactKind } from "./types";
 import type { Ledger } from "./store";
 
 export function reviewAgentDirectories(root: string) {
@@ -29,7 +29,7 @@ export function runReviewFallback(ledger: Ledger, task: string, repo: string, ro
       if (event.event_type !== "EVIDENCE_CAPTURED" || event.repo !== repo || event.sha !== head) continue;
       const p = JSON.parse(event.payload_json);
       if (!reviewMeetsFloor(p.status, p.meta, task, initialFloor, floorTime, evidenceSource(p, event.actor))) continue;
-      if (p.kind === "review" && p.meta?.role === role && evidenceSource(p, event.actor) !== "manual") return { event, p };
+      if (reviewFactKind(p) === "review" && p.meta?.role === role && evidenceSource(p, event.actor) !== "manual") return { event, p };
     }
   }
   const failure = latestReview();
