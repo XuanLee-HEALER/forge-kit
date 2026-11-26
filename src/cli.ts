@@ -1,6 +1,5 @@
 import { findKitRoot } from "./kit-root";
 export { findKitRoot };
-import { loadShipPolicy } from "./config";
 import {
   checkMigration,
   hash,
@@ -30,9 +29,8 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import {
-  collectProdDbHosts,
+  productionHosts,
   isProductionDb,
-  resolveDbEnvironmentsPath,
   loadDbEnvironments,
   findWorkbenchRoot,
   loadModelsConfig,
@@ -187,6 +185,7 @@ export function initWorkbench(opts: {
   const targetRoot = realpathSync(opts.targetDir);
 
   return withConfigWriteLock(localPath(targetRoot, ".workbench/workbench.yaml"), () => {
+    loadDbEnvironments(targetRoot, { strict: true, validateShadowed: true });
     recoverInstall(targetRoot);
     // Conflict protection: refuse to silently overwrite an existing unmanaged workbench without --force!
     const hasLock = existsSync(join(targetRoot, ".workbench", "kit-lock.json"));
@@ -265,6 +264,7 @@ export function syncWorkbench(opts?: { targetDir?: string; kitRoot?: string }): 
   if (!existsSync(path) && !existsSync(localPath(root,".workbench/sync-journal")))
     throw Error("Not an initialized workbench: missing "+path+"; use forge init");
   return withConfigWriteLock(localPath(root, ".workbench/workbench.yaml"), () => {
+    loadDbEnvironments(root, { strict: true, validateShadowed: true });
     recoverInstall(root);
     const previous = JSON.parse(readRequired(path).toString()) as KitLock;
     return install(root, kitRoot, previous);
@@ -506,7 +506,7 @@ function inspectWorkbench(root: string) {
         issues.push({
           level: "error",
           check: "skills",
-          message: dest + " differs from " + src + "; run forge sync",
+          message: dest + " differs from " + src + "; move any local edits to a private copy, then run forge sync",
         });
       }
     });
@@ -662,22 +662,14 @@ function inspectWorkbench(root: string) {
     });
   }
 
-  if (resolveDbEnvironmentsPath(root)) {
-    const hosts = collectProdDbHosts(root, loadWorkbenchConfig(root));
-    for (const [name, entry] of Object.entries(loadDbEnvironments(root))) {
-      if (entry && isProductionDb(name, entry, hosts) && (!entry.ro?.user || !entry.rw?.user))
-        issues.push({
-          level: "warn",
-          check: "db-credentials",
-          message: "Migrate production credentials to split ro/rw accounts.",
-        });
-    }
-  }
-
-  try {
-    loadShipPolicy(root);
-  } catch (err) {
-    issues.push({ level: "error", check: "ship-policy", message: String(err) });
+  const dbEnvironments = loadDbEnvironments(root, { strict: true, validateShadowed: true });
+  const cfg = loadWorkbenchConfig(root);
+  const hosts = productionHosts(cfg, dbEnvironments);
+  for (const [name, entry] of Object.entries(dbEnvironments)) {
+    if (isProductionDb(name, entry, hosts) && (!entry.ro?.user || !entry.rw?.user))
+      issues.push({
+        level: "warn", check: "db-credentials", message: "Migrate production credentials to split ro/rw accounts.",
+      });
   }
 
   const lockPath = localPath(root, ".workbench/kit-lock.json");
@@ -695,31 +687,19 @@ function inspectWorkbench(root: string) {
         issues.push({
           level: "error",
           check: "projection",
-          message: dest + " differs from installed manifest; inspect and run forge sync",
+          message: dest + " differs from the installed manifest; move the edited file aside, then run forge sync to recreate it",
         });
-    }
-    const cfg = loadWorkbenchConfig(root);
-    try {
-      const hosts = collectProdDbHosts(root, cfg, { strict: true });
-      if (cfg.guard.require_prod_db_hosts && hosts.length === 0) {
-        issues.push({
-          level: "error",
-          check: "prod-guard",
-          message:
-            "guard.require_prod_db_hosts is true but no prod_db_hosts configured in workbench.yaml or environments.json",
-        });
-      }
-    } catch (e) {
-      issues.push({
-        level: "error",
-        check: "prod-guard",
-        message: e instanceof Error ? e.message : String(e),
-      });
     }
   }
 
+  if (cfg.guard.require_prod_db_hosts && hosts.length === 0) {
+    issues.push({
+      level: "error", check: "prod-guard",
+      message: "guard.require_prod_db_hosts is true but no prod_db_hosts configured in workbench.yaml or environments.json",
+    });
+  }
+
   // 6. Registered repos have cards & exist on disk
-  const cfg = loadWorkbenchConfig(root);
   for (const repo of cfg.repos) {
     if (!existsSync(join(root, ".workbench", "repos", `${repo}.md`))) {
       issues.push({

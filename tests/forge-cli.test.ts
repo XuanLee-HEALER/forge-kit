@@ -252,6 +252,9 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const rendered = readFileSync(agents, "utf8");
     expect(rendered).toContain("移交");
     writeFileSync(skill,"private edit");
+    expect(doctorWorkbench(root).issues).toContainEqual(expect.objectContaining({
+      check:"projection",message:expect.stringContaining("move the edited file aside"),
+    }));
     expect(()=>syncWorkbench({targetDir:root})).toThrow("Ownership conflict");
     expect(readFileSync(skill,"utf8")).toBe("private edit");
     for (const path of [agents,skill,bundle]) rmSync(path);
@@ -324,6 +327,62 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const ship = run(join(wb, "bin/forge"), "ship","unknown");
     expect(ship.exitCode).toBe(1);
     expect(ship.stderr.toString() + ship.stdout.toString()).toMatch(/ship/i);
+  });
+
+  test("sync and doctor validate both private environment files before changing projections", () => {
+    const instance = join(target, "instance");
+    initWorkbench({ targetDir: instance });
+    const lock = join(instance, ".workbench/kit-lock.json");
+    const initialLock = readFileSync(lock);
+    const marker = "SYNTHETIC-PRIVATE-VALUE";
+    const valid = JSON.stringify({ local: { user: "test", password: marker } });
+    const primary = join(instance, ".workbench/env/environments.json");
+    const legacy = join(instance, ".agents/skills/dbop/environments.json");
+    mkdirSync(dirname(legacy), { recursive: true });
+    function rejected(path: string) {
+      const diagnosis = doctorWorkbench(instance);
+      expect(diagnosis.ok).toBe(false);
+      expect(JSON.stringify(diagnosis)).toContain(path);
+      expect(JSON.stringify(diagnosis)).not.toContain(marker);
+      let message = "";
+      try {
+        syncWorkbench({ targetDir: instance });
+      } catch (e) {
+        message = String(e);
+      }
+      expect(message).toContain(path);
+      expect(message).not.toContain(marker);
+      expect(readFileSync(lock)).toEqual(initialLock);
+    }
+    writeFileSync(primary, valid);
+    for (const path of [legacy, primary]) {
+      for (const bad of [
+        marker + " is invalid JSON",
+        JSON.stringify({ [marker]: { rw: { password: marker } } }),
+        JSON.stringify({ [marker]: [marker] }),
+      ]) {
+        writeFileSync(path, bad);
+        rejected(path);
+      }
+      writeFileSync(path, valid);
+      chmodSync(path, 0);
+      try {
+        rejected(path);
+      } finally {
+        chmodSync(path, 0o600);
+      }
+    }
+    const external = join(target, "external");
+    mkdirSync(external);
+    writeFileSync(join(external, "environments.json"), valid);
+    rmSync(legacy);
+    rmSync(dirname(legacy), { recursive: true });
+    symlinkSync(external, dirname(legacy));
+    rejected(legacy);
+    rmSync(dirname(legacy));
+    expect(doctorWorkbench(instance).ok).toBe(true);
+    syncWorkbench({ targetDir: instance });
+    expect(readFileSync(primary, "utf8")).toBe(valid);
   });
 
   test("doctor catches plaintext API keys and absolute symlinks", () => {

@@ -1,6 +1,6 @@
 import { parse as parseStrictYaml } from "yaml";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 
 export interface ProdDbTarget {
@@ -239,33 +239,101 @@ export function loadWorkbenchConfig(root: string): WorkbenchConfig {
   };
 }
 
+const dbEnvironmentFiles = [".workbench/env/environments.json", ".agents/skills/dbop/environments.json"];
+
+function dbConfigPath(root: string, rel: string) {
+  let path = root;
+  const file = join(root, rel);
+  for (const part of rel.split("/")) {
+    path = join(path, part);
+    const st = lstatSync(path, { throwIfNoEntry: false });
+    if (!st) return undefined;
+    if (st.isSymbolicLink())
+      throw Error(`DB configuration at ${file} contains a symlink at ${path}; use a local regular file`);
+    if (path !== file && (!st.isDirectory() || !(st.mode & 0o111)))
+      throw Error(`Unreadable DB configuration directory ${path} for ${file}; check permissions`);
+    if (path === file && (!st.isFile() || !(st.mode & 0o444)))
+      throw Error(`Unreadable DB configuration file ${file}; check type and permissions`);
+  }
+  return file;
+}
+
 export function resolveDbEnvironmentsPath(root: string) {
-  return [join(root, ".workbench/env/environments.json"), join(root, ".agents/skills/dbop/environments.json")].find(p => existsSync(p));
+  for (const rel of dbEnvironmentFiles) {
+    const path = dbConfigPath(root, rel);
+    if (path) return path;
+  }
+}
+
+function readDbEnvironmentFile(path: string): Record<string, DbEnvEntry> {
+  // Parser excerpts and arbitrary JSON keys can both contain credentials. Only report schema fields and ordinal.
+  const bytes = readFileSync(path, "utf8");
+  let data: unknown;
+  try {
+    data = JSON.parse(bytes);
+  } catch {
+    throw Error(`Failed to parse DB environments file ${path}; correct the JSON syntax`);
+  }
+  const object = (v: unknown): v is Record<string, unknown> =>
+    !!v && typeof v === "object" && !Array.isArray(v);
+  if (!object(data))
+    throw Error(`Invalid DB configuration ${path}; expected an object of named environments`);
+  for (const [index, [name, entry]] of Object.entries(data).entries()) {
+    const label = `${path} entry ${index + 1}`;
+    if (!name.trim() || !object(entry))
+      throw Error(`Invalid DB configuration at ${label}; expected a named object`);
+    for (const field of ["host", "database", "sslmode", "engine", "user", "password"]) {
+      if (Object.hasOwn(entry, field) && typeof entry[field] !== "string")
+        throw Error(`Invalid DB configuration at ${label}.${field}; expected a string`);
+    }
+    if (!["host", "user", "ro", "rw"].some((field) => Object.hasOwn(entry, field)))
+      throw Error(`Invalid DB configuration at ${label}; provide a database host or account`);
+    for (const field of ["host", "user"]) {
+      if (typeof entry[field] === "string" && !entry[field].trim())
+        throw Error(`Invalid DB configuration at ${label}.${field}; expected a nonempty string`);
+    }
+    if (
+      Object.hasOwn(entry, "port") &&
+      (typeof entry.port !== "number" ||
+        !Number.isInteger(entry.port) ||
+        entry.port < 1 ||
+        entry.port > 65535)
+    )
+      throw Error(`Invalid DB configuration at ${label}.port; expected a valid numeric port`);
+    for (const field of ["ro", "rw"]) {
+      if (!Object.hasOwn(entry, field)) continue;
+      const pair = entry[field];
+      if (
+        !object(pair) ||
+        typeof pair.user !== "string" ||
+        !pair.user.trim() ||
+        (Object.hasOwn(pair, "password") && typeof pair.password !== "string")
+      )
+        throw Error(
+          `Invalid DB configuration at ${label}.${field}; provide a user and an optional string password`,
+        );
+    }
+  }
+  return data as Record<string, DbEnvEntry>;
 }
 
 export function loadDbEnvironments(
   root: string,
-  opts?: { strict?: boolean },
+  opts?: { strict?: boolean; validateShadowed?: boolean },
 ): Record<string, DbEnvEntry> {
-  const p = resolveDbEnvironmentsPath(root);
-  if (p) {
-    try {
-      const parsed = JSON.parse(readFileSync(p, "utf8"));
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return parsed as Record<string, DbEnvEntry>;
-      }
-      if (opts?.strict) {
-        throw new Error(`Invalid DB environments JSON object in ${p}`);
-      }
-    } catch (err) {
-      if (opts?.strict) {
-        throw new Error(
-          `Failed to parse DB environments file ${p}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
+  let effective: Record<string, DbEnvEntry> | undefined;
+  try {
+    for (const rel of dbEnvironmentFiles) {
+      const path = dbConfigPath(root, rel);
+      if (!path) continue;
+      const entries = readDbEnvironmentFile(path);
+      effective ??= entries;
+      if (!opts?.validateShadowed) break;
     }
+  } catch (error) {
+    if (opts?.strict) throw error;
   }
-  return {};
+  return effective ?? {};
 }
 
 export function collectProdDbHosts(

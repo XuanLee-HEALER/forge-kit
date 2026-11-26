@@ -63,7 +63,7 @@ export function runDbCredCli(): void {
       ),
     );
   } catch {
-    console.error("Credentials unavailable. Usage: dbcred <env> [--ro | --rw [--runbook ID] [--session ID]]");
+    console.error("Credentials unavailable. Use forge dbcred <env> --ro for production reads. Run authorized production writes through forge ship. For a non-production account, use forge dbcred <env> [--ro | --rw].");
     process.exitCode = 1;
   }
 }

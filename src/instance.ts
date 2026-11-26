@@ -129,7 +129,7 @@ export function resolveInstance(root: string, kitRoot: string) {
     }
   });
   load(localPath(root, ".workbench/ship-policy.yaml"), () => loadShipPolicy(root));
-  load(file, () => loadWorkbenchConfig(root));
+  const { repos } = load(file, () => loadWorkbenchConfig(root));
   const loc = `${file} extensions`;
   const ext = record(cfg.extensions === undefined ? {} : cfg.extensions, loc);
   known(ext, ["actions", "stages", "verification", "delivery", "skills"], loc);
@@ -223,14 +223,33 @@ export function resolveInstance(root: string, kitRoot: string) {
     });
     skills.set(id, { kind: "skill", id, source: custom ? path : "core", value });
   }
-  return { actions, stages, skills, verification, delivery };
+  return { actions, stages, skills, verification, delivery, repos };
+}
+
+// Configured paths use the workbench namespace. Only paths belonging to the
+// target repository are projected into its isolated checkout.
+export function verificationStageCwd(root: string, repo: string, checkout: string, cwd: string, repos: string[]) {
+  const configured = localPath(root, cwd);
+  if (configured === root) return checkout;
+  const path = relative(root, configured);
+  const owner = [repo, ...repos].map(r => relative(root, localPath(root, r)))
+    .filter(r => r && (path === r || path.startsWith(r + "/")))
+    .sort((a, b) => b.length - a.length)[0];
+  const target = relative(root, localPath(root, repo));
+  if (owner && owner !== target) throw Error("Verification cwd belongs to another repository: " + cwd);
+  if (!owner && (target || path === ".workbench" || path.startsWith(".workbench/"))) return configured;
+  const subdir = relative(localPath(root, repo), configured);
+  const mapped = subdir ? localPath(checkout, subdir) : checkout;
+  if (!statSync(mapped, { throwIfNoEntry: false })?.isDirectory())
+    throw Error("Verification cwd missing from the selected commit: " + cwd);
+  return mapped;
 }
 
 export function runInstanceStage(
   root: string,
   kitRoot: string,
   id: string,
-  verification?: { checkout: string; head: string; config?: ReturnType<typeof resolveInstance> },
+  verification?: { checkout: string; head: string; repo: string; config?: ReturnType<typeof resolveInstance> },
   onOutput?: (stdout: Uint8Array, stderr: Uint8Array) => void,
 ) {
   const cfg = verification?.config ?? resolveInstance(root, kitRoot),
@@ -248,7 +267,7 @@ export function runInstanceStage(
     throw Error(`Recursive stage invocation: ${process.env.FORGE_ACTIVE_STAGE} -> ${id}`);
   const { argv, cwd } = action.value;
   const proc = Bun.spawnSync([...argv, ...stage.value.options], {
-    cwd: localPath(verification?.checkout ?? root, cwd),
+    cwd: verification ? verificationStageCwd(root, verification.repo, verification.checkout, cwd, cfg.repos) : localPath(root, cwd),
     stdin: "ignore",
     stdout: onOutput ? "pipe" : "inherit",
     stderr: onOutput ? "pipe" : "inherit",
@@ -256,6 +275,7 @@ export function runInstanceStage(
       PATH: process.env.PATH,
       LANG: process.env.LANG,
       FORGE_ACTIVE_STAGE: id,
+      ...(cfg.verification.value.stages.includes(id) ? {FORGE_VERIFY_ENVIRONMENT:cfg.verification.value.environment}:{}),
       ...(verification ? { FORGE_VERIFY_HEAD: verification.head } : {}),
       ...(verification && {
         FORGE_VERIFY_CHECKOUT: verification.checkout,
