@@ -52,11 +52,11 @@
 
 ## 交付方式
 
-- 单线程交付按授权终点验收并关账。分线程发布时，功能线程执行 `ledger handoff <task_id>`，将见证贴入 PR 后止于 `HANDED_OFF`；需改代码先 `ledger resume <task_id>`。发布线程用 `ledger release` 组批、核验远端 SHA、登记回执并批量关账。
+- 单线程交付按授权终点验收并关账。分线程发布时，功能线程确认实现和 PR 评审意见已处理、可随批发布，再执行 `ledger handoff <task_id>`，将见证贴入 PR 后止于 `HANDED_OFF`；实现问题退回功能线程，需改代码先 `ledger resume <task_id>`。发布线程用 `ledger release` 组批、核验远端 SHA、登记回执并批量关账。
 - 快轨由操作者维护写保护的 `.workbench/ship-policy.yaml`。冻结后用 `ledger fast-track prepare` 定范围，用户在主会话单独发送 `快轨批准 <ft-id>` 或 `快轨撤销 <ft-id>`。批准会话用 `forge-ship evaluate` 核验、用 `forge-ship run` 兑现；降级交给人工接管。操作顺序见 ship 技能。
 
 ## 调度与流程入口
 
 模型按 `.workbench/models.toml` 映射并同步到 `.codex/agents/*.toml`，流程不硬编码 ID。mechanical 用只读 scanner 检索；standard 用可写 dev 实施；deep 用只读 analyst 或 spec-reviewer 处理复杂权衡、高风险根因和文档评审，说明选用理由。小任务可自行完成。独立 review CLI 须实际隔离运行，不以自审代替。
 
-按阶段读 ready（热身）、grill（需求和 SSOT）、feature（双轨五阶段）、bugfix（amend 辐射与缺陷棘轮）、wrapup（验证与独立评审）、ship（交付）。四个专项入口为 implementation-review、simplicity-performance-review、code-simplification-review、comment-normalization-review。多仓管理用 wb-git，仓库命令查对应仓库卡。
+按阶段读 ready（热身）、grill（需求和 SSOT）、feature（双轨五阶段）、bugfix（amend 辐射与缺陷棘轮）、wrapup（验证与独立评审）、pr-triage（PR 评审分诊）、ship（交付）。四个专项入口为 implementation-review、simplicity-performance-review、code-simplification-review、comment-normalization-review。多仓管理用 wb-git，仓库命令查对应仓库卡。

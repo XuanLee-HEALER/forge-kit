@@ -158,6 +158,10 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     ]) {
       expect(lstatSync(join(bin, name)).mode & 0o111, name).toBeTruthy();
     }
+    const triagePath = ".agents/skills/pr-triage/SKILL.md";
+    const triage = readFileSync(join(kit, "core", triagePath), "utf8");
+    expect(readFileSync(join(root, triagePath), "utf8")).toBe(triage);
+    rmSync(join(root, triagePath));
     const forge = join(bin, "forge");
     run(forge, ["init", join(target, "second"), "--skip-review-agents"]);
     const policy = join(root, ".workbench/ship-policy.yaml");
@@ -172,6 +176,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     expect(rendered).toContain("HANDED_OFF");
     for (const path of [agents, skill, bundle]) writeFileSync(path, "stale");
     run(forge, ["sync", root]);
+    expect(readFileSync(join(root, triagePath), "utf8")).toBe(triage);
     expect(readFileSync(agents, "utf8")).toBe(rendered);
     expect(readFileSync(skill, "utf8")).toBe(readFileSync(join(kit, "core/.agents/skills/ship/SKILL.md"), "utf8"));
     expect(readFileSync(bundle).equals(readFileSync(join(kit, "dist/forge-ship.js")))).toBe(true);
