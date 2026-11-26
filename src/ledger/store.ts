@@ -1540,6 +1540,7 @@ export class Ledger {
     title: string;
     actions: Partial<RunbookActions>;
     exact_stages?: string[];
+    exact_fat?: string[];
   }): RunbookRecord {
     return createRunbook(this, params);
   }

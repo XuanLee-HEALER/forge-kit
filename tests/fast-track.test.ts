@@ -1,3 +1,4 @@
+import { mergePinnedHead } from "../src/conditional-merge";
 import { diffScope, deliveryDiff } from "../src/ship-diff";
 import { fastTrackCommand } from "../src/ledger/fast-track";
 import { beforeEach, test, expect } from "bun:test";
@@ -10,7 +11,7 @@ import { handleLedgerHook } from "../src/ledger-hook";
 import { evaluatePreToolUse } from "../src/guard";
 import { loadShipPolicy } from "../src/config";
 import { initWorkbench, syncWorkbench, doctorWorkbench } from "../src/cli";
-import { root, ledger, feature, git, remote, useReleaseFixture } from "./helpers/release";
+import { root, ledger, feature, git, remote, verifyFeature, useReleaseFixture } from "./helpers/release";
 
 useReleaseFixture();
 const template = readFileSync(join(import.meta.dir, "../templates/ship-policy.yaml"), "utf8");
@@ -153,6 +154,10 @@ test("scope-bound runbook activation requires the exact root prompt", () => {
   writeFileSync(policy(), template);
   expect(human("快轨批准 " + id)).toContain("ACTIVE");
   expect(ledger.getRunbook(rb.runbook_id)?.approved_session_id).toBe("test-session");
+  expect(() => ledger.completeRunbook(rb.runbook_id)).toThrow("verified action receipts");
+  expect(() => fastTrackCommand(ledger, ["revoke", id])).toThrow("approving root session");
+  expect(human("快轨撤销 " + id, { session_id: "different-session" })).toContain("refused");
+  expect(ledger.getRunbook(rb.runbook_id)?.status).toBe("APPROVED");
   expect(human("快轨撤销 " + id)).toContain("REVOKED");
 }, 30_000);
 
@@ -189,3 +194,170 @@ test("rename checks source and destination; gitlinks are outside file budget", (
   git(f.wt, "commit", "-m", "gitlink");
   expect(() => deliveryDiff(policy, ["src/**"])(f.repo, f.wt, "HEAD^", "HEAD")).toThrow("Submodule");
 });
+
+test("conditional Git merge protects the advertised base and preserves divergent history", () => {
+  const f = feature("api", 1),
+    bare = join(root, "api.git");
+  const url = git(f.dir, "remote", "get-url", "origin");
+  git(f.dir, "remote", "set-url", "--push", "origin", url);
+  git(f.wt, "commit", "--allow-empty", "-m", "next change");
+  const head = git(f.wt, "rev-parse", "HEAD");
+  // Both the intervening commit and the authorized head fast-forward the
+  // target. Ordinary non-forced Git push alone would accept the stale plan.
+  git(f.wt, "push", bare, f.head + ":refs/heads/intermediate");
+  const binary = Bun.which("git")!;
+  writeFileSync(
+    join(root, "bin/git"),
+    `#!/usr/bin/env bun
+const args=process.argv.slice(2);
+if(args.includes("push")) {
+  const index=args.indexOf(${JSON.stringify(url)});
+  if(index>=0) args[index]=${JSON.stringify(bare)};
+}
+const result=Bun.spawnSync([${JSON.stringify(binary)},...args],{stdin:"inherit",stdout:"inherit",stderr:"inherit"});process.exit(result.exitCode);
+`,
+    { mode: 0o755 },
+  );
+  expect(() =>
+    mergePinnedHead(
+      f.wt,
+      "main",
+      f.base,
+      head,
+      () => {},
+      () => {
+        git(bare, "update-ref", "refs/heads/main", f.head, f.base);
+      },
+    ),
+  ).toThrow("Conditional PR update refused");
+  expect(git(bare, "rev-parse", "main")).toBe(f.head);
+  git(f.dir, "commit", "--allow-empty", "-m", "independent main change");
+  const diverged = git(f.dir, "rev-parse", "main");
+  git(f.dir, "push", bare, diverged + ":refs/heads/staging");
+  git(bare, "update-ref", "refs/heads/main", diverged, f.head);
+  const target = mergePinnedHead(
+    f.wt,
+    "main",
+    diverged,
+    head,
+    () => {},
+    () => {},
+  );
+  expect(git(bare, "rev-parse", "main")).toBe(target);
+  expect(git(bare, "show", "-s", "--format=%P", target)).toBe(diverged + " " + head);
+  expect(git(f.wt, "rev-parse", "HEAD")).toBe(head);
+}, 30_000);
+
+test("runbook manifest positions the merge at the declared ship slot and retains its instance override", () => {
+  const { f } = exactFixture();
+  const config = join(root, ".workbench/workbench.yaml");
+  const base = readFileSync(config, "utf8");
+  function order(override: boolean) {
+    writeFileSync(
+      config,
+      base +
+        `
+extensions:
+  delivery: {endpoint: rollout, stages: [precheck, ship, postcheck]}
+  stages:
+    precheck: {action: inspect}
+    postcheck: {action: inspect}
+    ${override ? "ship: {action: inspect}" : ""}
+  actions:
+    inspect: {argv: ["bun", "-e", "console.log('test')"], cwd: ".", purpose: deliver}
+`,
+    );
+    const stages = override ? ["precheck", "ship", "postcheck"] : ["precheck", "postcheck"];
+    const rb = ledger.createRunbook({
+      task_id: f.task,
+      title: "Ordered rollout",
+      actions: { prs: [{ repo: f.repo, number: f.n }] },
+      exact_stages: stages,
+    });
+    const plan = JSON.parse(rb.actions_json).exact;
+    expect(plan.endpoint).toBe("rollout");
+    return plan.actions.map((action: { kind: string; stage?: string }) => action.stage ?? action.kind);
+  }
+  expect(order(false)).toEqual(["precheck", "pr", "postcheck"]);
+  expect(order(true)).toEqual(["precheck", "ship", "pr", "postcheck"]);
+}, 30_000);
+
+for (const outcome of ["success", "drift"]) {
+  test(
+    "FAT-only conditional delivery to a local bare remote: " + outcome,
+    () => {
+      initWorkbench({ targetDir: root, kitRoot: join(import.meta.dir, "..") });
+      const f = feature("api", 1),
+        bare = join(root, "api.git");
+      git(f.dir, "remote", "set-url", "origin", bare);
+      git(f.dir, "push", "origin", f.base + ":refs/heads/fat");
+      writeFileSync(
+        join(root, ".workbench/workbench.yaml"),
+        "name: fixture\nrepos: [api]\nextensions:\n  delivery: {endpoint: fat, stages: [ship]}\n",
+      );
+      ledger.updateEndpoint({ task_id: f.task, endpoint: "fat", reason: "Isolated test branch only" });
+      verifyFeature(f);
+      const rb = ledger.createRunbook({
+        task_id: f.task,
+        title: "Update the exact test branch",
+        actions: {},
+        exact_stages: [],
+        exact_fat: ["api:fat"],
+      });
+      const { envelope_id: id } = fastTrackCommand(ledger, [
+        "prepare",
+        f.task,
+        "--runbook",
+        rb.runbook_id,
+        "--to",
+        "fat",
+        "--paths",
+        "src/**",
+      ]) as { envelope_id: string };
+      expect(human("快轨批准 " + id)).toContain("ACTIVE");
+      let expected = f.head;
+      if (outcome === "drift") {
+        git(f.dir, "commit", "--allow-empty", "-m", "external target change");
+        expected = git(f.dir, "rev-parse", "HEAD");
+        git(f.dir, "push", "origin", expected + ":refs/heads/fat");
+      }
+      const cli = () =>
+        Bun.spawnSync(
+          [process.execPath, join(import.meta.dir, "../src/bin/cli.ts"), "ship", "run", "--envelope", id],
+          {
+            cwd: root,
+            env: {
+              ...process.env,
+              FORGE_WORKBENCH_ROOT: root,
+              FORGE_SESSION_ID: "test-session",
+              CODEX_SESSION_ID: "test-session",
+            },
+          },
+        );
+      const result = cli(),
+        json = JSON.parse(result.stdout.toString());
+      expect(json.ok, result.stderr.toString() + result.stdout.toString()).toBe(outcome === "success");
+      expect(git(bare, "rev-parse", "main")).toBe(f.base);
+      expect(git(bare, "rev-parse", "fat")).toBe(expected);
+      if (outcome === "success") {
+        expect(json.receipts).toHaveLength(1);
+        expect(JSON.parse(cli().stdout.toString()).receipts).toEqual(json.receipts);
+        const receipts = ledger
+          .getTaskEvents(f.task)
+          .map((e) => JSON.parse(e.payload_json))
+          .filter((p) => p.meta?.envelope_id === id);
+        expect(receipts.map((p) => p.kind)).toEqual(["fat"]);
+        expect(receipts[0].meta).toMatchObject({
+          ref: "refs/heads/fat",
+          old_sha: f.base,
+          new_sha: f.head,
+          delivery_endpoint: "fat",
+        });
+      } else {
+        expect(json.receipts).toHaveLength(0);
+        expect(json.reason.message).toContain("FAT target changed");
+      }
+    },
+    60_000,
+  );
+}

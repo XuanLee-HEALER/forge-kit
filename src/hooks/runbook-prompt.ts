@@ -1,5 +1,5 @@
 import { type CodexHookInput } from "../hook-io";
-import { approveRunbookFromUserPrompt } from "../ledger/runbook";
+import { approveRunbookFromUserPrompt, revokeRunbook } from "../ledger/runbook";
 import { humanFastTrack } from "../ledger/fast-track";
 import { Ledger } from "../ledger/store";
 import { type RunbookActions } from "../ledger/types";
@@ -42,6 +42,7 @@ export function handleUserPromptRunbookDirectives(
         e.envelope_id +
         " " +
         e.status +
+        (e.status==="ACTIVE" ? " · 使用 forge ship run --envelope "+e.envelope_id+" 逐项兑现。" : "") +
         ("delivery" in e && "notice" in e && e.notice ? " " + e.notice + " " + JSON.stringify(e.delivery) : "")
       );
     } catch (error) {
@@ -68,7 +69,7 @@ export function handleUserPromptRunbookDirectives(
     }
     for (const id of revokeIds) {
       try {
-        ledger.revokeRunbook(id);
+        revokeRunbook(ledger,id,sessionId);
         notes.push(`[Forge Runbook] 已撤销发版单 ${id}，相关放行立即失效。`);
       } catch (err) {
         notes.push(
@@ -82,6 +83,11 @@ export function handleUserPromptRunbookDirectives(
           runbook_id: id,
           session_id: sessionId,
         },deadline);
+        const binding=ledger.db.query<{envelope_id:string},[string]>("SELECT envelope_id FROM exact_ship_envelopes WHERE runbook_id=?").get(id);
+        if(binding) {
+          notes.push(`已批准 ${id}。按本次授权激活 ${binding.envelope_id}，然后运行 forge ship run --envelope ${binding.envelope_id}。逐项回执齐备后执行器自动完成 runbook。`);
+          continue;
+        }
         notes.push(
           `[Forge Runbook] 用户已在主会话批准发版单 ${record.runbook_id}（有效至 ${record.expires_at}，绑定当前 session）。` +
             `底层 guard 将自动放行已登记项：${formatRunbookScopeSummary(actions)}。` +

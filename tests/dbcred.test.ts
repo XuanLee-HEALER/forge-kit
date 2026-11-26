@@ -93,4 +93,7 @@ test("credentials select the requested account, protect production aliases and w
   expect(denied.exitCode).toBe(1);
   expect(denied.stdout.length).toBe(0);
   expect(denied.stderr.toString()).not.toContain(rw.password);
+  expect(denied.stderr.toString()).toContain("forge dbcred <env> --ro");
+  expect(denied.stderr.toString()).toContain("forge ship");
+  expect(denied.stderr.toString()).not.toContain("--runbook");
 });

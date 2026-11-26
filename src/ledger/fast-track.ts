@@ -67,7 +67,7 @@ export function exactRunbook(ledger: Ledger, e: Envelope) {
   )
     throw Error("Registered runbook contents or task changed");
   const plan: ExactPlan = JSON.parse(rb.actions_json).exact;
-  if (!plan || plan.endpoint !== binding.endpoint || !plan.actions?.length)
+  if (!plan || plan.endpoint !== binding.endpoint || !plan.actions?.length || !plan.ci || !plan.stages)
     throw Error("Runbook missing exact action or endpoint bindings");
   return { rb, plan, binding };
 }
@@ -214,6 +214,7 @@ export function shipReceipts(ledger: Ledger, id: string) {
 }
 function revoke(ledger: Ledger, e: Envelope, reason: string, session?: string) {
   if (!["PENDING", "ACTIVE"].includes(e.status)) throw Error("Envelope is " + e.status);
+  if(e.status==="ACTIVE" && (!session || session!==e.approved_session_id)) throw Error("Active authorization requires revocation from the approving root session");
   ledger.db
     .query(
       "UPDATE fast_track_envelopes SET status='REVOKED',updated_at=?,degraded_reason=? WHERE envelope_id=?",
@@ -325,6 +326,7 @@ export function fastTrackCommand(ledger: Ledger, args: string[]) {
     const plan: ExactPlan = JSON.parse(rb.actions_json).exact;
     if (!plan?.actions.length || plan.endpoint !== v.to)
       throw Error("Runbook must bind the exact requested endpoint; create a new runbook");
+    if(v.to==="fat" && plan.actions.some(a=>a.kind!=="fat")) throw Error("FAT scope can only update the registered test branch");
     const target_endpoint: Endpoint = v.to === "pr" || v.to === "fat" ? v.to : "prod";
     if (target_endpoint !== "prod" && plan.actions.some((a) => a.kind === "tag" || a.kind === "sql"))
       throw Error("Tag or database writes exceed the approved endpoint; register a production delivery");

@@ -8,6 +8,64 @@ let s: Sandbox;
 beforeEach(() => { s = sandbox(); });
 afterEach(() => s.cleanup());
 
+function localTransport(bare: string, calls: string) {
+  const git = Bun.which("git", {PATH: s.env.PATH});
+  if (!git) throw new Error("Git is required for the local transport fixture");
+  const race = join(s.root, "external-update");
+  const gate = join(s.root, "receive-gate");
+  const shellGit = "'" + git.replaceAll("'", "'\\''") + "'";
+  writeFileSync(join(s.bin, "git"), '#!/bin/sh\ncase " $* " in\n  *" push "*) exec "${0%/*}/fixture-push" "$@" ;;\n  *) exec ' + shellGit + ' "$@" ;;\nesac\n', {mode:0o755});
+  writeFileSync(join(s.bin, "fixture-push"), `#!/usr/bin/env bun
+const args = process.argv.slice(2);
+const push = args.indexOf("push");
+const remote = args.findIndex((arg, index) => index > push && ["origin", "https://github.com/fixture/app.git"].includes(arg));
+const git = ${JSON.stringify(git)}, bare = ${JSON.stringify(bare)};
+if (push >= 0 && remote > push) {
+  args[remote] = bare;
+  const race = Bun.file(${JSON.stringify(race)});
+  if (await race.exists()) {
+    const {when, base, other} = await race.json();
+    if (when === "before-advertisement") {
+      const update = Bun.spawnSync([git, "-C", bare, "update-ref", "refs/heads/main", other, base]);
+      if (update.exitCode !== 0) process.exit(7);
+    }
+  }
+}
+const result = Bun.spawnSync([git, ...args], {stdin:"inherit", stdout:"inherit", stderr:"inherit"});
+process.exit(result.exitCode);
+`, {mode:0o755});
+  writeFileSync(join(bare, "hooks/pre-receive"), `#!/usr/bin/env bun
+const updates = await Bun.stdin.text();
+if (!updates.includes("refs/heads/main")) process.exit(0);
+const gate = ${JSON.stringify(gate)};
+if (await Bun.file(gate+".armed").exists()) {
+  await Bun.write(gate+".entered", "1");
+  const deadline = Date.now()+15000;
+  while (!await Bun.file(gate).exists() && Date.now()<deadline) await Bun.sleep(20);
+  if (!await Bun.file(gate).exists()) process.exit(4);
+}
+const race = Bun.file(${JSON.stringify(race)});
+if (await race.exists()) {
+  const {when, base, other} = await race.json();
+  if (when === "before-update") {
+    // An independent target-side writer races after advertisement, outside receive-pack's quarantine.
+    const env = {...process.env};
+    for (const key of Object.keys(env)) if (key.startsWith("GIT_")) delete env[key];
+    const result = Bun.spawnSync([${JSON.stringify(git)}, "-C", ${JSON.stringify(bare)}, "update-ref", "refs/heads/main", other, base], {env});
+    process.exit(result.exitCode);
+  }
+}
+`, {mode:0o755});
+  writeFileSync(join(bare, "hooks/post-receive"), `#!/usr/bin/env bun
+import {appendFileSync} from "node:fs";
+for (const update of (await Bun.stdin.text()).trim().split("\\n")) {
+  const [, next, ref] = update.split(" ");
+  if (ref === "refs/heads/main") appendFileSync(${JSON.stringify(calls)}, "merge "+next+"\\n");
+}
+`, {mode:0o755});
+  return {race, gate};
+}
+
 function preparePullRequest(track: "full" | "targeted" = "full", defect = false, endpoint = "pr") {
   s.fresh();
   const repo = join(s.work, "app");
@@ -62,7 +120,7 @@ function preparePullRequest(track: "full" | "targeted" = "full", defect = false,
   Object.assign(s.env, {FORGE_SESSION_ID: "operator", FORGE_WORKBENCH_ROOT: s.work, PR_STATE: state, CI_STATE: ci,
     TARGET_GIT: bare, TARGET_LOG: calls});
   writeFileSync(join(s.bin, "gh"), `#!/usr/bin/env bun
-import {appendFileSync} from "node:fs";
+import {appendFileSync,readFileSync} from "node:fs";
 const args = process.argv.slice(2);
 const selector = args[2] ?? "";
 const file = args[0] === "pr" && /(?:^|\\/)2$/.test(selector) ? process.env.PR_STATE+"-2" : process.env.PR_STATE;
@@ -70,15 +128,19 @@ const pr = await Bun.file(file).json();
 const ref = (name) => Bun.spawnSync(["git", "-C", process.env.TARGET_GIT, "rev-parse", "refs/heads/"+name]).stdout.toString().trim();
 if (args[0] === "api") console.log(ref("main"));
 else if (args[0] === "pr" && args[1] === "list") console.log(JSON.stringify([pr]));
-else if (args[0] === "pr" && args[1] === "view") console.log(JSON.stringify(pr));
+else if (args[0] === "pr" && args[1] === "view") {
+  const main = ref("main");
+  const updated = readFileSync(process.env.TARGET_LOG, "utf8").split("\\n").includes("merge "+main);
+  const contains = oid => Bun.spawnSync(["git", "-C", process.env.TARGET_GIT, "merge-base", "--is-ancestor", oid, main]).exitCode===0;
+  if (!process.env.WITHHOLD_PR_RECEIPT && pr.state === "OPEN" && updated && contains(pr.headRefOid) && contains(pr.baseRefOid)) {
+    Object.assign(pr,{state:"MERGED",mergedAt:new Date().toISOString(),mergeCommit:{oid:main}});
+    await Bun.write(file,JSON.stringify(pr));
+  }
+  console.log(JSON.stringify(pr));
+}
 else if (args[0] === "pr" && args[1] === "checks") console.log(JSON.stringify([{name:"fixture-ci",bucket:await Bun.file(process.env.CI_STATE).text()}]));
 else if (args[0] === "pr" && args[1] === "merge") {
-  if (process.env.MERGE_GATE) {
-    await Bun.write(process.env.MERGE_GATE+".entered", "1");
-    const end=Date.now()+10000;
-    while (!await Bun.file(process.env.MERGE_GATE).exists() && Date.now()<end) await Bun.sleep(20);
-    if (!await Bun.file(process.env.MERGE_GATE).exists()) process.exit(4);
-  }
+  if (process.env.FIXTURE_HUMAN_MERGE !== "1") process.exit(2);
   const i=args.indexOf("--match-head-commit");
   if (i<0 || args[i+1]!==pr.headRefOid) process.exit(2);
   const result=Bun.spawnSync(["git","-C",process.env.TARGET_GIT,"update-ref","refs/heads/main",pr.headRefOid,pr.baseRefOid]);
@@ -122,11 +184,12 @@ function delivery(localRollout?: "success" | "failure") {
   const book = JSON.parse(ledger("runbook", "create", "--task", "ship-task", "--title", "local target", "--pr", "app:1",
     ...(localRollout ? ["--stage", "rollout"] : [])));
   const envelope = JSON.parse(ledger("fast-track", "prepare", "ship-task", "--to", localRollout ? "prod" : "pr", "--paths", "src/**", "--runbook", book.runbook_id)).envelope_id;
+  const transport = localTransport(prepared.bare, prepared.calls);
   const approve = () => {
-    s.hook("UserPromptSubmit", {session_id: "operator", prompt: "快轨批准 " + envelope});
-    expect(JSON.parse(ledger("fast-track", "status", envelope))[0].status).toBe("ACTIVE");
+    const approval = s.hook("UserPromptSubmit", {session_id: "operator", prompt: "快轨批准 " + envelope});
+    expect(JSON.parse(ledger("fast-track", "status", envelope))[0].status, JSON.stringify(approval)).toBe("ACTIVE");
   };
-  return {...prepared, approve, envelope, receipt, stageFile, shipArgs: [s.forge, "ship", "run", "--envelope", envelope]};
+  return {...prepared, ...transport, approve, envelope, receipt, stageFile, shipArgs: [s.forge, "ship", "run", "--envelope", envelope]};
 }
 
 for (const fault of ["unapproved", "session", "ci", "remote-head", "success"]) {
@@ -156,8 +219,8 @@ for (const fault of ["unapproved", "session", "ci", "remote-head", "success"]) {
 test("T11 simultaneous and restarted requests preserve one local effect and one receipt", async () => {
   const f = delivery();
   f.approve();
-  const gate = join(s.root, "release");
-  s.env.MERGE_GATE = gate;
+  const gate = f.gate;
+  writeFileSync(gate + ".armed", "1");
   const run = () => Bun.spawn(f.shipArgs, { cwd: s.work, env: s.env, stdout: "pipe", stderr: "pipe", timeout: 30_000 });
   const first = run();
   let second: ReturnType<typeof run> | undefined;
@@ -193,6 +256,7 @@ for (const track of ["full", "targeted"] as const) {
     const f = preparePullRequest(track, track === "targeted");
     expect(s.run([s.forge, "ledger", "close", "ship-task", "--summary", "open PR"]).code).not.toBe(0);
     expect(s.ok(["bun", "-e", "import {message} from './src/feature'; console.log(message)"], f.repo).trim()).toBe("ready");
+    s.env.FIXTURE_HUMAN_MERGE = "1";
     s.ok(["gh", "pr", "merge", "1", "--merge", "--match-head-commit", f.head]);
     expect(s.git(f.bare, "rev-parse", "refs/heads/main").trim()).toBe(f.head);
     f.ledger("pr-sync", "ship-task", "--repo", "app", "--branch", "feature-fixture", "--pr", "1");
@@ -237,6 +301,7 @@ test("T13 release keeps both handoff identities across stale-head rejection and 
   ledger("release", "verify", batch.release_id);
   const book = JSON.parse(ledger("release", "runbook", batch.release_id)).runbook_id;
   s.hook("UserPromptSubmit", {session_id:"operator", prompt: "批准 " + book});
+  s.env.FIXTURE_HUMAN_MERGE = "1";
   for (const [num, head] of [["1", first.head], ["2", sha]]) {
     s.ok(["gh", "pr", "merge", num!, "--merge", "--match-head-commit", head!]);
     s.git(first.repo, "fetch", first.bare, "+refs/heads/main:refs/remotes/origin/main");
@@ -293,3 +358,47 @@ for (const change of ["script", "arguments", "later-stage"]) {
     expect(s.git(f.bare, "rev-parse", "refs/heads/main").trim()).toBe(f.base);
   }, 90_000);
 }
+
+for (const when of ["before-advertisement", "before-update"]) {
+  test(`T11 conditional write rejects a main race ${when}`, () => {
+    const f = delivery();
+    f.approve();
+    // Rewinding to this ancestor would still allow an ordinary fast-forward to the approved head.
+    const other = s.git(f.bare, "rev-parse", f.base + "^").trim();
+    writeFileSync(f.race, JSON.stringify({when, base: f.base, other}));
+    const denied = s.run(f.shipArgs);
+    expect(denied.code, denied.out + denied.err).not.toBe(0);
+    expect(s.git(f.bare, "rev-parse", "refs/heads/main").trim()).toBe(other);
+    expect(readFileSync(f.calls, "utf8")).toBe("");
+    expect(JSON.parse(readFileSync(f.state, "utf8")).state).toBe("OPEN");
+  }, 90_000);
+}
+
+test("T11 a completed Git write cannot supply a withheld PR receipt", () => {
+  const f = delivery();
+  f.approve();
+  s.env.WITHHOLD_PR_RECEIPT = "1";
+  const result = s.run(f.shipArgs);
+  expect(s.git(f.bare, "rev-parse", "refs/heads/main").trim()).toBe(f.head);
+  expect(readFileSync(f.calls, "utf8")).toBe("merge " + f.head + "\n");
+  expect(result.code).not.toBe(0);
+  const report = JSON.parse(result.out || result.err);
+  expect(report.ok).toBe(false);
+  expect(report.receipts.filter((item: {status: string}) => item.status === "confirmed")).toEqual([]);
+  expect(JSON.parse(readFileSync(f.state, "utf8")).state).toBe("OPEN");
+}, 90_000);
+
+test("T11 a FAT-only envelope cannot merge main", () => {
+  const f = preparePullRequest();
+  localTransport(f.bare, f.calls);
+  const book = JSON.parse(f.ledger("runbook", "create", "--task", "ship-task", "--title", "PR target", "--pr", "app:1"));
+  const prepare = s.run([s.forge, "ledger", "fast-track", "prepare", "ship-task", "--to", "fat", "--paths", "src/**", "--runbook", book.runbook_id]);
+  if (prepare.code === 0) {
+    const envelope = JSON.parse(prepare.out).envelope_id;
+    s.hook("UserPromptSubmit", {session_id:"operator", prompt:"快轨批准 " + envelope});
+    const run = s.run([s.forge, "ship", "run", "--envelope", envelope]);
+    expect(run.code, run.out + run.err).not.toBe(0);
+  } else expect(prepare.out + prepare.err).toMatch(/fat|scope|endpoint/i);
+  expect(s.git(f.bare, "rev-parse", "refs/heads/main").trim()).toBe(f.base);
+  expect(readFileSync(f.calls, "utf8")).toBe("");
+}, 90_000);

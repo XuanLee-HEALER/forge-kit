@@ -1,9 +1,12 @@
+import { mergePinnedHead } from "./conditional-merge";
 import { diffScope, inspectMerge, deliveryDiff, git } from "./ship-diff";
 import { parseArgs } from "node:util";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 
 import {
+  fatRef,
+  checkFatProtection,
   checkDeliveryDefinition,
   pinCheckouts,
   stagePin,
@@ -147,8 +150,32 @@ function preflight(ledger: Ledger, e: Envelope) {
     lines += diffScope(dir, row, pin.head, true, paths, policy, files);
     if (lines > policy.max_lines_changed || files.size > policy.max_files_changed)
       throw Error("Diff exceeds policy limits");
-    const merges = plan.actions.filter((a): a is PrAction => a.kind === "pr" && a.repo === row.repo);
-    if (merges.length !== 1) throw Error("Expected one exact PR per attached branch; recreate the runbook");
+    if (plan.endpoint === "fat") {
+      checkFatProtection(ledger.workbenchRoot);
+      const index = plan.actions.findIndex((a) => a.kind === "fat" && a.repo === row.repo),
+        item = plan.actions[index];
+      if (
+        !item ||
+        item.kind !== "fat" ||
+        item.head !== pin.head ||
+        item.originHash !== pin.originHash ||
+        item.ref !== "refs/heads/fat" ||
+        item.remote !== "origin" ||
+        plan.actions.some((a) => a.kind !== "fat")
+      )
+        throw Error("Incomplete or out-of-scope FAT binding");
+      const live = fatRef(dir),
+        claimed = receipts(ledger, e.envelope_id).some((r) => r.action_index === index);
+      if (live !== item.baseOid && !(claimed && live === item.targetOid))
+        throw Error("Remote FAT target changed");
+      if (runGit(dir, ["merge-base", "--is-ancestor", row.base_sha!, item.baseOid]).code)
+        throw Error("FAT target is outside the approved base");
+      inspectMerge(row.repo, dir, item.baseOid, pin.head, check);
+      continue;
+    }
+    const merges = plan.ci.filter((a) => a.repo === row.repo);
+    if (merges.length !== 1)
+      throw Error("Expected one exact CI target per attached branch; recreate the runbook");
     const pr = merges[0],
       observation = checkedPr(dir, row.branch, pr);
     if (!observation.merged) inspectMerge(row.repo, dir, pr.baseOid, pin.head, check);
@@ -169,6 +196,12 @@ function preflight(ledger: Ledger, e: Envelope) {
   return { plan, dirs };
 }
 function observed(ledger: Ledger, e: Envelope, a: ShipAction, dirs: Map<string, string>): string | null {
+  if (a.kind === "fat") {
+    const live = fatRef(dirs.get(a.repo)!);
+    if (live === a.targetOid) return live;
+    if (live !== a.baseOid) throw Error("Remote FAT ref drifted");
+    return null;
+  }
   if (a.kind === "pr") {
     const row = ledger.getTaskRepos(e.task_id).find((r) => r.repo === a.repo)!;
     const pr = checkedPr(dirs.get(a.repo)!, row.branch, a);
@@ -208,15 +241,49 @@ function perform(
 ) {
   const state = observed(ledger, e, a, dirs);
   if (state) return state;
+  if (a.kind === "fat") {
+    const dir = dirs.get(a.repo)!;
+    const diff = deliveryDiff(validateScope(ledger, e), JSON.parse(e.allowed_path_globs_json));
+    mergePinnedHead(
+      dir,
+      "fat",
+      a.baseOid,
+      a.head,
+      (sha, env) => {
+        if (sha !== a.targetOid) throw Error("Prospective FAT update changed");
+        diff(a.repo, dir, a.baseOid, sha, env);
+      },
+      () => {
+        checkFatProtection(ledger.workbenchRoot);
+        checkAuthorization(ledger, e.envelope_id);
+      },
+      a.originHash,
+    );
+    const target = fatRef(dir);
+    if (target !== a.targetOid) throw Error("Cannot confirm the approved FAT ref");
+    return target;
+  }
   if (a.kind === "pr" || a.kind === "tag") {
     const dir = dirs.get(a.repo)!;
-    const cmd =
-      a.kind === "pr"
-        ? [process.env.FORGE_GH_BIN || "gh", "pr", "merge", a.url, "--merge", "--match-head-commit", a.head]
-        : ["git", "push", "origin", a.head + ":refs/tags/" + a.tag];
-    checkAuthorization(ledger, e.envelope_id);
-    const result = runProcess(cmd, { cwd: dir, env: checkoutEnvironment() });
-    if (result.code) throw Error(a.kind + " action failed; inspect remote state");
+    if (a.kind === "pr") {
+      const diff = deliveryDiff(validateScope(ledger, e), JSON.parse(e.allowed_path_globs_json));
+      mergePinnedHead(
+        dir,
+        a.base,
+        a.baseOid,
+        a.head,
+        (target, env) => diff(a.repo, dir, a.baseOid, target, env),
+        () => checkAuthorization(ledger, e.envelope_id),
+        plan.pins.find((pin) => pin.repo === a.repo)!.originHash,
+      );
+    } else {
+      checkAuthorization(ledger, e.envelope_id);
+      const result = runProcess(["git", "push", "--no-follow-tags", "origin", a.head + ":refs/tags/" + a.tag], {
+        cwd: dir,
+        env: checkoutEnvironment(),
+      });
+      if (result.code) throw Error("Tag action failed; inspect remote state");
+    }
     const confirmed = observed(ledger, e, a, dirs);
     if (!confirmed) throw Error("Uncertain remote outcome; inspect remote before retrying");
     return confirmed;
@@ -413,30 +480,61 @@ export function shipCli(argv: string[]) {
           .query("UPDATE runbooks SET status='COMPLETED',completed_at=? WHERE runbook_id=?")
           .run(now, rb.runbook_id);
         for (const pin of plan.pins) {
-          const pr = plan.actions.find((a): a is PrAction => a.kind === "pr" && a.repo === pin.repo)!;
-          const receipt = receipts(ledger, id).find((r) => r.action_index === plan.actions.indexOf(pr));
+          if (plan.endpoint === "fat") {
+            const index = plan.actions.findIndex((a) => a.kind === "fat" && a.repo === pin.repo),
+              action = plan.actions[index];
+            const receipt = receipts(ledger, id).find((r) => r.action_index === index);
+            if (action?.kind !== "fat" || receipt?.observation !== action.targetOid)
+              throw Error("Missing verified FAT receipt");
+            ledger.recordEvidence({
+              task_id: current.task_id,
+              repo: pin.repo,
+              branch: pin.branch,
+              sha: pin.head,
+              kind: "fat",
+              status: "pass",
+              source: "tool",
+              actor: "tool",
+              summary: "Confirmed exact FAT ref update",
+              meta: {
+                runbook_id: rb.runbook_id,
+                envelope_id: id,
+                delivery_endpoint: "fat",
+                remote: action.remote,
+                ref: action.ref,
+                old_sha: action.baseOid,
+                new_sha: receipt.observation,
+              },
+            });
+            continue;
+          }
+          const pr = plan.ci.find((a) => a.repo === pin.repo)!;
+          const prIndex = plan.actions.findIndex((a) => a.kind === "pr" && a.repo === pin.repo);
+          const receipt = receipts(ledger, id).find((r) => r.action_index === prIndex);
           const meta = {
             runbook_id: rb.runbook_id,
             envelope_id: id,
+            delivery_endpoint: plan.endpoint,
             pr_url: pr.url,
             pr_head_oid: pr.head,
             base_branch: pr.base,
             merge_commit: receipt?.observation,
             target_oid: receipt?.observation,
-            state: "MERGED",
+            ...(receipt && { state: "MERGED" }),
           };
-          ledger.recordEvidence({
-            task_id: current.task_id,
-            repo: pin.repo,
-            branch: pin.branch,
-            sha: pin.head,
-            kind: "pr",
-            status: "pass",
-            source: "tool",
-            actor: "tool",
-            summary: "Verified remote PR merge",
-            meta,
-          });
+          if (receipt)
+            ledger.recordEvidence({
+              task_id: current.task_id,
+              repo: pin.repo,
+              branch: pin.branch,
+              sha: pin.head,
+              kind: "pr",
+              status: "pass",
+              source: "tool",
+              actor: "tool",
+              summary: "Verified remote PR merge",
+              meta,
+            });
           if (current.target_endpoint === "prod")
             ledger.recordEvidence({
               task_id: current.task_id,

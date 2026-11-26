@@ -41,6 +41,7 @@ export function createRunbook(ledger: LedgerReader, params: {
   title: string;
   actions: Partial<RunbookActions>;
   exact_stages?: string[];
+    exact_fat?: string[];
 }): RunbookRecord {
   const title = params.title.trim();
   if (!title) throw new Error("Runbook title is required");
@@ -125,7 +126,7 @@ export function createRunbook(ledger: LedgerReader, params: {
     tags.length === 0 &&
     prs.length === 0 &&
     sql_files.length === 0 &&
-    !params.exact_stages?.length && kubectl_commands.length === 0
+    !params.exact_fat?.length && !params.exact_stages?.length && kubectl_commands.length === 0
   ) {
     throw new Error(
       "Runbook must include at least one action (--tag, --pr, --sql, or --kubectl)",
@@ -133,7 +134,7 @@ export function createRunbook(ledger: LedgerReader, params: {
   }
 
   const normalized: RunbookActions = { tags, prs, sql_files, kubectl_commands };
-  const exact = params.exact_stages && params.task_id ? buildPlan(ledger,params.task_id,normalized,params.exact_stages) : undefined;
+  const exact = params.exact_stages && params.task_id ? buildPlan(ledger,params.task_id,normalized,params.exact_stages,params.exact_fat) : undefined;
   for(const action of exact?.actions ?? []) {
     if(action.kind==="pr") {
       const pr=normalized.prs.find(pr=>pr.repo===action.repo && pr.number===action.number)!;
@@ -296,6 +297,8 @@ export function completeRunbook(ledger: ReleaseLedger, runbook_id: string): Runb
     const rb = ledger.getRunbook(id);
     if (!rb) throw new Error(`Runbook not found: ${id}`);
     if (rb.status === "COMPLETED") return rb;
+    if(ledger.db.query("SELECT 1 FROM exact_ship_envelopes WHERE runbook_id=?").get(id))
+      throw Error("Fast-track runbooks complete through verified action receipts. Use forge ship run --envelope <id>.");
     if (rb.status === "REVOKED") {
       throw new Error(`Cannot complete REVOKED runbook: ${id}`);
     }
@@ -312,11 +315,13 @@ export function completeRunbook(ledger: ReleaseLedger, runbook_id: string): Runb
   });
 }
 
-export function revokeRunbook(ledger: LedgerReader, runbook_id: string): RunbookRecord {
+export function revokeRunbook(ledger: LedgerReader, runbook_id: string, session?:string): RunbookRecord {
   const id = runbook_id.trim().toLowerCase();
   return withImmediateTx(ledger.db, () => {
     const rb = ledger.getRunbook(id);
     if (!rb) throw new Error(`Runbook not found: ${id}`);
+    const active=ledger.db.query<{approved_session_id:string},[string]>("SELECT e.approved_session_id FROM fast_track_envelopes e JOIN exact_ship_envelopes b ON e.envelope_id=b.envelope_id WHERE b.runbook_id=? AND e.status='ACTIVE'").get(id);
+    if(active && session!==active.approved_session_id) throw Error("Use the approving root session to revoke this active authorization");
     const ts = nowIso();
     ledger.db
       .query("UPDATE runbooks SET status = 'REVOKED', revoked_at = ? WHERE runbook_id = ?")

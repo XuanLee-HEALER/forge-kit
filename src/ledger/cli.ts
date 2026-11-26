@@ -1,3 +1,4 @@
+import { installedInstance } from "../workflow-config";
 import { existsSync } from "node:fs";
 import { ledgerDbPath } from "./types";
 import { fastTrackCommand } from "./fast-track";
@@ -120,7 +121,7 @@ Commands:
         options: {
           id: { type: "string" },
           title: { type: "string" },
-          endpoint: { type: "string", default: "pr" },
+          endpoint: { type: "string" },
           depth: { type: "string", default: "full" },
           repo: { type: "string" },
           branch: { type: "string" },
@@ -136,7 +137,7 @@ Commands:
       const res = ledger.openTask({
         task_id: values.id,
         title: values.title,
-        endpoint: values.endpoint as DeliveryEndpoint,
+        endpoint: values.endpoint ?? installedInstance(root)?.delivery.value.endpoint ?? "pr",
         depth: values.depth as VerificationDepth,
         repo: values.repo,
         branch: values.branch,
@@ -554,9 +555,17 @@ Commands:
       console.log(JSON.stringify(res, null, 2));
     } else if (cmd === "runbook") {
       const sub = rest[0];
-      if (!sub || sub === "--help" || sub === "-h") {
+      if (!sub || sub === "--help" || sub === "-h" || (sub === "create" && ["--help","-h"].includes(rest[1]))) {
         console.log(`Usage: forge ledger runbook <create|show|list|complete|revoke>
-  create   --title <text> [--id rb-xxxx] [--task <task_id>] [--tag <repo>:<tag>:<sha>]... [--pr <repo>:<num>]... [--sql <host>:<path>]... [--kubectl "<cmd>"]... [--stage <instance-stage>]...
+  create --title <text> [--id rb-xxxx] <actions>
+    Standalone: register at least one --pr <repo>:<num>, --tag <repo>:<tag>:<sha>,
+                --sql <host>:<path>, or --kubectl "<command>". Flags may repeat.
+    Task delivery: add --task <id>. Register a --pr for each attached repo when merging to main.
+                   Pass each custom delivery stage as --stage <id> in declared order.
+                   Register Kubernetes operations as versioned instance stages.
+                   Production endpoints may also register an exact --tag or --sql.
+    FAT task: use --task <id> --fat <repo>:fat for each attached repository. The only destination is refs/heads/fat.
+    Example: forge ledger runbook create --task fix-1 --title "Merge reviewed change" --pr api:42
   show     <runbook_id>
   list     [--status <PENDING|APPROVED|COMPLETED|REVOKED>]
   complete <runbook_id>
@@ -576,6 +585,7 @@ Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <ru
             sql: { type: "string", multiple: true },
             kubectl: { type: "string", multiple: true },
             stage: { type: "string", multiple: true },
+            fat: { type: "string", multiple: true },
           },
         });
         if (!values.title) throw new Error("Usage: forge ledger runbook create --title <text> ...");
@@ -600,11 +610,13 @@ Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <ru
           }
           return { host: spec.slice(0, idx), path: spec.slice(idx + 1), sha256: "" };
         });
+        if(values.task && values.kubectl?.length) throw Error("--task deliveries register Kubernetes operations via --stage <id>");
+        if(values.fat?.length && !values.task) throw Error("--fat requires --task");
         if (values.stage?.length && !values.task) throw Error("--stage requires --task");
         const rec = ledger.createRunbook({
           runbook_id: values.id,
           task_id: values.task,
-          ...(values.task && {exact_stages: values.stage ?? []}),
+          ...(values.task && {exact_stages: values.stage ?? [],exact_fat:values.fat ?? []}),
           title: values.title,
           actions: {
             tags,

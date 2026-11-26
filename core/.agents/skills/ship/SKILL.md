@@ -22,7 +22,9 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 
 ## Fast-Track
 
-从实例交付配置中读取有序阶段。用 `forge ledger runbook create --task "$TASK" --title "$TITLE" --pr "$REPO:$PR"` 登记精确合并；有自定义上线步骤时按声明顺序重复传入 `--stage <stage-id>`。登记时解析目标版本、动作参数及脚本摘要。把返回的具体目标和内容提供给批准人。
+从实例交付配置中读取有序阶段。用 `forge ledger runbook create --task "$TASK" --title "$TITLE" --pr "$REPO:$PR"` 登记精确合并；有自定义上线步骤时按声明顺序重复传入 `--stage <stage-id>`。登记时解析目标版本、动作参数及脚本摘要。内建 ship 在实例阶段列表的位置决定精确 PR/tag/SQL 的执行顺序。同名实例实现也按其位置运行。对于精确 PR，执行器只向批准的目标引用提交基于固定 base/head 的快进更新，并核验托管服务的合入回执。目标仓的推送策略若拒绝，交由操作者使用受保护的常规 PR 合并流程。把返回的具体目标和内容提供给批准人。
+
+实例终点为 FAT 时，按每个挂载仓登记 `--fat <repo>:fat`，绑定远端现有的 `refs/heads/fat`、旧 SHA、来源 head 及预期更新 SHA。该 runbook 只允许指定测试引用的条件更新。
 
 规格冻结后，使用 `forge ledger fast-track prepare <task-id> --to <endpoint> --paths <globs> --runbook <rb-id>` 绑定终点、范围和精确 runbook。向用户展示逐项资源、动作、版本和时效。用户在主会话单独发送 `快轨批准 <ft-id>` 或 `快轨撤销 <ft-id>`。快轨可覆盖整个实例交付路径。
 

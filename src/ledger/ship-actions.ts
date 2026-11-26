@@ -2,7 +2,8 @@
 // scripts, endpoints or Git identities before an executor claims an item.
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
-import { loadDbEnvironments } from "../config";
+import { prospectiveMerge } from "../conditional-merge";
+import { loadDbEnvironments, loadWorkbenchConfig } from "../config";
 import { localPath, resolveInstance } from "../instance";
 import { runGit } from "../git";
 import { sha256File } from "../shared/path";
@@ -26,7 +27,32 @@ export interface DbTarget {
   client: string;
   clientSha256: string;
 }
+export function fatRef(dir: string) {
+  const ref = "refs/heads/fat",
+    r = runGit(dir, ["ls-remote", "--symref", "--exit-code", "origin", "HEAD", ref]);
+  const lines = r.stdout.trim().split("\n");
+  const defaultRef = lines.find((line) => line.startsWith("ref: ") && line.endsWith("\tHEAD"));
+  if (!defaultRef || defaultRef === "ref: " + ref + "\tHEAD")
+    throw Error("FAT target must be distinct from the verified remote default branch");
+  const [sha, name] = (lines.find((line) => line.endsWith("\t" + ref)) ?? "").split("\t");
+  if (r.code || name !== ref || !isOid(sha)) throw Error("Cannot verify origin refs/heads/fat");
+  return sha;
+}
+export function checkFatProtection(root: string) {
+  const caps = loadWorkbenchConfig(root).guard.protected_branches;
+  if (caps.includes("fat") || caps.includes("refs/heads/fat")) throw Error("The FAT branch is protected");
+}
 export type ShipAction =
+  | {
+      kind: "fat";
+      repo: string;
+      remote: "origin";
+      ref: "refs/heads/fat";
+      baseOid: string;
+      head: string;
+      targetOid: string;
+      originHash: string;
+    }
   | { kind: "pr"; repo: string; number: number; url: string; head: string; base: string; baseOid: string }
   | { kind: "tag"; repo: string; tag: string; head: string }
   | { kind: "stage"; stage: string; target: string; cwd: string; argv: string[]; files: Record<string, string> }
@@ -35,6 +61,8 @@ export interface ExactPlan {
   endpoint: string;
   pins: CheckoutPin[];
   actions: ShipAction[];
+  ci: Extract<ShipAction, { kind: "pr" }>[];
+  stages: { id: string; core: boolean }[];
 }
 export const isOid = (value: string) => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
 
@@ -69,14 +97,19 @@ function instanceFor(root: string) {
   const lock = JSON.parse(readFileSync(join(root, ".workbench/kit-lock.json"), "utf8"));
   return resolveInstance(root, lock.kit_root);
 }
+function deliveryStages(cfg: ReturnType<typeof resolveInstance>) {
+  return cfg.delivery.value.stages.map((id) => ({
+    id,
+    core: cfg.stages.get(id)?.source === "core" && id === "ship",
+  }));
+}
 export function checkDeliveryDefinition(root: string, plan: ExactPlan) {
-  const cfg = instanceFor(root),
-    stages = plan.actions.filter((a) => a.kind === "stage").map((a) => a.stage);
+  const cfg = instanceFor(root);
   if (
     cfg.delivery.value.endpoint !== plan.endpoint ||
-    canonicalJson(cfg.delivery.value.stages.filter((id) => id !== "ship")) !== canonicalJson(stages)
+    canonicalJson(deliveryStages(cfg)) !== canonicalJson(plan.stages)
   )
-    throw Error("Delivery endpoint or stage order changed");
+    throw Error("Delivery endpoint, stage implementation or stage order changed");
 }
 export function stagePin(root: string, id: string): Extract<ShipAction, { kind: "stage" }> {
   const cfg = instanceFor(root),
@@ -130,34 +163,93 @@ export function buildPlan(
   task: string,
   actions: RunbookActions,
   stages: string[],
+  fat: string[] = [],
 ): ExactPlan {
   const pins = pinCheckouts(ledger, task);
   const cfg = instanceFor(ledger.workbenchRoot);
-  const expectedStages = cfg.delivery.value.stages.filter((id) => id !== "ship");
+  const sequence = deliveryStages(cfg);
+  if (cfg.delivery.value.endpoint === "fat") {
+    checkFatProtection(ledger.workbenchRoot);
+    if (
+      ledger.getTask(task)?.endpoint !== "fat" ||
+      sequence.length !== 1 ||
+      !sequence[0].core ||
+      stages.length ||
+      actions.prs.length ||
+      actions.tags.length ||
+      actions.sql_files.length ||
+      actions.kubectl_commands.length
+    )
+      throw Error("FAT endpoint permits only exact test-branch updates for a FAT task");
+    if (
+      new Set(pins.map((x) => x.repo)).size !== pins.length ||
+      canonicalJson([...fat].sort()) !== canonicalJson(pins.map((p) => p.repo + ":fat").sort())
+    )
+      throw Error("Register --fat <repo>:fat once for every attached repository");
+    const updates = pins.map((pin) => {
+      const row = ledger.getTaskRepos(task).find((r) => r.repo === pin.repo)!;
+      if (row.branch === "fat") throw Error("FAT delivery requires a separate source branch");
+      const { dir } = resolveTaskCheckout(ledger.workbenchRoot, row);
+      const get = (args: string[]) => runGit(dir, args).stdout.trim();
+      if (get(["remote", "get-url", "origin"]) !== get(["remote", "get-url", "--push", "origin"]))
+        throw Error("FAT fetch and push destinations must match");
+      const baseOid = fatRef(dir);
+      if (
+        runGit(dir, ["cat-file", "-e", baseOid + "^{commit}"]).code &&
+        runGit(dir, ["fetch", "--no-write-fetch-head", "--no-tags", "--refmap=", "origin", "refs/heads/fat"])
+          .code
+      )
+        throw Error("Fetch the live FAT commit before registering this action");
+      const targetOid = prospectiveMerge(dir, baseOid, pin.head);
+      return {
+        kind: "fat" as const,
+        repo: pin.repo,
+        remote: "origin" as const,
+        ref: "refs/heads/fat" as const,
+        head: pin.head,
+        baseOid,
+        targetOid,
+        originHash: pin.originHash,
+      };
+    });
+    return { endpoint: "fat", pins, actions: updates, ci: [], stages: sequence };
+  }
+  if (fat.length) throw Error("--fat requires the instance FAT endpoint");
+  const expectedStages = sequence.filter((stage) => !stage.core).map((stage) => stage.id);
   if (canonicalJson(expectedStages) !== canonicalJson(stages))
     throw Error("Runbook must include the configured delivery stages in order: " + expectedStages.join(", "));
   const items: ShipAction[] = [];
-  for (const pr of actions.prs) {
-    const candidates = pins.filter((p) => p.repo === pr.repo);
-    if (candidates.length !== 1) throw Error("Expected one task branch for " + pr.repo);
-    const pin = candidates[0],
-      row = ledger.getTaskRepos(task).find((r) => r.repo === pin.repo && r.branch === pin.branch)!;
+  const ci: Extract<ShipAction, { kind: "pr" }>[] = [];
+  for (const pr of actions.prs)
+    if (
+      pins.filter((p) => p.repo === pr.repo).length !== 1 ||
+      actions.prs.filter((x) => x.repo === pr.repo).length !== 1
+    )
+      throw Error("Expected one exact PR per repository: " + pr.repo);
+  const coreShip = sequence.some((stage) => stage.core);
+  for (const pin of pins) {
+    const pr = actions.prs.find((p) => p.repo === pin.repo);
+    if (!pr && (coreShip || cfg.delivery.value.endpoint === "pr"))
+      throw Error("Register the exact PR for " + pin.repo);
+    const row = ledger.getTaskRepos(task).find((r) => r.repo === pin.repo && r.branch === pin.branch)!;
     const { dir } = resolveTaskCheckout(ledger.workbenchRoot, row);
-    const data = inspectPr(dir, pin.branch, String(pr.number), process.env, undefined, {
+    const data = inspectPr(dir, pin.branch, pr ? String(pr.number) : undefined, process.env, undefined, {
       baseOid: true,
       bin: process.env.FORGE_GH_BIN,
     });
     if (data.headRefOid !== pin.head || !isOid(data.baseRefOid) || data.baseRefName !== "main")
       throw Error("Expected the exact task HEAD and main PR target");
-    items.push({
-      kind: "pr",
-      repo: pr.repo,
-      number: pr.number,
-      url: data.url,
+    const check = {
+      kind: "pr" as const,
+      repo: pin.repo,
+      number: Number(data.url.split("/").pop()),
+      url: String(data.url),
       head: pin.head,
-      base: data.baseRefName,
-      baseOid: data.baseRefOid,
-    });
+      base: String(data.baseRefName),
+      baseOid: String(data.baseRefOid),
+    };
+    ci.push(check);
+    if (pr) items.push(check);
   }
   for (const tag of actions.tags) {
     if (
@@ -178,7 +270,15 @@ export function buildPlan(
     throw Error(
       "Register a deployment as a versioned instance stage to bind its target, configuration and script",
     );
-  for (const stage of stages) items.push(stagePin(ledger.workbenchRoot, stage));
+  const registered = items.splice(0);
+  // The ship stage positions the explicitly registered
+  // PR/tag/SQL actions. Without a ship slot, these actions precede
+  // the custom delivery chain. A same-name instance stage is executed normally.
+  if (!sequence.some((stage) => stage.id === "ship")) items.push(...registered);
+  for (const stage of sequence) {
+    if (!stage.core) items.push(stagePin(ledger.workbenchRoot, stage.id));
+    if (stage.id === "ship") items.push(...registered);
+  }
   if (!items.length || new Set(items.map((a) => canonicalJson(a))).size !== items.length)
     throw Error("Expected distinct exact runbook actions");
   if (items.some((a) => a.kind === "tag")) {
@@ -192,5 +292,5 @@ export function buildPlan(
         throw Error("Cannot verify tag destination when fetch and push remotes differ");
     }
   }
-  return { endpoint: cfg.delivery.value.endpoint, pins, actions: items };
+  return { endpoint: cfg.delivery.value.endpoint, pins, actions: items, ci, stages: sequence };
 }
