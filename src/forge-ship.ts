@@ -11,6 +11,7 @@ import {
   remoteBranch,
   checkPushPermission,
   checkDeliveryDefinition,
+  deliveryStages,
   pinCheckouts,
   databaseTarget,
   isOid,
@@ -172,7 +173,18 @@ function preflight(ledger: Ledger, e: Envelope) {
       !rb.expires_at || Date.parse(rb.expires_at) <= Date.now()) throw Error("Runbook approval expired, revoked or changed");
   if (canonicalJson(pins) !== canonicalJson(plan.pins)) throw Error("Approved commit or remote changed");
   checkDeliveryDefinition(ledger.workbenchRoot, plan);
+  for (const a of plan.actions) {
+    if (a.kind === "stage") checkStagePin(ledger.workbenchRoot, a);
+    if (
+      a.kind === "sql" &&
+      (validateScope(ledger, e).forbid_db_rw ||
+        createHash("sha256").update(readFileSync(a.path)).digest("hex") !== a.sha256 ||
+        canonicalJson(databaseTarget(ledger.workbenchRoot, a.target.host)) !== canonicalJson(a.target))
+    )
+      throw Error("SQL target or content changed, or writes forbidden");
+  }
   const dirs = new Map(checkouts.map(({row, dir}) => [row.repo, dir]));
+  const verifiedMerges = new Map<string,string>();
   for (const {row, pin, dir} of checkouts) {
     if (plan.endpoint === "push") {
       const index = plan.actions.findIndex(a => a.kind === "push" && a.repo === row.repo);
@@ -194,24 +206,13 @@ function preflight(ledger: Ledger, e: Envelope) {
     const observation = checkedPr(dir, row.branch, pr);
     if (prospectiveMergeTree(dir, pr.baseOid, pin.head) !== pr.tree)
       throw Error("Prospective merge tree differs from the approved tree");
-    const hasMergeAction = plan.actions.some(a => (a.kind === "pr" && a.repo === row.repo) ||
-      (a.kind === "stage" && a.stage === "ship"));
-    if (!observation.merged && hasMergeAction)
+    if (!observation.merged)
       throw new AwaitingOperator("Manual merge required for " + pr.url +
         ": the host cannot bind base " + pr.baseOid + " when merging head " + pr.head +
         ". After the operator merges, rerun forge ship run to verify the remote receipt.");
+    verifiedMerges.set(row.repo, observation.oid);
   }
-  for (const a of plan.actions) {
-    if (a.kind === "stage") checkStagePin(ledger.workbenchRoot, a);
-    if (
-      a.kind === "sql" &&
-      (validateScope(ledger, e).forbid_db_rw ||
-        createHash("sha256").update(readFileSync(a.path)).digest("hex") !== a.sha256 ||
-        canonicalJson(databaseTarget(ledger.workbenchRoot, a.target.host)) !== canonicalJson(a.target))
-    )
-      throw Error("SQL target or content changed, or writes forbidden");
-  }
-  return { plan, dirs };
+  return { plan, dirs, verifiedMerges };
 }
 class AwaitingOperator extends Error {}
 function resolveFrontPlan(ledger: Ledger, e: Envelope) {
@@ -221,38 +222,36 @@ function resolveFrontPlan(ledger: Ledger, e: Envelope) {
   if (bound) return;
   const {checkouts, pins} = approvedCheckouts(ledger, e);
   const cfg = resolveInstance(ledger.workbenchRoot);
-  const stages = cfg.delivery.value.stages.filter(id => cfg.stages.get(id)?.source !== "core");
+  const stages = deliveryStages(cfg).filter(stage => !stage.core).map(stage => stage.id);
   const prs: {repo: string; number: number}[] = [];
   const targetBases = new Map<string,string>();
-  if (cfg.delivery.value.stages.includes("ship") || cfg.delivery.value.endpoint === "pr") {
-    for (const {dir, row, pin} of checkouts) {
-      const origin = repoOrigin(dir);
-      if (!origin || row.branch === "main" || row.branch.startsWith("-")) throw Error("Expected a feature branch in the approved repository");
-      const slug = [origin.host, origin.owner, origin.repo].join("/");
-      const gh = (args: string[]) => {
-        const r = runProcess([process.env.FORGE_GH_BIN || "gh", ...args], {cwd: dir, env: checkoutEnvironment()});
-        if (r.code) throw Error("Cannot confirm PR " + args[1] + " outcome: " + r.stderr.trim());
-        return r.stdout;
-      };
-      const list = JSON.parse(gh(["pr","list","--repo",slug,"--state","open","--head",row.branch,"--limit","2","--json","number,baseRefName"]));
-      if (!Array.isArray(list) || list.length > 1 || list.some(p => p.baseRefName !== "main" || !Number.isSafeInteger(p.number) || p.number < 1))
-        throw Error("Ambiguous or unexpected task PR");
-      const ref = "refs/heads/" + row.branch;
-      const remote = git(dir, ["ls-remote","--refs","origin",ref]).trim();
-      const base = gh(["api","--hostname",origin.host,"repos/" + origin.owner + "/" + origin.repo + "/git/ref/heads/main","--jq",".object.sha"]).trim();
-      if (!isOid(base)) throw Error("Cannot identify the target main OID before PR registration");
-      targetBases.set(row.repo,base);
-      const selector = list.length ? String(list[0].number) : undefined;
-      if (remote !== pin.head + "\t" + ref || !selector) {
-        const destination = slug + " " + row.branch + "@" + pin.head + " -> main@" + base;
-        throw new AwaitingOperator("Manual PR handoff before publication: " + destination +
-          ". A CLI head match or configured program cannot establish a merge-time base condition. Publish the branch and create the PR in the ordinary delivery flow, then rerun to pin the open PR before merging.");
-      }
-      const pr = inspectPr(dir,row.branch,selector,process.env,undefined,{bin:process.env.FORGE_GH_BIN,baseOid:true});
-      if (pr.state !== "OPEN" || pr.headRefOid !== pin.head || pr.baseRefName !== "main" || pr.baseRefOid !== base)
-        throw Error("Task PR differs from the authorized version or target");
-      prs.push({repo:row.repo, number:Number(pr.url.split("/").pop())});
+  for (const {dir, row, pin} of checkouts) {
+    const origin = repoOrigin(dir);
+    if (!origin || row.branch === "main" || row.branch.startsWith("-")) throw Error("Expected a feature branch in the approved repository");
+    const slug = [origin.host, origin.owner, origin.repo].join("/");
+    const gh = (args: string[]) => {
+      const r = runProcess([process.env.FORGE_GH_BIN || "gh", ...args], {cwd: dir, env: checkoutEnvironment()});
+      if (r.code) throw Error("Cannot confirm PR " + args[1] + " outcome: " + r.stderr.trim());
+      return r.stdout;
+    };
+    const list = JSON.parse(gh(["pr","list","--repo",slug,"--state","open","--head",row.branch,"--limit","2","--json","number,baseRefName"]));
+    if (!Array.isArray(list) || list.length > 1 || list.some(p => p.baseRefName !== "main" || !Number.isSafeInteger(p.number) || p.number < 1))
+      throw Error("Ambiguous or unexpected task PR");
+    const ref = "refs/heads/" + row.branch;
+    const remote = git(dir, ["ls-remote","--refs","origin",ref]).trim();
+    const base = gh(["api","--hostname",origin.host,"repos/" + origin.owner + "/" + origin.repo + "/git/ref/heads/main","--jq",".object.sha"]).trim();
+    if (!isOid(base)) throw Error("Cannot identify the target main OID before PR registration");
+    targetBases.set(row.repo,base);
+    const selector = list.length ? String(list[0].number) : undefined;
+    if (remote !== pin.head + "\t" + ref || !selector) {
+      const destination = slug + " " + row.branch + "@" + pin.head + " -> main@" + base;
+      throw new AwaitingOperator("Manual PR handoff before publication: " + destination +
+        ". A CLI head match or configured program cannot establish a merge-time base condition. Publish the branch and create the PR in the ordinary delivery flow, then rerun to pin the open PR before merging.");
     }
+    const pr = inspectPr(dir,row.branch,selector,process.env,undefined,{bin:process.env.FORGE_GH_BIN,baseOid:true});
+    if (pr.state !== "OPEN" || pr.headRefOid !== pin.head || pr.baseRefName !== "main" || pr.baseRefOid !== base)
+      throw Error("Task PR differs from the authorized version or target");
+    prs.push({repo:row.repo, number:Number(pr.url.split("/").pop())});
   }
   withImmediateTx(ledger.db, () => {
     checkEnvelopeApproval(ledger, envelope(ledger, e.envelope_id));
@@ -314,24 +313,14 @@ function reconcileStage(
   const actionId = e.envelope_id + "/" + index;
   const absentAfterIntent = "Target reports action " + actionId + " absent after submission intent. Inspect the submitter and target before manual recovery.";
   function observe() {
-    const fact = observeStage(ledger.workbenchRoot, a, actionId, plan.endpoint, versions, plan.ci);
+    const fact = observeStage(ledger.workbenchRoot, a, actionId, plan.endpoint, versions);
     if (fact.state === "pending") throw new WaitingForTarget(index, e.envelope_id);
     if (fact.state === "failed") throw Error("Target reports failed delivery for " + a.stage);
     if (fact.state !== "completed") return null;
-    if (a.stage === "ship") {
-      for (const pr of plan.ci.filter(pr => plan.actions.some(action => action.kind === "pr" && action.repo === pr.repo))) {
-        const row = ledger.getTaskRepos(e.task_id).find(item => item.repo === pr.repo)!;
-        const {dir} = resolveTaskCheckout(ledger.workbenchRoot,row);
-        if (!checkedPr(dir, row.branch, pr).merged)
-          throw Error("Merge-stage observer reported completion but the pinned PR is still open: " + pr.url);
-      }
-    }
     return canonicalJson(fact);
   }
   const alreadyDone = observe();
   if (alreadyDone) return alreadyDone;
-  if (a.stage === "ship") throw new AwaitingOperator("PR merge handed off; waiting for the registered target observer to confirm " + actionId +
-    ". The submit program has no verified merge-time base condition.");
   checkStagePin(ledger.workbenchRoot, a);
   // Persist intent before invoking the writer, so a crash or asynchronous submission cannot replay it.
   withImmediateTx(ledger.db, () => {
@@ -344,7 +333,7 @@ function reconcileStage(
     if (submitted) throw Error(absentAfterIntent);
     trackEvent(ledger, e, "SHIP_STAGE_SUBMISSION_INTENT", { index, action_id: actionId });
   });
-  const env = { ...stageEnvironment(actionId, plan.endpoint, versions, plan.ci), FORGE_ACTIVE_STAGE: a.stage };
+  const env = { ...stageEnvironment(actionId, plan.endpoint, versions), FORGE_ACTIVE_STAGE: a.stage };
   const submission = runProcess(a.execute.argv, { cwd: a.execute.cwd, env, timeoutMs: 60_000 });
   const receipt = observe();
   if (receipt) return receipt;
@@ -370,18 +359,15 @@ function perform(
       checkAuthorization(ledger, e.envelope_id);
     });
   }
-  if (a.kind === "pr" || a.kind === "tag") {
-    const dir = dirs.get(a.repo)!;
-    if (a.kind === "pr") {
-      throw Error("Manual merge required before any merge write: this host cannot condition a PR merge on the approved base OID");
-    } else {
-      checkAuthorization(ledger, e.envelope_id);
-      const result = runProcess(["git", "push", "--no-follow-tags", "origin", a.head + ":refs/tags/" + a.tag], {
-        cwd: dir,
-        env: checkoutEnvironment(),
-      });
-      if (result.code) throw Error("Tag action failed; inspect remote state");
-    }
+  if (a.kind === "pr")
+    throw new AwaitingOperator("Manual merge required for the pinned PR " + a.url);
+  if (a.kind === "tag") {
+    checkAuthorization(ledger, e.envelope_id);
+    const result = runProcess(["git", "push", "--no-follow-tags", "origin", a.head + ":refs/tags/" + a.tag], {
+      cwd: dirs.get(a.repo)!,
+      env: checkoutEnvironment(),
+    });
+    if (result.code) throw Error("Tag action failed; inspect remote state");
     const confirmed = observed(ledger, e, a, dirs);
     if (!confirmed) throw Error("Uncertain remote outcome; inspect remote before retrying");
     return confirmed;
@@ -561,7 +547,7 @@ export function shipCli(argv: string[]) {
       return withImmediateTx(ledger.db, () => {
         const current = envelope(ledger, id);
         if (current.status !== "ACTIVE") return state(ledger, id);
-        preflight(ledger, current);
+        const {verifiedMerges} = preflight(ledger, current);
         const { rb } = exactRunbook(ledger, current);
         if (rb.status !== "APPROVED" || !rb.expires_at || Date.parse(rb.expires_at) <= Date.now())
           throw Error("Approval expired or revoked");
@@ -597,34 +583,31 @@ export function shipCli(argv: string[]) {
             continue;
           }
           const pr = plan.ci.find((a) => a.repo === pin.repo)!;
-          const prIndex = plan.actions.findIndex((a) => a.kind === "pr" && a.repo === pin.repo);
-          const receipt = receipts(ledger, id).find((r) => r.action_index === prIndex);
+          const mergeOid = verifiedMerges.get(pin.repo);
+          if (!mergeOid) throw Error("Missing independent remote PR merge receipt");
           const meta = {
             runbook_id: rb.runbook_id,
             envelope_id: id,
             delivery_endpoint: plan.endpoint,
-            ...(receipt && {
-              pr_url: pr.url,
-              pr_head_oid: pr.head,
-              base_branch: pr.base,
-              merge_commit: receipt.observation,
-              target_oid: receipt.observation,
-              state: "MERGED",
-            }),
+            pr_url: pr.url,
+            pr_head_oid: pr.head,
+            base_branch: pr.base,
+            merge_commit: mergeOid,
+            target_oid: mergeOid,
+            state: "MERGED",
           };
-          if (receipt)
-            ledger.recordEvidence({
-              task_id: current.task_id,
-              repo: pin.repo,
-              branch: pin.branch,
-              sha: pin.head,
-              kind: "pr",
-              status: "pass",
-              source: "tool",
-              actor: "tool",
-              summary: "Verified remote PR merge",
-              meta,
-            });
+          ledger.recordEvidence({
+            task_id: current.task_id,
+            repo: pin.repo,
+            branch: pin.branch,
+            sha: pin.head,
+            kind: "pr",
+            status: "pass",
+            source: "tool",
+            actor: "tool",
+            summary: "Verified remote PR merge",
+            meta,
+          });
           if (current.target_endpoint === "prod")
             ledger.recordEvidence({
               task_id: current.task_id,

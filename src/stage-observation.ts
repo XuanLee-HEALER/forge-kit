@@ -1,5 +1,5 @@
 import { runProcess } from "./git";
-import { stagePin, type ShipAction, type ExactPlan } from "./ledger/ship-actions";
+import { stagePin, type ShipAction } from "./ledger/ship-actions";
 import { canonicalJson } from "./ledger/types";
 
 type Stage = Extract<ShipAction, { kind: "stage" }>;
@@ -11,14 +11,13 @@ export interface TargetObservation {
   versions: Revision[];
 }
 
-export function stageEnvironment(actionId: string, endpoint: string, versions: Revision[], targets?: ExactPlan["ci"]) {
+export function stageEnvironment(actionId: string, endpoint: string, versions: Revision[]) {
   return {
     PATH: process.env.PATH,
     LANG: process.env.LANG,
     FORGE_ACTION_ID: actionId,
     FORGE_ENDPOINT: endpoint,
     FORGE_APPROVED_HEADS: JSON.stringify(versions),
-    ...(targets && {FORGE_APPROVED_TARGETS: JSON.stringify(targets)}),
   };
 }
 export function checkStagePin(root: string, stage: Stage) {
@@ -33,10 +32,9 @@ export function observeStage(
   actionId: string,
   endpoint: string,
   versions: Revision[],
-  targets?: ExactPlan["ci"],
 ): TargetObservation {
   checkStagePin(root, stage);
-  const env = { ...stageEnvironment(actionId, endpoint, versions, targets), FORGE_ACTIVE_STAGE: stage.stage };
+  const env = { ...stageEnvironment(actionId, endpoint, versions), FORGE_ACTIVE_STAGE: stage.stage };
   const r = runProcess(stage.observe.argv, { cwd: stage.observe.cwd, env, timeoutMs: 60_000 });
   if (r.code !== 0) {
     const failure = r.termination ?? ("exit code " + r.code);

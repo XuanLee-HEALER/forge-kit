@@ -98,7 +98,9 @@ export function pinCheckouts(ledger: LedgerReader, task: string) {
 export function deliveryStages(cfg: ReturnType<typeof resolveInstance>) {
   return cfg.delivery.value.stages.map((id) => ({
     id,
-    core: cfg.stages.get(id)?.source === "core" && id === "ship",
+    // At the PR endpoint, the ship slot records the hosted merge observation.
+    // An instance program cannot replace that operation or gain a PR-grade write grant.
+    core: id === "ship" && (cfg.delivery.value.endpoint === "pr" || cfg.stages.get(id)?.source === "core"),
   }));
 }
 function requireTargetObservation(endpoint: string, actions: ShipAction[]) {
@@ -245,8 +247,8 @@ export function buildPlan(
       baseOid: true,
       bin: process.env.FORGE_GH_BIN,
     });
-    if (data.headRefOid !== pin.head || !isOid(data.baseRefOid) || data.baseRefName !== "main")
-      throw Error("Expected the exact task HEAD and main PR target");
+    if (data.state !== "OPEN" || data.headRefOid !== pin.head || !isOid(data.baseRefOid) || data.baseRefName !== "main")
+      throw Error("Pin the open PR targeting main at the verified task HEAD before the operator merges it");
     const check = {
       kind: "pr" as const,
       repo: pin.repo,

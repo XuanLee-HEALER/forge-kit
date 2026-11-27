@@ -166,9 +166,7 @@ function validateActionCeiling(policy: ShipPolicy, endpoint: Endpoint, plan: Exa
   if (endpoint === "fat" || plan.actions.some(a => !["pr", "push", "stage", "tag", "sql"].includes(a.kind)))
     throw Error("Retired delivery action; register a supported instance stage");
   // Instance stages run arbitrary delivery writers with an independent target observer.
-  const privateMerge = plan.endpoint === "pr" && plan.stages.some(stage => !stage.core && stage.id === "ship");
-  if (endpoint !== "prod" && plan.actions.some(a => a.kind === "tag" || a.kind === "sql" ||
-      (a.kind === "stage" && !(privateMerge && a.stage === "ship"))))
+  if (endpoint !== "prod" && plan.actions.some(a => ["stage", "tag", "sql"].includes(a.kind)))
     throw Error("Deployment, tag or database writes require a production delivery endpoint");
   if (policy.forbid_db_rw && plan.actions.some(a => a.kind === "sql"))
     throw Error("Policy forbids database writes");
@@ -392,7 +390,7 @@ export function fastTrackCommand(ledger: Ledger, args: string[]) {
     } else {
       ceiling(policy, target_endpoint);
       const definition = frontDefinition(ledger, id, endpoint);
-      if (target_endpoint !== "prod" && definition.commands.some(stage => stage.stage !== "ship"))
+      if (target_endpoint !== "prod" && definition.commands.length)
         throw Error("Deployment requires production authorization");
       binding = {runbook_id: "", actions_hash: sha256String(canonicalJson(definition)), endpoint};
     }

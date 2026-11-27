@@ -247,7 +247,7 @@ export function checkLedgerGate(
             return (
               `账本门禁：业务仓 ${loc.repo} (${deliveryBranch}) 即将提交（${eligibility.files.length} 文件 / ${eligibility.changedLines} 行：${eligibility.reason}），不可沿用或静默豁免。\n` +
               `请选择：\n` +
-              `  1) 新开账本：.workbench/bin/forge ledger open --id <YYYYMMDD-slug> --title "<标题>" --endpoint <local|fat|pr> --depth <targeted|full> --repo ${loc.repo} --branch ${deliveryBranch}${attachHint}\n` +
+              `  1) 新开账本：.workbench/bin/forge ledger open --id <YYYYMMDD-slug> --title "<标题>" --endpoint <local|pr> --depth <targeted|full> --repo ${loc.repo} --branch ${deliveryBranch}${attachHint}\n` +
               `  3) 若确认完全不涉及逻辑/设定，拿不准请先询问用户确认。`
             );
           }
@@ -255,7 +255,7 @@ export function checkLedgerGate(
           return (
             `账本门禁：业务仓 ${loc.repo} (${deliveryBranch}) 尚未绑定开发账本。\n` +
             `请选择：\n` +
-            `  1) 新开账本：.workbench/bin/forge ledger open --id <YYYYMMDD-slug> --title "<标题>" --endpoint <local|fat|pr> --depth <targeted|full> --repo ${loc.repo} --branch ${deliveryBranch}${attachHint}\n` +
+            `  1) 新开账本：.workbench/bin/forge ledger open --id <YYYYMMDD-slug> --title "<标题>" --endpoint <local|pr> --depth <targeted|full> --repo ${loc.repo} --branch ${deliveryBranch}${attachHint}\n` +
             `  3) 若为不涉及逻辑/设定的极小改动（纯文档/注释/typo）：.workbench/bin/forge ledger exempt --repo ${loc.repo} --branch ${deliveryBranch} --reason "<原因>"`
           );
         }
@@ -287,7 +287,7 @@ export function checkLedgerGate(
           if (openTasks.length === 0) {
             return (
               `账本门禁：${loc.repo} (${deliveryBranch}${deliveryDetached ? " detached" : ""}) 尚未绑定有效开发账本（或豁免未绑定当前 SHA ${deliverySha.slice(0, 8)}），禁止直接执行 ${isGitPush ? "git push" : "gh pr create"}。\n` +
-              `请先绑定账本（跨仓或独立 FAT 分支可用 forge ledger attach；极小无逻辑改动须登记当前 SHA 的合规 exempt）。`
+              `请先绑定账本（跨仓或独立交付分支可用 forge ledger attach；极小无逻辑改动须登记当前 SHA 的合规 exempt）。`
             );
           }
           if (openTasks.length > 1) {
@@ -296,7 +296,7 @@ export function checkLedgerGate(
 
           const task = openTasks[0];
 
-          // On detached FAT merge worktree: check merged HEAD first; ONLY fall back to parent feature SHA
+          // On a detached integration worktree: check merged HEAD first; ONLY fall back to parent feature SHA
           // if merged HEAD had NO explicit test/build/review failure!
           let readiness = ledger.checkPushReadiness({
             task_id: task.task_id,
