@@ -62,11 +62,11 @@ console.log(await target.exists() ? await target.text() : JSON.stringify({state:
   remote(2, {baseRefOid: f.base, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN"});
   const realGit = Bun.which("git")!;
   // Hosted reads resolve to the same bare repository updated by the simulated operator.
-  writeFileSync(join(root, "bin/git"), `#!/usr/bin/env bun
-const args = process.argv.slice(2);
-if (args.includes("ls-remote") && args.includes("origin")) args[args.indexOf("origin")] = ${JSON.stringify(bare)};
-const p = Bun.spawnSync([${JSON.stringify(realGit)}, ...args], {stdout:"inherit", stderr:"inherit"});
-process.exit(p.exitCode ?? 1);`, {mode: 0o755});
+  writeFileSync(join(root, "bin/git"), `#!/bin/sh
+if [ "$1" = "-C" ] && [ "$3" = "ls-remote" ]; then
+  exec ${Bun.$.escape(realGit)} -c ${Bun.$.escape("url." + bare + ".insteadOf=https://github.com/acme/api.git")} "$@"
+fi
+exec ${Bun.$.escape(realGit)} "$@"`, {mode: 0o755});
   writeFileSync(join(root, "bin/gh"), `#!/usr/bin/env bun
 import {Database} from "bun:sqlite";
 import {appendFileSync} from "node:fs";

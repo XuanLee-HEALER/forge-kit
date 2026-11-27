@@ -113,7 +113,7 @@ export const evidenceCommands = {
     }
     const manualKinds = ["prod", "verify", "deploy", "smoke", "manual", "note"] as const;
     const kind = manualKinds.find(kind => kind === values.kind);
-    if (!kind) throw new Error("forge ledger record accepts manual attestations only; run the actual verification or review tool for executable evidence. For native reports, use forge ledger review-record.");
+    if (!kind) throw new Error("forge ledger record accepts manual attestations only; run the actual verification tool for executable evidence. Register native review reports with forge ledger review-record.");
     const parsedMeta = values.meta ? JSON.parse(values.meta) : {};
     const ev = ledger.recordEvidence({
       task_id,

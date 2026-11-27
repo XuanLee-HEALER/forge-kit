@@ -177,18 +177,8 @@ export class Ledger {
     return listActiveSpecLocks(this);
   }
 
-  /**
-   * Check readiness for a specific (task, repo, head_sha):
-   * - Zero open blockers;
-   * - If spec package is frozen: zero silent disk drift and not left in un-refrozen AMENDED state;
-   * - Latest post-amend status of each executed verification kind (test/build/lint/hurl) for this exact
-   *   (repo, head_sha) must not be `fail`;
-   * - Unstarted review selections require a subsequent tool or subagent pass for the same role, HEAD and base;
-   * - Current tasks require the configured verification receipt or, for default verification, both a
-   *   passing static check and an executed test. Legacy tasks retain their original evidence rules:
-   * - For legacy `targeted`: at least one of test/build/lint/hurl must be `pass`;
-   * - For legacy `full`: static check (`lint`) MUST be `pass`, at least one of test/build/hurl MUST be `pass`,
-   *   and latest review status must be `pass` or `fallback`.
+  /** Check the selected revision's verification, native review and delivery evidence.
+   * Delivery requires a native baseline-to-HEAD pass. Reassessments must cite each failure they resolve.
    */
   checkPushReadiness(params: readiness.ReadinessParams): {
     ready: boolean;

@@ -590,7 +590,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     for (const kind of ["test", "build", "lint", "review", "hurl"]) {
       const proc = record(kind);
       expect(proc.exitCode).not.toBe(0);
-      expect(proc.stderr.toString()).toContain("actual verification or review tool");
+      expect(proc.stderr.toString()).toContain("actual verification tool");
     }
     expect(record("fat", ["--actor", "hook"]).exitCode).not.toBe(0);
     const fat = record("fat");
