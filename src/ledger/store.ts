@@ -1141,13 +1141,14 @@ export class Ledger {
         );
       }
       if (!hasPassingExecVerify) {
+        const checks = currentWorkflow ? "build or executed test" : "build/test/hurl";
         missing.push(
-          `no passing build or executed test evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
+          `no passing ${checks} evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
         );
       }
     } else if (!hasPassingVerify) {
       missing.push(
-        `no passing static check, build or executed test evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
+        `no passing build/test/lint/hurl evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
       );
     }
 
