@@ -115,14 +115,9 @@ export function recordBlocker(ledger: LedgerReader, params: RecordBlockerParams)
       },
     });
 
-    const countRow = ledger.db
-      .query(
-        "SELECT COUNT(*) AS cnt FROM task_blockers WHERE task_id = ? AND status = 'OPEN'",
-      )
-      .get(params.task_id) as { cnt: number };
-    ledger.db
-      .query("UPDATE tasks SET open_blockers = ? WHERE task_id = ?")
-      .run(countRow.cnt, params.task_id);
+    ledger.db.query(
+      "UPDATE tasks SET open_blockers = (SELECT COUNT(*) FROM task_blockers WHERE task_id = ? AND status = 'OPEN') WHERE task_id = ?",
+    ).run(params.task_id, params.task_id);
     return ev;
   });
 }

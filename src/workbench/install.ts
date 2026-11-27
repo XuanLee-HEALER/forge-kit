@@ -74,7 +74,6 @@ export function initWorkbench(opts: {
       localPath(targetRoot, path);
     const workbenchName = opts.name || basename(targetRoot);
 
-    // Create instance directories
     mkdirSync(join(targetRoot, ".workbench", "repos"), { recursive: true });
     mkdirSync(join(targetRoot, ".workbench", "env"), { recursive: true });
     mkdirSync(join(targetRoot, ".workbench", "ledger"), { recursive: true });
