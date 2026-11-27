@@ -9,7 +9,7 @@ import { verifiedPr } from "./pr";
 import { requireReleaseBase, type HandoffItem, type Snapshot } from "./release-inspection";
 import type { Ledger } from "./store";
 import { appendEventInTx, withImmediateTx } from "./transactions";
-import { evidenceSource, isRolloutEndpoint, nowIso, type RunbookSqlFileAction } from "./types";
+import { evidenceSource, isRolloutEndpoint, nowIso } from "./types";
 
 export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback?: string, callbacks?:{verifyTarget:(repo:string,branch:string,oid:string,state:string)=>void; beforeRecord:(items:HandoffItem[])=>void; afterRecord:()=>void}) {
   function candidates() {

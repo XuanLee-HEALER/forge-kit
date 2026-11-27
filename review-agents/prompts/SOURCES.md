@@ -33,7 +33,7 @@ The comments prompt's “General documentation quality standard” generalizes l
 
 ## Performance and simplification calibration — 2026-11-18
 
-The performance role traces reachable execution and necessary work before rating regressions. Blocking findings require evidence of material impact under supported workloads. The simplification role checks local value conversions independently of wider restructuring. It compares affected unit, integration and HTTP acceptance tests by the behavior and dependency boundary each covers. These are locally developed review criteria. Both roles remain independent and advisory.
+The performance criteria trace reachable execution and necessary work before rating regressions. Blocking findings require evidence of material impact under supported workloads. The simplification criteria cover local value conversions independently of wider restructuring and compare affected unit, integration and HTTP acceptance tests by the behavior and dependency boundary each covers. The simplify reviewer applies both sets of locally developed criteria.
 
 ## Quality and documentation blocking criteria — 2026-11-18
 

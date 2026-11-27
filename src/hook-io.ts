@@ -213,18 +213,6 @@ export function emitPostCompactMessage(systemMessage: string): void {
   console.log(JSON.stringify({ systemMessage }));
 }
 
-export function emitPostToolUseContext(additionalContext: string): void {
-  if (!additionalContext.trim()) return;
-  console.log(
-    JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "PostToolUse",
-        additionalContext,
-      },
-    }),
-  );
-}
-
 export function emitUserPromptSubmitContext(additionalContext: string): void {
   if (!additionalContext.trim()) return;
   console.log(

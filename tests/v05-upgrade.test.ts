@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
+import { snapshot } from "./helpers/ledger-snapshot";
+import { digest, historicalKit, releaseCLI } from "./helpers/historical-kit";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, unlinkSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, readdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { bootstrap, kit, legacyRevision, sandbox, type Sandbox } from "./v05-sandbox";
+import { kit, legacyRevision, sandbox, type Sandbox } from "./v05-sandbox";
 
 let s: Sandbox;
 beforeEach(() => { s = sandbox(); });
@@ -108,129 +109,118 @@ else process.exit(2);
   return { tips, search, envelopes };
 }
 
-function sqlIdentifier(name: string) { return '"' + name.replaceAll('"', '""') + '"'; }
-type Table = { name: string; columns: string[] };
-function snapshot(tables?: Table[]) {
-  const db = new Database(join(s.work, ".workbench/ledger/ledger.sqlite"), { readonly: true });
-  try {
-    const names = db.query("SELECT name FROM pragma_table_list WHERE schema='main' AND type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as {name: string}[];
-    const schema = tables ?? names.map(({name}) => ({
-      name, columns: (db.query("SELECT name FROM pragma_table_info(?) ORDER BY cid").all(name) as {name: string}[]).map(c => c.name),
-    }));
-    const rows = schema.map(({name, columns}) => {
-      const fields = columns.map(sqlIdentifier).join(", ");
-      return db.query(`SELECT ${fields} FROM ${sqlIdentifier(name)} ORDER BY ${fields}`).values();
-    });
-    expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
-    return { schema, rows };
-  } finally { db.close(); }
-}
-function privateState(paths: string[]) {
-  return paths.map(file => {
-    const stat = lstatSync(file);
-    return [file, stat.mode, stat.isFile(), createHash("sha256").update(readFileSync(file)).digest("hex")];
-  });
+function tree() {
+  function entries(relative: string): unknown[] {
+    const path = join(s.work, relative);
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) return [relative, stat.mode, readlinkSync(path)];
+    if (stat.isFile()) return [relative, stat.mode, digest(path)];
+    return [relative, stat.mode, readdirSync(path).sort().map(name => entries(join(relative,name)))];
+  }
+  return entries(".");
 }
 
-for (const invalid of [false, true]) {
-  test(`T03/T06 v0.4.1 upgrade preserves business rows, tips and private files; invalid=${invalid}`, () => {
-    const { tips, search, envelopes } = oldInstance();
-    const originalLink = join(s.work, ".agents/skills/implementation-review");
-    const changedLink = join(s.work, ".agents/skills/simplicity-performance-review");
-    expect(lstatSync(originalLink).isSymbolicLink()).toBe(true);
-    expect(lstatSync(changedLink).isSymbolicLink()).toBe(true);
-    const originalTarget = join(s.work, "review-agents/skills/implementation-review/SKILL.md");
-    const privateTarget = s.privateFile(".workbench/overrides/legacy/SKILL.md", "private redirected specialization");
-    const privateLinkText = "../../.workbench/overrides/legacy";
-    unlinkSync(changedLink);
-    symlinkSync(privateLinkText, changedLink);
-    const privateFiles = [originalTarget, privateTarget,
-      join(s.work, ".workbench/models.toml"),
-      s.privateFile("AGENTS.local.md", "local instance instruction\n"),
-      s.privateFile(".workbench/env/synthetic.key", "TEST-CREDENTIAL-MARKER\n"),
-      s.privateFile(".agents/skills/form-ux/SKILL.md", "user-modified retired skill\n"),
-      s.privateFile(".agents/skills/custom/SKILL.md", "private specialization\n"),
-      s.privateFile("original-request.md", "initial task\n"),
-      s.privateFile("private-script", "#!/bin/sh\n.workbench/bin/ledger status\n"),
-    ];
-    chmodSync(privateFiles.at(-1)!, 0o750);
-    const file = join(s.work, ".workbench/workbench.yaml");
-    const good = readFileSync(file);
-    const old = snapshot();
-    const preserved = privateState(privateFiles);
-    if (invalid) {
-      const config = join(s.work, ".codex/config.toml");
-      const original = readFileSync(config, "utf8");
-      const oldLock = readFileSync(join(s.work, ".workbench/kit-lock.json"));
-      for (const edited of [original.replace("previous-standard", "manual-model"), original + "# local change\n"]) {
-        writeFileSync(config, edited);
-        const conflict = s.run([bootstrap, "sync", s.work]);
-        expect(conflict.code).not.toBe(0);
-        expect(conflict.err + conflict.out).toContain("Ownership conflict");
-        expect(readFileSync(config, "utf8")).toBe(edited);
-        expect(readFileSync(join(s.work, ".workbench/kit-lock.json"))).toEqual(oldLock);
-      }
-      writeFileSync(config, original);
-      const scanner = join(s.work, ".codex/agents/scanner.toml");
-      const stock = readFileSync(scanner, "utf8");
-      const editedScanner = stock.replace("gpt-6.1-terra", "hand-edited-scanner");
-      expect(editedScanner).not.toBe(stock);
-      writeFileSync(scanner, editedScanner);
-      const conflict = s.run([bootstrap, "sync", s.work]);
-      expect(conflict.code).not.toBe(0);
-      expect(conflict.err + conflict.out).toContain("Ownership conflict at " + realpathSync(scanner));
-      expect(readFileSync(scanner, "utf8")).toBe(editedScanner);
-      expect(readFileSync(join(s.work, ".workbench/kit-lock.json"))).toEqual(oldLock);
-      writeFileSync(scanner, stock);
-      writeFileSync(file, "extensions: [\n");
-      const broken = privateState([file]);
-      const result = s.run([bootstrap, "sync", s.work]);
-      expect(result.code).not.toBe(0);
-      expect(result.out + result.err).toMatch(/workbench\.yaml/);
-      expect(privateState([file])).toEqual(broken);
-      expect(snapshot(old.schema)).toEqual(old);
-      expect(privateState(privateFiles)).toEqual(preserved);
-      writeFileSync(file, good);
-    }
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const applied = s.run([bootstrap, "sync", s.work]);
-      const result = applied.out + applied.err;
-      expect(applied.code, result).toBe(0);
-      expect(result).not.toContain("TEST-CREDENTIAL-MARKER");
-      expect(() => lstatSync(originalLink)).toThrow(/ENOENT/);
-      expect(readlinkSync(changedLink)).toBe(privateLinkText);
-      if (attempt === 0) expect(result).toMatch(/simplicity-performance-review/);
-      expect(snapshot(old.schema)).toEqual(old);
-      expect(privateState(privateFiles)).toEqual(preserved);
-      expect(readFileSync(file)).toEqual(good);
-      expect(Bun.TOML.parse(s.read(".codex/config.toml"))).toMatchObject({model: "fixture-standard", model_reasoning_effort: "high"});
-      for (const [agent, model, effort] of [
-        ["implementer", "fixture-standard", "high"],
-        ["scanner", "private-scanner", "low"],
-        ["analyst", "gpt-6.2-astra", "high"],
-        ["reviewer", "gpt-6.2-astra", "high"],
-      ]) {
-        const rendered = readFileSync(join(s.work, `.codex/agents/${agent}.toml`), "utf8");
-        expect(Bun.TOML.parse(rendered)).toMatchObject({ model, model_reasoning_effort: effort });
-      }
-      s.ok([s.forge, "doctor", s.work, "--json"]);
-      const historical = JSON.parse(s.ok([s.forge,"ledger","query","--q","historical","--json"]));
-      expect(historical.events.some((e:{payload_json:string})=>JSON.parse(e.payload_json).kind==="fat")).toBe(true);
-      for (const tip of tips) s.ok([s.forge, "ledger", "verify-tip", tip]);
-      expect(JSON.parse(s.ok([s.forge, "ledger", "query", "--q", "rehearsal", "--json"]))).toEqual(search);
-      for (const name of ["ledger", "wb-git", "wb-verify", "forge-ship", "forge-review"])
-        expect(existsSync(join(s.work, ".workbench/bin", name))).toBe(false);
-    }
-    for (const id of envelopes) {
-      const result = s.run([s.forge, "ship", "run", "--envelope", id]);
-      expect(result.code).not.toBe(0);
-      expect(result.out + result.err).toMatch(/re.?register|re.?approv|register a new plan|new.*runbook|重新登记|重新批准/i);
-    }
-    const beforeAppend = s.ok([s.forge, "ledger", "tip", "active"]).trim();
-    s.ok([s.forge, "ledger", "record", "active", "--kind", "note", "--status", "info", "--summary", "after-upgrade"]);
-    const previous = beforeAppend.split("@")[1]!;
-    const event = JSON.parse(s.ok([s.forge, "ledger", "query", "--q", "after", "--json"])).events.find((e: {prev_hash: string}) => e.prev_hash === previous);
-    expect(event).toBeDefined();
-    expect(JSON.parse(s.ok([s.forge, "ledger", "verify", "--json"])).ok).toBe(true);
-  }, 120_000);
-}
+test("direct sync rejects the installed 0.4.1 lock before writing to the target", () => {
+  oldInstance();
+  const bootstrap = releaseCLI(s);
+  const before = tree();
+  const reject = () => {
+    const result = s.run([bootstrap, "sync", s.work]);
+    expect(result.code).not.toBe(0);
+    expect(result.err + result.out).toMatch(/0\.4\.1/);
+    expect(result.err + result.out).toMatch(/migrat|manually|手动|迁移/i);
+  };
+  reject();
+  expect(tree()).toEqual(before);
+  const modes = new Map<string, number>();
+  function protect(path: string) {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) return;
+    modes.set(path, stat.mode);
+    if (stat.isDirectory()) for (const name of readdirSync(path)) protect(join(path, name));
+    chmodSync(path, stat.mode & ~0o222);
+  }
+  try {
+    protect(s.work);
+    const readOnly = tree();
+    reject();
+    expect(tree()).toEqual(readOnly);
+  } finally {
+    for (const [path, mode] of modes) chmodSync(path, mode);
+  }
+  expect(tree()).toEqual(before);
+}, 120_000);
+
+test("a migrated 0.5.3 instance preserves 0.4 archives, in-flight tasks and bound history", () => {
+  const bootstrap = releaseCLI(s);
+  const {tips, envelopes} = oldInstance();
+  const app = join(s.work, "app");
+  const base = s.git(app, "rev-parse", "HEAD").trim();
+  s.privateFile("app/change.ts", "export const answer = 42;\n");
+  s.git(app, "add", "--", "change.ts");
+  s.git(app, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "legacy review scope", "--", "change.ts");
+  const head = s.git(app, "rev-parse", "HEAD").trim();
+  // The old tool API authenticates tool-written evidence and maintains the v0.4 chain.
+  s.ok(["bun", "-e", `
+    import { Ledger } from ${JSON.stringify(join(s.root, "legacy-kit/src/ledger/store.ts"))};
+    const [root, base, head] = process.argv.slice(1);
+    const ledger = new Ledger(root);
+    const floor = ledger.getSpecState("active").evidence_floor_seq.review;
+    ledger.recordEvidence({task_id:"active", repo:"app", branch:"active", sha:head, kind:"review", source:"tool",
+      actor:"tool", status:"fail", summary:"performance review interrupted",
+      meta:{role:"performance", base, head, review_task_id:"active", review_floor_seq:floor, exit_code:2, report_status:"error"}});
+    ledger.closeDb();
+  `, s.work, base, head]);
+  const old = historicalKit(s, "0.5.3");
+  s.ok([join(old, "bin/forge"), "sync", s.work]);
+  const ledger = (...args: string[]) => s.ok([s.forge, "ledger", ...args]);
+  const search = JSON.parse(ledger("query", "--q", "rehearsal", "--json"));
+  const initial = snapshot(s.work);
+  const sameSource = join(s.root, "before-baseline-executions");
+  cpSync(s.work, sameSource, {recursive:true, verbatimSymlinks:true});
+  const trace = join(s.root, "backend-calls.jsonl");
+  const codex = join(s.bin, "codex");
+  writeFileSync(codex, `#!/usr/bin/env bun
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const native = args.includes("--output-schema") && args.includes("review");
+const request = native ? null : JSON.parse(await Bun.stdin.text());
+const head = Bun.spawnSync(["git", "rev-parse", "HEAD"]).stdout.toString().trim();
+appendFileSync(${JSON.stringify(trace)}, JSON.stringify({args, request, head})+"\\n");
+await Bun.write(args[args.indexOf("-o")+1], JSON.stringify(native ? {passed:true, report:"checked diff"} :
+  {role:request.role, status:"pass", summary:"checked diff", findings:[], limitations:[],
+    checked:request.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"}))}));
+`, {mode:0o755});
+  s.env.FORGE_CODEX_BIN = codex;
+  const native = [s.forge, "ledger", "review-native", "--task", "active", "--repo", "app", "--base", base];
+  const retry = [s.forge, "review", "--task", "active", "--repo", "app", "--base", base, "--head", head, "--roles", "performance"];
+  s.ok(native, app);
+  s.ok(retry, app);
+  const calls = readFileSync(trace, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  expect(calls).toHaveLength(2);
+  expect(calls[0].head).toBe(head);
+  expect(calls[0].args).toContain(base);
+  expect(calls[0].args.join(" ")).toContain("synthetic upgrade witness");
+  expect(calls[1].request).toMatchObject({role:"performance", base, head});
+  renameSync(s.work, join(s.root, "baseline-executions"));
+  renameSync(sameSource, s.work);
+  s.ok([bootstrap, "sync", s.work]);
+  expect(snapshot(s.work, initial.schema)).toEqual(initial);
+  const originalCalls = readFileSync(trace);
+  for (const args of [native, retry]) {
+    const refused = s.run(args, app);
+    expect(refused.code).not.toBe(0);
+    expect(readFileSync(trace)).toEqual(originalCalls);
+    expect(snapshot(s.work, initial.schema)).toEqual(initial);
+  }
+  for (const tip of tips) ledger("verify-tip", tip);
+  expect(JSON.parse(ledger("verify", "--json")).ok).toBe(true);
+  expect(JSON.parse(ledger("query", "--q", "rehearsal", "--json"))).toEqual(search);
+  const historical = JSON.parse(ledger("query", "--q", "historical", "--json"));
+  expect(historical.events.some((e:{payload_json:string})=>JSON.parse(e.payload_json).kind==="fat")).toBe(true);
+  for (const id of envelopes) {
+    const result = s.run([s.forge, "ship", "run", "--envelope", id]);
+    expect(result.code).not.toBe(0);
+    expect(result.out + result.err).toMatch(/re.?register|re.?approv|register a new plan|new.*runbook|重新登记|重新批准/i);
+  }
+}, 120_000);

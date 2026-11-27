@@ -27,6 +27,14 @@ test("T04/T05/T12 clean installation discovers exactly the core catalog under Bu
   expect(statSync(join(s.work, "AGENTS.md")).size).toBeLessThan(8000);
   const list = JSON.parse(s.ok([s.forge, "instance", "list", "--json"]));
   for (const id of skills) expect(JSON.stringify(list)).toContain(id);
+  const skill = (id: string) => JSON.parse(s.ok([s.forge, "instance", "show", "skill", id, "--json"]));
+  const grill = skill("grill");
+  expect(grill.source).toBe("core");
+  expect(grill.value.body).toMatch(/背景[^。]*举例[^。]*正式承诺/);
+  expect(grill.value.body).toMatch(/新增限制[^。]*用例[^。]*真实入口[^。]*具体损失[^。]*机制/);
+  const ready = skill("ready");
+  expect(ready.source).toBe("core");
+  expect(ready.value.body).toMatch(/覆写[^。]*实例[^。]*维护[^。]*升级[^。]*对照[^。]*更新或移除/);
   for (const command of ["ledger", "wb-git", "wb-verify", "forge-ship", "forge-review"])
     expect(existsSync(join(s.work, ".workbench/bin", command))).toBe(false);
   s.ok([s.forge, "doctor", s.work, "--json"]);

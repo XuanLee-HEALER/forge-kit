@@ -1,4 +1,4 @@
-import { normalizeDbHosts, loadDbEnvironments } from "../config";
+import { normalizeDbHosts } from "../config";
 import { type ApprovedRunbookEntry } from "./runbook-state";
 import { canonicalizeOsPath, sha256File } from "../shared/path";
 import {
@@ -48,8 +48,6 @@ function isAllowedDbcredSubstitution(
   inner: string,
   workbenchRoot: string,
   workdir: string,
-  runbook: ApprovedRunbookEntry,
-  host: string,
 ): boolean {
   const trimmed = inner.trim();
   if (!trimmed || /[;|&`<>()\n\r\0'"]/.test(trimmed)) return false;
@@ -158,7 +156,7 @@ function migrationMatches(cmd: string, root: string, cwd: string, runbook: Appro
   const destinations = new Set(hosts.flatMap(normalizeDbHosts));
   const [host] = destinations;
   if (!host || destinations.size !== 1 || !prodHosts.includes(host) || files.length !== 1) return false;
-  if (!credentials.every(inner => isAllowedDbcredSubstitution(inner, root, cwd, runbook, host))) return false;
+  if (!credentials.every(inner => isAllowedDbcredSubstitution(inner, root, cwd))) return false;
   const path = canonicalizeOsPath(cwd, files[0]);
   return !!path && runbook.actions.sql_files.some(f => f.path === path && normalizeDbHosts(f.host).includes(host) && f.sha256 === sha256File(path));
 }

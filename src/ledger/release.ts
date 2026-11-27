@@ -21,7 +21,7 @@ import {
 } from "./release-inspection";
 import type { Ledger } from "./store";
 import { appendEventInTx, withImmediateTx } from "./transactions";
-import { nowIso, type RunbookSqlFileAction, type RunbookTagAction } from "./types";
+import { nowIso, type RunbookTagAction } from "./types";
 
 function create(ledger: Ledger, args: string[]) {
   const { values } = parseArgs({

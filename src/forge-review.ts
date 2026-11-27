@@ -5,11 +5,10 @@ import { checkMigration } from "./managed-assets";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { reviewOptions, reviewSelection, runReview, type PreviousReview } from "../review-agents/src/engine";
-import { canonicalRepoPath, findWorkbenchRoot, loadModelsConfig } from "./config";
+import { findWorkbenchRoot, loadModelsConfig } from "./config";
 import { runGit } from "./git";
 import { executionSnapshot, recheckExecution, targetOptions } from "./ledger/execution";
 import { evidenceSource, reviewFactKind, usesV05 } from "./ledger/types";
-import { reviewMeetsFloor } from "./ledger/review-range";
 import { Ledger } from "./ledger/store";
 
 export { reviewExitCode } from "../review-agents/src/engine";
@@ -19,30 +18,6 @@ function resolveCommit(repo: string, value: string) {
   const result = runGit(repo, ["rev-parse", "--verify", "--end-of-options", value + "^{commit}"]);
   if (result.code) throw Error("Unresolvable review commit");
   return result.stdout.trim();
-}
-
-// v0.4 tracked performance separately. A retry is bound to the latest unresolved
-// receipt for this role, attachment, range and review cycle.
-function performanceFailure(ledger: Ledger, snap: ReturnType<typeof executionSnapshot>, base: string) {
-  if (usesV05(ledger, snap.task_id) || base !== snap.base)
-    throw Error("A performance retry requires a v0.4 task and its original attached review range");
-  const rows = ledger.getTaskEvents(snap.task_id);
-  const floor = snap.floors.review;
-  const floorTime = rows.find(row => row.seq === floor)?.ts;
-  const attachments = ledger.getTaskRepos(snap.task_id).filter(row => row.repo === snap.repo);
-  for (const row of rows.reverse()) {
-    if (row.seq < floor) break;
-    if (row.event_type !== "EVIDENCE_CAPTURED" || row.sha !== snap.head || !row.repo ||
-        canonicalRepoPath(ledger.workbenchRoot, row.repo) !== snap.repo ||
-        (row.branch ? row.branch !== snap.branch : attachments.length !== 1)) continue;
-    const evidence = JSON.parse(row.payload_json);
-    const source = evidenceSource(evidence, row.actor);
-    if (reviewFactKind(evidence) !== "review" || evidence.meta?.role !== "performance" || source === "manual" ||
-        !reviewMeetsFloor(evidence.status, evidence.meta, snap.task_id, floor, floorTime, source)) continue;
-    if (evidence.status === "fail" && evidence.meta.base === base) return row.seq;
-    break;
-  }
-  throw Error("No unresolved v0.4 performance failure for this task, branch, range and review cycle");
 }
 
 // Only the most recent applicable execution may supply proof. A newer
@@ -73,7 +48,7 @@ export async function reviewCli(args: string[]) {
   const root = findWorkbenchRoot(values.cwd);
   checkMigration(root);
   const config = loadModelsConfig(root);
-  const {sequence} = reviewSelection(values, values.roles === "performance" ? ["performance"] : roles);
+  const {sequence} = reviewSelection(values, roles);
   const explicit = values.model !== undefined || values.effort !== undefined;
   if (explicit && values.tier !== undefined) throw Error("Use either --model with --effort or --tier");
   if (values.tier !== undefined && !Object.hasOwn(config.tiers, values.tier)) throw Error("Unknown --tier");
@@ -90,7 +65,6 @@ export async function reviewCli(args: string[]) {
     const base = values.base === undefined ? snap.base : resolveCommit(snap.dir, values.base);
     if (!base || head !== snap.head || !snap.base || runGit(snap.dir, ["merge-base", "--is-ancestor", snap.base, base]).code)
       throw Error("Expected an attached review range ending at the current delivery HEAD");
-    const priorFailure = values.roles === "performance" ? performanceFailure(ledger, snap, base) : undefined;
     const spec = ledger.getSpecState(snap.task_id);
     const specPath = spec.state === "FROZEN" && (spec.files?.ssot ?? spec.files?.scope);
     const started = new Date().toISOString();
@@ -101,23 +75,17 @@ export async function reviewCli(args: string[]) {
       ...values, repo: snap.dir, base, head, spec: specPath ? join(root, specPath) : undefined,
       specSha256: spec.hashes?.ssot ?? spec.hashes?.scope,
       ruleContext: reviewSkill && [reviewSkill.description, reviewSkill.body],
-      // A legacy task can acquire coverage proofs from this engine. Its historical
-      // performance retry must still execute against the original failed range.
-      taskHistory: priorFailure !== undefined ? undefined : values.full ? {} : reviewHistory(ledger,snap,base,sequence),
-      legacyPerformanceRetry: priorFailure !== undefined,
+      taskHistory: values.full ? {} : reviewHistory(ledger,snap,base,sequence),
       models, model:undefined,
     });
     ledger.db.transaction(() => {
       recheckExecution(ledger, snap);
-      if (priorFailure !== undefined && performanceFailure(ledger, snap, base) !== priorFailure)
-        throw Error("Performance review evidence changed during the retry");
       for (const result of report.roles) {
         const selectedOnly = result.backend === null && result.attempts.length === 0 && !result.coverage.reused;
         ledger.recordEvidence({
           task_id: snap.task_id, repo: snap.repo, branch: snap.branch, sha: head, actor: "tool", source: "tool",
           kind: selectedOnly ? "review_selection" : "review", status: selectedOnly ? "info" : result.status === "pass" ? "pass" : "fail", summary: result.summary,
           meta: {
-            ...(priorFailure !== undefined && { retry_of: priorFailure }),
             role: result.role, base, head, ...(selectedOnly ? { selection_id: execution } : { execution_id: execution, started_at: started }),
             review_task_id: snap.task_id, review_floor_seq: snap.floors.review, freeze_seq: snap.freeze_seq,
             ...(result.missing_materials ? { missing_materials: result.missing_materials } : {}),

@@ -43,7 +43,7 @@ export interface WorkbenchConfig {
 
 export interface ModelsConfig {
   tiers: Record<string, {model:string; effort:Model["effort"]}>;
-  review: { roles: Record<Role, string> };
+  review: { roles: Record<Role | "performance", string> };
 }
 
 export interface DbCredentialPair {
@@ -268,13 +268,6 @@ function dbConfigPath(root: string, rel: string) {
   return file;
 }
 
-export function resolveDbEnvironmentsPath(root: string) {
-  for (const rel of dbEnvironmentFiles) {
-    const path = dbConfigPath(root, rel);
-    if (path) return path;
-  }
-}
-
 function readDbEnvironmentFile(path: string): Record<string, DbEnvEntry> {
   // Parser excerpts and arbitrary JSON keys can both contain credentials. Only report schema fields and ordinal.
   const bytes = readFileSync(path, "utf8");
@@ -385,7 +378,7 @@ export function decodeModelsConfig(parsed: object, file: string): ModelsConfig {
     if (!efforts.some(e => e === effort)) throw Error(file + ": Invalid " + field + ".effort");
     tiers[name] = {model, effort: effort as Model["effort"]};
   }
-  const mapping: Record<Role, string> = { business: "deep", quality: "deep", simplify: "standard", comments: "mechanical", performance: "deep" };
+  const mapping: ModelsConfig["review"]["roles"] = { business: "deep", quality: "deep", simplify: "standard", comments: "mechanical", performance: "deep" };
   if ("review" in parsed) {
     const review = parsed.review;
     if (!review || typeof review !== "object" || Array.isArray(review) || Object.keys(review).some(k => k !== "roles"))
@@ -461,7 +454,4 @@ export function loadShipPolicy(root: string) {
     policy: { ...policy, forbidden_paths: policy.forbidden_paths.map(shipGlob) } as ShipPolicy,
     hash: createHash("sha256").update(bytes).digest("hex"),
   };
-}
-export function computeShipPolicyHash(root: string) {
-  return loadShipPolicy(root).hash;
 }

@@ -1,6 +1,6 @@
 import { buildPlan } from "./ship-actions";
 import { checkedActions, requireActionReceipts, detail, inspect, observe, type ReleaseLedger } from "./release-inspection";
-import { runGit, withinProcessDeadline } from "../git";
+import { isOid, runGit, withinProcessDeadline } from "../git";
 import { withImmediateTx } from "./transactions";
 import {
   canonicalJson,
@@ -84,7 +84,7 @@ export function createRunbook(ledger: LedgerReader, params: {
     if (!repo || !Number.isInteger(num) || num <= 0) {
       throw new Error(`Invalid PR action (${raw.repo}:${raw.number}); expected <repo>:<positive-int>`);
     }
-    if (raw.pin && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(raw.pin.head)) throw Error("Invalid pinned PR head");
+    if (raw.pin && !isOid(raw.pin.head)) throw Error("Invalid pinned PR head");
     prs.push({ repo, number: num, ...(raw.pin && { pin: raw.pin }) });
   }
 

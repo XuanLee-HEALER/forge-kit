@@ -1,5 +1,5 @@
 import { repoOrigin } from "../shared/gh-remote";
-import { checkoutEnvironment, runProcess, runGit } from "../git";
+import { isOid, checkoutEnvironment, runProcess } from "../git";
 
 export class PrUnavailable extends Error {}
 
@@ -29,7 +29,7 @@ export function inspectPr(dir: string, branch: string, pr?: string, env = proces
   const data = JSON.parse(result.stdout);
   if (!prNumber(data.url) || (pr && prNumber(data.url) !== number) || data.isCrossRepository !== false ||
       data.headRepository?.name?.toLowerCase() !== origin.repo || data.headRepositoryOwner?.login?.toLowerCase() !== origin.owner ||
-      !["OPEN", "MERGED"].includes(data.state) || data.headRefName !== branch || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(data.headRefOid))
+      !["OPEN", "MERGED"].includes(data.state) || data.headRefName !== branch || !isOid(data.headRefOid))
     throw new Error("Pull request does not match origin, branch, state or HEAD");
   return data;
 }
@@ -38,25 +38,4 @@ export function verifiedPr(dir: string, branch: string, head: string, pr?: strin
   const data = inspectPr(dir, branch, pr, env, undefined, {baseOid});
   if (data.headRefOid !== head) throw Error("Pull request does not match origin, branch, state or HEAD");
   return data;
-}
-
-
-export function tagTargetIsCurrent(dir: string, remote: string, branch: string, expected: string) {
-  const [host, owner, repo] = remote.split("/");
-  const live = runProcess(
-    [process.env.FORGE_GH_BIN || "gh", "api", "--hostname", host,
-      "repos/" + owner + "/" + repo + "/branches/" + encodeURIComponent(branch), "--jq", ".commit.sha"],
-    {cwd: dir, env: checkoutEnvironment(), timeoutMs: 3000},
-  );
-  return live.code === 0 && live.stdout.trim() === expected;
-}
-
-export function verifyTagBase(dir: string, branch: string, expected: string, head: string) {
-  const origin = repoOrigin(dir);
-  if (!origin) throw Error("Cannot pin tag destination");
-  const remote = [origin.host, origin.owner, origin.repo].join("/");
-  if (!tagTargetIsCurrent(dir, remote, branch, expected) ||
-      runGit(dir, ["merge-base", "--is-ancestor", expected, head]).code)
-    throw Error("Tag SHA must include the live target branch");
-  return remote;
 }

@@ -261,7 +261,7 @@ test("ledger reviews preserves selected roles that could not start and their mis
     attempts: [{ backend: "codex", status: "incomplete" }] });
 });
 
-for (const version of ["0.4", "0.5"] as const) test(`v${version} performance retry preserves the original role and range`, () => {
+for (const version of ["0.4", "0.5"] as const) test(`v${version} rejects retired performance retry without rewriting failed evidence`, () => {
   s.fresh();
   const app = join(s.work, "app");
   s.git(s.work, "clone", "-q", repo, app);
@@ -281,38 +281,11 @@ for (const version of ["0.4", "0.5"] as const) test(`v${version} performance ret
     const standalone = s.run([join(kit,"review-agents/bin/review"), "--repo", app, "--base", base, "--head", head, "--roles", "performance"]);
     expect(standalone.code).not.toBe(0);
     expect(review("performance", "--base", head).code).not.toBe(0);
-    if (version === "0.5") {
-      expect(review("performance").code).not.toBe(0);
-      expect(readFileSync(log, "utf8")).toBe("");
-      return;
-    }
-
-    for (const kind of ["lint","test"] as const) db.recordEvidence({...scope, kind, status:"pass", summary: "fixture verification"});
-    configureCodex({QUALITY: JSON.stringify(modelReport("pass"))});
-    const readiness = () => db.checkPushReadiness({task_id:task, repo:"app", branch:"main", head_sha:head});
-    expect(review("quality,simplify").code).toBe(0);
-    expect(readiness().hasExplicitFailure).toBe(true);
-    configureCodex({PASS: JSON.stringify(modelReport("blocked"))});
-    expect(review("performance").code).toBe(1);
-    expect(readiness().hasExplicitFailure).toBe(true);
-    configureCodex({PASS: JSON.stringify(modelReport("pass"))});
-    const retry = review("performance");
-    expect(retry.code, retry.out + retry.err).toBe(0);
-    expect(JSON.parse(retry.out).roles).toMatchObject([{ role:"performance", base, head, status:"pass", backend:"codex" }]);
-    expect(readiness().ready).toBe(true);
-    expect(db.getTaskEvents(task).find(e => e.seq === failure.seq)).toEqual(failure);
-    const records = db.getTaskEvents(task).filter(e => e.event_type === "EVIDENCE_CAPTURED")
-      .map(e => ({seq:e.seq, ...JSON.parse(e.payload_json)})).filter(e => e.meta?.role === "performance");
-    expect(records.map(r => r.status)).toEqual(["fail","fail","pass"]);
-    expect(records[1].meta.retry_of).toBe(failure.seq);
-    expect(records[2].meta.retry_of).toBe(records[1].seq);
-    const inputs = readFileSync(log,"utf8").trim().split("\n").map(line => JSON.parse(line));
-    const prompt = JSON.parse(inputs.at(-1).prompt);
-    expect(prompt).toMatchObject({role:"performance",base,head});
-    expect(prompt.instructions).toContain("# Simplicity and performance reviewer");
-    expect(prompt.instructions).not.toContain("# Code simplification reviewer");
-    expect(inputs.at(-1).args).toContain("read-only");
+    const before = db.getTaskEvents(task);
     expect(review("performance").code).not.toBe(0);
+    expect(readFileSync(log, "utf8")).toBe("");
+    expect(db.getTaskEvents(task)).toEqual(before);
+    expect(db.getTaskEvents(task).at(-1)).toEqual(failure);
   } finally { db.closeDb(); }
 }, 30_000);
 

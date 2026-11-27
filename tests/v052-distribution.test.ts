@@ -32,9 +32,9 @@ test("current distribution removes stale JS bundles and retired protocol configu
     symlinkSync(join(kit, "node_modules"), join(temp, "node_modules"));
     if (existsSync(join(kit, "review-agents/node_modules"))) symlinkSync(join(kit, "review-agents/node_modules"), join(temp, "review-agents/node_modules"));
     for (const manifest of ["package.json", "review-agents/package.json"]) {
-      expect(JSON.parse(readFileSync(join(temp, manifest), "utf8")).version).toBe("0.5.3");
+      expect(JSON.parse(readFileSync(join(temp, manifest), "utf8")).version).toBe("0.5.4");
     }
-    expect(readFileSync(join(kit, "kit.toml"), "utf8")).toMatch(/^version = "0\.5\.3"$/m);
+    expect(readFileSync(join(kit, "kit.toml"), "utf8")).toMatch(/^version = "0\.5\.4"$/m);
     mkdirSync(join(temp, "dist"));
     writeFileSync(join(temp, "dist/stale.js"), "stale");
     const result = Bun.spawnSync([process.execPath, "run", "build"], { cwd: temp });
@@ -58,7 +58,7 @@ test("current distribution removes stale JS bundles and retired protocol configu
     expect(readFileSync(join(kit, "core/AGENTS.md")).length).toBeLessThan(8000);
     const guard = join(kit, "src/guard");
     const lines = readdirSync(guard).filter(f => f.endsWith(".ts")).reduce((n, f) => n + (readFileSync(join(guard, f), "utf8").match(/\n/g)?.length ?? 0), 0);
-    expect(lines).toBeLessThan(1498);
+    expect(lines).toBeLessThanOrEqual(750);
     for (const obsolete of ["docs/designs", "docs", "packs"]) expect(existsSync(join(kit, obsolete))).toBe(false);
   } finally { rmSync(temp, { recursive: true, force: true }); }
 }, 30_000);

@@ -5,7 +5,8 @@ import { resolve } from "node:path";
 import { prospectiveMergeTree } from "../ship-diff";
 import { loadDbEnvironments, loadWorkbenchConfig } from "../config";
 import { localPath, resolveInstance } from "../instance";
-import { runGit } from "../git";
+import { isOid, runGit } from "../git";
+export { isOid } from "../git";
 import { interpreterScript } from "../shared/action-program";
 import { sha256File } from "../shared/path";
 import { resolveTaskCheckout } from "./checkout";
@@ -67,8 +68,6 @@ export interface ExactPlan {
   ci: Extract<ShipAction, { kind: "pr" }>[];
   stages: { id: string; core: boolean }[];
 }
-export const isOid = (value: string) => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
-
 export function pinCheckouts(ledger: LedgerReader, task: string) {
   return ledger
     .getTaskRepos(task)

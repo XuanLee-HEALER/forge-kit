@@ -226,10 +226,9 @@ async function reviewRole(role: Role, repo: Repo, material: Material, model: Mod
 export async function runReview(params: Option & {
   repo: string; base: string; head: string; spec?: string; specSha256?: string;
   models?: Partial<Record<Role, {model:string;effort:string}>>; model?: {model:string;effort:string};
-  legacyPerformanceRetry?: boolean;
   taskHistory?: Partial<Record<Role,PreviousReview>>; full?:boolean; ruleContext?:string[];
 }) {
-  const { mode, sequence } = reviewSelection(params, params.legacyPerformanceRetry ? ["performance"] : roles);
+  const { mode, sequence } = reviewSelection(params, roles);
   const models = sequence.map(role => {
     const pair = params.models?.[role] ?? params.model;
     return modelPair(pair?.model, pair?.effort);

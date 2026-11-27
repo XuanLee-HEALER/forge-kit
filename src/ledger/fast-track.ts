@@ -3,7 +3,7 @@ import { resolveInstance } from "../instance";
 import { randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
 import { canonicalRepoPath, loadShipPolicy, loadWorkbenchConfig, shipGlob, type ShipPolicy } from "../config";
-import { runGit } from "../git";
+import { isOid, runGit } from "../git";
 import { matchesGlob } from "../shared/path";
 import { resolveTaskCheckout } from "./checkout";
 import type { Ledger } from "./store";
@@ -130,7 +130,7 @@ function taskSnapshot(ledger: Ledger, id: string) {
     throw Error("A drift-free frozen specification is required");
   const bases = rows
     .map((r) => {
-      if (!r.base_sha || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(r.base_sha))
+      if (!r.base_sha || !isOid(r.base_sha))
         throw Error("Invalid attached base SHA");
       const { dir } = resolveTaskCheckout(ledger.workbenchRoot, r);
       if (runGit(dir, ["cat-file", "-t", r.base_sha]).stdout.trim() !== "commit")

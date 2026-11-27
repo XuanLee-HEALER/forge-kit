@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ShipPolicy } from "./config";
 import type { TaskRepoRecord } from "./ledger/types";
-import { runGit, runProcess, checkoutEnvironment } from "./git";
+import { isOid, runGit, runProcess, checkoutEnvironment } from "./git";
 import { matchesGlob } from "./shared/path";
 
 export function git(dir: string, args: string[], env?: Record<string, string | undefined>) {
@@ -75,7 +75,7 @@ export function prospectiveMergeTree(
       GIT_ALTERNATE_OBJECT_DIRECTORIES: original,
     };
     const result = git(dir, ["merge-tree", "--write-tree", target, head], env).trim();
-    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(result)) throw Error("Cannot verify prospective merge tree");
+    if (!isOid(result)) throw Error("Cannot verify prospective merge tree");
     return result;
   } finally {
     rmSync(objects, { recursive: true, force: true });

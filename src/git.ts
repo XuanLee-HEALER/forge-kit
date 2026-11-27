@@ -3,6 +3,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
+export const isOid = (value: string) => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
+
 export interface GitRunResult {
   code: number;
   stdout: string;
@@ -184,124 +186,4 @@ export function listWorkbenchRepos(
     }
   }
   return found.sort();
-}
-
-export function getCommitDiffStats(
-  checkoutDir: string,
-  commitRef: string,
-): { files: string[]; changedLines: number } | null {
-  const namesRes = runGit(checkoutDir, [
-    "diff-tree",
-    "--no-commit-id",
-    "--name-only",
-    "-r",
-    "--root",
-    commitRef,
-  ]);
-  if (namesRes.code !== 0) return null;
-  const files = namesRes.stdout
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  const numstatRes = runGit(checkoutDir, [
-    "diff-tree",
-    "--no-commit-id",
-    "--numstat",
-    "-r",
-    "--root",
-    commitRef,
-  ]);
-  if (numstatRes.code !== 0) return null;
-  let changedLines = 0;
-  for (const line of numstatRes.stdout.split("\n")) {
-    const parts = line.trim().split(/\s+/);
-    if (parts.length < 3) continue;
-    const add = Number(parts[0]);
-    const del = Number(parts[1]);
-    if (Number.isFinite(add)) changedLines += add;
-    if (Number.isFinite(del)) changedLines += del;
-  }
-  return { files, changedLines };
-}
-
-/**
- * Compute aggregate diff stats of a branch/commit against the nearest base branch
- * (origin/<base> or <base>), falling back to single-commit diff when no distinct base exists.
- */
-export function getBranchDiffStats(
-  checkoutDir: string,
-  commitRef: string,
-  baseBranches: string[] = ["main", "master"],
-): { files: string[]; changedLines: number } | null {
-  const targetRes = runGit(checkoutDir, ["rev-parse", commitRef]);
-  if (targetRes.code !== 0 || !targetRes.stdout.trim()) return null;
-  const targetSha = targetRes.stdout.trim();
-
-  const candidates: string[] = [];
-  for (const b of baseBranches) {
-    candidates.push(`origin/${b}`, b);
-  }
-  for (const base of candidates) {
-    const baseRes = runGit(checkoutDir, ["rev-parse", "--verify", base]);
-    if (baseRes.code !== 0 || !baseRes.stdout.trim()) continue;
-    const mbRes = runGit(checkoutDir, ["merge-base", base, targetSha]);
-    if (mbRes.code !== 0 || !mbRes.stdout.trim()) continue;
-    const mergeBase = mbRes.stdout.trim();
-    if (mergeBase === targetSha) continue;
-
-    const namesRes = runGit(checkoutDir, ["diff", "--name-only", `${mergeBase}..${targetSha}`]);
-    const numstatRes = runGit(checkoutDir, ["diff", "--numstat", `${mergeBase}..${targetSha}`]);
-    if (namesRes.code !== 0 || numstatRes.code !== 0) return null;
-    const files = namesRes.stdout
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    let changedLines = 0;
-    for (const line of numstatRes.stdout.split("\n")) {
-      const parts = line.trim().split(/\s+/);
-      if (parts.length < 3) continue;
-      const add = Number(parts[0]);
-      const del = Number(parts[1]);
-      if (Number.isFinite(add)) changedLines += add;
-      if (Number.isFinite(del)) changedLines += del;
-    }
-    return { files, changedLines };
-  }
-
-  // Only fall back to single-commit diff when there is literally 1 commit in the repo (root commit).
-  // If multiple commits exist without a resolvable base branch, fail closed (return null) so
-  // multi-commit branches cannot smuggle earlier business code commits behind a trailing doc commit.
-  const countRes = runGit(checkoutDir, ["rev-list", "--count", targetSha]);
-  if (countRes.code === 0 && countRes.stdout.trim() === "1") {
-    return getCommitDiffStats(checkoutDir, targetSha);
-  }
-  return null;
-}
-
-export function getStagedDiffStats(checkoutDir: string): {
-  files: string[];
-  changedLines: number;
-} {
-  const namesRes = runGit(checkoutDir, ["diff", "--cached", "--name-only"]);
-  const files =
-    namesRes.code === 0
-      ? namesRes.stdout
-          .split("\n")
-          .map((s) => s.trim())
-          .filter(Boolean)
-      : [];
-  const numstatRes = runGit(checkoutDir, ["diff", "--cached", "--numstat"]);
-  let changedLines = 0;
-  if (numstatRes.code === 0) {
-    for (const line of numstatRes.stdout.split("\n")) {
-      const parts = line.trim().split(/\s+/);
-      if (parts.length < 3) continue;
-      const add = Number(parts[0]);
-      const del = Number(parts[1]);
-      if (Number.isFinite(add)) changedLines += add;
-      if (Number.isFinite(del)) changedLines += del;
-    }
-  }
-  return { files, changedLines };
 }

@@ -1,14 +1,9 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { canonicalRepoPath, loadModelsConfig, repoCardPath } from "../config";
-import { checkoutEnvironment, runGit, runProcess } from "../git";
+import { canonicalRepoPath } from "../config";
+import { isOid, checkoutEnvironment, runGit, runProcess } from "../git";
 import { usesV05 } from "./types";
 import { verifiedPr } from "./pr";
 import { prRemoteRefs, reachableFromRefs, resolveTaskCheckout } from "./checkout";
-import { coversReviewBase } from "./review-range";
-import { getSpecState } from "./spec";
-import { Ledger } from "./store";
+import type { Ledger } from "./store";
 
 function attached(ledger: Ledger, task: string, repo: string, branch?: string) {
   const rows = ledger.getTaskRepos(task).filter(r => r.repo === canonicalRepoPath(ledger.workbenchRoot,repo) && (!branch || r.branch === branch));
@@ -23,77 +18,11 @@ function commit(dir: string, ref: string) {
   return r.stdout.trim();
 }
 
-export function reviewNative(ledger: Ledger, task: string, repo: string, baseRef: string, branch?: string) {
-  if (usesV05(ledger, task))
-    throw Error("review-native is for v0.4 tasks; use forge review --task " + task + " --repo " + repo + " --roles business");
-  const attachment = attached(ledger, task, repo, branch);
-  const { dir } = resolveTaskCheckout(ledger.workbenchRoot, attachment);
-  function current() {
-    if (runGit(dir, ["symbolic-ref", "--quiet", "HEAD"]).stdout.trim() !== "refs/heads/" + attachment.branch)
-      throw new Error("Review checkout is not on the attached branch");
-    return commit(dir, "HEAD");
-  }
-  const floor = () => getSpecState(ledger, task, { metadataOnly: true }).evidence_floor_seq.review;
-  const head = current();
-  const base = commit(dir, baseRef);
-  if (!coversReviewBase(ledger.workbenchRoot, attachment, base)) throw new Error("Review base does not cover the attached task base");
-  if (runGit(dir, ["merge-base", "--is-ancestor", base, head]).code !== 0)
-    throw new Error("Native review requires the attached base to be an ancestor of HEAD; restore the branch history or review the exact tree diff with a role reviewer.");
-  const review_floor_seq = floor();
-  const started_at = new Date().toISOString();
-  const spec = getSpecState(ledger, task, { metadataOnly: true });
-  const context = [join(ledger.workbenchRoot, "AGENTS.md"), join(ledger.workbenchRoot, "AGENTS.local.md"),
-    repoCardPath(ledger.workbenchRoot, canonicalRepoPath(ledger.workbenchRoot, repo)), ...(spec.spec_dir ? [join(ledger.workbenchRoot, spec.spec_dir)] : [])]
-    .filter(path => existsSync(path));
-  const model = loadModelsConfig(ledger.workbenchRoot).tiers.standard;
-  const tmp = mkdtempSync(join(tmpdir(), "forge-native-review-"));
-  try {
-    // Review the captured objects even if the original checkout changes and later returns to this SHA.
-    const snapshot = join(tmp, "checkout");
-    const clone = runGit(dir, ["clone", "--local", "--shared", "--no-checkout", "--", dir, snapshot]);
-    if (clone.code || runGit(snapshot, ["-c", "core.hooksPath=/dev/null", "checkout", "--detach", head]).code)
-      throw new Error("Cannot prepare review checkout at " + head);
-    const schema = join(tmp, "schema.json"), output = join(tmp, "verdict.json");
-    writeFileSync(schema, JSON.stringify({ type: "object", additionalProperties: false, required: ["passed", "report"],
-      properties: { passed: { type: "boolean" }, report: { type: "string" } } }));
-    const result = Bun.spawnSync(["codex", "-s", "read-only", "exec", "review", "--ephemeral", "--base", base,
-      "-m", model.model, "-c", "model_reasoning_effort=" + JSON.stringify(model.effort),
-      "-c", "project_doc_max_bytes=0", "-c", "developer_instructions=" + JSON.stringify(
-        "Review the pinned diff for task " + JSON.stringify(ledger.getTask(task)?.title) +
-        ". Available workbench rules and specification paths: " + JSON.stringify(context) +
-        ". Use supplied context where applicable. Return only a JSON object with exactly two fields: passed (boolean, false for blocking findings or incomplete review) and report (nonempty string with findings and limitations)."),
-      "--output-schema", schema, "-o", output], { env: checkoutEnvironment(), cwd: snapshot, stdin: "ignore", stdout: "ignore", stderr: "inherit" });
-    let passed = false, summary = "Native review did not produce a passing verdict";
-    if (result.exitCode === 0) {
-      try {
-        const report = JSON.parse(readFileSync(output, "utf8"));
-        if (typeof report.passed === "boolean" && typeof report.report === "string" && report.report.trim()) {
-          passed = report.passed;
-          summary = report.report;
-        } else if (Array.isArray(report.findings) && typeof report.overall_explanation === "string") {
-          passed = report.overall_correctness === "patch is correct" && report.findings.length === 0;
-          summary = JSON.stringify(report);
-        }
-      } catch {
-        summary = "Native review returned an unreadable or incomplete verdict";
-      }
-    }
-    return ledger.db.transaction(() => {
-    const live = attached(ledger, task, repo, attachment.branch);
-      if (resolveTaskCheckout(ledger.workbenchRoot, live).dir !== dir || current() !== head || floor() !== review_floor_seq || live.base_sha !== attachment.base_sha)
-        throw new Error("HEAD, attachment or review floor changed during review");
-      return ledger.recordEvidence({ task_id: task, repo, branch: attachment.branch, sha: head, kind: "review",
-        status: passed ? "pass" : "fail", source: "tool", actor: "tool", summary,
-        meta: { role: "codex-review", head, base, started_at, review_floor_seq, review_task_id: task } });
-    }).immediate();
-  } finally { rmSync(tmp, { recursive: true, force: true }); }
-}
-
 function mainContainsHead(dir:string, url:string, head:string):string {
   const pr=new URL(url), repo=pr.pathname.split("/").slice(1,3).join("/");
   const api=(path:string,jq:string)=>runProcess([process.env.FORGE_GH_BIN || "gh","api","--hostname",pr.host,"repos/"+repo+"/"+path,"--jq",jq],{cwd:dir,env:checkoutEnvironment()});
   const result=api("git/ref/heads/main",".object.sha"), tip=result.stdout.trim();
-  if(result.code || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(tip)) throw Error("Cannot verify current remote main");
+  if(result.code || !isOid(tip)) throw Error("Cannot verify current remote main");
   if(head===tip || runGit(dir,["merge-base","--is-ancestor",head,tip]).code===0) return tip;
   const comparison=api("compare/"+head+"..."+tip,".status");
   if(comparison.code || !["identical","ahead"].includes(comparison.stdout.trim())) throw Error("Remote main does not contain the verified PR head");

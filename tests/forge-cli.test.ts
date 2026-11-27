@@ -207,41 +207,6 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     expect(listing.stdout.toString()).not.toMatch(/\/(form-ux|dbop|comm-lark|work-communication)(\/|$)|\/qa-polling\.md/m);
   });
 
-  test("sync preserves edited domain skills and instance data from a v0.4 pack install", () => {
-    const source = join(import.meta.dir, "..");
-    const previousKit = join(target, "previous-kit");
-    const bench = join(target, "bench");
-    copySourceKit(previousKit);
-    const previousForm = join(previousKit, "core/.agents/skills/form-ux");
-    mkdirSync(previousForm, { recursive: true });
-    writeFileSync(join(previousForm, "SKILL.md"), "old managed form conventions");
-    initWorkbench({ targetDir: bench, kitRoot: source });
-    const lockPath = join(bench, ".workbench/kit-lock.json");
-    const lock = JSON.parse(readFileSync(lockPath, "utf8"));
-    writeFileSync(lockPath, JSON.stringify({ ...lock, kit_version: "0.4.1", kit_root: previousKit, packs: ["dbop", "comm-lark"] }));
-    const files = {
-      ".agents/skills/form-ux/SKILL.md": "local form conventions",
-      ".agents/skills/dbop/SKILL.md": "local database conventions",
-      ".agents/skills/work-communication/references/qa-polling.md": "local reporting procedure",
-      ".agents/skills/private-specialty/SKILL.md": "unmanaged specialty",
-      ".workbench/env/environments.json": JSON.stringify({ local: { user: "fixture", password: "synthetic-only" } }),
-      "AGENTS.local.md": "private configuration",
-    };
-    for (const [path, content] of Object.entries(files)) {
-      const file = join(bench, path);
-      mkdirSync(dirname(file), { recursive: true });
-      writeFileSync(file, content, { mode: 0o600 });
-    }
-    for (let pass = 0; pass < 2; pass++) {
-      const sync = Bun.spawnSync([join(source, "bin/forge"), "sync", bench], {
-        cwd: target, env: { ...process.env, BUN_BIN: process.execPath },
-      });
-      expect(sync.exitCode, sync.stderr.toString()).toBe(0);
-      for (const [path, content] of Object.entries(files)) {
-        expect(readFileSync(join(bench, path), "utf8"), path).toBe(content);
-      }
-    }
-  });
 
   test("installed forge restores managed shipping files and diagnoses policy and wrapper failures", () => {
     const kit = join(import.meta.dir, "..");
@@ -354,7 +319,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const wb = join(bench, ".workbench"),
       lockPath = join(wb, "kit-lock.json");
     const lock = JSON.parse(readFileSync(lockPath, "utf8"));
-    lock.kit_version = "0.4.1";
+    lock.kit_version = "0.5.2";
     writeFileSync(lockPath, JSON.stringify(lock));
     writeFileSync(join(bench, "AGENTS.local.md"), "operator edits");
     for (const file of ["bin/forge", "bin/cli.js"])
