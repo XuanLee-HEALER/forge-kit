@@ -36,7 +36,8 @@ Commands:
   record    <task_id> --kind <prod|verify|deploy|smoke|manual|note> --status <pass|fail|fallback|info> --summary <text> [--repo <r> --branch <b> --sha <sha> --meta <json>]
   reviews <task_id>
   pr-sync <task_id> --repo <repo> [--pr <number-or-url>] [--branch <branch>]
-  review-fallback <task_id> --repo <repo> --role <role> --sha <full-sha>
+  review-record <task_id> [--repo <repo>] [--branch <branch>] --role <business|quality|simplify|comments> --base <sha> --head <sha> --status <pass|blocked|incomplete> --report <file> --summary <text> [--session-id <id>] [--model <name>] [--effort <level>]
+                For ambiguous or later incremental rechecks, cite each resolved "seq N" in --summary and explain the fix and coverage in the report.
   exempt    --repo <r> --branch <b> --reason <text> [--sha <sha> --ttl-hours <n>]
   status    [--task <id>] [--repo <r> --branch <b>] [--json]
   query     [--q <fts>] [--repo <r>] [--status <OPEN|HANDED_OFF|CLOSED|CANCELLED>] [--since <iso>] [--json]

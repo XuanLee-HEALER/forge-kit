@@ -20,10 +20,11 @@ export function reviewFactKind(evidence: { kind?: string; meta?: { report_status
   return "review";
 }
 
-export type EvidenceSource = "tool" | "hook" | "manual";
+export type EvidenceSource = "tool" | "hook" | "manual" | "subagent";
 
-export function evidenceSource(payload: { source?: unknown }, actor: string): EvidenceSource {
+export function evidenceSource(payload: { source?: unknown; kind?: string }, actor: string): EvidenceSource {
   const source = Object.hasOwn(payload, "source") ? payload.source : actor;
+  if (payload.source === "subagent" && payload.kind === "review") return "subagent";
   return source === "hook" || source === "tool" ? source : "manual";
 }
 

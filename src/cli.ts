@@ -24,7 +24,7 @@ Usage:
   forge instance show <kind> <id> [--json]
   forge instance run <stage-id>
   forge verify --task <task-id> --cwd <checkout> --mode all   Run the configured verification stages
-  forge review | ship | ledger | git | guard | ledger-hook | dbcred | cmdfmt | lang-check`);
+  forge ship | ledger | git | guard | ledger-hook | dbcred | cmdfmt | lang-check`);
     return;
   }
 

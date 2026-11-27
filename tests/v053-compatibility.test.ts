@@ -19,29 +19,6 @@ function cli(bin: string, args: string[], env?: Record<string, string>) {
   return result.stdout.toString();
 }
 
-test("a changed exported generator brings its unchanged caller into the review", () => {
-  scope("task");
-  cli("ledger", ["freeze", "task"]);
-  writeFileSync(join(f.repo, "stream.ts"), "export function* values() { yield 1; }\n");
-  writeFileSync(join(f.repo, "reader.ts"), 'import { values } from "./stream";\nexport const first = values().next().value;\n');
-  f.git("add", "--", "stream.ts", "reader.ts");
-  f.git("commit", "-qm", "define generator and consumer");
-  const base = f.git("rev-parse", "HEAD");
-  writeFileSync(join(f.repo, "stream.ts"), 'export function* values() { yield "one"; }\n');
-  f.git("commit", "-qm", "change yielded type", "--", "stream.ts");
-  const backend = join(f.root, "reviewer");
-  writeFileSync(backend, `#!/usr/bin/env bun
-import {appendFileSync} from "node:fs";
-const q=JSON.parse(await Bun.stdin.text());
-const checked=q.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"}));
-appendFileSync(import.meta.path+".paths", checked.map(c=>c.path).join("\\n")+"\\n");
-await Bun.write(process.argv[process.argv.indexOf("-o")+1],JSON.stringify({role:q.role,checked,status:"pass",summary:"Checked",limitations:[],findings:[]}));
-`, {mode: 0o755});
-  cli("review", ["--task", "task", "--repo", "service", "--base", base, "--roles", "quality"], {FORGE_CODEX_BIN: backend});
-  expect(f.git("diff", "--name-only", base, "HEAD")).toBe("stream.ts");
-  expect(readFileSync(backend + ".paths", "utf8").split("\n")).toContain("reader.ts");
-});
-
 test("verification uses fresh evidence when the stage locale changes", () => {
   scope("task");
   cli("ledger", ["freeze", "task"]);

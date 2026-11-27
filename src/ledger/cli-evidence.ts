@@ -1,6 +1,6 @@
 import { parseArgs } from "node:util";
 import { syncPr } from "./delivery-tools";
-import { runReviewFallback } from "./review-fallback";
+import { recordReview } from "./review-record";
 import type { Ledger } from "./store";
 import { evidenceSource, reviewFactKind } from "./types";
 
@@ -63,7 +63,11 @@ export const evidenceCommands = {
       const meta = evidence.meta ?? {};
       return [{ kind, seq: event.seq, repo: event.repo, branch: event.branch, base: meta.base,
         head: event.sha, role: meta.role, status: meta.report_status ?? evidence.status,
-        backend: meta.backend, attempts: meta.attempts, coverage:meta.coverage, scheduling:meta.scheduling, limitations: meta.limitations, missing_materials: meta.missing_materials, source: evidenceSource(evidence, event.actor), summary: evidence.summary }];
+        backend: meta.backend, attempts: meta.attempts, coverage: meta.coverage, scheduling: meta.scheduling,
+        limitations: meta.limitations, missing_materials: meta.missing_materials,
+        source: evidenceSource(evidence, event.actor), summary: evidence.summary,
+        report_path: meta.report_path, report_sha256: meta.report_sha256, session_id: meta.session_id,
+        model: meta.model, effort: meta.effort }];
     });
     console.log(JSON.stringify(records, null, 2));
     return;
@@ -76,14 +80,16 @@ export const evidenceCommands = {
     console.log(syncPr(ledger, task, values.repo, values.pr, values.branch).payload_json);
   },
 
-  "review-fallback"(ledger, rest) {
+  "review-record"(ledger, rest) {
     const [task, ...args] = rest;
-    const { values } = parseArgs({ args, options: { repo: { type: "string" }, role: { type: "string" }, sha: { type: "string" } } });
-    if (!task || !values.repo || !values.role || !values.sha) throw new Error("Expected task ID, --repo, --role and --sha");
-    const event = runReviewFallback(ledger, task, values.repo, values.role, values.sha);
-    const result = JSON.parse(event.payload_json);
-    console.log(JSON.stringify(result));
-    if (result.status === "fail") process.exitCode = 1;
+    const { values } = parseArgs({ args, options: {
+      repo: { type: "string" }, branch: { type: "string" }, role: { type: "string" },
+      base: { type: "string" }, head: { type: "string" }, status: { type: "string" },
+      report: { type: "string" }, summary: { type: "string" }, "session-id": { type: "string" },
+      model: { type: "string" }, effort: { type: "string" },
+    } });
+    if (!task) throw Error("Expected a task ID");
+    console.log(JSON.stringify(recordReview(ledger, task, values), null, 2));
   },
 
   record(ledger, rest) {
@@ -105,7 +111,7 @@ export const evidenceCommands = {
     }
     const manualKinds = ["prod", "verify", "deploy", "smoke", "manual", "note"] as const;
     const kind = manualKinds.find(kind => kind === values.kind);
-    if (!kind) throw new Error("forge ledger record accepts manual attestations only; run the actual verification or review tool for executable evidence.");
+    if (!kind) throw new Error("forge ledger record accepts manual attestations only; run the actual verification or review tool for executable evidence. For native reports, use forge ledger review-record.");
     const parsedMeta = values.meta ? JSON.parse(values.meta) : {};
     const ev = ledger.recordEvidence({
       task_id,

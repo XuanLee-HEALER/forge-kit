@@ -41,8 +41,6 @@ function copySourceKit(destination: string) {
   for (const item of ["bin", "src", "core", "templates", "kit.toml", "package.json"]) {
     cpSync(join(source, item), join(destination, item), { recursive: true });
   }
-  for (const subdir of ["src","prompts"]) cpSync(join(source,"review-agents",subdir),join(destination,"review-agents",subdir),{recursive:true});
-  symlinkSync(join(source,"review-agents/node_modules"),join(destination,"review-agents/node_modules"));
   symlinkSync(join(source, "node_modules"), join(destination, "node_modules"));
 }
 
@@ -55,7 +53,7 @@ afterEach(() => {
 });
 
 describe("forge CLI: init / add-repo / sync / doctor", () => {
-  test("review and verification check the migration journal at the selected workbench", () => {
+  test("verification checks the migration journal at the selected workbench", () => {
     const first = join(target, "first"), second = join(target, "second");
     for (const root of [first, second]) {
       mkdirSync(join(root, ".workbench"), {recursive:true});
@@ -64,14 +62,12 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     mkdirSync(join(second, ".workbench/sync-journal"));
     const env = {...process.env};
     delete env.FORGE_WORKBENCH_ROOT;
-    for (const command of ["review", "verify"]) {
-      const run = (cwd:string, selected:string) => Bun.spawnSync([process.execPath,
-        join(import.meta.dir,"../src/bin/cli.ts"), command, "--cwd", selected, "--task", "absent"], {cwd, env});
-      expect(run(first,second).stderr.toString()).toContain("interrupted migration");
-      const healthy = run(second,first);
-      expect(healthy.exitCode).not.toBe(0);
-      expect(healthy.stderr.toString()).not.toContain("interrupted migration");
-    }
+    const run = (cwd:string, selected:string) => Bun.spawnSync([process.execPath,
+      join(import.meta.dir,"../src/bin/cli.ts"), "verify", "--cwd", selected, "--task", "absent"], {cwd, env});
+    expect(run(first,second).stderr.toString()).toContain("interrupted migration");
+    const healthy = run(second,first);
+    expect(healthy.exitCode).not.toBe(0);
+    expect(healthy.stderr.toString()).not.toContain("interrupted migration");
   });
   test("init refuses to overwrite existing unmanaged AGENTS.md without --force", () => {
     writeFileSync(join(target, "AGENTS.md"), "# Legacy\n");
@@ -149,12 +145,10 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
       "# My Private Local Rules\n",
     );
 
-    for (const bin of ["review", "verify"]) {
-      const check = Bun.spawnSync([join(res.root, ".workbench/bin/forge"), bin, "--task", "absent"],
-        { cwd:res.root, env:{...process.env,BUN_BIN:process.execPath} });
-      expect(check.exitCode).toBe(bin === "review" ? 2 : 1);
-      expect(check.stdout.toString()+check.stderr.toString()).toMatch(/attached checkout/);
-    }
+    const check = Bun.spawnSync([join(res.root, ".workbench/bin/forge"), "verify", "--task", "absent"],
+      { cwd:res.root, env:{...process.env,BUN_BIN:process.execPath} });
+    expect(check.exitCode).toBe(1);
+    expect(check.stdout.toString()+check.stderr.toString()).toMatch(/attached checkout/);
     const doc = doctorWorkbench(res.root);
     expect(doc.ok).toBe(true);
     expect(doc.issues.length).toBe(0);

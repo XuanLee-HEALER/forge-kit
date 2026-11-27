@@ -1,7 +1,7 @@
 import { accessSync, constants, existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { findWorkbenchRoot, isProductionDb, loadDbEnvironments, loadModelsConfig, loadWorkbenchConfig, productionHosts, repoCardPath } from "../config";
+import { findWorkbenchRoot, isProductionDb, loadDbEnvironments, loadModelsConfig, loadWorkbenchConfig, productionHosts, repoCardPath, reviewRoleModel, reviewRoles } from "../config";
 import { localPath, readRequired, resolveInstance, isProjectVerification } from "../instance";
 import { Ledger } from "../ledger/store";
 import { hash, checkMigration, missingLockRecovery, type InstallLock } from "../managed-assets";
@@ -193,6 +193,8 @@ function inspectWorkbench(root: string, issues: DoctorIssue[]) {
     "analyst.toml": models.tiers.deep,
     "reviewer.toml": models.tiers.deep,
   };
+  for (const role of reviewRoles)
+    expectedAgentModel[`reviewer-${role}.toml`] = reviewRoleModel(models, role);
   const agentsDir = join(root, ".codex", "agents");
   if (existsSync(agentsDir)) {
     for (const f of readdirSync(agentsDir)) {

@@ -22,8 +22,18 @@ test("T04/T05/T12 clean installation discovers exactly the core catalog under Bu
   const skills = ["bugfix", "feature", "grill", "pr-triage", "ready", "review", "ship", "verify"];
   expect(readdirSync(join(s.work, ".agents/skills")).sort()).toEqual(skills);
   expect(readdirSync(join(s.work, ".codex/agents")).sort()).toEqual(
-    ["analyst", "implementer", "reviewer", "scanner"].map(name => name + ".toml"),
+    ["analyst", "implementer", "reviewer", "reviewer-business", "reviewer-quality", "reviewer-simplify", "reviewer-comments", "scanner"].map(name => name + ".toml").sort(),
   );
+  const duties = {business:/承诺|业务|requirements/i, quality:/正确性|失败|correctness/i,
+    simplify:/性能|performance/i, comments:/注释|文档|comments/i};
+  for (const [role, responsibility] of Object.entries(duties)) {
+    const agent = Bun.TOML.parse(s.read(`.codex/agents/reviewer-${role}.toml`));
+    expect(agent).toMatchObject({name:"reviewer-" + role, sandbox_mode:"read-only"});
+    const instructions = String(Reflect.get(agent, "developer_instructions"));
+    for (const criterion of [responsibility, /base/i, /head/i, /调用方|callers/i, /测试|tests/i])
+      expect(instructions).toMatch(criterion);
+  }
+  expect(Bun.TOML.parse(s.read(".codex/agents/reviewer.toml"))).toMatchObject({name:"reviewer", sandbox_mode:"read-only"});
   expect(statSync(join(s.work, "AGENTS.md")).size).toBeLessThan(8000);
   const list = JSON.parse(s.ok([s.forge, "instance", "list", "--json"]));
   for (const id of skills) expect(JSON.stringify(list)).toContain(id);
@@ -211,17 +221,10 @@ for (const error of ["yaml", "reference", "permissions"]) {
   }, 60_000);
 }
 
-function linkWorkspaceDependencies(destination: string) {
-  for (const workspace of [".", "review-agents"]) {
-    const deps = join(workspace, "node_modules");
-    if (existsSync(join(kit, deps))) symlinkSync(join(kit, deps), join(destination, deps));
-  }
-}
-
 test("T05/T12 portable distribution self-bootstraps outside the checkout", () => {
   const archive = join(s.root, "distribution.tgz");
   const source = join(s.root, "distribution-source");
-  // Build the working sources in isolation so neither package can reuse a previous bundle.
+  // Build the working sources in isolation so the package cannot reuse a previous bundle.
   const paths = s.git(kit, "ls-files", "--cached", "--others", "--exclude-standard", "-z");
   for (const path of paths.split("\0").filter(Boolean)) {
     const input = join(kit, path);
@@ -230,14 +233,14 @@ test("T05/T12 portable distribution self-bootstraps outside the checkout", () =>
     mkdirSync(dirname(output), {recursive: true});
     cpSync(input, output, {verbatimSymlinks: true});
   }
-  linkWorkspaceDependencies(source);
+  symlinkSync(join(kit, "node_modules"), join(source, "node_modules"));
   mkdirSync(join(source, ".workbench"));
   writeFileSync(join(source, ".workbench/private-marker"), "synthetic instance file");
   s.ok(["bun", "run", "build"], source);
   s.ok(["bun", "pm", "pack", "--quiet", "--ignore-scripts", "--filename", archive], source);
   const files = s.ok(["tar", "-tzf", archive], s.root).trim().split("\n");
   expect(files).toContain("package/dist/cli.js");
-  expect(files).toContain("package/review-agents/dist/review.js");
+  expect(files.some(file => /^package\/(review-agents|src)\//.test(file))).toBe(false);
   for (const path of files) {
     expect(path).not.toMatch(/^package\/(?:\.workbench|\.codex|\.agents|packs)(?:\/|$)/);
     expect(path).not.toMatch(/(?:^package\/AGENTS\.local\.md|v0\.5-requirements\.md|work-communication|form-ux\/|qa-polling)/);
@@ -247,6 +250,12 @@ test("T05/T12 portable distribution self-bootstraps outside the checkout", () =>
   expect(s.git(s.work, "status", "--porcelain")).toBe("");
   const forge = join(s.root, "package/bin/forge");
   const release = join(s.root, "package");
+  const ledgerHelp = s.ok([forge, "ledger", "--help"], release);
+  const registration = ledgerHelp.split("\n").find(line => /^\s*review-record\s/.test(line));
+  for (const flag of ["--repo", "--branch", "--role", "--base", "--head", "--status", "--report", "--summary", "--session-id", "--model", "--effort"])
+    expect(registration).toContain(flag);
+  expect(ledgerHelp).not.toContain("review-fallback");
+  expect(s.ok([forge, "--help"], release)).not.toMatch(/forge review\b/);
   const uninitialized = s.run([forge, "add-repo", s.work], release);
   expect(uninitialized.code).not.toBe(0);
   expect(uninitialized.err + uninitialized.out).toContain("Not an initialized workbench");
@@ -273,6 +282,7 @@ test("T05/T12 portable distribution self-bootstraps outside the checkout", () =>
     repo: ".", repoRoot: realpathSync(s.work), checkoutDir: realpathSync(checkout),
   });
   expect(s.read(".workbench/root-repo.md")).toContain("`.`");
+  for (const retired of [["review"], ["ledger", "review-fallback"]]) expect(s.run([forge, ...retired]).code).not.toBe(0);
   const doctor = JSON.parse(s.ok([forge, "doctor", ".", "--json"]));
   expect(doctor.ok).toBe(true);
   expect(doctor.issues.filter((issue: {check: string}) => issue.check === "repos")).toEqual([]);
@@ -308,23 +318,20 @@ test("self-hosted root task routes commit, review and isolated verification evid
   const verified = JSON.parse(s.ok([s.forge, "verify", "--task", "root-task", "--repo", ".", "--kind", "test",
     "--", "bun", "test", "./root.test.ts"], linked));
   expect(verified).toMatchObject({ok: true, task_id: "root-task", head, results: [{kind: "test", exit_code: 0}]});
-  const codex = join(s.bin, "codex");
-  writeFileSync(codex, '#!/usr/bin/env bun\nconst request = JSON.parse(await Bun.stdin.text()); await Bun.write(process.argv[process.argv.indexOf("-o")+1], JSON.stringify({status:"pass",summary:"Checked",role:request.role,checked:request.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"})),limitations:[],findings:[]}));\n', {mode: 0o755});
-  s.env.FORGE_CODEX_BIN = codex;
-  s.ok([s.forge, "review", "--task", "root-task", "--repo", ".", "--roles", "quality"], linked);
-  expect(JSON.parse(ledger("reviews", "root-task"))).toContainEqual(expect.objectContaining({role: "quality", status: "pass", base, head}));
+  const report = s.privateFile(".workbench/runs/root-task/quality.md", "Reviewed the linked checkout and its root test.\n");
+  s.ok([s.forge, "ledger", "review-record", "root-task", "--repo", ".", "--role", "quality", "--base", base,
+    "--head", head, "--report", report, "--status", "pass", "--summary", "Checked the linked checkout"], linked);
+  expect(JSON.parse(ledger("reviews", "root-task"))).toContainEqual(expect.objectContaining({
+    role: "quality", status: "pass", source: "subagent", repo: ".", branch: "root-task", base, head,
+  }));
+
 }, 60_000);
 
 test("installed skills use the delivered release across source changes, removal and override rollback", () => {
   const source = join(s.root, "source");
   mkdirSync(source);
-  const checkout = join(s.root, "release-input");
-  const revision = s.git(kit, "rev-parse", "HEAD").trim();
-  s.git(s.root, "clone", "--local", "--no-checkout", "--", kit, checkout);
-  s.git(checkout, "checkout", "--detach", revision);
-  linkWorkspaceDependencies(checkout);
-  for (const path of ["core", "templates", "kit.toml"]) cpSync(join(checkout, path), join(source, path), {recursive:true});
-  s.ok(["bun", "build", "--target=bun", "src/bin/cli.ts", "--outfile", join(source, "dist/cli.js")], checkout);
+  for (const path of ["core", "templates", "kit.toml"]) cpSync(join(kit, path), join(source, path), {recursive:true});
+  s.ok(["bun", "build", "--target=bun", "src/bin/cli.ts", "--outfile", join(source, "dist/cli.js")], kit);
   const release = ["bun", join(source, "dist/cli.js")];
   s.ok([...release, "init", s.work]);
   const show = [s.forge, "instance", "show", "skill", "ready", "--json"];

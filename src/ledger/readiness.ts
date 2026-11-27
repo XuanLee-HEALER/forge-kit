@@ -1,11 +1,11 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { canonicalRepoPath } from "../config";
+import { canonicalRepoPath, reviewRoles } from "../config";
 import { isOid, runGit } from "../git";
 import { installedInstance, verificationPolicy } from "../workflow-config";
 import type { TaskReader } from "./queries";
 import { deploymentStages } from "./release-inspection";
-import { coversReviewBase, reviewMeetsFloor } from "./review-range";
+import { coversReviewBase, resolveReviewedIssues, reviewMeetsFloor, type ReviewIssue } from "./review-range";
 import { getSpecState } from "./spec";
 import {
   evidenceSource,
@@ -85,22 +85,24 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
     );
   }
 
+  const floors = specState.evidence_floor_seq;
   const events = ledger.db
     .query(
-      `SELECT seq, actor, branch, event_type, payload_json FROM events
+      `SELECT seq, actor, branch, sha, event_type, payload_json FROM events
        WHERE task_id = ? AND canonical_repo(repo) = canonical_repo(?)
-         AND (event_type IN ('REPO_ATTACHED','REPO_DETACHED') OR (event_type='EVIDENCE_CAPTURED' AND sha=?))
+         AND (event_type IN ('REPO_ATTACHED','REPO_DETACHED') OR (event_type='EVIDENCE_CAPTURED' AND
+           (sha=? OR (seq >= ? AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.kind') END = 'review'))))
        ORDER BY seq ASC`,
     )
-    .all(params.task_id, params.repo, params.head_sha) as Array<{
+    .all(params.task_id, params.repo, params.head_sha, floors.review) as Array<{
     seq: number;
     event_type: string;
     branch: string | null;
+    sha: string | null;
     actor: string;
     payload_json: string;
   }>;
 
-  const floors = specState.evidence_floor_seq;
   const reviewFloor = ledger.db.query("SELECT ts FROM events WHERE task_id = ? AND seq = ?")
     .get(params.task_id, floors.review) as { ts: string } | null;
   const unresolved = !params.branch && repoAttachments.length > 1 && attachments.length !== 1;
@@ -113,6 +115,7 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
   type BranchEvidence = {
     checks: Map<string, string>;
     pendingSelections: Map<string, string>;
+    issues: Map<number, ReviewIssue>;
     reviews: Map<string, {role: string; status: string; baseline: boolean}>;
     endpoint?: string;
   };
@@ -135,13 +138,14 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
     if (params.branch && branch && branch !== params.branch) continue;
     let evidence = byBranch.get(branch);
     if (!evidence) {
-      evidence = { checks: new Map(), reviews: new Map(), pendingSelections: new Map() };
+      evidence = { checks: new Map(), reviews: new Map(), pendingSelections: new Map(), issues: new Map() };
       byBranch.set(branch, evidence);
     }
     try {
       const p = JSON.parse(ev.payload_json) as {
         source?: EvidenceSource;
         kind?: string;
+        summary?: string;
         status?: string;
         meta?: {
           report_status?: string; backend?: unknown; attempts?: unknown;
@@ -154,7 +158,7 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
           mode?: string; freeze_seq?: number; review_task_id?: string;
           started_at?: string;
           review_floor_seq?: number;
-          base?: string;
+          base?: string; head?: string; report_sha256?: string; report_path?: string;
         };
       };
       if (!p.kind || !p.status) continue;
@@ -175,22 +179,41 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
       }
       const fact = reviewFactKind(p);
       if (fact) {
+        const source = evidenceSource(p, ev.actor);
+        const native = source === "subagent";
+        const atHead = ev.sha === params.head_sha;
+        if (!atHead && !currentWorkflow && !native) continue;
+        if (native && (fact !== "review" || !ev.branch || !attachedAtEvent.has(ev.branch) ||
+            !ev.sha || p.meta?.head !== ev.sha || !p.meta.base || !isOid(p.meta.base) ||
+            !reviewRoles.some(role => role === p.meta?.role) || !p.meta.report_path ||
+            !/^[a-f0-9]{64}$/.test(p.meta.report_sha256 ?? "") ||
+            !(p.status === "pass" ? p.meta.report_status === "pass" :
+              p.status === "fail" && ["blocked", "incomplete"].includes(p.meta.report_status ?? "")))) continue;
         // Old receipts may omit freeze_seq. Their event must still follow this freeze and satisfy its review floor.
         if (strictLegacyReview && fact === "review" && p.status !== "fail" && (
-          p.source !== "tool" || p.status !== "pass" || ev.branch !== params.branch ||
+          (!native && p.source !== "tool") || p.status !== "pass" || ev.branch !== params.branch ||
           !specState.freeze_seq || ev.seq <= specState.freeze_seq ||
           (p.meta?.freeze_seq !== undefined && p.meta.freeze_seq !== specState.freeze_seq)
         )) continue;
-        if (currentWorkflow && (evidenceSource(p, ev.actor) !== "tool" ||
+        if ((currentWorkflow || native) && ((!native && source !== "tool") ||
             p.meta?.review_task_id !== params.task_id || p.meta.freeze_seq !== specState.freeze_seq || p.meta.review_floor_seq !== floors.review)) continue;
         if (ev.seq < floors.review || !reviewMeetsFloor(p.status, p.meta, params.task_id, floors.review, reviewFloor?.ts, evidenceSource(p, ev.actor))) continue;
         const roleKey = normalizeReviewRole(p.meta?.role);
         const rangeKey = JSON.stringify([p.meta?.base, roleKey]);
         if (fact === "review_selection") {
-          if (evidenceSource(p, ev.actor) === "tool") evidence.pendingSelections.set(rangeKey, roleKey);
+          if (atHead && source === "tool") evidence.pendingSelections.set(rangeKey, roleKey);
           continue;
         }
-        if (p.status === "pass" && evidenceSource(p, ev.actor) === "tool") evidence.pendingSelections.delete(rangeKey);
+        if ((currentWorkflow || native) && ev.sha) {
+          const receipt = { role: roleKey, base: p.meta?.base ?? "", head: ev.sha, seq: ev.seq, source };
+          if (p.status === "fail") evidence.issues.set(ev.seq, receipt);
+          if (p.status === "pass") {
+            resolveReviewedIssues(evidence.issues, receipt, p.summary ?? "", join(ledger.workbenchRoot, params.repo), params.head_sha);
+          }
+        }
+        if (!atHead) continue;
+        if (p.status === "pass" && (source === "tool" || native)) evidence.pendingSelections.delete(rangeKey);
+        if (p.status === "fail" && (currentWorkflow || native)) continue;
         const historical = branch ? [attachedAtEvent.get(branch)] : [...attachedAtEvent.values()];
         const current = branch ? repoAttachments.filter((r) => r.branch === branch) : [];
         const covered = (row: ReviewAttachment | undefined) =>
@@ -248,6 +271,7 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
       if (status === "fail") failedKinds.add(kind);
       if (eligible && status === "pass") latestByKind.set(kind, status);
     }
+    for (const issue of evidence.issues.values()) failedRoles.add(issue.role);
     for (const role of evidence.pendingSelections.values()) incompleteRoles.add(role);
     for (const {role, status, baseline} of evidence.reviews.values()) {
       if (status === "fail") failedRoles.add(role);

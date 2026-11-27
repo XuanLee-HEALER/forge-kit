@@ -18,10 +18,10 @@ Git 命令用 `git -C <仓>` 或在指定工作树内执行。沿用指定分支
 
 ## 评审、验证与交付
 
-review 根据固定变更范围给出独立报告。调用评审 CLI 前先执行 `forge ledger reviews <task-id>`，对照历史版本、范围与角色结果决定本次角色。verify 在目标 SHA 的隔离检出中运行项目选择的工具，从公开入口核对交付行为。报告记录实际输出、退出状态或持久化结果，并区分执行通过、仅编译、失败和未验证。ship 以实例终点和本次授权为准，默认完成 PR 合入 main 并核验远端回执。移交与批次按各自任务记录版本和见证。外部 PR 意见使用 pr-triage。
+review 根据固定变更范围给出独立报告。派发原生只读角色前先执行 `forge ledger reviews <task-id>`，对照历史版本、范围与角色结果决定本次角色。主线程保存返回的原始报告，以 `forge ledger review-record` 逐份绑定版本、角色和会话。verify 在目标 SHA 的隔离检出中运行项目选择的工具，从公开入口核对交付行为。报告记录实际输出、退出状态或持久化结果，并区分执行通过、仅编译、失败和未验证。ship 以实例终点和本次授权为准，默认完成 PR 合入 main 并核验远端回执。移交与批次按各自任务记录版本和见证。外部 PR 意见使用 pr-triage。
 
 在执行不可逆动作前，核对精确资源、版本、具体动作及内容摘要。快轨可在规格冻结时先批准范围与终点。runbook 与快轨均需主会话整句人工批准，受授权会话、时效和外部状态约束。发生漂移时停止并保留已确认回执。凭据只在适用环境使用，日志仅呈现脱敏结果。最小权限、分支保护及所需 CI 检查由部署方实施。
 
 ## 委派
 
-ready 生成现场摘要。按所需专长选 scanner 只读检索、analyst 只读分析、implementer 在授权工作区实施、reviewer 独立只读评审。任务书指明输入、权限、输出和完成条件；实例在 `.workbench/models.toml` 配置模型档位。
+ready 生成现场摘要。按所需专长选 scanner 只读检索、analyst 只读分析、implementer 在授权工作区实施、reviewer 独立审查规格与用例，reviewer-business、reviewer-quality、reviewer-simplify、reviewer-comments 分别审查固定提交的业务、质量、简单性与性能、注释与接口文档。任务书指明输入、权限、输出和完成条件；实例在 `.workbench/models.toml` 配置模型档位。

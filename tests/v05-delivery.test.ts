@@ -175,16 +175,11 @@ else if (published && args[0] === "pr" && args[1] === "merge") {
   await Bun.write(file, JSON.stringify({...pr,state:"MERGED",mergedAt:new Date().toISOString(),mergeCommit:{oid:pr.headRefOid}}));
 } else { console.error("unexpected host operation "+JSON.stringify(args)); process.exit(2); }
 `, {mode: 0o755});
-  const codex = join(s.bin, "codex");
-  writeFileSync(codex, `#!/usr/bin/env bun
-const args=process.argv.slice(2); const request = JSON.parse(await Bun.stdin.text());
-await Bun.write(args[args.indexOf("-o")+1],JSON.stringify({status:"pass",summary:"contract checked",findings:[],role:request.role,checked:request.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"})),limitations:[]}));
-`, {mode: 0o755});
-  s.env.FORGE_CODEX_BIN = codex;
   for (const kind of ["lint", "test"]) s.ok([s.forge, "verify", "--task", "ship-task", "--cwd", repo, "--kind", kind,
     "--", "bun", ...(kind === "test" ? ["test"] : ["run", "check"])]);
-  s.ok([s.forge, "review", "--task", "ship-task", "--repo", "app", "--cwd", repo, "--base", taskBase, "--head", head,
-    "--roles", "quality", "--mode", "serial"]);
+  ledger("review-record", "ship-task", "--role", "quality", "--base", taskBase, "--head", head,
+    "--status", "pass", "--summary", "Checked delivery contract",
+    "--report", s.privateFile(".workbench/runs/ship-task/quality.md", "Checked delivery contract. No blockers.\n"));
   if (!early && availablePr) ledger("pr-sync", "ship-task", "--repo", "app", "--branch", "feature-fixture", "--pr", "1");
   return {ledger, repo, head, base, taskBase, bare, state, ci, calls, approvalId};
 }
@@ -494,8 +489,9 @@ test("T13 release keeps both handoff identities across stale-head rejection and 
   ledger("freeze", "second", "--lock-tests", "example.test.ts");
   for (const [kind, args] of [["lint", ["run", "check"]], ["test", ["test"]]] as const)
     s.ok([s.forge, "verify", "--task", "second", "--cwd", repo, "--kind", kind, "--", "bun", ...args]);
-  s.ok([s.forge, "review", "--task", "second", "--repo", "app", "--cwd", repo, "--base", first.head, "--head", sha,
-    "--roles", "quality", "--mode", "serial"]);
+  ledger("review-record", "second", "--role", "quality", "--base", first.head, "--head", sha,
+    "--status", "pass", "--summary", "Checked delivery contract",
+    "--report", s.privateFile(".workbench/runs/second/quality.md", "Checked delivery contract. No blockers.\n"));
   const secondState = first.state + "-2";
   const record = {...JSON.parse(readFileSync(first.state, "utf8")), url:"https://forge.example.test:8443/fixture/app/pull/2",
     number:2, headRefName:"followup",headRefOid:sha,baseRefOid:first.head};

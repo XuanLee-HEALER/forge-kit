@@ -1,6 +1,6 @@
 {
   "name": "forge-kit",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "private": true,
   "type": "module",
   "files": [
@@ -8,24 +8,13 @@
     "core",
     "dist/cli.js",
     "kit.toml",
-    "review-agents/bin",
-    "review-agents/dist/review.js",
-    "review-agents/package.json",
-    "review-agents/standalone/bun.lock",
-    "review-agents/prompts",
-    "review-agents/src",
-    "templates",
-    "review-agents/README.md",
-    "review-agents/evals/quality.json",
-    "review-agents/scripts",
-    "review-agents/tests",
-    "review-agents/tsconfig.json"
+    "templates"
   ],
   "bin": {
     "forge": "./bin/forge"
   },
   "scripts": {
-    "build": "bun scripts/build.ts && (cd review-agents && bun run build)",
+    "build": "bun scripts/build.ts",
     "check": "bun --bun run tsc --noEmit",
     "test": "bun test ./tests",
     "test:unit": "bun run test:all",
@@ -38,8 +27,5 @@
   },
   "dependencies": {
     "yaml": "^2.8.1"
-  },
-  "workspaces": [
-    "review-agents"
-  ]
+  }
 }

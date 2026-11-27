@@ -7,13 +7,13 @@ import { spawnSync } from "node:child_process";
 const [command, ...args] = process.argv.slice(2);
 
 async function main() {
-  if (!["ledger", "review", "verify", "git", "ship", "guard", "ledger-hook", "dbcred", "cmdfmt", "lang-check"].includes(command)) {
+  if (!["ledger", "verify", "git", "ship", "guard", "ledger-hook", "dbcred", "cmdfmt", "lang-check"].includes(command)) {
     return runForgeCli();
   }
   const { findWorkbenchRoot } = await import("../config");
   const { checkMigration } = await import("../managed-assets");
   try {
-    if (command !== "review" && command !== "verify") checkMigration(findWorkbenchRoot());
+    if (command !== "verify") checkMigration(findWorkbenchRoot());
   }
   catch (error) {
     if (command !== "guard") throw error;
@@ -41,17 +41,6 @@ async function main() {
       else process.stdout.write(child.stdout);
       return;
     }
-    case "review": {
-      if (args.includes("--help")) {
-        console.log("forge review --task <id> --repo <repo> [--base <sha>] [--head <sha>] [--roles business,quality,simplify,comments] [--full] [--mode parallel|serial|ordered] [--order <roles>] [--model <id> --effort <level> | --tier <name>]");
-        return;
-      }
-      const { reviewCli, reviewExitCode } = await import("../forge-review");
-      const result = await reviewCli(args);
-      console.log(JSON.stringify(result));
-      process.exitCode = reviewExitCode(result.status);
-      return;
-    }
     case "verify":
     case "ship": {
       const result = command === "ship"
@@ -65,5 +54,5 @@ async function main() {
 
 main().catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = command === "review" ? 2 : 1;
+  process.exitCode = 1;
 });

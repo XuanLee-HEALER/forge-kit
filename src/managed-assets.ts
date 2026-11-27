@@ -23,7 +23,6 @@ export interface InstallLock {
   kit_commit: string | null;
   workbench_name: string;
   packs?: string[];
-  review_agents_enabled?: boolean;
   updated_at: string;
   managed_files?: Record<string, string>;
   skill_overrides?: Record<string, string>;

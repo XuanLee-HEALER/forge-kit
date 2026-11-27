@@ -1,14 +1,14 @@
 import { expect, test } from "bun:test";
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
-import { sandbox } from "./v05-sandbox";
+import { kit, sandbox } from "./v05-sandbox";
 
 import { releaseCLI, digest, historicalKit, type HistoricalVersion } from "./helpers/historical-kit";
 import { snapshot as ledgerSnapshot } from "./helpers/ledger-snapshot";
 
-for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3"] satisfies HistoricalVersion[]) test(
-  `sync twice from ${version} preserves historical rows, tips, private files and actions`, () => {
+for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4"] satisfies HistoricalVersion[]) test(
+  `upgrade from ${version} preserves history and renders configured reviewer tiers on repeated sync`, () => {
   const s = sandbox();
   try {
     const bootstrap = releaseCLI(s);
@@ -24,6 +24,14 @@ for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3"] satisfies HistoricalV
     s.git(app, "init", "-b", "development");
     s.git(app, "add", "--", "check.ts", "api.hurl");
     s.git(app, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "check", "--", "check.ts", "api.hurl");
+    const base = s.git(app, "rev-parse", "HEAD").trim();
+    const origin = join(s.root, "origin.git");
+    s.git(s.root, "init", "--bare", origin);
+    s.git(app, "remote", "add", "origin", origin);
+    s.privateFile("app/history.md", "Historical review target.\n");
+    s.git(app, "add", "--", "history.md");
+    s.git(app, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "reviewable change", "--", "history.md");
+    s.git(app, "push", "origin", "development");
     const head = s.git(app, "rev-parse", "HEAD").trim();
     const ready = s.privateFile(".workbench/overrides/ready/SKILL.md", "---\nname: ready\ndescription: Site ready check\n---\nUse the site runbook.\n");
     const card = s.privateFile(".workbench/repos/app.md", "# app\nPrivate project conventions.\n");
@@ -46,14 +54,29 @@ for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3"] satisfies HistoricalV
     const local = s.privateFile("AGENTS.local.md", "Private upgrade marker\n");
     const scope = s.privateFile(".workbench/specs/history/scope.md", "Record a non-Web project check.\n");
     const policy = join(s.work, ".workbench/ship-policy.yaml");
-    expect(parse(readFileSync(policy, "utf8")).fast_track.forbid_db_rw).toBe(version === "0.5.2" || version === "0.5.3");
-    const files = [ready, card, artifact, local, scope, config, script, policy, join(s.work, ".workbench/models.toml")];
+    expect(parse(readFileSync(policy, "utf8")).fast_track.forbid_db_rw).toBe(version >= "0.5.2");
+    const files = [ready, card, artifact, local, scope, config, script, policy];
     const before = files.map(digest);
     const ledger = (...args: string[]) => s.ok([s.forge, "ledger", ...args]);
     ledger("open", "--id", "history", "--title", "Upgrade witness", "--repo", "app", "--branch", "development",
-      "--worktree", app, "--base", head, "--head", head, "--endpoint", "local", "--depth", "targeted");
+      "--worktree", app, "--base", base, "--head", head, "--endpoint", "local", "--depth", "targeted");
     ledger("decide", "history", "--key", "contract", "--summary", "Run the local project check on this revision");
     ledger("freeze", "history", "--lock-tests", "check.ts");
+    // Seed an authentic event through this release's writer, then query it through both CLIs.
+    symlinkSync(join(kit, "node_modules"), join(s.root, "node_modules"));
+    s.ok(["bun", "-e", `
+      import {Ledger} from ${JSON.stringify(join(old, "historical-src/ledger/store.ts"))};
+      const [root, base, head] = process.argv.slice(1);
+      const db = new Ledger(root);
+      const spec = db.getSpecState("history");
+      db.recordEvidence({task_id:"history", repo:"app", branch:"development", sha:head, kind:"review",
+        actor:"tool", source:"tool", status:"pass", summary:"Historical quality review",
+        meta:{role:"quality", base, head, report_status:"pass", review_task_id:"history",
+          freeze_seq:spec.freeze_seq, review_floor_seq:spec.evidence_floor_seq.review}});
+      db.closeDb();
+    `, s.work, base, head]);
+    const historicalReview = JSON.parse(ledger("reviews", "history"));
+    expect(historicalReview).toMatchObject([{source:"tool", role:"quality", status:"pass", base, head, repo:"app", branch:"development"}]);
     const verify = [s.forge, "verify", "--task", "history", "--cwd", app, "--mode", "all"];
     expect(JSON.parse(s.ok(verify))).toMatchObject({ok: true, head});
     const snapshot = () => ({
@@ -87,10 +110,35 @@ for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3"] satisfies HistoricalV
       expect(conflict(bootstrap)).toBe(baselineExit);
       writeFileSync(managed, stock);
     }
-    for (let i = 0; i < 2; i++) {
+    const models = join(s.work, ".workbench/models.toml");
+    const roleTiers = {business:"deep", quality:"deep", simplify:"standard", comments:"mechanical"};
+    const defaultMapping = version === "0.5.0";
+    if (!defaultMapping) Object.assign(roleTiers, {quality:"mechanical", comments:"standard"});
+    const renderModels = (updated: boolean) => {
+      const tiers = ["standard", "mechanical", "deep"].map(tier =>
+        `[tiers.${tier}]\nmodel = "${tier}-${updated ? "updated" : "original"}"\neffort = "${updated ? "high" : "low"}"\n`);
+      const mapping = Object.entries(roleTiers).map(([role, tier]) => `${role} = "${tier}"`);
+      return [...tiers, ...(defaultMapping ? [] : ["[review.roles]", ...mapping])].join("\n");
+    };
+    writeFileSync(models, renderModels(false));
+    let previousRoles: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      if (i === 1) writeFileSync(models, renderModels(true));
       s.ok([bootstrap, "sync", s.work]);
-      expect(lockVersion()).toBe("0.5.4");
+      expect(lockVersion()).toBe("0.5.5");
+      expect(readFileSync(models, "utf8")).toBe(renderModels(i > 0));
+      const roles = Object.entries(roleTiers).map(([role, tier]) => {
+        const path = join(s.work, ".codex/agents/reviewer-" + role + ".toml");
+        expect(Bun.TOML.parse(readFileSync(path, "utf8"))).toMatchObject({
+          name:"reviewer-" + role, model:tier + (i ? "-updated" : "-original"),
+          model_reasoning_effort:i ? "high" : "low", sandbox_mode:"read-only",
+        });
+        return digest(path);
+      });
+      if (i === 2) expect(roles).toEqual(previousRoles);
+      previousRoles = roles;
       expect(ledgerSnapshot(s.work, rows.schema)).toEqual(rows);
+      expect(JSON.parse(ledger("reviews", "history"))).toMatchObject(historicalReview);
       expect(show("skill", "ready")).toEqual(privateReady);
       expect(show("action", "web")).toEqual(privateAction);
       expect(files.map(digest)).toEqual(before);

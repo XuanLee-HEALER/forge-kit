@@ -1,6 +1,6 @@
 [kit]
 name = "forge-kit"
-version = "0.5.4"
+version = "0.5.5"
 runtime = "codex"
 
 [managed]
@@ -10,7 +10,10 @@ rendered_files = [
   ".codex/hooks.json",
 ]
 
-agent_files = ["scanner.toml", "analyst.toml", "implementer.toml", "reviewer.toml"]
+agent_files = [
+  "scanner.toml", "analyst.toml", "implementer.toml", "reviewer.toml",
+  "reviewer-business.toml", "reviewer-quality.toml", "reviewer-simplify.toml", "reviewer-comments.toml",
+]
 copied_files = [".codex/config.toml"]
 bin_bundles = ["cli.js"]
 bin_wrappers = ["forge"]

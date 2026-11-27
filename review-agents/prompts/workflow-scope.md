@@ -1,3 +1,0 @@
-Blocking findings require a concrete confirmed commitment or supported primary path, a reachable trigger, the incorrect outcome and evidence. Reserve blocking for a confirmed specification violation, actual functional or data error, established compatibility break or actual security flaw. Treat speculation outside the declared threat model as optional advice or omit it. After a fix, check affected behavior and close resolved findings when coverage is complete. Refer new commitment tradeoffs to the operator.
-
-Forge records approval of workflow nodes and evidence of the resulting target and version. Codex permissions and platform protections govern command execution. Threads use separate worktrees. Evaluate supported operator actions within this scope.

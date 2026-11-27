@@ -175,6 +175,8 @@ test("a migrated 0.5.3 instance preserves 0.4 archives, in-flight tasks and boun
   s.ok([join(old, "bin/forge"), "sync", s.work]);
   const ledger = (...args: string[]) => s.ok([s.forge, "ledger", ...args]);
   const search = JSON.parse(ledger("query", "--q", "rehearsal", "--json"));
+  const migratedReviews = JSON.parse(ledger("reviews", "active"));
+  expect(migratedReviews).toMatchObject([{role:"performance", base, head, status:"error", source:"tool", repo:"app", branch:"active"}]);
   const initial = snapshot(s.work);
   const sameSource = join(s.root, "before-baseline-executions");
   cpSync(s.work, sameSource, {recursive:true, verbatimSymlinks:true});
@@ -206,6 +208,11 @@ await Bun.write(args[args.indexOf("-o")+1], JSON.stringify(native ? {passed:true
   renameSync(sameSource, s.work);
   s.ok([bootstrap, "sync", s.work]);
   expect(snapshot(s.work, initial.schema)).toEqual(initial);
+  const restoredReviews = JSON.parse(ledger("reviews", "active"));
+  expect(restoredReviews).toMatchObject(migratedReviews);
+  for (const key of ["report_path", "report_sha256", "session_id", "model", "effort"]) {
+    expect(restoredReviews[0][key] ?? null).toBeNull();
+  }
   const originalCalls = readFileSync(trace);
   for (const args of [native, retry]) {
     const refused = s.run(args, app);

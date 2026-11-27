@@ -34,12 +34,6 @@ else if(group==="pr" && cmd==="view"){
 } else process.exit(1);`,
       { mode: 0o755 },
     );
-    writeFileSync(join(bin, "codex"), [
-      "#!/usr/bin/env bun",
-      'const args = process.argv.slice(2); const request = JSON.parse(await Bun.stdin.text());',
-      'if (!args.includes("--ephemeral") || args[args.indexOf("-s")+1] !== "read-only") process.exit(2);',
-      'await Bun.write(args[args.indexOf("-o")+1], JSON.stringify({status:"pass",summary:"Reviewed fixed release range",role:request.role,checked:request.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"})),limitations:[],findings:[]}));',
-    ].join("\n"), {mode:0o755});
     const tsc=require.resolve("typescript/bin/tsc");
     writeFileSync(join(bin,"tsc"),"#!/usr/bin/env bun\nimport "+JSON.stringify(tsc)+";\n",{mode:0o755});
     ledger = new Ledger(root);
@@ -54,7 +48,7 @@ else if(group==="pr" && cmd==="view"){
 function cli(name: string, args: string[], ok = true) {
   const p = Bun.spawnSync([process.execPath, join(import.meta.dir, "../../src/bin/cli.ts"), name, ...args], {
     cwd: root,
-    env: { ...process.env, FORGE_WORKBENCH_ROOT: root, FORGE_CODEX_BIN: join(bin, "codex") },
+    env: { ...process.env, FORGE_WORKBENCH_ROOT: root },
   });
   const output = p.stdout.toString() + p.stderr.toString();
   expect(p.exitCode, output).toBe(ok ? 0 : 1);
@@ -130,7 +124,7 @@ export function feature(repo: string, n: number, workflow_version: "0.4" | "0.5"
     headRepository: { name: basename(repo) },
     headRepositoryOwner: { login: "acme" },
   });
-  return { repo, n, task, branch, wt, dir, head, base, url };
+  return { repo, n, task, branch, wt, dir, head, base, url, workflow_version };
 }
 export type Feature = ReturnType<typeof feature>;
 export function verifyFeature(f: Feature, { review = true } = {}) {
@@ -143,7 +137,20 @@ export function verifyFeature(f: Feature, { review = true } = {}) {
   const target = ["--task", f.task, "--cwd", f.wt];
   cli("verify",[...target,"--kind","lint","--","tsc","--noEmit","--allowJs","--checkJs","--skipLibCheck","value.js"]);
   cli("verify", [...target, "--kind", "test", "--", process.execPath, "test", "./example.test.ts"]);
-  if (review) cli("review", [...target, "--roles", "quality"]);
+  if (!review) return;
+  if (f.workflow_version === "0.4") {
+    const spec = ledger.getSpecState(f.task);
+    ledger.recordEvidence({task_id: f.task, repo: f.repo, branch: f.branch, sha: f.head,
+      kind: "review", status: "pass", source: "tool", summary: "Historical release review",
+      meta: {role: "quality", base: f.base, head: f.head, freeze_seq: spec.freeze_seq,
+        review_task_id: f.task, review_floor_seq: spec.evidence_floor_seq.review}});
+    return;
+  }
+  const report = join(root, f.task + "-quality.md");
+  writeFileSync(report, "Reviewed the fixed release range. No blockers.\n");
+  cmd("review-record", f.task, "--repo", f.repo, "--branch", f.branch, "--role", "quality", "--base", f.base, "--head", f.head,
+    "--status", "pass", "--summary", "Reviewed release", "--report", report,
+    "--model", "fixture-model", "--effort", "medium");
 }
 export function merge(f: Feature) {
   git(f.dir, "merge", "--no-edit", f.branch);

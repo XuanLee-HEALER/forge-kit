@@ -52,8 +52,6 @@ beforeEach(() => {
   mkdirSync(docs, { recursive: true });
   for (const name of ["ssot", "tech-spec", "test-spec"]) writeFileSync(join(docs, name + ".md"), name);
   ledger = new Ledger(root);
-  tool("codex", `while [ "$1" != "-o" ]; do shift; done
-printf '%s' '{"passed":true,"report":"validated pinned diff"}' > "$2"`);
 });
 afterEach(() => { ledger.closeDb(); rmSync(root, { recursive: true, force: true }); });
 function historicalReview(head: string) {
@@ -76,7 +74,7 @@ test("v0.5 rejects the legacy native review before executing Codex or writing ev
   expect(ledger.getTask("fix")!.tip_hash).toBe(tip);
 });
 
-test("review range and launch floor bind primary, fallback and native evidence", () => {
+test("review range and launch floor bind historical tool and hook evidence", () => {
   open("local");
   expect(ledger.getTaskRepos("fix")[0].base_sha).toBe(base);
   const middle = commit("middle");
@@ -96,8 +94,6 @@ test("review range and launch floor bind primary, fallback and native evidence",
   }
   ledger.recordEvidence({ task_id: "fix", repo: "svc", sha: head, kind: "review", status: "fail", source: "hook",
     summary: "provider", meta: { role: "quality", base: middle, report_status: "error", exit_code: 2, error_code: "credit_balance_exhausted" } });
-  const fallback = invoke(["review-fallback", "fix", "--repo", "svc", "--role", "quality", "--sha", head]);
-  expect(fallback.stderr.toString()).toContain("base");
   expect(readiness(head).ready).toBe(false);
   const next = commit("advance"); verification(next);
   expect(readiness(next).recordedReviewRoles).toEqual([]);
@@ -212,22 +208,6 @@ test("a replacement task at floor zero requires its own role review", () => {
   ledger.recordEvidence({ task_id, repo: "svc", sha: head, kind: "review", source: "tool", status: "pass",
     summary: "current review", meta: { role: "quality", base, review_floor_seq: 0, review_task_id: task_id } });
   expect(roles()).toContain("quality");
-});
-
-test("fallback selects the current provider failure when an earlier review finishes last", () => {
-  const head = commit("delivery");
-  open("local"); ledger.freezeSpec({ task_id: "fix" });
-  const floor = ledger.getSpecState("fix").evidence_floor_seq.review;
-  ledger.recordEvidence({ task_id: "fix", repo: "svc", sha: head, kind: "review", source: "hook",
-    status: "fail", summary: "provider exhausted", meta: { role: "quality", base, review_task_id: "fix", review_floor_seq: floor,
-    exit_code: 2, report_status: "error", error_code: "credit_balance_exhausted" } });
-  ledger.recordEvidence({ task_id: "fix", repo: "svc", sha: head, kind: "review", source: "hook",
-    status: "fail", summary: "old failure", meta: { role: "quality", base, review_floor_seq: 0 } });
-  const prompts = join(root, "review-agents/prompts"); mkdirSync(prompts, { recursive: true });
-  writeFileSync(join(prompts, "quality.md"), "Review quality.");
-  const result = invoke(["review-fallback", "fix", "--repo", "svc", "--role", "quality", "--sha", head]);
-  expect(result.exitCode, result.stderr.toString()).toBe(0);
-  expect(JSON.parse(result.stdout.toString())).toMatchObject({ status: "fallback", meta: { review_floor_seq: floor } });
 });
 
 test("reviewing from an older ancestor cannot credit the task diff", () => {

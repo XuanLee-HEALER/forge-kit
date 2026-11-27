@@ -5,19 +5,17 @@ description: 需要独立审查固定版本的变更或复核修复时，查看�
 
 # 独立评审
 
-**输入**为任务、目标仓、固定 base/head、冻结规格、实际变更和以往评审记录。
+1. 运行 `forge ledger reviews <task-id>`。核对当前冻结规格、挂载仓与分支、任务基线、待交付 HEAD、已有报告的原始范围和未决项。查看固定 base..head 的实际差异。
+2. 按改动选择 reviewer-business（业务承诺）、reviewer-quality（实现缺陷）、reviewer-simplify（简单性与性能）、reviewer-comments（注释与接口文档）。用 Codex 原生 `spawn_agent` 按角色名派发，每位使用 `fork_turns="none"` 的独立上下文。默认并行，有依赖时可串行或按指定顺序执行。通用 reviewer 评规格与用例。
+3. 任务书给出仓路径、分支、固定 base/head、冻结规格路径、历史摘要和报告路径，例如 `.workbench/runs/<task-id>/review-<round>-<role>.md`。复核列出上轮已审 SHA、未决项和本轮修复范围。子代理只读核对代码、调用方与测试，返回含结论、阻断项、建议及未核验项的 Markdown 全文。
+4. 逐角色记录真实会话 ID、派发与收到最终报告的时间及耗时。主线程将返回稿原样写入任务书指定路径，阅读后逐份登记。CLI 可省略会话 ID；实际派发使用可核验的原生会话标识。若角色未载入或会话标识缺失，保留现场，接续到能够核验的原生会话。单次覆盖模型或 effort 时传入各自实际值，其余字段沿用角色配置。
 
-1. 每次调用评审 CLI 前先执行 `forge ledger reviews <task-id>`，核对记录的仓库、原始角色、base/head、状态及范围，并检查本次 diff。由工作 agent 选择本轮角色与理由，保留旧记录的版本归属。
-2. 四个维度分别为 business（业务承诺及规格）、quality（实现缺陷）、simplify（性能及简单性）、comments（注释及接口文档）。默认全量，可按范围传入子集。不同角色独立运行。按需选 parallel、serial，或用 ordered 与完整的 --order 排列。
-3. 在干净的待审版本运行，例如 `forge review --task "$TASK" --repo "$REPO" --base "$BASE" --head "$HEAD" --roles quality,comments --mode parallel`。每个角色用隔离 Codex CLI 分批核验固定范围内的全部变更块。材料缺失、执行错误、中断和阻断发现均须保留原状态。
-4. 读每个实际角色的发现和摘要。对可重现的阻断项修正实现，按新版本重看账本再决定复核范围。未运行的角色单独标明。
+```bash
+forge ledger review-record "$TASK" --repo "$REPO" --branch "$BRANCH" \
+  --role "$ROLE" --base "$BASE" --head "$HEAD" --status "$STATUS" \
+  --report "$REPORT" --summary "$SUMMARY" --session-id "$SESSION_ID"
+```
 
-**输出与完成条件**为对应固定范围的独立报告与账本记录。报告列出角色、实际后端、状态、关键发现和位置。执行错误或未完成时保留缺口，已有阻断项须在相应范围复核。
+登记角色为 business、quality、simplify 或 comments。状态为 pass、blocked 或 incomplete。发现阻断时写明对应承诺、触发条件、错误结果及证据。缺少关键材料时登记 incomplete，补齐后复核。
 
-交付前至少一项通过的独立评审须覆盖当前冻结版本、任务基线至交付 HEAD 的非空差异。子范围复核按范围和角色保留；某角色因材料缺失而未启动时，补齐材料后对同一范围重跑该角色，可在 `forge ledger reviews <task-id>` 查看缺项与实际尝试。
-
-已迁入 0.5.x 的 v0.4 任务可用 `forge ledger reviews <task-id>` 查阅原角色及范围，仍在途的任务由操作者手动收尾。
-
-同任务、冻结周期、基线和角色的后继版本按完整清单复用有效逐块回执。公共契约变更须覆盖受影响调用方，影响难以界定时该角色全审。通过 `--full` 强制所选角色全审。报告分别列出本轮实际核验、历史复用和缺块数量。
-
-阻断项须列出具体承诺或主路径、可触发条件、错误结果和证据，仅限违反已确认规格、实际功能或数据错误、明确兼容破坏、真实安全缺陷。超出声明威胁模型的推测可作为建议或忽略。修复后复核问题与影响范围；覆盖完整且无上述错误即可通过，新承诺取舍提交操作者。
+修复后查询历史，仅派受影响角色，对照原报告逐项核实阻断的处理结果。报告与账本均填写实际审查的 base/head；增量复核在报告和摘要中标明原失败序号（如 `#12`）。若 base 晚于失败 head，还须解释跳过区间与该阻断的关系，并给出相应修复或验证证据。交付前至少一份通过报告覆盖当前冻结周期内任务基线至最终 HEAD 的非空差异。旧版评审可通过 reviews 查看原角色、范围与归属。

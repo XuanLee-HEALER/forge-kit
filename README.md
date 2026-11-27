@@ -33,11 +33,7 @@
 ### L2 核心组件
 
 - **统一入口（`forge`）**：向工作 Codex thread 统一暴露工作台能力与实例覆写配置。
-- **审查引擎（`review-agents`，经由 `forge review` 暴露）**：
-  - 内部独立管理审查提示词与执行编排，输入代码变更与控制参数，输出结构化审查摘要供工作 thread 修复。
-  - 实例配置透传与账本记录由 `forge review` 层完成，审查引擎本身不耦合账本概念。
-  - 支持通过 flags 指定执行角色子集（默认全量，可按改动范围按需运行）及执行拓扑（并发、串行或指定顺序）。
-  - 使用**无内置上下文的 Codex CLI 独立审查引擎**，通过审查质量回归评测集核验四维缺陷检出与干净样本表现。
+- **原生只读评审角色**由 Codex 在独立上下文中运行。`forge sync` 依据实例的 `.workbench/models.toml` 渲染 `.codex/agents/reviewer-*.toml`。工作 thread 选择角色并派发固定提交范围，保存报告后通过 `forge ledger review-record` 登记，用 `forge ledger reviews` 查询历史。
 - **任务账本（`ledger`）**：仅用于正式开发周期（1 任务 = 1 账本，支持归档与清理），通过被动检查机制记录客观事实、防止遗漏或跳步。
 - **安全守卫（`guard`）**：针对不可逆高危动作（未授权生产库写入、保护分支推送、未审批发版）的薄安全带。
 
@@ -65,7 +61,7 @@ flowchart TD
     LocalFix --> Gate
 
     Gate --> Impl["并行实现: 代码实现 || 测试用例编写"]
-    Impl --> Review["按需独立 Review: forge review 选角色与拓扑 -> 依摘要修复"]
+    Impl --> Review["按范围派发原生只读角色 -> 保存报告并经 forge ledger review-record 入账 -> 修复及复核"]
     Review --> Verify["集成验证: 实例覆写环境执行集成/冒烟/性能测试, 修至 bug-free"]
     Verify --> Ship{"交付与收尾"}
 
@@ -95,11 +91,14 @@ flowchart TD
 - 保持代码模块化与清晰逻辑层级，控制单文件与单次迭代变更边界。
 
 #### 3. 四维独立 Review
-工作 thread 根据实际改动通过 `forge review` 按需触发：
-1. **业务对齐**：验证实现与 SSOT 或修改范围一致。
-2. **实现层 Bug**：按目标语言特性排查常见缺陷与边界错误。
-3. **Simplify**：平衡性能与实现简洁度。
-4. **Comment Refine**：保持基本可读性与注释准确性，减少冗余注释，确保接口文档完备且与实现同步。
+工作 thread 先用 `forge ledger reviews <task-id>` 核对历史，再按实际改动派发各自独立的只读子代理，默认并行。
+
+1. **reviewer-business** 核对业务流程与冻结规格中的承诺。
+2. **reviewer-quality** 从实际调用方检查实现缺陷、失败路径与边界错误。
+3. **reviewer-simplify** 检查实现是否可以简化，核实受支持负载下的性能影响。
+4. **reviewer-comments** 对照实现核实注释、使用示例和接口文档。
+
+主线程保存各角色的 Markdown 原文，通过 `forge ledger review-record <task-id>` 登记实际范围、结论、会话与报告。修复后由受影响角色逐项复核；交付 HEAD 至少有一份从任务基线审起的通过报告。
 
 #### 4. 集成验证与交付
 - 集成验证在实例覆写指定的验证环境中运行集成测试、冒烟测试（按需含性能测试），修复直至 bug-free。
@@ -121,7 +120,6 @@ flowchart TD
 
 ```bash
 # 1. 构建工作台工具集并运行测试
-git submodule update --init --recursive
 bun install --frozen-lockfile
 bun run build
 bun run test:all
@@ -141,9 +139,7 @@ git clone <repo-url> ~/work/my-workbench/backend
 ### 在本仓库自举
 
 ```bash
-git submodule update --init --recursive
 bun install --frozen-lockfile
-(cd review-agents && bun install --frozen-lockfile)
 ./bin/forge init . --name forge-kit
 ./bin/forge add-repo . --workbench .
 ./bin/forge doctor .

@@ -1,6 +1,6 @@
 import { existsSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
-import { loadModelsConfig, loadWorkbenchConfig, parseTomlFile } from "../config";
+import { loadModelsConfig, loadWorkbenchConfig, parseTomlFile, reviewRoleModel, reviewRoles } from "../config";
 import { runGit } from "../git";
 import { localPath, readRequired, resolveInstance } from "../instance";
 import { installAssets, wrapper, type Asset, type InstallLock } from "../managed-assets";
@@ -24,11 +24,7 @@ function loadKitManifest(kitRoot: string): KitManifest {
 }
 
 export function renderTemplate(content: string, vars: Record<string, string>): string {
-  let out = content;
-  for (const [k, v] of Object.entries(vars)) {
-    out = out.replaceAll(`{{${k}}}`, v);
-  }
-  return out;
+  return content.replace(/\{\{([A-Z0-9_-]+)\}\}/g, (placeholder, key) => vars[key] ?? placeholder);
 }
 
 function loadBundle(kitRoot: string, name: string): Buffer {
@@ -84,10 +80,15 @@ function managedPlan(kitRoot: string, root: string, manifest: KitManifest) {
   const cfg = loadWorkbenchConfig(root),
     models = loadModelsConfig(root);
   const vars: Record<string, string> = { WORKBENCH_NAME: cfg.name, WORKBENCH_ROOT: root };
-  for (const [key, tier] of Object.entries(models.tiers)) {
-    vars[key.toUpperCase() + "_MODEL"] = tier.model;
-    vars[key.toUpperCase() + "_EFFORT"] = tier.effort;
+  function modelVars(prefix: string, tier: { model: string; effort: string }) {
+    // Model placeholders occur inside TOML basic strings.
+    vars[prefix + "_MODEL"] = JSON.stringify(tier.model).slice(1, -1);
+    vars[prefix + "_EFFORT"] = tier.effort;
   }
+  for (const [key, tier] of Object.entries(models.tiers))
+    modelVars(key.toUpperCase(), tier);
+  for (const role of reviewRoles)
+    modelVars("REVIEW_" + role.toUpperCase(), reviewRoleModel(models, role));
   const assets = new Map<string, Asset>();
   function put(path: string, bytes: string | Buffer, mode = 0o644) {
     assets.set(path, { bytes: Buffer.from(bytes), mode });

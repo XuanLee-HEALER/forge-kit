@@ -1,5 +1,3 @@
-import { efforts, type Model } from "../review-agents/src/models";
-import { roles, type Role } from "../review-agents/src/roles";
 import { parse as parseStrictYaml } from "yaml";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -41,9 +39,13 @@ export interface WorkbenchConfig {
   guard: GuardConfig;
 }
 
+export const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export const reviewRoles = ["business", "quality", "simplify", "comments"] as const;
+export type ReviewRole = typeof reviewRoles[number];
+
 export interface ModelsConfig {
-  tiers: Record<string, {model:string; effort:Model["effort"]}>;
-  review: { roles: Record<Role | "performance", string> };
+  tiers: Record<string, { model: string; effort: typeof efforts[number] }>;
+  review: { roles: Record<ReviewRole | "performance", string> };
 }
 
 export interface DbCredentialPair {
@@ -376,7 +378,7 @@ export function decodeModelsConfig(parsed: object, file: string): ModelsConfig {
     const { model, effort } = tier as Record<string, unknown>;
     if (typeof model !== "string" || !model.trim()) throw Error(file + ": Invalid " + field + ".model");
     if (!efforts.some(e => e === effort)) throw Error(file + ": Invalid " + field + ".effort");
-    tiers[name] = {model, effort: effort as Model["effort"]};
+    tiers[name] = {model, effort: effort as typeof efforts[number]};
   }
   const mapping: ModelsConfig["review"]["roles"] = { business: "deep", quality: "deep", simplify: "standard", comments: "mechanical", performance: "deep" };
   if ("review" in parsed) {
@@ -386,13 +388,17 @@ export function decodeModelsConfig(parsed: object, file: string): ModelsConfig {
     if ("roles" in review) {
       if (!review.roles || typeof review.roles !== "object" || Array.isArray(review.roles)) throw Error(file + ": Invalid review.roles");
       for (const [role, tier] of Object.entries(review.roles)) {
-        if (!roles.some(r => r === role) || typeof tier !== "string" || !Object.hasOwn(tiers, tier))
+        if (!reviewRoles.some(r => r === role) || typeof tier !== "string" || !Object.hasOwn(tiers, tier))
           throw Error(file + ": Invalid review.roles." + role);
-        mapping[role as Role] = tier;
+        mapping[role as ReviewRole] = tier;
       }
     }
   }
   return { tiers, review: { roles: mapping } };
+}
+
+export function reviewRoleModel(models: ModelsConfig, role: ReviewRole) {
+  return models.tiers[models.review.roles[role]];
 }
 
 export function loadModelsConfig(root: string): ModelsConfig {

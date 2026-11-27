@@ -171,7 +171,7 @@ export function getHeadAndParents(checkoutDir: string): string[] {
 
 export function listWorkbenchRepos(
   workbenchRoot: string,
-  excluded = new Set(["review-agents", ".workbench", ".codex", ".agents"]),
+  excluded = new Set<string>(),
 ): string[] {
   if (!existsSync(workbenchRoot)) return [];
   const entries = readdirSync(workbenchRoot, { withFileTypes: true });
