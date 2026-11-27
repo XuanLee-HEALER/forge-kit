@@ -232,7 +232,8 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
             }
           }
           if ((legacyFullPass && source === "tool") || (!legacy && p.status === "pass")) {
-            resolveReviewedIssues(evidence.issues, receipt, p.summary ?? "", join(ledger.workbenchRoot, params.repo), params.head_sha, coversBase);
+            const taskBase = branch ? attachedAtEvent.get(branch)?.base_sha : undefined;
+            resolveReviewedIssues(evidence.issues, receipt, p.summary ?? "", join(ledger.workbenchRoot, params.repo), params.head_sha, taskBase);
           }
         }
         if (!atHead) continue;

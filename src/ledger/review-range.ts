@@ -58,15 +58,17 @@ function ancestor(dir: string, older: string, newer: string) {
 const nativeSuccessors = new Map([["business-review", "business"], ["performance", "simplify"]]);
 
 export function resolveReviewedIssues(issues: Map<number, ReviewIssue>, pass: ReviewIssue, summary: string,
-  dir: string, deliveryHead: string, coversBaseline: boolean) {
+  dir: string, deliveryHead: string, taskBase: string | null | undefined) {
   if (!issues.size || !ancestor(dir, pass.head, deliveryHead)) return;
   if (pass.source === "tool") {
-    // Old tools could repeat a range at its HEAD or review the full baseline again after a fix.
+    // At a new HEAD the tool must have reviewed the entire failed interval inside the task range.
     for (const issue of issues.values()) {
       if (issue.source !== "tool" || issue.role !== pass.role) continue;
       const covered = issue.head === pass.head
         ? issue.base === pass.base
-        : coversBaseline && ancestor(dir, pass.base, issue.base) && ancestor(dir, issue.head, pass.head);
+        : taskBase && ancestor(dir, taskBase, pass.base) && ancestor(dir, pass.base, issue.base) &&
+          ancestor(dir, issue.base, issue.head) && ancestor(dir, issue.head, pass.head) &&
+          compareReviewTrees(dir, pass.base, pass.head) === "changed";
       if (covered) issues.delete(issue.seq);
     }
     return;
