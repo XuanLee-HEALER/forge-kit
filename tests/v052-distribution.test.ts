@@ -18,6 +18,16 @@ test("README preserves content outside the approved review and installation chan
   expect(readme).toContain("forge ledger review-record");
 });
 
+test("T12 README changes only the approved v0.5.7 delivery sentence", () => {
+  const readme = readFileSync(join(kit, "README.md"), "utf8");
+  const approved = "交付前，至少有一个角色沿提交链无空洞覆盖任务基线至交付 HEAD，且所有已启动角色均无未解除的评审失败";
+  const previous = "交付 HEAD 至少有一份从任务基线审起的通过报告";
+  expect(readme.split("\n")[100]).toContain(approved);
+  // Hash of the entire README at fec8d0b, including its final newline.
+  expect(createHash("sha256").update(readme.replace(approved, previous)).digest("hex"))
+    .toBe("1732e1bcfbbb0837019e367fcf5a0c142abce11b50e0a0e311b36dd306bee8a4");
+});
+
 test("current distribution removes stale JS bundles and retired protocol configuration", () => {
   const temp = mkdtempSync(join(tmpdir(), "forge-dist-contract-"));
   try {
@@ -29,9 +39,9 @@ test("current distribution removes stale JS bundles and retired protocol configu
     }
     symlinkSync(join(kit, "node_modules"), join(temp, "node_modules"));
     const manifest = JSON.parse(readFileSync(join(temp, "package.json"), "utf8"));
-    expect(manifest.version).toBe("0.5.6");
+    expect(manifest.version).toBe("0.5.7");
     expect(JSON.stringify(manifest)).not.toContain("review-agents");
-    expect(readFileSync(join(kit, "kit.toml"), "utf8")).toMatch(/^version = "0\.5\.6"$/m);
+    expect(readFileSync(join(kit, "kit.toml"), "utf8")).toMatch(/^version = "0\.5\.7"$/m);
     mkdirSync(join(temp, "dist"));
     writeFileSync(join(temp, "dist/stale.js"), "stale");
     const result = Bun.spawnSync([process.execPath, "run", "build"], { cwd: temp });
@@ -69,12 +79,21 @@ test("effective skills and read-only reviewer roles can load the installed revie
     const referencePath = join(dirname(review.value.path), resource);
     expect(review.source).toBe("core");
     expect(review.value.body).toContain(`](${resource})`);
+    const guidance: string = review.value.body;
+    expect(guidance).toMatch(/forge ledger reviews[\s\S]+spawn_agent[\s\S]+fork_turns="none"/);
+    expect(guidance).toMatch(/仅续聊受影响角色[^\n]*followup_task[^\n]*原会话 ID/);
+    expect(guidance).toMatch(/原会话不可续聊或规格 amend[^\n]*新开会话全审/);
+    expect(guidance).toMatch(/incomplete[^\n]*原会话扩大范围[^\n]*缺证区间/);
     const core = readFileSync(referencePath, "utf8");
     expect(core).toBe(readFileSync(join(kit, "core", installed), "utf8"));
     for (const id of ["grill", "feature", "pr-triage"]) expect(skill(id).value.body).toContain(installed);
     for (const role of ["business", "quality", "simplify", "comments"]) {
-      const values = Bun.TOML.parse(s.read(`.codex/agents/reviewer-${role}.toml`));
-      expect(values).toMatchObject({name: `reviewer-${role}`, sandbox_mode: "read-only", developer_instructions: expect.stringContaining(installed)});
+      const values = Bun.TOML.parse(s.read(`.codex/agents/reviewer-${role}.toml`)) as {developer_instructions: string};
+      expect(values).toMatchObject({name: `reviewer-${role}`, sandbox_mode: "read-only"});
+      expect(values.developer_instructions).toContain(installed);
+      const habits = values.developer_instructions.split("\n").filter(line => line.includes("git diff --stat"));
+      expect(habits).toHaveLength(1);
+      expect(habits[0]).toMatch(/git diff --stat.*按文件.*上下文.*新改动.*已审代码.*交互/);
     }
 
     const privateDir = ".workbench/overrides/review";

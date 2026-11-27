@@ -98,7 +98,7 @@ flowchart TD
 3. **reviewer-simplify** 检查实现是否可以简化，核实受支持负载下的性能影响。
 4. **reviewer-comments** 对照实现核实注释、使用示例和接口文档。
 
-主线程保存各角色的 Markdown 原文，通过 `forge ledger review-record <task-id>` 登记实际范围、结论、会话与报告。修复后由受影响角色逐项复核；交付 HEAD 至少有一份从任务基线审起的通过报告。
+主线程保存各角色的 Markdown 原文，通过 `forge ledger review-record <task-id>` 登记实际范围、结论、会话与报告。修复后由受影响角色逐项复核；交付前，至少有一个角色沿提交链无空洞覆盖任务基线至交付 HEAD，且所有已启动角色均无未解除的评审失败。
 
 #### 4. 集成验证与交付
 - 集成验证在实例覆写指定的验证环境中运行集成测试、冒烟测试（按需含性能测试），修复直至 bug-free。

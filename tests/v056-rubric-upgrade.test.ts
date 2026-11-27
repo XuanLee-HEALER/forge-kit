@@ -30,7 +30,7 @@ test("0.5.5 review override keeps its body and gains the default rubric when upg
     const defaultDigest = digest(join(kit, "core", installed, resource));
     for (let i = 0; i < 2; i++) {
       s.ok([candidate, "sync", s.work]);
-      expect(version()).toBe("0.5.6");
+      expect(version()).toBe("0.5.7");
       expect(readFileSync(installedSkill)).toEqual(bytes);
       expect(readFileSync(privateSkill)).toEqual(bytes);
       expect(existsSync(join(s.work, override, resource))).toBe(false);

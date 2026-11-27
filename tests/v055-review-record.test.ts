@@ -34,11 +34,11 @@ function ready(id = task) {
     head_sha: head, checkEndpoint: true });
 }
 function rejected(argv: string[]) {
-  const count = events().length;
+  const history = events();
   const before = ready();
   const result = command(...argv);
   expect(result.exitCode, argv.join(" ")).not.toBe(0);
-  expect(events()).toHaveLength(count);
+  expect(events()).toEqual(history);
   expect(ready()).toEqual(before);
 }
 function checks(id = task) {
@@ -169,6 +169,21 @@ test("attachment selectors must identify exactly one repository and branch", () 
   }
   ok(...args(), "--repo", "service", "--branch", "feature");
   expect(events().at(-1)).toMatchObject({ repo: "service", branch: "feature", sha: head });
+  expect(ready().ready).toBe(true);
+
+  const prefix = head;
+  head = change("unreviewed suffix on the target branch");
+  checks();
+  f.git("branch", "-f", "other", head);
+  f.git("-C", join(f.root, "mirror"), "pull", "--ff-only", "origin", "feature");
+  for (const [repo, branch] of [["mirror", "feature"], ["service", "other"]] as const) {
+    ok(...args("quality", "pass", prefix), "--repo", repo, "--branch", branch);
+    const readiness = ready();
+    expect(readiness.ready).toBe(false);
+    expect(readiness.missing.join(" ")).toContain("quality");
+    expect(readiness.missing.join(" ")).toContain(head.slice(0, 7));
+  }
+  ok(...args("quality", "pass", prefix), "--repo", "service", "--branch", "feature");
   expect(ready().ready).toBe(true);
 });
 

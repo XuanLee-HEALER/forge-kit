@@ -7,7 +7,7 @@ import { kit, sandbox } from "./v05-sandbox";
 import { releaseCLI, digest, historicalKit, type HistoricalVersion } from "./helpers/historical-kit";
 import { snapshot as ledgerSnapshot } from "./helpers/ledger-snapshot";
 
-for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4", "0.5.5"] satisfies HistoricalVersion[]) test(
+for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4", "0.5.5", "0.5.6"] satisfies HistoricalVersion[]) test(
   `upgrade from ${version} preserves history and renders configured reviewer tiers on repeated sync`, () => {
   const s = sandbox();
   try {
@@ -62,11 +62,13 @@ for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4", "0.5.5"] sat
       "--worktree", app, "--base", base, "--head", head, "--endpoint", "local", "--depth", "targeted");
     ledger("decide", "history", "--key", "contract", "--summary", "Run the local project check on this revision");
     ledger("freeze", "history", "--lock-tests", "check.ts");
-    if (version === "0.5.5") {
+    const nativeReview = version >= "0.5.5";
+    const session = `${version}-fixture-session`;
+    if (nativeReview) {
       const report = s.privateFile(".workbench/runs/history/quality.md", "Quality review of the complete fixture change.\n");
       ledger("review-record", "history", "--repo", "app", "--branch", "development", "--base", base, "--head", head,
         "--role", "quality", "--status", "pass", "--summary", "Reviewed the full fixture range", "--report", report,
-        "--session-id", "v055-fixture-session");
+        "--session-id", session);
       files.push(report);
       before.push(digest(report));
     } else {
@@ -85,7 +87,7 @@ for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4", "0.5.5"] sat
       `, s.work, base, head]);
     }
     const historicalReview = JSON.parse(ledger("reviews", "history"));
-    const source = version === "0.5.5" ? "subagent" : "tool";
+    const source = nativeReview ? "subagent" : "tool";
     expect(historicalReview).toMatchObject([{source, role:"quality", status:"pass", base, head, repo:"app", branch:"development"}]);
     const verify = [s.forge, "verify", "--task", "history", "--cwd", app, "--mode", "all"];
     expect(JSON.parse(s.ok(verify))).toMatchObject({ok: true, head});
@@ -135,7 +137,7 @@ for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4", "0.5.5"] sat
     for (let i = 0; i < 3; i++) {
       if (i === 1) writeFileSync(models, renderModels(true));
       s.ok([bootstrap, "sync", s.work]);
-      expect(lockVersion()).toBe("0.5.6");
+      expect(lockVersion()).toBe("0.5.7");
       expect(readFileSync(models, "utf8")).toBe(renderModels(i > 0));
       const roles = Object.entries(roleTiers).map(([role, tier]) => {
         const path = join(s.work, ".codex/agents/reviewer-" + role + ".toml");
@@ -169,6 +171,19 @@ for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4", "0.5.5"] sat
     if (version === "0.5.5") {
       expect(JSON.parse(ledger("close", "history", "--no-archive")).task.status).toBe("CLOSED");
       expect(JSON.parse(ledger("reviews", "history"))).toEqual(historicalReview);
+    }
+    if (version === "0.5.6") {
+      const report = s.privateFile(".workbench/runs/history/follow-up.md", "Checked the follow-up change against the earlier review.\n");
+      s.privateFile("app/history.md", "Historical review target with follow-up.\n");
+      s.git(app, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "follow-up", "--", "history.md");
+      const followup = s.git(app, "rev-parse", "HEAD").trim();
+      ledger("review-record", "history", "--repo", "app", "--branch", "development", "--base", head, "--head", followup,
+        "--role", "quality", "--status", "pass", "--summary", "Reviewed the follow-up range", "--report", report, "--session-id", session);
+      expect(JSON.parse(s.ok(verify))).toMatchObject({ok: true, head: followup});
+      expect(JSON.parse(ledger("close", "history", "--no-archive")).task.status).toBe("CLOSED");
+      expect(JSON.parse(ledger("reviews", "history"))).toMatchObject([
+        historicalReview[0], {base: head, head: followup, session_id: session, status: "pass"},
+      ]);
     }
     if (version === "0.5.3") {
       const calls = join(s.root, "hurl.json");

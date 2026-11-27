@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { reviewRoles } from "../config";
 import { isOid } from "../git";
-import { compareReviewTrees, coversReviewBase, resolveReviewedIssues, type ReviewIssue } from "./review-range";
+import { compareReviewTrees, reviewAncestry, reviewBaseline, reviewCoverageGap, ReviewGitError, type ReviewRange } from "./review-range";
 import type { LedgerReader, TaskRepoRecord, TaskSpecState } from "./types";
 
 interface ReviewReceipt {
@@ -18,6 +18,11 @@ interface ReviewReceipt {
     review_task_id?: string;
     review_floor_seq?: number;
   };
+}
+
+interface AttachedReview extends ReviewRange {
+  role: string;
+  attachedBase: string | null;
 }
 
 export function checkReviewReadiness(ledger: LedgerReader, attachment: TaskRepoRecord,
@@ -42,9 +47,10 @@ export function checkReviewReadiness(ledger: LedgerReader, attachment: TaskRepoR
            AND json_extract(payload_json, '$.source') = 'subagent' END))
      ORDER BY seq`,
   ).all(task_id, repo, branch, Math.max(floor, spec.freeze_seq + 1));
-  const issues = new Map<number, ReviewIssue>();
+  const issues = new Map<number, AttachedReview & { status: "blocked" | "incomplete" }>();
+  const passes: (AttachedReview & { seq: number; summary: string })[] = [];
+  const byRole = new Map<string, ReviewRange[]>();
   let attachedBase: string | null | undefined;
-  let coversBaseline = false;
   for (const ev of events) {
     if (ev.event_type === "REPO_DETACHED") {
       attachedBase = undefined;
@@ -62,28 +68,80 @@ export function checkReviewReadiness(ledger: LedgerReader, attachment: TaskRepoR
         !m.role || !reviewRoles.some(role => role === m.role) ||
         typeof m.report_path !== "string" || !m.report_path ||
         typeof m.report_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(m.report_sha256)) continue;
-    const range = { role: m.role, base: m.base, head: ev.sha };
+    const range = { role: m.role, base: m.base, head: ev.sha, attachedBase };
     if (p.status === "fail" && (m.report_status === "blocked" || m.report_status === "incomplete")) {
-      issues.set(ev.seq, range);
+      issues.set(ev.seq, { ...range, status: m.report_status });
     } else if (p.status === "pass" && m.report_status === "pass") {
-      resolveReviewedIssues(issues, range, typeof p.summary === "string" ? p.summary : "", dir, head);
-      if (range.head !== head) continue;
-      roles.add(range.role);
-      coversBaseline ||= coversReviewBase(dir, attachedBase, range.base) &&
-        (attachedBase === base_sha || coversReviewBase(dir, base_sha, range.base));
+      passes.push({ ...range, seq: ev.seq, summary: typeof p.summary === "string" ? p.summary : "" });
+    } else {
+      continue;
     }
+    if (!byRole.has(range.role)) byRole.set(range.role, []);
+  }
+
+  let coverageMissing: string | undefined;
+  try {
+    const ancestor = reviewAncestry(dir);
+    const base = reviewBaseline(dir, base_sha);
+    const baselines = new Map([[base_sha, base]]);
+    function applies(range: AttachedReview) {
+      if (!range.attachedBase || range.base === range.head || !ancestor(range.head, head) ||
+          !ancestor(base, range.base) || !ancestor(range.base, range.head)) return false;
+      const original = baselines.get(range.attachedBase) ?? reviewBaseline(dir, range.attachedBase);
+      baselines.set(range.attachedBase, original);
+      return ancestor(original, range.base);
+    }
+
+    for (const pass of passes) {
+      if (!applies(pass)) continue;
+      if (pass.head === head) roles.add(pass.role);
+      const ranges = byRole.get(pass.role)!;
+      ranges.push(pass);
+      for (const [, reference] of pass.summary.matchAll(/(?:\bseq\s+|#)([1-9]\d*)\b/gi)) {
+        const seq = Number(reference);
+        const issue = issues.get(seq);
+        if (!issue || seq >= pass.seq || issue.role !== pass.role || !ancestor(issue.head, pass.head)) continue;
+        if (!ancestor(pass.base, issue.base) && !(issue.status === "blocked" && ancestor(issue.head, pass.base))) continue;
+        if (issue.status === "blocked" && applies(issue)) ranges.push(issue);
+        issues.delete(seq);
+      }
+    }
+
+    if (!ancestor(base, head)) {
+      coverageMissing = required + ". The task baseline is not an ancestor of delivery HEAD";
+    } else {
+      const trees = compareReviewTrees(dir, base, head);
+      if (trees === "unavailable") throw new ReviewGitError("Cannot inspect task baseline or delivery HEAD tree");
+      if (trees === "equal") {
+        coverageMissing = required + ". The task baseline and delivery HEAD trees are identical";
+      } else {
+        const gaps: string[] = [];
+        for (const [role, ranges] of byRole) {
+          const gap = reviewCoverageGap(ranges, base, head, ancestor);
+          if (!gap) {
+            gaps.length = 0;
+            break;
+          }
+          gaps.push(`${role} ${gap}`);
+        }
+        if (!byRole.size || gaps.length) coverageMissing = [required, ...gaps].join(". ");
+      }
+    }
+  } catch (error) {
+    if (!(error instanceof ReviewGitError)) throw error;
+    coverageMissing = `${required}. Git evidence unavailable. ${error.message}`;
   }
 
   if (issues.size) {
-    const byRole = new Map<string, string[]>();
+    const issuesByRole = new Map<string, string[]>();
     for (const [seq, { role }] of issues) {
-      const refs = byRole.get(role) ?? [];
+      const refs = issuesByRole.get(role) ?? [];
       refs.push(`#${seq}`);
-      byRole.set(role, refs);
+      issuesByRole.set(role, refs);
     }
-    const details = [...byRole].map(([role, refs]) => `${role} (${refs.join(", ")})`).join(", ");
-    return { roles: [...roles], failed: true, missing: `latest review failed (${details}) for ${target}` };
+    const details = [...issuesByRole].map(([role, refs]) => `${role} (${refs.join(", ")})`).join(", ");
+    const failure = `latest review failed (${details}) for ${target}`;
+    return { roles: [...roles], failed: true, missing: coverageMissing ? failure + "\n" + coverageMissing : failure };
   }
-  const complete = coversBaseline && compareReviewTrees(dir, base_sha, head) === "changed";
-  return { roles: [...roles], failed: false, missing: complete ? undefined : required };
+  return { roles: [...roles], failed: false, missing: coverageMissing };
 }

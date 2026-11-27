@@ -11,6 +11,7 @@ const releases = {
   "0.5.3": ["dc43ddc9897481e50da4379dc8d73becd3637f27", "268f616d5a15d45874c6b1a7a96ac248f9f546f9ff4c4362851a51bf67e290fb"],
   "0.5.4": ["0e252c19bce5184c7aff66bbde753683b8fd5a36", "d18fb1432215566374d3a7747d931603e451df0cc2e4568cdd3841e34f417329"],
   "0.5.5": ["47537e9c7eb047f848e0cf1f98ab4c5f29a34d04", "3fa44013ccc67b97846267ecb7a27e474334d787679c9f33edcbaa12ddb9ce18"],
+  "0.5.6": ["fec8d0beb5e8383ea167574f97105675bfc6fe37", "539ce7e5c291ba1bc4bae19d201b7426af16655d6eec3de68ecfa1dd9c0c517a"],
 } as const;
 
 const bundles = {
@@ -20,6 +21,7 @@ const bundles = {
   "0.5.3": ["fb1b7ed422edab73aaf4309e837c4b5ef17c72ca4330e19029d19d3016bd54cd", "d6f36d7ba00b18c1a3391f1e5812cf0639ad97b774035bf3f995ab326ab99e4b"],
   "0.5.4": ["47eaf3e96d6f73192bf4481008aca5553d7f76bed5465b7b0c3f535a81f3a89a", "5cb9a803afccb32315512223d6f2f20d6bb0ef54e18cfec1ed62097b19e203df"],
   "0.5.5": ["653648aa4a9cdc9482fa4afef2a135921806d0f12cd269ace172da12f9da7ed1", null],
+  "0.5.6": ["dddc18f863fee293abd29110a98ff462dfd8b4322a809082ec6e7794f2e9c9ca", null],
 } as const;
 export type HistoricalVersion = keyof typeof releases;
 export const digest = (path: string) => new Bun.CryptoHasher("sha256").update(readFileSync(path)).digest("hex");

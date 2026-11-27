@@ -12,34 +12,63 @@ export function compareReviewTrees(dir: string, base: string, head: string): "ch
   return before === after ? "equal" : "changed";
 }
 
-export function coversReviewBase(dir: string, recordedBase: string | null, reviewBase: string): boolean {
-  if (!recordedBase || !/^[a-f0-9]{7,64}$/i.test(recordedBase)) return false;
-  if (recordedBase === reviewBase) return true;
-  const resolved = runGit(dir, ["--no-replace-objects", "rev-parse", "--verify", "--end-of-options", recordedBase + "^{commit}"]);
-  return resolved.code === 0 && resolved.stdout.trim() === reviewBase;
+export class ReviewGitError extends Error {}
+
+export function reviewBaseline(dir: string, recordedBase: string): string {
+  const oid = /^[a-f0-9]{7,64}$/i.test(recordedBase)
+    ? runGit(dir, ["--no-replace-objects", "rev-parse", "--verify", "--end-of-options", recordedBase + "^{commit}"])
+    : undefined;
+  const sha = oid?.stdout.trim();
+  if (oid?.code === 0 && sha && isOid(sha) && sha.startsWith(recordedBase.toLowerCase())) return sha;
+  throw new ReviewGitError("Cannot resolve review baseline " + recordedBase);
 }
 
-export interface ReviewIssue {
-  role: string;
+export interface ReviewRange {
   base: string;
   head: string;
 }
 
-function ancestor(dir: string, older: string, newer: string) {
-  return older === newer || runGit(dir, ["--no-replace-objects", "merge-base", "--is-ancestor", older, newer]).code === 0;
+type IsAncestor = (older: string, newer: string) => boolean;
+
+export function reviewAncestry(dir: string): IsAncestor {
+  const cache = new Map<string, boolean>();
+  return (older, newer) => {
+    if (older === newer) return true;
+    const pair = older + ".." + newer;
+    const previous = cache.get(pair);
+    if (previous !== undefined) return previous;
+    const result = runGit(dir, ["--no-replace-objects", "merge-base", "--is-ancestor", older, newer]);
+    if (result.code !== 0 && (result.code !== 1 || result.termination || result.stderr.trim())) {
+      throw new ReviewGitError("Cannot verify review ancestry for " + pair);
+    }
+    const ancestor = result.code === 0;
+    cache.set(pair, ancestor);
+    return ancestor;
+  };
 }
 
-export function resolveReviewedIssues(issues: Map<number, ReviewIssue>, pass: ReviewIssue, summary: string,
-  dir: string, deliveryHead: string) {
-  if (!issues.size) return;
-  const references = summary.matchAll(/(?:\bseq\s+|#)([1-9]\d*)\b/gi);
-  let reachesDelivery: boolean | undefined;
-  for (const [, seq] of references) {
-    const issue = issues.get(Number(seq));
-    if (!issue || issue.role !== pass.role) continue;
-    reachesDelivery ??= ancestor(dir, pass.head, deliveryHead);
-    if (!reachesDelivery) return;
-    if (ancestor(dir, issue.head, pass.head) &&
-        (ancestor(dir, pass.base, issue.base) || ancestor(dir, issue.head, pass.base))) issues.delete(Number(seq));
+export function reviewCoverageGap(ranges: ReviewRange[], base: string, head: string, ancestor: IsAncestor): string | undefined {
+  // The Set iterator also visits new endpoints. In a merge, reachable endpoints can be incomparable.
+  const reached = new Set([base]);
+  for (const covered of reached) {
+    for (const range of ranges) {
+      if (reached.has(range.head) || !ancestor(range.base, covered) || !ancestor(covered, range.head)) continue;
+      if (range.head === head) return undefined;
+      reached.add(range.head);
+    }
   }
+
+  let nextBase: string | undefined;
+  const endpoints = [...reached];
+  for (const range of ranges) {
+    if (endpoints.some(covered => ancestor(range.base, covered))) continue;
+    if (!nextBase || ancestor(range.base, nextBase)) nextBase = range.base;
+  }
+  const next = nextBase ?? head;
+  let covered = base;
+  for (const candidate of reached) {
+    if (ancestor(covered, candidate) && ancestor(candidate, next)) covered = candidate;
+  }
+  const gap = `${covered.slice(0, 8)}..${next.slice(0, 8)}`;
+  return nextBase ? `coverage gap ${gap}` : `has not covered delivery HEAD (${gap})`;
 }
