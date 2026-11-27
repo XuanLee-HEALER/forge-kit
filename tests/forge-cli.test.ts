@@ -98,7 +98,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     expect(lstatSync(join(res.root, ".workbench/bin/forge")).mode & 0o111).toBeTruthy();
 
     const defaults = readFileSync(join(res.root, ".codex/config.toml"), "utf8");
-    expect(defaults).toContain('model = "gpt-6.2-sol"');
+    expect(defaults).toContain('model = "gpt-6.2-astra"');
     expect(defaults).toContain('model_reasoning_effort = "medium"');
 
     // Customize private rules + models.toml + inline YAML repos array
