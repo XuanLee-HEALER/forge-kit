@@ -70,7 +70,9 @@ export function resolveReviewedIssues(issues: Map<number, ReviewIssue>, pass: Re
   const references = summary.matchAll(/(?:\bseq\s+|#)([1-9]\d*)\b/gi);
   for (const [, seq] of references) {
     const issue = issues.get(Number(seq));
-    if (!issue || issue.role !== pass.role || !ancestor(dir, pass.head, deliveryHead) ||
+    if (!issue) continue;
+    const role = issue.role === "business-review" ? "business" : issue.role;
+    if (role !== pass.role || !ancestor(dir, pass.head, deliveryHead) ||
         !ancestor(dir, issue.head, pass.head)) continue;
     if (ancestor(dir, pass.base, issue.base) || ancestor(dir, issue.head, pass.base)) issues.delete(issue.seq);
   }

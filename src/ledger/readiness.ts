@@ -116,7 +116,8 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
     checks: Map<string, string>;
     pendingSelections: Map<string, string>;
     issues: Map<number, ReviewIssue>;
-    reviews: Map<string, {role: string; status: string; baseline: boolean}>;
+    nativeAtHead: boolean;
+    reviews: Map<string, {role: string; status: string; baseline: boolean; native: boolean}>;
     endpoint?: string;
   };
   const byBranch = new Map<string | null, BranchEvidence>();
@@ -138,7 +139,7 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
     if (params.branch && branch && branch !== params.branch) continue;
     let evidence = byBranch.get(branch);
     if (!evidence) {
-      evidence = { checks: new Map(), reviews: new Map(), pendingSelections: new Map(), issues: new Map() };
+      evidence = { checks: new Map(), reviews: new Map(), pendingSelections: new Map(), issues: new Map(), nativeAtHead: false };
       byBranch.set(branch, evidence);
     }
     try {
@@ -182,7 +183,11 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
         const source = evidenceSource(p, ev.actor);
         const native = source === "subagent";
         const atHead = ev.sha === params.head_sha;
-        if (!atHead && !currentWorkflow && !native) continue;
+        const legacy = !currentWorkflow && !native;
+        // A historical tool receipt may predate freeze_seq metadata. Its event still belongs to one freeze.
+        const legacyFreeze = legacy && specState.freeze_seq !== null && ev.seq > specState.freeze_seq &&
+          (p.meta?.freeze_seq === undefined || p.meta.freeze_seq === specState.freeze_seq);
+        if (!atHead && legacy && !legacyFreeze) continue;
         if (native && (fact !== "review" || !ev.branch || !attachedAtEvent.has(ev.branch) ||
             !ev.sha || p.meta?.head !== ev.sha || !p.meta.base || !isOid(p.meta.base) ||
             !reviewRoles.some(role => role === p.meta?.role) || !p.meta.report_path ||
@@ -204,23 +209,34 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
           if (atHead && source === "tool") evidence.pendingSelections.set(rangeKey, roleKey);
           continue;
         }
-        if ((currentWorkflow || native) && ev.sha) {
-          const receipt = { role: roleKey, base: p.meta?.base ?? "", head: ev.sha, seq: ev.seq, source };
-          if (p.status === "fail") evidence.issues.set(ev.seq, receipt);
-          if (p.status === "pass") {
-            resolveReviewedIssues(evidence.issues, receipt, p.summary ?? "", join(ledger.workbenchRoot, params.repo), params.head_sha);
-          }
+        if (atHead && native) evidence.nativeAtHead = true;
+        const receipt = ev.sha && (!legacy || legacyFreeze)
+          ? { role: roleKey, base: p.meta?.base ?? "", head: ev.sha, seq: ev.seq, source }
+          : undefined;
+        if (receipt && p.status === "fail") {
+          evidence.issues.set(ev.seq, receipt);
+          continue;
         }
-        if (!atHead) continue;
-        if (p.status === "pass" && (source === "tool" || native)) evidence.pendingSelections.delete(rangeKey);
-        if (p.status === "fail" && (currentWorkflow || native)) continue;
         const historical = branch ? [attachedAtEvent.get(branch)] : [...attachedAtEvent.values()];
         const current = branch ? repoAttachments.filter((r) => r.branch === branch) : [];
         const covered = (row: ReviewAttachment | undefined) =>
           !!row && coversReviewBase(ledger.workbenchRoot, row, p.meta?.base);
         const coversBase = historical.length > 0 && historical.every(covered) && current.every(covered);
+        if (receipt) {
+          if (legacy && coversBase && (p.status === "pass" || p.status === "fallback")) {
+            // Legacy full-range retries replaced earlier legacy results for this role at this HEAD.
+            for (const issue of evidence.issues.values()) {
+              if (issue.source !== "subagent" && issue.role === roleKey && issue.head === ev.sha)
+                evidence.issues.delete(issue.seq);
+            }
+          } else if (!legacy && p.status === "pass") {
+            resolveReviewedIssues(evidence.issues, receipt, p.summary ?? "", join(ledger.workbenchRoot, params.repo), params.head_sha);
+          }
+        }
+        if (!atHead) continue;
+        if (p.status === "pass" && (source === "tool" || native)) evidence.pendingSelections.delete(rangeKey);
         if (currentWorkflow || p.status === "fail" || coversBase) {
-          evidence.reviews.set(currentWorkflow ? rangeKey : roleKey, { role: roleKey, status: p.status, baseline: coversBase && current.length > 0 });
+          evidence.reviews.set(currentWorkflow ? rangeKey : roleKey, { role: roleKey, status: p.status, baseline: coversBase && current.length > 0, native });
         }
       }
       if (
@@ -264,6 +280,7 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
   const latestByKind = new Map<string, string>();
   const passingRoles = new Set<string>();
   let baselinePassed = false;
+  let fullLegacyReview = false;
   let latestEndpointStatus: string | undefined;
   for (const [branch, evidence] of byBranch) {
     const eligible = attachments.length === 1 && branch === attachments[0].branch;
@@ -271,13 +288,19 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
       if (status === "fail") failedKinds.add(kind);
       if (eligible && status === "pass") latestByKind.set(kind, status);
     }
-    for (const issue of evidence.issues.values()) failedRoles.add(issue.role);
+    for (const issue of evidence.issues.values()) {
+      // Tool-only v0.4 deliveries used just their selected HEAD. Native reassessment also tracks prior revisions.
+      if (currentWorkflow || evidence.nativeAtHead || issue.source === "subagent" || issue.head === params.head_sha)
+        failedRoles.add(issue.role);
+    }
     for (const role of evidence.pendingSelections.values()) incompleteRoles.add(role);
-    for (const {role, status, baseline} of evidence.reviews.values()) {
+    for (const {role, status, baseline, native} of evidence.reviews.values()) {
       if (status === "fail") failedRoles.add(role);
       if (eligible && (status === "pass" || status === "fallback")) {
         passingRoles.add(role);
         if (baseline) baselinePassed = true;
+        if (["codex-review", "quality", "business-review", "default"].includes(role) || (native && role === "business"))
+          fullLegacyReview = true;
       }
     }
     if (evidence.endpoint === "fail" || (eligible && latestEndpointStatus !== "fail" && evidence.endpoint)) {
@@ -346,10 +369,7 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
       );
     }
   } else if (task.verification_depth === "full") {
-    const hasQualityOrBusiness = [...passingRoles].some((r) =>
-      ["codex-review", "quality", "business-review", "default"].includes(r),
-    );
-    if (!hasQualityOrBusiness) {
+    if (!fullLegacyReview) {
       missing.push(
         `full verification requires business/quality review pass or fallback for ${params.repo}@${params.head_sha.slice(0, 8)}`,
       );
