@@ -38,7 +38,7 @@ export function verifyCli(args: string[]) {
     ((split >= 0 || kind !== undefined) &&
       (!argv.length || !kind || !["lint", "test", "build", "hurl"].includes(kind) || values.mode))
   )
-    throw Error("Use --mode all for the configured verification stages, --mode static|dynamic to select built-in checks, or --kind lint|test|build|hurl -- <command> [args...] for a recognized runner");
+    throw Error("Use --mode all for the configured verification stages, --mode static|dynamic to filter built-in checks (configured actions still run), or --kind lint|test|build|hurl -- <command> [args...] for a recognized runner");
   const root = findWorkbenchRoot(values.cwd);
   checkMigration(root);
   const ledger = new Ledger(root);
