@@ -61,12 +61,13 @@ console.log(await target.exists() ? await target.text() : JSON.stringify({state:
   git(f.wt, "push", bare, f.branch);
   remote(2, {baseRefOid: f.base, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN"});
   const realGit = Bun.which("git")!;
-  // Hosted reads resolve to the same bare repository updated by the simulated operator.
-  writeFileSync(join(root, "bin/git"), `#!/bin/sh
-if [ "$1" = "-C" ] && [ "$3" = "ls-remote" ]; then
-  exec ${Bun.$.escape(realGit)} -c ${Bun.$.escape("url." + bare + ".insteadOf=https://github.com/acme/api.git")} "$@"
-fi
-exec ${Bun.$.escape(realGit)} "$@"`, {mode: 0o755});
+  // Keep the hosted identity while serving Git's read transport from the fixture.
+  const transport = join(root, "local-ssh");
+  writeFileSync(transport, `#!/bin/sh
+exec ${Bun.$.escape(realGit)} upload-pack ${Bun.$.escape(bare)}`, {mode: 0o755});
+  git(f.dir, "remote", "set-url", "origin", "ssh://git@github.com/acme/api.git");
+  git(f.dir, "config", "core.sshCommand", Bun.$.escape(transport));
+  git(f.dir, "config", "ssh.variant", "simple");
   writeFileSync(join(root, "bin/gh"), `#!/usr/bin/env bun
 import {Database} from "bun:sqlite";
 import {appendFileSync} from "node:fs";

@@ -14,7 +14,10 @@ agent_files = [
   "scanner.toml", "analyst.toml", "implementer.toml", "reviewer.toml",
   "reviewer-business.toml", "reviewer-quality.toml", "reviewer-simplify.toml", "reviewer-comments.toml",
 ]
-copied_files = [".codex/config.toml"]
+copied_files = [
+  ".codex/config.toml",
+  ".agents/skills/review/references/risk-rubric.md",
+]
 bin_bundles = ["cli.js"]
 bin_wrappers = ["forge"]
 
