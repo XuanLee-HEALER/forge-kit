@@ -178,7 +178,7 @@ export class Ledger {
   }
 
   /** Check the selected revision's verification, native review and delivery evidence.
-   * Delivery requires a native baseline-to-HEAD pass. Reassessments must cite each failure they resolve.
+   * Delivery requires continuous native review coverage from baseline to HEAD by one role. Reassessments must cite each failure they resolve.
    */
   checkPushReadiness(params: readiness.ReadinessParams): {
     ready: boolean;

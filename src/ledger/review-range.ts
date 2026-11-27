@@ -48,8 +48,22 @@ export function reviewAncestry(dir: string): IsAncestor {
 }
 
 export function reviewCoverageGap(ranges: ReviewRange[], base: string, head: string, ancestor: IsAncestor): string | undefined {
-  // The Set iterator also visits new endpoints. In a merge, reachable endpoints can be incomparable.
+  // Each range already proved strict ancestry, so exact joins need only compare endpoint IDs.
+  const adjacent = new Map<string, string[]>();
+  for (const range of ranges) {
+    const ends = adjacent.get(range.base) ?? [];
+    ends.push(range.head);
+    adjacent.set(range.base, ends);
+  }
   const reached = new Set([base]);
+  for (const covered of reached) {
+    for (const end of adjacent.get(covered) ?? []) {
+      if (end === head) return undefined;
+      reached.add(end);
+    }
+  }
+
+  // The Set iterator visits new endpoints. Merge paths can leave several incomparable endpoints.
   for (const covered of reached) {
     for (const range of ranges) {
       if (reached.has(range.head) || !ancestor(range.base, covered) || !ancestor(covered, range.head)) continue;
