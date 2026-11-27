@@ -24,7 +24,7 @@ Licenses observed in checked-out repositories: PR-Agent MIT; Superpowers MIT; Go
 
 ## Pilot-v2 refinements
 
-Based on pilot-v1 evidence: distinguish third-party assumptions from inspected artifacts; inspect first-use materialization and representation conversions; compare repeated current test contracts across files; trace swallowed failures. These are general review strategies, not repository-specific expected answers. No benchmark labels or repository identifiers are embedded in role prompts. See evals/pilot-results.md and evals/pilot-v2-plan.md.
+Based on pilot-v1 evidence: distinguish third-party assumptions from inspected artifacts; inspect first-use materialization and representation conversions; compare repeated current test contracts across files; trace swallowed failures. These are general review strategies, not repository-specific expected answers. No benchmark labels or repository identifiers are embedded in role prompts.
 
 
 ## Documentation refinement experience — 2026-11-16
@@ -37,4 +37,4 @@ The performance role traces reachable execution and necessary work before rating
 
 ## Quality and documentation blocking criteria — 2026-11-18
 
-Local adjudication separates introduced behavior, affected callers and independent remedies. The Quality rubric uses observable implementation or test consequences. The Comments rubric checks what happens when a caller follows the affected documentation and identifies the text that needs correction. The baseline evidence is in [the paired replay](../evals/quality-comments-20261118/README.md).
+Local adjudication separates introduced behavior, affected callers and independent remedies. The Quality rubric uses observable implementation or test consequences. The Comments rubric checks what happens when a caller follows the affected documentation and identifies the text that needs correction.

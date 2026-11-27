@@ -1,6 +1,6 @@
 {
   "name": "forge-kit",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "type": "module",
   "files": [
@@ -11,6 +11,7 @@
     "review-agents/bin",
     "review-agents/dist/review.js",
     "review-agents/package.json",
+    "review-agents/standalone/bun.lock",
     "review-agents/prompts",
     "review-agents/src",
     "templates",
@@ -18,7 +19,6 @@
     "review-agents/evals/paired.json",
     "review-agents/scripts",
     "review-agents/tests",
-    "bun.lock",
     "review-agents/tsconfig.json"
   ],
   "bin": {

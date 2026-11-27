@@ -10,4 +10,17 @@ The default runs business, quality, simplify (including performance), and commen
 
 Auto starts a fresh ephemeral read-only Codex CLI for each role. A recognized provider outage or quota failure allows a single API attempt. Explicit `--backend codex` and `--backend api` select one backend. The Codex executable comes from PATH or `FORGE_CODEX_BIN`. Its subprocess receives an allowlist of runtime, proxy/TLS and provider-authentication settings, including `HOME`, `CODEX_HOME`, `CODEX_API_KEY` and `OPENAI_API_KEY`. The API expects `OPENAI_API_KEY` or a private TOML file at `REVIEW_CONFIG` (default `~/.config/review-agents/config.toml`) with `openai.api_key`. A compatible Responses endpoint can be configured with `OPENAI_BASE_URL`. Use `--model` and `--effort` to select the runtime model. Exit codes are 0 for pass, 1 for blocked, 2 for execution error and 3 for incomplete.
 
+## Running and developing the package
+
+The built archive includes `bin/review` and its self-contained `dist/review.js`. Unpack it and invoke `./bin/review` with Bun and Git on PATH. You can skip dependency installation and compilation for this entry point. A real review also requires access to the selected provider.
+
+For source development in forge-kit, run `bun install --frozen-lockfile` once at the workspace root. Bun uses the root lockfile to install both packages. For a standalone copy outside a workspace, run these commands in the review package directory. The nested lockfile travels with the archive because Bun 1.4.4 excludes a package-root `bun.lock` when packing.
+
+```sh
+cp standalone/bun.lock bun.lock
+bun install --frozen-lockfile
+```
+
+The source entry point, build, tests and evaluation use OpenAI and Zod from `node_modules`. A production-only install (`bun install --production --frozen-lockfile` with the appropriate lockfile in place) supplies those libraries. Static checking also needs TypeScript and the Bun type definitions from the full development install.
+
 From this directory run `bun run check`, `bun run build`, and `bun test tests`. Run `bun run eval` to score four labeled defects and their clean controls through the Codex subprocess adapter and a loopback Responses API. Offline results use deterministic simulated providers. Run `bun run eval --live` to score the same inputs with real models. Each returned record includes the exact material revision, role, actual provider, result, and score.

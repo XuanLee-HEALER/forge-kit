@@ -50,7 +50,8 @@ guard:
 # extensions:
 #   actions:
 #     smoke-check:
-#       argv: ["bun", "-e", "console.log('smoke ok')"]
+#       argv: ["bun", "test", "./tests/smoke.test.ts"]
+#       inputs: ["tests/smoke.test.ts"]
 #       cwd: "."
 #       purpose: verify
 #   stages:

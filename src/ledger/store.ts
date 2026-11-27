@@ -1142,12 +1142,12 @@ export class Ledger {
       }
       if (!hasPassingExecVerify) {
         missing.push(
-          `no passing build/test/hurl evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
+          `no passing build or executed test evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
         );
       }
     } else if (!hasPassingVerify) {
       missing.push(
-        `no passing build/test/lint/hurl evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
+        `no passing static check, build or executed test evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
       );
     }
 

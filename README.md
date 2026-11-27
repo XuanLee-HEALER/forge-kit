@@ -123,52 +123,88 @@ flowchart TD
 
 ## 快速开始
 
+从**已构建的根发行包**解压后，在含 `kit.toml` 的目录运行下列命令。运行时需 Bun、Bash 和 Git。发行包已包含 CLI 和审查引擎的 Bun bundle，初始化、健康检查和使用已安装的命令均可跳过 `bun install` 和 `bun run build`。保留整个解包目录以供后续同步，其中 `core/` 含隐藏的技能和 Codex 配置，`templates/` 提供实例模板。
+
 ```bash
-# 1. 构建工作台工具集并运行测试
-bun install --frozen-lockfile
-bun run build
-bun run test:all
-
-# 2. 在空目录初始化自包含工作台
 ./bin/forge init ~/work/my-workbench --name my-workbench --git-org my-org
-
-# 3. 注册业务仓库（自动生成仓库卡并更新配置）
 git clone <repo-url> ~/work/my-workbench/backend
-./bin/forge add-repo ~/work/my-workbench/backend
-
-# 4. 健康检查与升级同步
-./bin/forge doctor ~/work/my-workbench
-./bin/forge sync ~/work/my-workbench
+cd ~/work/my-workbench
+export PATH="$PWD/.workbench/bin:$PATH"
+forge add-repo backend
+forge doctor . --json
 ```
+
+**从源码开发或打包**时，在根目录执行以下命令。根 `bun.lock` 同时锁定根包和 `review-agents/`，根目录的一次安装即可为两个包提供依赖。Bun 使用 `node_modules/` 解析这些模块。根包使用 YAML 解析器，内嵌的审查引擎使用 OpenAI SDK 和 Zod。静态检查另需各包对应的 TypeScript 和 Bun 类型声明。
+
+```bash
+export BUN_INSTALL_CACHE_DIR="${BUN_INSTALL_CACHE_DIR:-$HOME/.bun/install/cache}"
+bun install --frozen-lockfile
+bun run check
+(cd review-agents && bun run check)
+bun run test:all
+(cd review-agents && bun run eval)
+bun tests/v051-version.ts
+bun run build
+bun pm pack
+(cd review-agents && bun pm pack)
+```
+
+`test:all` 运行两个包的测试。`eval` 使用本地模拟的 Codex 和 API 后端。独立的 `tests/v051-version.ts` 用 `forge verify` 在隔离检出中读取实际提交，分别核对预期版本匹配和不匹配时的退出状态、账本回执及临时目录清理。运行真实审查还需可用的 Codex CLI 会话或 API 凭据与网络连接。
+
+**只从源码初始化工作台**时，可以仅安装生产依赖。源码启动器运行 `src/bin/cli.ts`，初始化时按当前源码构建实例使用的 bundle，无需预建 `dist/`。在新的 forge-kit 克隆根目录自举可执行：
+
+```bash
+bun install --production --frozen-lockfile
+./bin/forge init . --name forge-kit
+./bin/forge add-repo .
+.workbench/bin/forge doctor . --json
+```
+
+**独立审查包**解压后可直接运行 `./bin/review`。它加载 `dist/review.js`，可以跳过依赖安装和构建。在根工作区之外开发该包、修改提示或运行源码测试与离线评估时，在独立目录执行以下命令。工作区内继续使用根锁文件。
+
+```bash
+cp standalone/bun.lock bun.lock
+bun install --frozen-lockfile
+bun run check
+bun run build
+bun test tests
+bun run eval
+```
+
+角色、后端及凭据配置见[独立引擎说明](review-agents/README.md)。
 
 ### 浅克隆的离线升级测试
 
-T03/T06 从 forge-kit v0.4.1 提交 `eb139c117be733173648abce723b6eaaf975f7bc` 及其完整目录树、文件对象生成旧实例。完整克隆直接运行测试。单提交浅克隆可使用以下命令从已有可信历史仓预供一份 tar，设置 `FORGE_V04_TEST_ARCHIVE` 为归档的本地绝对路径。测试在解包和构建前核对 SHA-256，固定值为 `0fb9dc3bab1714fcdf54e514e46561e4ceca516784301bd98efb00e6e9355468`。
+完整克隆可直接运行升级测试。浅克隆可从含相应提交、目录树和文件对象的可信历史仓生成两份 tar。测试先核对归档的 SHA-256，再解包并在临时目录运行旧版安装器。
+
+| 升级起点 | 用例及保护行为 | tar 的 SHA-256 |
+| --- | --- | --- |
+| v0.4.1 | `tests/v05-upgrade.test.ts` 核对旧账本、历史见证、私有文件及受管入口迁移 | `0fb9dc3bab1714fcdf54e514e46561e4ceca516784301bd98efb00e6e9355468` |
+| v0.5.0 | `tests/v051-upgrade.test.ts` 连续同步两次，核对私有验证动作、决定、历史回执和见证 | `dd59b1771a3e19e9b588dd3b46d21a714c79b6226e848f55539664c81ece80eb` |
+
+将 `HISTORY_REPO` 设为完整历史仓的绝对路径，`FIXTURES` 设为存放归档的本地绝对路径。以下命令从当前开发检出运行。
 
 ```bash
-git -C /path/to/full-forge-kit --no-replace-objects -c core.attributesFile=/dev/null -c tar.umask=0002 archive \
-  --format=tar --output=/path/to/fixtures/forge-kit-v0.4.1.tar eb139c117be733173648abce723b6eaaf975f7bc
-export FORGE_V04_TEST_ARCHIVE=/path/to/fixtures/forge-kit-v0.4.1.tar
-bun test tests/v05-upgrade.test.ts
-# 在已建账并冻结的浅克隆工作台中，通过隔离入口执行同一验收
+mkdir -p "$FIXTURES"
+export FORGE_V04_TEST_ARCHIVE="$FIXTURES/forge-kit-v0.4.1.tar"
+export FORGE_V05_TEST_ARCHIVE="$FIXTURES/forge-kit-v0.5.0.tar"
+git -C "$HISTORY_REPO" --no-replace-objects -c core.attributesFile=/dev/null -c tar.umask=0002 archive \
+  --format=tar --output="$FORGE_V04_TEST_ARCHIVE" eb139c117be733173648abce723b6eaaf975f7bc
+git -C "$HISTORY_REPO" --no-replace-objects -c core.attributesFile=/dev/null -c tar.umask=0002 archive \
+  --format=tar --output="$FORGE_V05_TEST_ARCHIVE" e2d7453ab08bee29cf174425e84012819a74bcc3
+bun test ./tests/v05-upgrade.test.ts ./tests/v051-upgrade.test.ts
+```
+
+在已建账并冻结的工作台中，`TASK` 为任务 ID，`CHECKOUT` 为该任务的 forge-kit 检出。离线执行需预先准备 Bun、Git、tar，以及包含本仓冻结安装所需包的 `BUN_INSTALL_CACHE_DIR`。历史评审由本地替身执行。通过工作台入口把两份归档显式传入隔离检出。
+
+```bash
 forge verify --task "$TASK" --cwd "$CHECKOUT" --offline \
   --fixture-env "FORGE_V04_TEST_ARCHIVE=$FORGE_V04_TEST_ARCHIVE" \
-  --kind test -- bun test ./tests/v05-upgrade.test.ts
+  --fixture-env "FORGE_V05_TEST_ARCHIVE=$FORGE_V05_TEST_ARCHIVE" \
+  --kind test -- bun test ./tests/v05-upgrade.test.ts ./tests/v051-upgrade.test.ts
 ```
-
-离线机器还需预供 Bun、Git、tar 和本仓锁定的 Bun 依赖。夹具在临时目录构建原版安装器，并用本地评审替身生成历史见证，无需旧评审子模块或远端服务。
 
 T10 使用三个独立 Codex CLI 会话读取安装后的 bugfix 说明，为 QA 缺陷、生产缺陷和报警选择诊断命令。运行 `FORGE_LIVE_T10=1 bun test tests/v05-incident-workflow.test.ts` 需可用的 Codex CLI 与模型访问权限。诊断目标均为本机临时 HTTP 服务；测试输出展示会话、选择的命令及服务端收到的请求。
-
-### 在本仓库自举
-
-```bash
-bun install --frozen-lockfile
-bun run build
-./bin/forge init . --name forge-kit
-./bin/forge add-repo .
-./bin/forge doctor .
-```
 
 ## 实例配置示例
 
