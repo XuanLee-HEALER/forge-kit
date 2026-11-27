@@ -1,22 +1,14 @@
-import OpenAI from "openai";
 import { z } from "zod";
-import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { mkdtempSync, rmSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Report } from "./report";
-import { loadApiKey } from "./config";
+import type { Model } from "./models";
 
 const schema = z.toJSONSchema(Report, { target: "draft-7" });
 delete schema.$schema;
-export type Backend = "api" | "codex";
-export type Model = { model: string; effort: string };
+export class BackendFailure extends Error {}
 
-export class BackendFailure extends Error {
-  constructor(message: string, readonly upstream = false) { super(message); }
-}
-
-// Only a transport-level failure event can authorize another provider invocation.
-// Assistant messages, subprocess stderr and model-controlled reports are never signals.
 function upstreamCode(events: string): string | undefined {
   for (const line of events.trim().split("\n").reverse()) {
     let event;
@@ -33,6 +25,16 @@ function upstreamCode(events: string): string | undefined {
   }
 }
 
+// Drain transport output without retaining prompts or unbounded event histories.
+async function tail(stream: ReadableStream<Uint8Array>) {
+  let bytes = Buffer.alloc(0);
+  for await (const part of stream) {
+    const end = part.subarray(Math.max(0, part.length - 8192));
+    bytes = Buffer.concat([bytes, end]).subarray(-8192);
+  }
+  return bytes.toString("utf8");
+}
+
 // Provider authentication and transport are independent of workbench, cloud
 // and deployment credentials present in the invoking agent's process.
 function codexEnvironment(cwd: string): NodeJS.ProcessEnv {
@@ -40,7 +42,6 @@ function codexEnvironment(cwd: string): NodeJS.ProcessEnv {
   for (const name of [
     "PATH", "HOME", "CODEX_HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL",
     "SYSTEMROOT", "USERPROFILE", "LOCALAPPDATA", "APPDATA",
-    "CODEX_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL",
     "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY",
     "https_proxy", "http_proxy", "no_proxy", "all_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR",
   ]) {
@@ -49,7 +50,7 @@ function codexEnvironment(cwd: string): NodeJS.ProcessEnv {
   return env;
 }
 
-async function codex(prompt: string, model: Model) {
+export async function invoke(prompt: string, model: Model) {
   const tmp = mkdtempSync(join(tmpdir(), "forge-model-"));
   try {
     const schemaPath = join(tmp, "schema.json");
@@ -65,43 +66,21 @@ async function codex(prompt: string, model: Model) {
       "-m", model.model, "-c", "model_reasoning_effort=" + JSON.stringify(model.effort),
       "--output-schema", schemaPath, "-o", result, "-",
     ];
-    const proc = Bun.spawn(args, { cwd: tmp, env: codexEnvironment(tmp), stdin: new Blob([prompt]), stdout: "pipe", stderr: "ignore", timeout: 300_000 });
-    const [events, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    const proc = Bun.spawn(args, { cwd: tmp, env: codexEnvironment(tmp), stdin: new Blob([prompt]), stdout: "pipe", stderr: "pipe", timeout: 300_000 });
+    const [events, stderr, code] = await Promise.all([tail(proc.stdout), tail(proc.stderr), proc.exited]);
     if (code !== 0) {
-      const upstream = !proc.signalCode && upstreamCode(events);
-      throw new BackendFailure(upstream || "Codex execution failed (exit " + code + ")", Boolean(upstream));
+      const upstream = proc.signalCode ? "Codex terminated by signal " + proc.signalCode : upstreamCode(events);
+      // Return diagnostic classes without replaying untrusted command output.
+      const reason = /unexpected argument|unrecognized (?:option|argument|feature)/i.test(stderr) ? "unsupported CLI option" :
+        /unauthori[sz]ed|authentication|not logged in/i.test(stderr) ? "authentication failed" : "execution failed";
+      throw new BackendFailure(upstream || "Codex " + reason + " (exit " + code + ")");
     }
+    if ((statSync(result, {throwIfNoEntry:false})?.size ?? 0) > 20_000) throw new BackendFailure("Codex report exceeds the response budget");
     try { return JSON.parse(readFileSync(result, "utf8")); }
     catch { throw new BackendFailure("Codex returned an unreadable JSON report"); }
+  } catch (error) {
+    if (error instanceof BackendFailure) throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new BackendFailure("Unable to start or read Codex" + (code && /^[A-Z_]+$/.test(code) ? " (" + code + ")" : ""));
   } finally { rmSync(tmp, { recursive: true, force: true }); }
-}
-
-export async function invoke(backend: Backend, prompt: string, model: Model) {
-  if (backend === "codex") return codex(prompt, model);
-  const config = process.env.REVIEW_CONFIG || join(homedir(), ".config/review-agents/config.toml");
-  const apiKey = process.env.OPENAI_API_KEY || (existsSync(config) && await loadApiKey(config));
-  if (!apiKey) throw new BackendFailure("API credentials missing (OPENAI_API_KEY or REVIEW_CONFIG)");
-  const client = new OpenAI({ apiKey, maxRetries: 0, timeout: 300_000 });
-  try {
-    const response = await client.responses.create({
-      model: model.model, input: prompt, store: false,
-      reasoning: { effort: model.effort as "medium" | "high" },
-      text: { format: { type: "json_schema", name: "review", strict: true, schema } },
-    });
-    if (response.status === "incomplete") {
-      const reason = response.incomplete_details?.reason;
-      const summary = reason === "max_output_tokens" || reason === "content_filter"
-        ? "API response incomplete: " + reason : "API response incomplete";
-      return { status: "incomplete", summary, findings: [], checked: [], limitations: [summary] };
-    }
-    if (response.status && response.status !== "completed") {
-      const known = ["queued", "in_progress", "failed", "cancelled"].includes(response.status);
-      throw new BackendFailure(known ? "API response was " + response.status : "API returned an unexpected response status");
-    }
-    return JSON.parse(response.output_text);
-  } catch (err) {
-    if (err instanceof BackendFailure) throw err;
-    if (err instanceof OpenAI.APIError) throw new BackendFailure("API request failed (HTTP " + (err.status ?? "unknown") + ")");
-    throw new BackendFailure("API returned an unreadable response");
-  }
 }

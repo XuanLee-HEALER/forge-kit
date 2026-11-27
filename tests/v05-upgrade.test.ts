@@ -52,6 +52,7 @@ function oldInstance() {
     ledger("decide", task, "--key", "migration", "--summary", "portable witness");
     ledger("record", task, "--kind", "note", "--status", "info", "--summary", "upgrade rehearsal");
   }
+  ledger("record","archived","--kind","fat","--status","pass","--summary","historical FAT acceptance","--repo","app","--branch","archived","--sha",head);
   ledger("close", "archived", "--force-incomplete", "--reason", "baseline lifecycle", "--no-archive");
   ledger("blocker", "active", "open", "--id", "hold", "--summary", "pending decision");
   const specs = join(s.work, ".workbench/specs/active");
@@ -213,6 +214,8 @@ for (const invalid of [false, true]) {
         expect(Bun.TOML.parse(rendered)).toMatchObject({ model, model_reasoning_effort: effort });
       }
       s.ok([s.forge, "doctor", s.work, "--json"]);
+      const historical = JSON.parse(s.ok([s.forge,"ledger","query","--q","historical","--json"]));
+      expect(historical.events.some((e:{payload_json:string})=>JSON.parse(e.payload_json).kind==="fat")).toBe(true);
       for (const tip of tips) s.ok([s.forge, "ledger", "verify-tip", tip]);
       expect(JSON.parse(s.ok([s.forge, "ledger", "query", "--q", "rehearsal", "--json"]))).toEqual(search);
       for (const name of ["ledger", "wb-git", "wb-verify", "forge-ship", "forge-review"])
@@ -221,7 +224,7 @@ for (const invalid of [false, true]) {
     for (const id of envelopes) {
       const result = s.run([s.forge, "ship", "run", "--envelope", id]);
       expect(result.code).not.toBe(0);
-      expect(result.out + result.err).toMatch(/re.?register|re.?approv|new.*runbook|重新登记|重新批准/i);
+      expect(result.out + result.err).toMatch(/re.?register|re.?approv|register a new plan|new.*runbook|重新登记|重新批准/i);
     }
     const beforeAppend = s.ok([s.forge, "ledger", "tip", "active"]).trim();
     s.ok([s.forge, "ledger", "record", "active", "--kind", "note", "--status", "info", "--summary", "after-upgrade"]);

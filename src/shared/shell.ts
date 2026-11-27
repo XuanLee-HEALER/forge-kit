@@ -415,7 +415,7 @@ export function hasUnquotedPipe(cmd: string): boolean {
  * Strip unquoted shell redirections (`> /dev/null`, `2>&1`, `>> log`, `< input`) from a command segment
  * while preserving quoted literal filenames (e.g. `"foo>bar.test.js"`).
  */
-export function stripUnquotedShellRedirections(seg: string): string {
+export function stripUnquotedShellRedirections(seg: string, outputPaths?: string[]): string {
   let out = "";
   let quote: "'" | '"' | "$'" | null = null;
   let escape = false;
@@ -534,7 +534,12 @@ export function stripUnquotedShellRedirections(seg: string): string {
       } else {
         i += 1;
       }
+      const targetStart = i;
       skipTargetWord();
+      if (outputPaths && (ch !== "<" || next === ">")) {
+        const target = splitShellTokens(seg.slice(targetStart, i).trim())?.[0];
+        if (target) outputPaths.push(target);
+      }
       out += " ";
       continue;
     }

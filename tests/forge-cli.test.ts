@@ -102,7 +102,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     expect(lstatSync(join(res.root, ".workbench/bin/forge")).mode & 0o111).toBeTruthy();
 
     const defaults = readFileSync(join(res.root, ".codex/config.toml"), "utf8");
-    expect(defaults).toContain('model = "gpt-6.2-astra"');
+    expect(defaults).toContain('model = "gpt-6.2-sol"');
     expect(defaults).toContain('model_reasoning_effort = "medium"');
 
     // Customize private rules + models.toml + inline YAML repos array
@@ -458,7 +458,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const valid = '[tiers.standard]\nmodel = "fixture-standard"\neffort = "low"\n';
     for (const [contents, field] of [
       ['[tiers.standard]\nmodel = "fixture-standard"\n', "tiers.standard.effort"],
-      [valid + '[tiers.deeep]\nmodel = "unused"\neffort = "high"\n', "tiers.deeep"],
+      [valid + '[review.roles]\nquality = "unregistered"\n', "review.roles.quality"],
       [valid + 'modle = "unused"\n', "tiers.standard.modle"],
     ]) {
       writeFileSync(models, contents);
@@ -633,8 +633,10 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     }
     expect(record("fat", ["--actor", "hook"]).exitCode).not.toBe(0);
     const fat = record("fat");
-    expect(fat.exitCode).toBe(0);
-    expect(JSON.parse(JSON.parse(fat.stdout.toString()).payload_json).source).toBe("manual");
+    expect(fat.exitCode).not.toBe(0);
+    const manual = record("manual");
+    expect(manual.exitCode,manual.stderr.toString()).toBe(0);
+    expect(JSON.parse(JSON.parse(manual.stdout.toString()).payload_json).source).toBe("manual");
   });
 });
 

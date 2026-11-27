@@ -69,5 +69,5 @@ export function verificationPolicy(root: string, repo: string, head: string, con
     });
     return [id, stage.value, action, files, pinned];
   });
-  return createHash("sha256").update(JSON.stringify([environment, sequence])).digest("hex");
+  return createHash("sha256").update(JSON.stringify([environment, sequence, config.verification.value.timeout_ms])).digest("hex");
 }

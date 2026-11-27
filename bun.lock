@@ -15,7 +15,6 @@
     "review-agents": {
       "name": "review-agents",
       "dependencies": {
-        "openai": "7.51.0",
         "zod": "^4.0.0",
       },
       "devDependencies": {
@@ -31,7 +30,6 @@
 
     "bun-types": ["bun-types@1.4.5", "", { "dependencies": { "@types/node": "*", "undici-types": "*" } }, "sha512-ECHn+9dhL3wv0G6u0+7dQvrnaimXiRDxxerYBmhTaLyJEEuvTPWk2Fye3XIf5Y++JIIiHKfQw4Z7V5D8KuiXbg=="],
 
-    "openai": ["openai@7.51.0", "", { "peerDependencies": { "@aws-sdk/credential-provider-node": ">=3.972.0 <4", "@smithy/hash-node": ">=4.3.0 <5", "@smithy/signature-v4": ">=5.4.0 <6", "google-auth-library": ">=9.15.1 <12", "undici": ">=5 <9", "ws": "^8.21.0", "zod": "^3.25 || ^4.0" }, "optionalPeers": ["@aws-sdk/credential-provider-node", "@smithy/hash-node", "@smithy/signature-v4", "google-auth-library", "undici", "ws", "zod"] }, "sha512-Ibu1d3ilmMbXRS8Y3WUPNTKk96p0rg1/BSlqASnvKy6i8efKjliUZGSfUTTCRcZJNGQ3xXMdita2REQOlH68JA=="],
 
     "review-agents": ["review-agents@workspace:review-agents"],
 

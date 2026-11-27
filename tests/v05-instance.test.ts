@@ -301,9 +301,9 @@ test("self-hosted root task routes commit, review and isolated verification evid
     "--", "bun", "test", "./root.test.ts"], linked));
   expect(verified).toMatchObject({ok: true, task_id: "root-task", head, results: [{kind: "test", exit_code: 0}]});
   const codex = join(s.bin, "codex");
-  writeFileSync(codex, '#!/usr/bin/env bun\nawait Bun.stdin.text(); await Bun.write(process.argv[process.argv.indexOf("-o")+1], JSON.stringify({status:"pass",summary:"Checked",checked:["root.test.ts"],limitations:[],findings:[]}));\n', {mode: 0o755});
+  writeFileSync(codex, '#!/usr/bin/env bun\nconst request = JSON.parse(await Bun.stdin.text()); await Bun.write(process.argv[process.argv.indexOf("-o")+1], JSON.stringify({status:"pass",summary:"Checked",role:request.role,checked:request.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"})),limitations:[],findings:[]}));\n', {mode: 0o755});
   s.env.FORGE_CODEX_BIN = codex;
-  s.ok([s.forge, "review", "--task", "root-task", "--repo", ".", "--roles", "quality", "--backend", "codex"], linked);
+  s.ok([s.forge, "review", "--task", "root-task", "--repo", ".", "--roles", "quality"], linked);
   expect(JSON.parse(ledger("reviews", "root-task"))).toContainEqual(expect.objectContaining({role: "quality", status: "pass", base, head}));
 }, 60_000);
 

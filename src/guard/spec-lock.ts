@@ -169,11 +169,10 @@ export function checkSpecAndTestLocks(
     for (const [index, segment] of segments.entries()) {
       const cwd = resolveSegmentCwd(segments, index, baseWorkdir);
       const targets: string[] = [];
-      // Skip quoted strings while looking for literal output redirects.
-      for (const match of segment.matchAll(/"[^"]*"|'[^']*'|>>?\|?\s*("[^"]*"|'[^']*'|[^\s;&|<>]+)/g)) {
-        if (match[1]) targets.push(...(splitShellTokens(match[1]) ?? []).map(p => resolve(cwd, p)));
-      }
-      const prefix = unwrapShellPrefix(splitShellTokens(stripUnquotedShellRedirections(segment)) ?? []);
+      const redirects: string[] = [];
+      const command = stripUnquotedShellRedirections(segment, redirects);
+      targets.push(...redirects.map(p => resolve(cwd, p)));
+      const prefix = unwrapShellPrefix(splitShellTokens(command) ?? []);
       const git = prefix.bin === "git" ? extractGitSubcommand(["git", ...prefix.args]) : null;
       const bin = git && ["mv", "rm"].includes(git.subcmd) ? git.subcmd : prefix.bin;
       const commandDir = resolveGitDirFlags(cwd, [...prefix.dirs, ...(git?.gitDirFlags ?? [])]) ?? cwd;

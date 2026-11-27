@@ -80,7 +80,7 @@ switch (settings.CLI_FAILURE) {
 const index = args.indexOf("-o");
 if (index < 0) process.exit(2);
 const result = request.role === "quality" ? settings.QUALITY : settings.PASS;
-writeFileSync(args[index+1], result);
+writeFileSync(args[index+1], JSON.stringify({...JSON.parse(result),role:request.role,checked:request.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"}))}));
 `);
   chmodSync(codex, 0o755);
 });
@@ -97,7 +97,7 @@ test("the clean standalone package runs a pinned review offline from its bundled
   // Only the source checkout used to build the tarball can resolve installed dependencies.
   symlinkSync(existsSync(join(workspace, "node_modules")) ? join(workspace, "node_modules") : join(kit, "node_modules"), join(source, "node_modules"));
   s.env.FORGE_CODEX_BIN = codex;
-  const args = ["--repo", repo, "--base", base, "--head", head, "--roles", "quality", "--backend", "codex"];
+  const args = ["--repo", repo, "--base", base, "--head", head, "--roles", "quality", "--model", "gpt-6.2-sol", "--effort", "medium"];
   const run = (root: string) => {
     const report = JSON.parse(s.ok([join(root, "bin/review"), ...args]));
     expect(report).toMatchObject({status:"pass", roles:[{role:"quality", backend:"codex", status:"pass"}]});
@@ -122,7 +122,7 @@ test("the clean standalone package runs a pinned review offline from its bundled
   for (const request of requests) expect(request.prompt).toContain(marker);
 }, 60_000);
 
-async function exercise(backend: string, status: Status, options: {failure?: string; roles?: string; mode?: string; gate?: string; findingLine?: number} = {}) {
+async function exercise(status: Status, options: {failure?: string; roles?: string; mode?: string; gate?: string; findingLine?: number} = {}) {
   const apiRequests: string[] = [];
   const quality = modelReport(status);
   if (options.findingLine !== undefined && quality.findings[0]) quality.findings[0].line = options.findingLine;
@@ -140,7 +140,7 @@ async function exercise(backend: string, status: Status, options: {failure?: str
   });
   const args = [join(kit, "review-agents/bin/review"), "--repo", repo, "--base", base, "--head", head,
     "--spec", join(repo, promptPath), "--roles", options.roles ?? "quality,comments", "--mode", options.mode ?? "ordered",
-    "--backend", backend];
+    "--model", "gpt-6.2-sol", "--effort", "medium"];
   if (!options.mode) args.push("--order", "comments,quality");
   try {
     configureCodex({ QUALITY: JSON.stringify(quality), PASS: JSON.stringify(modelReport("pass")),
@@ -156,24 +156,26 @@ async function exercise(backend: string, status: Status, options: {failure?: str
   } finally { await server.stop(true); }
 }
 
-for (const backend of ["codex", "api"]) {
+{
+  const backend = "codex";
   for (const status of ["pass", "blocked", "incomplete", "error"] as const) {
     test(`T07/T08 independent engine: ${backend} comments pass plus quality ${status}`, async () => {
-      const result = await exercise(backend, status);
-      expect(result.code, result.out + result.err).toBe(statuses[status]);
+      const result = await exercise(status);
+      const expected = status === "error" ? "incomplete" : status;
+      expect(result.code, result.out + result.err).toBe(statuses[expected]);
       const report = JSON.parse(result.out);
-      expect(report).toMatchObject({base, head, mode: "ordered", status});
+      expect(report).toMatchObject({base, head, mode: "ordered", status:expected});
       expect(report.schemaVersion).toBeDefined();
       expect(report.roles.map((r: {role: string}) => r.role).sort()).toEqual(["comments", "quality"]);
       for (const role of report.roles) {
-        expect(role).toMatchObject({ base, head, backend, status: role.role === "comments" ? "pass" : status });
+        expect(role).toMatchObject({ base, head, backend, status: role.role === "comments" ? "pass" : expected });
         expect(role.attempts.length).toBeGreaterThan(0);
         expect(Array.isArray(role.findings)).toBe(true);
         expect(typeof role.summary).toBe("string");
       }
-      expect(result.cli.length).toBe(backend === "codex" ? 2 : 0);
-      expect(result.apiRequests.length).toBe(backend === "api" ? 2 : 0);
-      const prompts = backend === "api" ? result.apiRequests : result.cli.map(r => r.prompt);
+      expect(result.cli.length).toBe(2);
+      expect(result.apiRequests).toEqual([]);
+      const prompts = result.cli.map(r => r.prompt);
       for (const prompt of prompts) expect(prompt).toContain(marker);
       if (backend === "codex") {
         expect(result.cli.map(r => r.role)).toEqual(["comments", "quality"]);
@@ -188,18 +190,18 @@ for (const backend of ["codex", "api"]) {
 }
 
 for (const failure of ["upstream", "local", "unknown"]) {
-  test(`T08 auto fallback for ${failure} failure`, async () => {
-    const result = await exercise("auto", "pass", {failure, roles: "quality", mode: "serial"});
+  test(`T08 no API fallback for ${failure} failure`, async () => {
+    const result = await exercise("pass", {failure, roles: "quality", mode: "serial"});
     expect(result.cli.length).toBe(1);
-    expect(result.apiRequests.length).toBe(failure === "upstream" ? 1 : 0);
-    expect(result.code).toBe(failure === "upstream" ? 0 : 2);
+    expect(result.apiRequests).toEqual([]);
+    expect(result.code).not.toBe(0);
     const report = JSON.parse(result.out);
-    expect(report.roles[0].backend).toBe(failure === "upstream" ? "api" : "codex");
+    expect(report.roles[0].backend).toBe("codex");
   }, 30_000);
 }
 
 test("T08 invalid roles fail before either model receives materials", async () => {
-  const result = await exercise("auto", "pass", {roles: "missing-role", mode: "serial"});
+  const result = await exercise("pass", {roles: "missing-role", mode: "serial"});
   expect(result.code).not.toBe(0);
   expect(result.cli).toEqual([]);
   expect(result.apiRequests).toEqual([]);
@@ -207,7 +209,7 @@ test("T08 invalid roles fail before either model receives materials", async () =
 
 for (const mode of ["parallel", "serial"]) {
   test(`T08 selected roles respect the ${mode} scheduling barrier`, async () => {
-    const result = await exercise("codex", "pass", {mode, gate: mode});
+    const result = await exercise("pass", {mode, gate: mode});
     expect(result.code, result.out + result.err).toBe(0);
     const trace = readFileSync(log + ".trace", "utf8").trim().split("\n");
     expect(trace).toHaveLength(4);
@@ -225,8 +227,8 @@ test("ledger reviews preserves selected roles that could not start and their mis
   s.ok([s.forge, "ledger", "open", "--id", "selection", "--title", "Check review coverage", "--repo", "app",
     "--branch", "main", "--base", base, "--depth", "targeted"]);
   s.env.FORGE_CODEX_BIN = codex;
-  const args = [s.forge, "review", "--task", "selection", "--repo", "app", "--roles", "business,quality", "--backend", "codex"];
-  const prior = s.run([s.forge, "review", "--task", "selection", "--repo", "app", "--roles", "quality", "--backend", "codex"], app);
+  const args = [s.forge, "review", "--task", "selection", "--repo", "app", "--roles", "business,quality", "--model", "gpt-6.2-sol", "--effort", "medium"];
+  const prior = s.run([s.forge, "review", "--task", "selection", "--repo", "app", "--roles", "quality", "--model", "gpt-6.2-sol", "--effort", "medium"], app);
   expect(prior.code, prior.out + prior.err).toBe(0);
   const result = s.run(args, app);
   expect(result.code, result.out + result.err).toBe(3);
@@ -234,7 +236,7 @@ test("ledger reviews preserves selected roles that could not start and their mis
   expect(reviews).toHaveLength(3);
   expect(reviews[0]).toMatchObject({ kind: "review", role: "quality", status: "pass", base, head });
   expect(reviews[1]).toMatchObject({ kind: "review_selection", role: "business", status: "incomplete", backend: null, attempts: [],
-    missing_materials: ["spec"], base, head });
+    missing_materials: expect.arrayContaining(["spec",skillPath]), base, head });
   expect(reviews[2]).toMatchObject({ kind: "review", role: "quality", status: "pass", backend: "codex", attempts: [{backend: "codex", status: "pass"}] });
   expect(readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line).role)).toEqual(["quality", "quality"]);
 
@@ -271,7 +273,7 @@ for (const version of ["0.4", "0.5"] as const) test(`v${version} performance ret
     for (const file of ["ssot", "tech-spec", "test-spec"]) s.privateFile(`.workbench/specs/${task}/${file}.md`, "Review the pinned revision.");
     const floor = db.freezeSpec({task_id: task}).spec.evidence_floor_seq.review;
     s.env.FORGE_CODEX_BIN = codex;
-    const review = (role: string, ...more: string[]) => s.run([s.forge, "review", "--task", task, "--repo", "app", "--roles", role, "--backend", "codex", ...more], app);
+    const review = (role: string, ...more: string[]) => s.run([s.forge, "review", "--task", task, "--repo", "app", "--roles", role, "--model", "gpt-6.2-sol", "--effort", "medium", ...more], app);
     expect(review("performance").code).not.toBe(0);
     const scope = { task_id:task, repo:"app", branch:"main", sha:head, source:"tool" as const, actor:"tool" };
     const failure = db.recordEvidence({...scope, kind:"review", status:"fail", summary:"upstream transient failure",
@@ -315,9 +317,10 @@ for (const version of ["0.4", "0.5"] as const) test(`v${version} performance ret
 }, 30_000);
 
 
-for (const backend of ["codex", "api"]) test("invalid pinned finding line is a provider error via " + backend, async () => {
-  const result = await exercise(backend, "blocked", {roles: "quality", mode: "serial", findingLine: 900});
-  expect(result.code, result.err).toBe(2);
-  expect(JSON.parse(result.out).roles[0]).toMatchObject({backend, status:"error", findings:[],
-    attempts:[{backend,status:"error",reason:"Finding line exceeds the pinned file length"}]});
+test("an invalid pinned finding cannot complete the assigned chunk", async () => {
+  const backend = "codex";
+  const result = await exercise("blocked", {roles: "quality", mode: "serial", findingLine: 900});
+  expect(result.code, result.err).toBe(3);
+  expect(JSON.parse(result.out).roles[0]).toMatchObject({backend,status:"incomplete",findings:[],
+    missing_materials:[skillPath],attempts:[{backend,status:"incomplete",reason:expect.stringMatching(/location/i)}]});
 });

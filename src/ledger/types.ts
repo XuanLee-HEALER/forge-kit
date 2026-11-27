@@ -208,7 +208,6 @@ export interface RunbookRecord {
 export const VALID_ENDPOINTS = new Set<string>([
   "investigation",
   "local",
-  "fat",
   "pr",
   "prod",
 ]);

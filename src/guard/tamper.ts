@@ -13,6 +13,9 @@ import {
   hasUnquotedRedirect,
   splitShellSegments,
   splitShellTokens,
+  stripUnquotedShellRedirections,
+  resolveSegmentCwd,
+  unwrapShellPrefix,
 } from "../shared/shell";
 
 const LEDGER_HOOK_READONLY_INSPECTORS = new Set([
@@ -68,13 +71,27 @@ export function checkLedgerTamper(
   const cmd = extractShellCommand(input);
   if (!cmd) return null;
 
-  for (const seg of splitShellSegments(cmd)) {
+  const segments = splitShellSegments(cmd);
+  for (const [index, seg] of segments.entries()) {
     const toks = splitShellTokens(seg);
-    const paths = toks?.slice(1).filter(t=>!t.startsWith("-")).map(t=>canonicalizeMaybePath(resolve(baseWorkdir,t))) ?? [];
-    if (toks?.[0]?.split("/").pop() === "find" && toks.includes("-delete") && toks[1]?.startsWith("-")) paths.push(canonicalizeMaybePath(baseWorkdir));
-    const ancestor = (/\b(rm|mv|rmdir|cp|rsync|tar|unzip|ditto)\b/.test(seg) || (toks?.some(t=>t.split("/").pop()==="find") && toks.includes("-delete"))) && paths.some(path=>policyPath.startsWith(path+"/"));
-    const gitDiff = toks?.[0]==="git" && toks[1]==="diff" && toks.slice(2).every(t=>t==="--" || canonicalizeMaybePath(resolve(baseWorkdir,t))===policyPath) && !hasUnquotedRedirect(seg,">");
-    if ((seg.includes("ship-policy.yaml") || paths.includes(policyPath) || ancestor) && !(gitDiff || (toks && isReadonlyLedgerHookInspection(cmd,seg,toks)))) return "ship-policy.yaml requires an operator edit.";
+    const cwd = resolveSegmentCwd(segments, index, baseWorkdir);
+    const redirects: string[] = [];
+    const command = stripUnquotedShellRedirections(seg, redirects);
+    const words = splitShellTokens(command) ?? [];
+    const { bin, args, dirs } = unwrapShellPrefix(words);
+    const commandDir = resolve(cwd, ...dirs);
+    const paths = args.filter(t => !t.startsWith("-")).map(t => canonicalizeMaybePath(resolve(commandDir, t)));
+    const removesTree = ["rm", "mv", "rmdir", "rsync", "tar", "unzip", "ditto", "cp"].includes(bin ?? "") ||
+      (bin === "find" && args.includes("-delete"));
+    if (bin === "find" && args[0]?.startsWith("-")) paths.push(canonicalizeMaybePath(commandDir));
+    const ancestors = bin === "cp" || bin === "rsync" || bin === "ditto" ? paths.slice(-1) : paths;
+    const textOutput = (bin === "echo" || bin === "printf") && !/\$\(|`/.test(command);
+    const targetsPolicy = paths.includes(policyPath) || (!textOutput && command.includes(".workbench/ship-policy.yaml"));
+    const readsOnly = textOutput || isReadonlyLedgerHookInspection(command, command, words) ||
+      (bin === "git" && args[0] === "diff" && args.slice(1).every(t => t === "--" || canonicalizeMaybePath(resolve(commandDir, t)) === policyPath));
+    if (redirects.some(p => canonicalizeMaybePath(resolve(cwd, p)) === policyPath) ||
+        (removesTree && ancestors.some(p => policyPath.startsWith(p + "/"))) || (targetsPolicy && !readsOnly))
+      return "ship-policy.yaml requires an operator edit.";
     if (!cfg.guard.block_ledger_direct_edits) continue;
     if (toks) {
       const mentionsLedgerHook = toks.some((tok) => {

@@ -21,6 +21,7 @@ const cases = [
 ] as const;
 type Plan = {
   decisions: Record<string, string>;
+  fullDecision: {passed: string; blocker: string; newRisk: string};
   assignments: Record<"full"|"targeted", {implementation: string[]; tests: string[]; scheduling: string; frozenDocuments: string[]; canStartUnconfirmed: boolean; canStartBeforeFreeze: boolean}>;
 };
 type Job = {files: Record<string,string>; output: string; prompt: string};
@@ -107,12 +108,15 @@ try {
   const feature = s.read(".agents/skills/feature/SKILL.md");
   const facts = cases.map(([id,local,noCore,covered])=>({id,localAndSimple:local,preservesCoreAndContracts:noCore,mainAlreadyTestsIt:covered}));
   const schema = jsonObject({decisions:jsonObject(Object.fromEntries(cases.map(([id])=>[id,{enum:["full","targeted"]}]))),
+    fullDecision:jsonObject(Object.fromEntries(["passed","blocker","newRisk"].map(id=>[id,{enum:["freeze","revise","operator"]}]))),
     assignments:jsonObject({full:assignment,targeted:assignment})});
   const plan: Plan = JSON.parse(await session({title:"workflow classification",dir:authorRoom({}),role:"reviewer",schema,
     prompt:"Apply the following installed feature instructions to each independent case. Report the chosen track and the two post-freeze " +
       "author input lists and launch schedule for each track. Also identify what freezes and whether authors may start without confirmation or before freezing. Use only these document names: ssot.md, tech-spec.md, test-spec.md, scope.md. "+
-      "For launch schedule choose parallel, implementation-first, or tests-first.\n"+feature+"\nCases:\n"+JSON.stringify(facts)}));
+      "For launch schedule choose parallel, implementation-first, or tests-first. In full mode the operator already accepted the SSOT and authorized work. " +
+      "Choose the next action in three cases: passed means independent reviews passed with unchanged scope and risks; blocker means a fixable test gap; newRisk means a new decision about a business risk.\n"+feature+"\nCases:\n"+JSON.stringify(facts)}));
   for (const [id,,,,expected] of cases) assert.equal(plan.decisions[id],expected,"case "+id);
+  assert.deepEqual(plan.fullDecision,{passed:"freeze",blocker:"revise",newRisk:"operator"});
   observations.push({skillSha256:hash(feature),facts,plan});
   const ledger = (...args:string[])=>s.ok([s.forge,"ledger",...args]);
   for (const track of ["full","targeted"] as const) {
@@ -138,7 +142,7 @@ try {
     const docs: Record<string,string> = {};
     if (track==="full") {
       docs["ssot.md"]=contract;
-      ledger("decide",track,"--key","confirmed-ssot","--summary","Synthetic operator accepts the public normalization contract");
+      ledger("decide",track,"--key","confirmed-ssot","--summary","Synthetic operator accepts the public normalization contract and authorizes implementation");
       const [tech,tests]=await paired("specification",[
         {files:{...docs},output:"tech-spec.md",prompt:"Write a concise implementation specification for the contract. Name the file, export, and behavior; no extra requirements."},
         {files:{...docs},output:"test-spec.md",prompt:"Write a concise contract-test specification covering the given examples and public API; no extra requirements."},
@@ -150,7 +154,7 @@ try {
     } else docs["scope.md"]="Scope: update normalize.ts only. Main already tests normalized labels in existing.test.ts. Supplemental regression cases: "+contract;
     for (const [file,content] of Object.entries(docs)) s.privateFile(".workbench/specs/"+track+"/"+file,content);
     assert.notEqual(JSON.parse(ledger("spec-status",track)).state,"FROZEN");
-    ledger("decide",track,"--key","confirmed-spec","--summary","Synthetic operator accepts the scoped changes and cases");
+    if(track==="targeted") ledger("decide",track,"--key","confirmed-spec","--summary","Synthetic operator accepts the scoped changes and cases");
     ledger("freeze",track);
     const freeze = JSON.parse(ledger("spec-status",track));
     assert.equal(freeze.state,"FROZEN");

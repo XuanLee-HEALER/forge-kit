@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
 import { bootstrap, kit, sandbox } from "./v05-sandbox";
@@ -20,8 +20,24 @@ test("sync from v0.5 twice preserves private verification actions, decisions and
       "archive", "--format=tar", "--output", tar, baseline]);
     expect(digest(tar)).toBe(archiveDigest);
     s.ok(["tar", "-xf", tar, "-C", old]);
-    symlinkSync(join(kit, "node_modules"), join(old, "node_modules"));
-    symlinkSync(join(kit, "review-agents/node_modules"), join(old, "review-agents/node_modules"));
+    // The historical release requires its own dependencies, including its retired review SDK.
+    const bundles = [
+      [process.env.FORGE_V050_CLI_FIXTURE_FILE, "dist/cli.js", "b564cc71307e7181ee63c8828ca72c9be74edbacf7af871c3cc4f471b158cd3a"],
+      [process.env.FORGE_V050_REVIEW_FIXTURE_FILE, "review-agents/dist/review.js", "a4be4e07f2eef4b2814b0792d554d7513bff2638489084b7751d8feeb977aceb"],
+    ] as const;
+    if (bundles.some(([path]) => path !== undefined)) {
+      for (const [path, name, sha] of bundles) {
+        if (!path) throw Error("Supply both fixed v0.5.0 bundle fixtures");
+        mkdirSync(join(old, name, ".."), {recursive: true});
+        copyFileSync(path, join(old, name));
+        expect(digest(join(old, name))).toBe(sha);
+      }
+    } else {
+      s.env.BUN_INSTALL_CACHE_DIR = process.env.BUN_INSTALL_CACHE_DIR || join(process.env.HOME!, ".bun/install/cache");
+      s.ok(["bun", "install", "--offline", "--frozen-lockfile"], old);
+      s.ok(["bun", "run", "build"], old);
+    }
+    rmSync(join(old, "src"), {recursive: true});
     const oldCLI = join(old, "bin/forge");
     s.ok([oldCLI, "init", s.work]);
     const lockVersion = () => JSON.parse(s.read(".workbench/kit-lock.json")).kit_version;
@@ -44,7 +60,9 @@ test("sync from v0.5 twice preserves private verification actions, decisions and
     }}));
     const local = s.privateFile("AGENTS.local.md", "Private upgrade marker\n");
     const scope = s.privateFile(".workbench/specs/history/scope.md", "Record a non-Web project check.\n");
-    const files = [local, scope, config, script];
+    const policy = join(s.work, ".workbench/ship-policy.yaml");
+    expect(parse(readFileSync(policy, "utf8")).fast_track.forbid_db_rw).toBe(false);
+    const files = [local, scope, config, script, policy, join(s.work, ".workbench/models.toml")];
     const before = files.map(digest);
     const ledger = (...args: string[]) => s.ok([s.forge, "ledger", ...args]);
     ledger("open", "--id", "history", "--title", "Upgrade witness", "--repo", "app", "--branch", "development",
@@ -67,7 +85,7 @@ test("sync from v0.5 twice preserves private verification actions, decisions and
 
     for (let i = 0; i < 2; i++) {
       s.ok([bootstrap, "sync", s.work]);
-      expect(lockVersion()).toBe("0.5.1");
+      expect(lockVersion()).toBe(JSON.parse(readFileSync(join(kit, "package.json"),"utf8")).version);
       expect(files.map(digest)).toEqual(before);
       expect(snapshot()).toEqual(initial);
       expect(JSON.parse(s.ok([s.forge, "instance", "show", "action", "web", "--json"])).value).toMatchObject(webAction);

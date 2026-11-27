@@ -36,9 +36,9 @@ else if(group==="pr" && cmd==="view"){
     );
     writeFileSync(join(bin, "codex"), [
       "#!/usr/bin/env bun",
-      'const args = process.argv.slice(2);',
+      'const args = process.argv.slice(2); const request = JSON.parse(await Bun.stdin.text());',
       'if (!args.includes("--ephemeral") || args[args.indexOf("-s")+1] !== "read-only") process.exit(2);',
-      'await Bun.write(args[args.indexOf("-o")+1], JSON.stringify({status:"pass",summary:"Reviewed fixed release range",checked:[],limitations:[],findings:[]}));',
+      'await Bun.write(args[args.indexOf("-o")+1], JSON.stringify({status:"pass",summary:"Reviewed fixed release range",role:request.role,checked:request.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"})),limitations:[],findings:[]}));',
     ].join("\n"), {mode:0o755});
     const tsc=require.resolve("typescript/bin/tsc");
     writeFileSync(join(bin,"tsc"),"#!/usr/bin/env bun\nimport "+JSON.stringify(tsc)+";\n",{mode:0o755});

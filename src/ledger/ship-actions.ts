@@ -2,8 +2,7 @@
 // scripts, endpoints or Git identities before an executor claims an item.
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { atomicProtocol } from "../atomic-pr";
-import { prospectiveMerge, prospectiveMergeTree } from "../conditional-merge";
+import { prospectiveMergeTree } from "../ship-diff";
 import { loadDbEnvironments, loadWorkbenchConfig } from "../config";
 import { localPath, readRequired, resolveInstance } from "../instance";
 import { runGit } from "../git";
@@ -29,20 +28,17 @@ export interface DbTarget {
   client: string;
   clientSha256: string;
 }
-export function fatRef(dir: string) {
-  const ref = "refs/heads/fat",
-    r = runGit(dir, ["ls-remote", "--symref", "--exit-code", "origin", "HEAD", ref]);
-  const lines = r.stdout.trim().split("\n");
-  const defaultRef = lines.find((line) => line.startsWith("ref: ") && line.endsWith("\tHEAD"));
-  if (!defaultRef || defaultRef === "ref: " + ref + "\tHEAD")
-    throw Error("FAT target must be distinct from the verified remote default branch");
-  const [sha, name] = (lines.find((line) => line.endsWith("\t" + ref)) ?? "").split("\t");
-  if (r.code || name !== ref || !isOid(sha)) throw Error("Cannot verify origin refs/heads/fat");
-  return sha;
+export function remoteBranch(dir: string, ref: string) {
+  const result = runGit(dir, ["ls-remote", "--exit-code", "--refs", "origin", ref]);
+  const [oid, name] = result.stdout.trim().split("\t");
+  if (result.code || !isOid(oid) || name !== ref) throw Error("Cannot verify exact remote branch " + ref);
+  return oid;
 }
-export function checkFatProtection(root: string) {
-  const caps = loadWorkbenchConfig(root).guard.protected_branches;
-  if (caps.includes("fat") || caps.includes("refs/heads/fat")) throw Error("The FAT branch is protected");
+export function checkPushPermission(root: string, branch: string) {
+  const policy = loadWorkbenchConfig(root).guard;
+  const names = [branch, "refs/heads/" + branch];
+  if (names.some(n => policy.protected_branches.includes(n)) && !names.some(n => policy.allow_protected_ff.includes(n)))
+    throw Error("Protected branch requires explicit instance permission for exact fast-forward");
 }
 interface PinnedCommand {
   cwd: string;
@@ -51,16 +47,15 @@ interface PinnedCommand {
 }
 export type ShipAction =
   | {
-      kind: "fat";
+      kind: "push";
       repo: string;
       remote: "origin";
-      ref: "refs/heads/fat";
+      ref: string;
       baseOid: string;
       head: string;
-      targetOid: string;
       originHash: string;
     }
-  | { kind: "pr"; repo: string; number: number; url: string; head: string; base: string; baseOid: string; tree: string; atomicProtocol?: string }
+  | { kind: "pr"; repo: string; number: number; url: string; head: string; base: string; baseOid: string; tree: string }
   | { kind: "tag"; repo: string; tag: string; head: string }
   | { kind: "stage"; stage: string; target: string; execute: PinnedCommand; observe: PinnedCommand }
   | { kind: "sql"; target: DbTarget; path: string; sha256: string };
@@ -100,21 +95,19 @@ export function pinCheckouts(ledger: LedgerReader, task: string) {
     })
     .sort((a, b) => a.repo.localeCompare(b.repo) || a.branch.localeCompare(b.branch));
 }
-function deliveryStages(cfg: ReturnType<typeof resolveInstance>) {
+export function deliveryStages(cfg: ReturnType<typeof resolveInstance>) {
   return cfg.delivery.value.stages.map((id) => ({
     id,
     core: cfg.stages.get(id)?.source === "core" && id === "ship",
   }));
 }
 function requireTargetObservation(endpoint: string, actions: ShipAction[]) {
-  if (endpoint !== "fat" && endpoint !== "pr" && !actions.some((action) => action.kind === "stage"))
+  if (endpoint !== "push" && endpoint !== "pr" && !actions.some((action) => action.kind === "stage"))
     throw Error("A protected delivery endpoint requires a configured stage and independent target observer");
 }
 export function checkDeliveryDefinition(root: string, plan: ExactPlan) {
   const cfg = resolveInstance(root);
   requireTargetObservation(plan.endpoint, plan.actions);
-  if (plan.actions.some(a => a.kind === "pr" && a.atomicProtocol && !cfg.delivery.value.atomic_pr_hosts.includes(new URL(a.url).host)))
-    throw Error("Approved atomic PR host removed from instance delivery configuration");
   if (
     cfg.delivery.value.endpoint !== plan.endpoint ||
     canonicalJson(deliveryStages(cfg)) !== canonicalJson(plan.stages)
@@ -201,58 +194,35 @@ export function buildPlan(
   task: string,
   actions: RunbookActions,
   stages: string[],
-  fat: string[] = [],
+  pushes: string[] = [],
 ): ExactPlan {
   const pins = pinCheckouts(ledger, task);
   const cfg = resolveInstance(ledger.workbenchRoot);
   const sequence = deliveryStages(cfg);
-  if (cfg.delivery.value.endpoint === "fat") {
-    checkFatProtection(ledger.workbenchRoot);
-    if (
-      ledger.getTask(task)?.endpoint !== "fat" ||
-      sequence.length !== 1 ||
-      !sequence[0].core ||
-      stages.length ||
-      actions.prs.length ||
-      actions.tags.length ||
-      actions.sql_files.length ||
-      actions.kubectl_commands.length
-    )
-      throw Error("FAT endpoint permits only exact test-branch updates for a FAT task");
-    if (
-      new Set(pins.map((x) => x.repo)).size !== pins.length ||
-      canonicalJson([...fat].sort()) !== canonicalJson(pins.map((p) => p.repo + ":fat").sort())
-    )
-      throw Error("Register --fat <repo>:fat once for every attached repository");
-    const updates = pins.map((pin) => {
-      const row = ledger.getTaskRepos(task).find((r) => r.repo === pin.repo)!;
-      if (row.branch === "fat") throw Error("FAT delivery requires a separate source branch");
-      const { dir } = resolveTaskCheckout(ledger.workbenchRoot, row);
-      const get = (args: string[]) => runGit(dir, args).stdout.trim();
-      if (get(["remote", "get-url", "origin"]) !== get(["remote", "get-url", "--push", "origin"]))
-        throw Error("FAT fetch and push destinations must match");
-      const baseOid = fatRef(dir);
-      if (
-        runGit(dir, ["cat-file", "-e", baseOid + "^{commit}"]).code &&
-        runGit(dir, ["fetch", "--no-write-fetch-head", "--no-tags", "--refmap=", "origin", "refs/heads/fat"])
-          .code
-      )
-        throw Error("Fetch the live FAT commit before registering this action");
-      const targetOid = prospectiveMerge(dir, baseOid, pin.head);
-      return {
-        kind: "fat" as const,
-        repo: pin.repo,
-        remote: "origin" as const,
-        ref: "refs/heads/fat" as const,
-        head: pin.head,
-        baseOid,
-        targetOid,
-        originHash: pin.originHash,
-      };
+  if (pushes.length || cfg.delivery.value.endpoint === "push") {
+    if (cfg.delivery.value.endpoint !== "push" || ledger.getTask(task)?.endpoint !== "push" ||
+        stages.length || sequence.length !== 1 || !sequence[0].core ||
+        actions.prs.length || actions.tags.length || actions.sql_files.length || actions.kubectl_commands.length ||
+        pushes.length !== pins.length || new Set(pins.map(p => p.repo)).size !== pins.length)
+      throw Error("Exact push requires the configured push endpoint and one branch per repository");
+    const updates = pins.map(pin => {
+      const targets = pushes.filter(item => item.startsWith(pin.repo + ":"));
+      if (targets.length !== 1) throw Error("Expected --push <repo>:<branch> for " + pin.repo);
+      const branch = targets[0].slice(pin.repo.length + 1);
+      const ref = "refs/heads/" + branch;
+      const row = ledger.getTaskRepos(task).find(r => r.repo === pin.repo)!;
+      const {dir} = resolveTaskCheckout(ledger.workbenchRoot, row);
+      if (!branch || runGit(dir, ["check-ref-format", ref]).code) throw Error("Invalid push branch");
+      checkPushPermission(ledger.workbenchRoot, branch);
+      if (runGit(dir, ["remote", "get-url", "origin"]).stdout !== runGit(dir, ["remote", "get-url", "--push", "origin"]).stdout)
+        throw Error("Push and read destinations must match");
+      const baseOid = remoteBranch(dir, ref);
+      if (baseOid === pin.head || runGit(dir, ["merge-base", "--is-ancestor", baseOid, pin.head]).code)
+        throw Error("Exact push requires a strict fast-forward from the live remote value");
+      return {kind: "push" as const, repo: pin.repo, remote: "origin" as const, ref, head: pin.head, baseOid, originHash: pin.originHash};
     });
-    return { endpoint: "fat", pins, actions: updates, ci: [], stages: sequence };
+    return { endpoint: "push", pins, actions: updates, ci: [], stages: sequence };
   }
-  if (fat.length) throw Error("--fat requires the instance FAT endpoint");
   const expectedStages = sequence.filter((stage) => !stage.core).map((stage) => stage.id);
   if (canonicalJson(expectedStages) !== canonicalJson(stages))
     throw Error("Runbook must include the configured delivery stages in order: " + expectedStages.join(", "));
@@ -286,7 +256,6 @@ export function buildPlan(
       base: String(data.baseRefName),
       baseOid: String(data.baseRefOid),
       tree: prospectiveMergeTree(dir, data.baseRefOid, pin.head),
-      ...(cfg.delivery.value.atomic_pr_hosts.includes(new URL(data.url).host) && {atomicProtocol}),
     };
     ci.push(check);
     if (pr) items.push(check);

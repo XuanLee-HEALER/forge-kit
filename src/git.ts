@@ -89,7 +89,7 @@ export function runGit(
 
 /**
  * Locate git repo identity for any path, INCLUDING detached/external worktrees
- * (such as /tmp/fat-merge created via `git worktree add --detach` for FAT merge)
+ * (such as a temporary checkout created via `git worktree add --detach`)
  * as long as the canonical main repo checkout lives inside workbenchRoot.
  */
 export function locateRepo(
@@ -155,7 +155,7 @@ export function locateRepo(
 }
 
 /**
- * For a detached worktree (e.g. FAT merge commit), return HEAD and its direct parents
+ * For a detached worktree (e.g. an integration merge commit), return HEAD and its direct parents
  * so we can trace back to the feature branch commit bound to an OPEN ledger task.
  */
 export function getHeadAndParents(checkoutDir: string): string[] {

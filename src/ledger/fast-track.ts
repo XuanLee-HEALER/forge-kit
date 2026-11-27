@@ -1,7 +1,8 @@
-import type { ExactPlan } from "./ship-actions";
+import { deliveryStages, stagePin, type ExactPlan } from "./ship-actions";
+import { resolveInstance } from "../instance";
 import { randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
-import { canonicalRepoPath, loadShipPolicy, shipGlob, type ShipPolicy } from "../config";
+import { canonicalRepoPath, loadShipPolicy, loadWorkbenchConfig, shipGlob, type ShipPolicy } from "../config";
 import { runGit } from "../git";
 import { matchesGlob } from "../shared/path";
 import { resolveTaskCheckout } from "./checkout";
@@ -162,53 +163,92 @@ function ceiling(policy: ShipPolicy, to: string) {
 }
 function validateActionCeiling(policy: ShipPolicy, endpoint: Endpoint, plan: ExactPlan) {
   ceiling(policy, endpoint);
-  if (endpoint === "fat" && plan.actions.some(a => a.kind !== "fat"))
-    throw Error("FAT scope can only update the registered test branch");
+  if (endpoint === "fat" || plan.actions.some(a => !["pr", "push", "stage", "tag", "sql"].includes(a.kind)))
+    throw Error("Retired delivery action; register a supported instance stage");
   // Instance stages run arbitrary delivery writers with an independent target observer.
-  if (endpoint !== "prod" && plan.actions.some(a => ["stage", "tag", "sql"].includes(a.kind)))
+  const privateMerge = plan.endpoint === "pr" && plan.stages.some(stage => !stage.core && stage.id === "ship");
+  if (endpoint !== "prod" && plan.actions.some(a => a.kind === "tag" || a.kind === "sql" ||
+      (a.kind === "stage" && !(privateMerge && a.stage === "ship"))))
     throw Error("Deployment, tag or database writes require a production delivery endpoint");
   if (policy.forbid_db_rw && plan.actions.some(a => a.kind === "sql"))
     throw Error("Policy forbids database writes");
 }
+function frontDefinition(ledger: Ledger, task: string, endpoint: string) {
+  const cfg = resolveInstance(ledger.workbenchRoot);
+  if (ledger.getTask(task)?.endpoint !== endpoint || cfg.delivery.value.endpoint !== endpoint || endpoint === "push")
+    throw Error("Scope approval requires the registered task endpoint; use an exact runbook for push");
+  const stages = deliveryStages(cfg);
+  const commands = stages.filter(s => !s.core).map(s => stagePin(ledger.workbenchRoot, s.id));
+  if (endpoint !== "pr" && !commands.length) throw Error("Named endpoint requires a target observer");
+  const {protected_branches, allow_protected_ff} = loadWorkbenchConfig(ledger.workbenchRoot).guard;
+  return {endpoint, stages, commands, protected_branches, allow_protected_ff};
+}
+export function preparedScope(ledger: Ledger, e: Envelope) {
+  const record = ledger.getTaskEvents(e.task_id).find(ev =>
+    ev.event_type === "FAST_TRACK_PREPARED" && JSON.parse(ev.payload_json).envelope_id === e.envelope_id);
+  if (!record) throw Error("Missing original envelope preparation");
+  return {record, anchor: JSON.parse(record.payload_json)};
+}
 export function validateScope(ledger: Ledger, e: Envelope) {
-  const { policy, hash } = loadShipPolicy(ledger.workbenchRoot);
-  const { binding, plan } = exactRunbook(ledger, e);
-  validateActionCeiling(policy, e.target_endpoint, plan);
-  const snapshot = taskSnapshot(ledger, e.task_id);
-  if (
-    hash !== e.policy_hash ||
-    scopeHash(e, binding) !== e.scope_hash ||
-    e.freeze_seq !== snapshot.freeze_seq ||
-    e.spec_hashes_json !== snapshot.spec_hashes_json ||
-    e.base_shas_json !== snapshot.base_shas_json
-  )
-    throw Error("Policy, frozen scope or attachment bases changed");
+  const {policy, hash} = loadShipPolicy(ledger.workbenchRoot);
+  const {record, anchor} = preparedScope(ledger, e);
+  const front = anchor.mode === "frozen-scope-v1";
+  let binding: Binding;
+  if (front) {
+    ceiling(policy, e.target_endpoint);
+    binding = {endpoint: anchor.endpoint, runbook_id: "", actions_hash: sha256String(canonicalJson(frontDefinition(ledger, e.task_id, anchor.endpoint)))};
+    const bound = ledger.db.query("SELECT 1 FROM exact_ship_envelopes WHERE envelope_id=?").get(e.envelope_id);
+    const event = ledger.getTaskEvents(e.task_id).find(ev => ev.event_type === "SHIP_PLAN_BOUND" &&
+      JSON.parse(ev.payload_json).envelope_id === e.envelope_id);
+    if (bound || event) {
+      const realized = exactRunbook(ledger, e);
+      const proof = event && JSON.parse(event.payload_json);
+      if (!proof || realized.binding.actions_hash !== proof.actions_hash || realized.binding.runbook_id !== proof.runbook_id ||
+          realized.plan.endpoint !== anchor.endpoint || proof.endpoint !== anchor.endpoint ||
+          realized.plan.actions.some(a => a.kind !== "pr" && a.kind !== "stage")) throw Error("Resolved plan differs from its scope receipt");
+      validateActionCeiling(policy, e.target_endpoint, realized.plan);
+    }
+  } else {
+    const exact = exactRunbook(ledger, e);
+    validateActionCeiling(policy, e.target_endpoint, exact.plan);
+    binding = exact.binding;
+  }
+  const snap = taskSnapshot(ledger, e.task_id);
   const events = ledger.getTaskEvents(e.task_id);
-  const prepared = events.find(
-    (ev) =>
-      ev.event_type === "FAST_TRACK_PREPARED" && JSON.parse(ev.payload_json).envelope_id === e.envelope_id,
-  );
-  const anchor = prepared && JSON.parse(prepared.payload_json);
-  if (
-    !prepared ||
-    anchor.runbook_id !== binding.runbook_id ||
-    anchor.actions_hash !== binding.actions_hash ||
-    anchor.endpoint !== binding.endpoint ||
-    anchor.scope_hash !== e.scope_hash ||
-    anchor.base_shas_json !== e.base_shas_json ||
-    anchor.ttl_minutes !== e.ttl_minutes ||
-    events.some(
-      (ev) => {
-        if (ev.seq <= prepared.seq) return false;
+  if (hash !== e.policy_hash || scopeHash(e, binding) !== e.scope_hash ||
+      (!front && e.freeze_seq !== snap.freeze_seq) || e.spec_hashes_json !== snap.spec_hashes_json ||
+      e.base_shas_json !== snap.base_shas_json || anchor.runbook_id !== binding.runbook_id ||
+      anchor.actions_hash !== binding.actions_hash || anchor.endpoint !== binding.endpoint ||
+      anchor.scope_hash !== e.scope_hash || anchor.base_shas_json !== e.base_shas_json ||
+      anchor.ttl_minutes !== e.ttl_minutes ||
+      events.some(ev => {
+        if (ev.seq <= record.seq) return false;
         if (ev.event_type === "ENDPOINT_UPDATED") {
           const change = JSON.parse(ev.payload_json);
           return change.prev_endpoint !== change.endpoint;
         }
-        return ["TASK_CLOSED", "TASK_CANCELLED", "HANDOFF_RECORDED", "TASK_RESUMED"].includes(ev.event_type);
-      },
-    )
-  )
-    throw Error("Prepared scope is no longer current");
+        return ["TASK_CLOSED","TASK_CANCELLED","HANDOFF_RECORDED","TASK_RESUMED","SPEC_AMENDED","REPO_ATTACHED","REPO_DETACHED"].includes(ev.event_type);
+      }))
+    throw Error("Policy, frozen scope, endpoint or attachment bases changed");
+  if (front && snap.freeze_seq !== e.freeze_seq) {
+    const freezes = events.filter(ev => ev.event_type === "SPEC_FROZEN" && ev.seq >= e.freeze_seq);
+    if (!freezes.length || freezes[0].seq !== e.freeze_seq || freezes.at(-1)!.seq !== snap.freeze_seq)
+      throw Error("Missing frozen scope history");
+    let prior = JSON.parse(freezes[0].payload_json);
+    for (const ev of freezes.slice(1)) {
+      const next = JSON.parse(ev.payload_json);
+      if (canonicalJson(next.hashes) !== e.spec_hashes_json ||
+          canonicalJson(next.files) !== canonicalJson(prior.files) || next.spec_dir !== prior.spec_dir ||
+          (next.locked_test_globs.length === prior.locked_test_globs.length &&
+            Object.keys(next.locked_test_files).length === Object.keys(prior.locked_test_files).length) ||
+          prior.locked_test_globs.some((glob: string) => !next.locked_test_globs.includes(glob)) ||
+          ["locked_test_files", "locked_test_modes", "locked_test_blobs", "tracked_locked_tests", "locked_gitlinks"].some(key =>
+            Object.entries(prior[key] ?? {}).some(([path, value]) => !Object.hasOwn(next[key] ?? {}, path) ||
+              canonicalJson(next[key][path]) !== canonicalJson(value))))
+        throw Error("Frozen specification or existing test lock changed");
+      prior = next;
+    }
+  }
   return policy;
 }
 export function shipReceipts(ledger: Ledger, id: string) {
@@ -249,9 +289,9 @@ export function humanFastTrack(ledger: Ledger, id: string, session: string, appr
     if (!approve) return revoke(ledger, e, "Human revocation", session);
     if (e.status !== "PENDING") throw Error("Envelope is " + e.status);
     validateScope(ledger, e);
-    const { rb } = exactRunbook(ledger, e);
+    const rb = preparedScope(ledger, e).anchor.mode === "frozen-scope-v1" ? undefined : exactRunbook(ledger, e).rb;
     if (
-      rb.status !== "PENDING" &&
+      rb && rb.status !== "PENDING" &&
       !(
         rb.status === "APPROVED" &&
         rb.approved_session_id === session &&
@@ -262,9 +302,9 @@ export function humanFastTrack(ledger: Ledger, id: string, session: string, appr
     const now = Date.now(),
       approved = new Date(now).toISOString(),
       expires = new Date(
-        Math.min(now + 60000 * e.ttl_minutes, rb.expires_at ? Date.parse(rb.expires_at) : Infinity),
+        Math.min(now + 60000 * e.ttl_minutes, rb?.expires_at ? Date.parse(rb.expires_at) : Infinity),
       ).toISOString();
-    if (rb.status === "PENDING")
+    if (rb?.status === "PENDING")
       ledger.db
         .query(
           "UPDATE runbooks SET status='APPROVED',approved_session_id=?,approved_at=?,expires_at=? WHERE runbook_id=? AND status='PENDING'",
@@ -305,7 +345,13 @@ export function fastTrackCommand(ledger: Ledger, args: string[]) {
             [string]
           >("SELECT runbook_id, actions_hash, endpoint FROM exact_ship_envelopes WHERE envelope_id=?")
           .get(row.envelope_id);
-        return binding ? { ...row, ...binding, receipts: shipReceipts(ledger, row.envelope_id) } : row;
+        if (binding) return {...row, ...binding, receipts: shipReceipts(ledger, row.envelope_id)};
+        const prepared = ledger.getTaskEvents(row.task_id).find(ev => ev.event_type === "FAST_TRACK_PREPARED" &&
+          JSON.parse(ev.payload_json).envelope_id === row.envelope_id);
+        const scope = prepared && JSON.parse(prepared.payload_json);
+        if (scope?.mode === "frozen-scope-v1") return {...row, mode: scope.mode, endpoint: scope.endpoint,
+          max_files_changed: scope.max_files_changed, max_lines_changed: scope.max_lines_changed};
+        return row;
       });
   }
   const [id, ...flags] = rest;
@@ -330,19 +376,26 @@ export function fastTrackCommand(ledger: Ledger, args: string[]) {
       },
     });
     const { policy, hash } = loadShipPolicy(ledger.workbenchRoot);
-    const rb = v.runbook && ledger.getRunbook(v.runbook);
-    if (
-      !rb ||
-      rb.task_id !== id ||
-      !["APPROVED", "PENDING"].includes(rb.status) ||
-      rb.actions_hash !== sha256String(rb.actions_json)
-    )
-      throw Error("Expected --runbook with exact pending or approved actions for this task");
-    const plan: ExactPlan = JSON.parse(rb.actions_json).exact;
-    if (!plan?.actions.length || plan.endpoint !== v.to)
-      throw Error(`Runbook must bind the exact requested endpoint; use forge ledger runbook create --exact --task ${id} and approve the new plan`);
-    const target_endpoint: Endpoint = v.to === "pr" || v.to === "fat" ? v.to : "prod";
-    validateActionCeiling(policy, target_endpoint, plan);
+    const endpoint = v.to || ledger.getTask(id)?.endpoint;
+    if (!endpoint) throw Error("Missing delivery endpoint");
+    const rb = v.runbook ? ledger.getRunbook(v.runbook) : null;
+    if (v.runbook && (!rb || rb.task_id !== id || !["APPROVED","PENDING"].includes(rb.status) ||
+        rb.actions_hash !== sha256String(rb.actions_json)))
+      throw Error("Expected an exact runbook for this task");
+    const plan: ExactPlan | undefined = rb && JSON.parse(rb.actions_json).exact;
+    const target_endpoint: Endpoint = ["pr","push"].includes(endpoint) ? "pr" : "prod";
+    let binding: Binding;
+    if (rb) {
+      if (!plan?.actions.length || plan.endpoint !== endpoint) throw Error("Runbook must bind the requested endpoint");
+      validateActionCeiling(policy, target_endpoint, plan);
+      binding = {runbook_id: rb.runbook_id, actions_hash: rb.actions_hash, endpoint};
+    } else {
+      ceiling(policy, target_endpoint);
+      const definition = frontDefinition(ledger, id, endpoint);
+      if (target_endpoint !== "prod" && definition.commands.some(stage => stage.stage !== "ship"))
+        throw Error("Deployment requires production authorization");
+      binding = {runbook_id: "", actions_hash: sha256String(canonicalJson(definition)), endpoint};
+    }
     const snap = taskSnapshot(ledger, id);
     const repos =
       v.repos === undefined
@@ -376,11 +429,7 @@ export function fastTrackCommand(ledger: Ledger, args: string[]) {
       freeze_seq: snap.freeze_seq,
       policy_hash: hash,
     };
-    const scope = scopeHash(e, {
-        runbook_id: rb.runbook_id,
-        actions_hash: rb.actions_hash,
-        endpoint: plan.endpoint,
-      }),
+    const scope = scopeHash(e, binding),
       ts = nowIso();
     ledger.db
       .query(
@@ -401,24 +450,15 @@ export function fastTrackCommand(ledger: Ledger, args: string[]) {
         ts,
         ts,
       );
-    ledger.db
-      .query(
-        "INSERT INTO exact_ship_envelopes(envelope_id, runbook_id, actions_hash, endpoint) VALUES (?,?,?,?)",
-      )
-      .run(e.envelope_id, rb.runbook_id, rb.actions_hash, plan.endpoint);
+    if (rb) ledger.db.query("INSERT INTO exact_ship_envelopes(envelope_id,runbook_id,actions_hash,endpoint) VALUES (?,?,?,?)")
+      .run(e.envelope_id, rb.runbook_id, rb.actions_hash, endpoint);
     trackEvent(ledger, e, "FAST_TRACK_PREPARED", {
-      runbook_id: rb.runbook_id,
-      actions_hash: rb.actions_hash,
-      endpoint: plan.endpoint,
-      scope_hash: scope,
-      base_shas_json: snap.base_shas_json,
-      ttl_minutes: ttl,
+      ...binding, ...(!rb && {mode: "frozen-scope-v1"}), scope_hash: scope, base_shas_json: snap.base_shas_json,
+      max_files_changed: policy.max_files_changed, max_lines_changed: policy.max_lines_changed, ttl_minutes: ttl,
     });
     return {
-      ...envelope(ledger, e.envelope_id),
-      runbook_id: rb.runbook_id,
-      actions: plan.actions,
-      endpoint: plan.endpoint,
+      ...envelope(ledger, e.envelope_id), endpoint, runbook_id: rb?.runbook_id, actions: plan?.actions,
+      max_files_changed: policy.max_files_changed, max_lines_changed: policy.max_lines_changed,
       approval: "快轨批准 " + e.envelope_id,
     };
   });

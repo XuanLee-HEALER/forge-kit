@@ -25,7 +25,7 @@ export async function runLedgerCli(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   const USAGE = `Usage: forge ledger <command> [options]
 Commands:
-  open         --id <id> --title <title> --endpoint <investigation|local|fat|pr|prod> --depth <targeted|full> [--repo <r> --branch <b> --base <sha> --head <sha> --worktree <p>]
+  open         --id <id> --title <title> --endpoint <investigation|local|pr|prod|instance-endpoint> --depth <targeted|full> [--repo <r> --branch <b> --base <sha> --head <sha> --worktree <p>]
   attach       <task_id> --repo <r> --branch <b> [--base <sha> --head <sha> --worktree <p>]
   detach       <task_id> --repo <r> --branch <b> [--reason <text>]
   reopen       <task_id> [--endpoint <ep>] [--depth <d>] [--reason <text>]
@@ -35,7 +35,7 @@ Commands:
   spec-status <task_id>
   decide      <task_id> --key <k> --summary <text> [--supersedes <seq>]
   blocker   <task_id> <open|close> --id <bid> --summary <text>
-  record    <task_id> --kind <fat|prod|verify|deploy|smoke|manual|note> --status <pass|fail|fallback|info> --summary <text> [--repo <r> --branch <b> --sha <sha> --meta <json>]
+  record    <task_id> --kind <prod|verify|deploy|smoke|manual|note> --status <pass|fail|fallback|info> --summary <text> [--repo <r> --branch <b> --sha <sha> --meta <json>]
   reviews <task_id>
   review-native --task <id> --repo <repo> --base <ref> [--branch <branch>]  (v0.4 tasks only)
   pr-sync <task_id> --repo <repo> [--pr <number-or-url>] [--branch <branch>]
@@ -43,7 +43,7 @@ Commands:
   exempt    --repo <r> --branch <b> --reason <text> [--sha <sha> --ttl-hours <n>]
   status    [--task <id>] [--repo <r> --branch <b>] [--json]
   query     [--q <fts>] [--repo <r>] [--status <OPEN|HANDED_OFF|CLOSED|CANCELLED>] [--since <iso>] [--json]
-  fast-track prepare <task_id> --to <endpoint> --paths <globs> --runbook <rb-id> [--repos <repos>] [--ttl <minutes>]
+  fast-track prepare <task_id> --to <endpoint> --paths <globs> [--runbook <rb-id>] [--repos <repos>] [--ttl <minutes>]
   fast-track status [<id>] [--task <task_id>]
   fast-track revoke <id> [--reason <reason>] (PENDING)
   ACTIVE: send "快轨撤销 <id>" as the entire message in the approving root session.
@@ -377,7 +377,7 @@ Commands:
       if (!task_id || !values.kind || !values.summary) {
         throw new Error("Usage: forge ledger record <task_id> --kind <k> --status <s> --summary <text>");
       }
-      const manualKinds = ["fat", "prod", "verify", "deploy", "smoke", "manual", "note"] as const;
+      const manualKinds = ["prod", "verify", "deploy", "smoke", "manual", "note"] as const;
       const kind = manualKinds.find(kind => kind === values.kind);
       if (!kind) throw new Error("forge ledger record accepts manual attestations only; run the actual verification or review tool for executable evidence.");
       const parsedMeta = values.meta ? JSON.parse(values.meta) : {};
@@ -571,7 +571,7 @@ Commands:
                    Pass each custom delivery stage as --stage <id> in declared order.
                    Register Kubernetes operations as versioned instance stages.
                    Production endpoints may also register an exact --tag or --sql.
-    FAT task: use --exact --task <id> --fat <repo>:fat for each attached repository. The only destination is refs/heads/fat.
+    Fast-forward: use --exact --task <id> --push <repo>:<branch> for each attached repository at the configured push endpoint.
     Example: forge ledger runbook create --exact --task fix-1 --title "Merge reviewed change" --pr api:42
   show     <runbook_id>
   list     [--status <PENDING|APPROVED|COMPLETED|REVOKED>]
@@ -593,7 +593,7 @@ Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <ru
             kubectl: { type: "string", multiple: true },
             exact: { type: "boolean" },
             stage: { type: "string", multiple: true },
-            fat: { type: "string", multiple: true },
+            push: { type: "string", multiple: true },
           },
         });
         if (!values.title) throw new Error("Usage: forge ledger runbook create --title <text> ...");
@@ -619,12 +619,12 @@ Note: Approval is NEVER a CLI action; the user confirms in chat with "批准 <ru
           return { host: spec.slice(0, idx), path: spec.slice(idx + 1), sha256: "" };
         });
         if (values.exact && !values.task) throw Error("--exact requires --task <id>");
-        if ((values.stage || values.fat) && !values.exact) throw Error("--stage and --fat require --exact --task <id>");
+        if ((values.stage || values.push) && !values.exact) throw Error("--stage and --push require --exact --task <id>");
         if (values.exact && values.kubectl?.length) throw Error("Register exact Kubernetes operations via --stage <id>");
         const rec = ledger.createRunbook({
           runbook_id: values.id,
           task_id: values.task,
-          ...(values.exact && {exact_stages: values.stage ?? [],exact_fat:values.fat ?? []}),
+          ...(values.exact && {exact_stages: values.stage ?? [],exact_push:values.push ?? []}),
           title: values.title,
           actions: {
             tags,

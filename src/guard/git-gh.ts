@@ -181,7 +181,7 @@ export function checkGitPhysicalFuse(
       }
       const resource = pathname.replace(/\/{2,}/g, "/").replace(/^\/api\/v3\//i, "/")
         .replace(/^\/repos\/[^/]+\/[^/]+\//i, "/").replace(/^\//, "");
-      const sensitive = /^(?:pulls|git\/refs|merges|releases|forge\/atomic-pr\/v1\/pulls)(?:[/?#]|$)/i.test(resource);
+      const sensitive = /^(?:pulls|git\/refs|merges|releases)(?:[/?#]|$)|\/pulls\/\d+\/merge\/?$/i.test(resource);
       if (/(?:^|\/)graphql\/?$/i.test(pathname)) {
         const queries = fields.filter(f => f.startsWith("query="));
         const query = queries[0]?.slice(6) ?? "";
@@ -312,7 +312,7 @@ export function checkGitPhysicalFuse(
           return `物理保险丝：禁止未批准推送生产发布 tag (${refspec})，请先用 \`forge ledger runbook create\` 生成发版单并经用户在对话中回复「批准 <runbook_id>」后再推送。`;
         }
         if (protectedBranches.has(cleanRef)) {
-          return `物理保险丝：禁止直接推送到受保护主分支 (${cleanRef})，请提 PR 由用户合并。`;
+          return `物理保险丝：禁止直接推送到受保护主分支 (${cleanRef})，请使用受控交付入口登记目标分支和精确快进授权。`;
         }
       }
       // Implicit push (`git push` or `git push origin`) -> inspect current checkout branch
@@ -323,7 +323,7 @@ export function checkGitPhysicalFuse(
       if (!refspecs.length && targetDir) {
         const loc = locateRepo(workbenchRoot, targetDir);
         if (loc && protectedBranches.has(loc.branch)) {
-          return `物理保险丝：当前位于受保护主分支 (${loc.branch})，禁止隐式直接推送，请提 PR 由用户合并。`;
+          return `物理保险丝：当前位于受保护主分支 (${loc.branch})，禁止隐式直接推送，请使用受控交付入口登记目标分支和精确快进授权。`;
         }
       }
       if (isForce && refspecs.length === 0) {

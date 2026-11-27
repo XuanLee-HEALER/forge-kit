@@ -3,7 +3,6 @@ import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
 import { findWorkbenchRoot, loadWorkbenchConfig } from "./config";
 import { listWorkbenchRepos, runGit, runProcess } from "./git";
-import { fatMerge } from "./ledger/fat-merge";
 import { Ledger } from "./ledger";
 
 export interface WorktreeInfo {
@@ -31,7 +30,7 @@ export interface RepoGitFact {
   }> | null;
 }
 
-const DEFAULT_KEEP_RE = "^(main|master|fat)$";
+const DEFAULT_KEEP_RE = "^(main|master)$";
 
 export function collectGitFacts(
   workbenchRoot: string,
@@ -108,7 +107,7 @@ export function collectGitFacts(
     const busyBranches = new Set(
       wts.map((w) => w.branch).filter((b): b is string => Boolean(b)),
     );
-    const keep = new Set([defaultBranch, "fat", "HEAD", ...cfg.guard.protected_branches]);
+    const keep = new Set([defaultBranch, "HEAD", ...cfg.guard.protected_branches, ...cfg.guard.allow_protected_ff].map(branch => branch.replace(/^refs\/heads\//, "")));
     const fmt =
       "--format=%(refname:short)|%(authoremail:trim)|%(committerdate:short)|%(objectname)";
 
@@ -250,8 +249,17 @@ function loadProtectedOpenTaskRefs(workbenchRoot: string): {
   const worktrees = new Set<string>();
   const ledgerPath = join(workbenchRoot, ".workbench", "ledger", "ledger.sqlite");
   if (!existsSync(ledgerPath)) return { branches, worktrees };
-  const ledger = new Ledger(workbenchRoot);
+  const ledger = new Ledger(workbenchRoot, {readonly: true});
   try {
+    if (ledger.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runbooks'").get()) {
+      // Preserve exact branch destinations recorded by existing and historical executors.
+      const registered = ledger.db.query<{repo:string; ref:string}, []>(
+        `SELECT DISTINCT json_extract(action.value,'$.repo') AS repo, json_extract(action.value,'$.ref') AS ref
+         FROM runbooks, json_each(actions_json,'$.exact.actions') AS action
+         WHERE json_extract(action.value,'$.remote')='origin' AND json_extract(action.value,'$.ref') LIKE 'refs/heads/%'`
+      ).all();
+      for (const {repo,ref} of registered) branches.add(repo + ":" + ref.slice("refs/heads/".length));
+    }
     for (const task of ledger.db.query<{ task_id: string }, []>("SELECT task_id FROM tasks WHERE status IN ('OPEN','HANDED_OFF')").all()) {
       for (const r of ledger.getTaskRepos(task.task_id)) {
         branches.add(`${r.repo}:${r.branch}`);
@@ -290,7 +298,7 @@ export function sweepMergedBranches(
     : workbenchRoot;
   const cfg = loadWorkbenchConfig(canonicalRoot);
   const keepRe = new RegExp(opts.keepPattern || DEFAULT_KEEP_RE);
-  const protectedBranches = new Set(cfg.guard.protected_branches);
+  const protectedBranches = new Set([...cfg.guard.protected_branches, ...cfg.guard.allow_protected_ff].map(branch => branch.replace(/^refs\/heads\//, "")));
   const sweepLog = join(canonicalRoot, ".workbench", "sweep-log.jsonl");
   const openProtected = loadProtectedOpenTaskRefs(canonicalRoot);
 
@@ -464,8 +472,7 @@ export function runWbGitCli(): void {
   const [cmd, ...rest] = process.argv.slice(2);
   const root = findWorkbenchRoot();
   if (!cmd || cmd === "--help" || cmd === "-h") {
-    console.log(`Usage: forge git <status|sweep|fat-merge> [options]
-  fat-merge <repo> <feature-branch> [--task ID] [--fat-branch fat] [--cherry-pick] [--no-push] [--verify-cmd COMMAND]
+    console.log(`Usage: forge git <status|sweep> [options]
   status [--prs] [--json] [--repo <name>] [--all-discovered]
   sweep  [--apply] [--repo <name>] [--keep <regex>] [--no-fetch] [--all-discovered]`);
     process.exit(0);
@@ -487,14 +494,6 @@ export function runWbGitCli(): void {
     });
     if (values.json) console.log(JSON.stringify(facts, null, 2));
     else printGitFacts(facts);
-  } else if (cmd === "fat-merge") {
-    const {values, positionals} = parseArgs({args:rest, allowPositionals:true, options:{
-      task:{type:"string"}, "verify-cmd":{type:"string"}, "fat-branch":{type:"string", default:"fat"}, "cherry-pick":{type:"boolean"}, "no-push":{type:"boolean"}
-    }});
-    if (positionals.length !== 2) throw Error("Expected <repo> <feature-branch>");
-    const ledger = new Ledger(root);
-    try { console.log(JSON.stringify(fatMerge(ledger,positionals[0],positionals[1],values["fat-branch"]!,values.task,values["cherry-pick"],values["no-push"],values["verify-cmd"]))); }
-    finally { ledger.closeDb(); }
   } else if (cmd === "sweep") {
     const { values } = parseArgs({
       args: rest,

@@ -58,15 +58,12 @@ export function diffScope(
   return lines;
 }
 // Simulate the merge in a temporary object store, preserving the caller's refs, index and objects.
-export function inspectMerge(
-  repo: string,
+export function prospectiveMergeTree(
   dir: string,
   target: string,
   head: string,
-  check: ReturnType<typeof deliveryDiff>,
 ) {
   if (!runGit(dir, ["merge-base", "--is-ancestor", target, head]).code) {
-    check(repo, dir, target, head);
     return git(dir, ["rev-parse", head + "^{tree}"]).trim();
   }
   const original = git(dir, ["rev-parse", "--path-format=absolute", "--git-path", "objects"]).trim();
@@ -79,18 +76,8 @@ export function inspectMerge(
     };
     const result = git(dir, ["merge-tree", "--write-tree", target, head], env).trim();
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(result)) throw Error("Cannot verify prospective merge tree");
-    check(repo, dir, target, result, env);
     return result;
   } finally {
     rmSync(objects, { recursive: true, force: true });
   }
-}
-export function deliveryDiff(policy: ShipPolicy, paths: string[]) {
-  const files = new Set<string>();
-  let lines = 0;
-  return (repo: string, dir: string, from: string, to: string, env?: Record<string, string | undefined>) => {
-    lines += diffScope(dir, { repo, base_sha: from }, to, true, paths, policy, files, env);
-    if (files.size > policy.max_files_changed || lines > policy.max_lines_changed)
-      throw Error("Delivery diff exceeds policy cap");
-  };
 }

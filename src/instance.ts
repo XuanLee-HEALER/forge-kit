@@ -1,6 +1,8 @@
+import { enterVerificationScope } from "./verification-scope";
+import { defaultVerificationTimeout, VerificationLog, verificationLogDirectory } from "./verification-log";
 import { createHash } from "node:crypto";
 import { findKitRoot } from "./kit-root";
-import { accessSync, constants, existsSync, lstatSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync, readFileSync, statSync, writeSync } from "node:fs";
 import { basename, isAbsolute, join, normalize, relative } from "node:path";
 import { parse } from "yaml";
 import { locateRepo } from "./git";
@@ -226,22 +228,21 @@ export function resolveInstance(root: string, kitRoot?: string) {
   }
   const v = section("verification"),
     d = section("delivery");
-  known(v, ["environment", "stages"], loc + ".verification");
+  function positiveInteger(field: string, fallback: number, max: number) {
+    const value = v[field] === undefined ? fallback : v[field];
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > max)
+      throw Error(loc + ".verification." + field + " must be a positive integer up to " + max);
+    return value;
+  }
+  known(v, ["environment", "stages", "timeout_ms", "failure_log_retention_days"], loc + ".verification");
   known(d, ["endpoint", "stages", "atomic_pr_hosts"], loc + ".delivery");
-  const atomicHosts = d.atomic_pr_hosts === undefined ? [] : d.atomic_pr_hosts;
-  const validAuthority = (value: unknown) => {
-    if (typeof value !== "string" || !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*(?::[1-9][0-9]{0,4})?$/.test(value))
-      return false;
-    const url = URL.parse("https://" + value);
-    return url !== null && url.hostname !== "github.com" && url.host === value;
-  };
-  if (!Array.isArray(atomicHosts) || !atomicHosts.every(validAuthority))
-    throw Error(loc + ".delivery.atomic_pr_hosts must list canonical HTTPS authorities (host or host:port) supporting forge.atomic-pr.v1");
   const verification = {
     kind: "verification",
     id: "default",
     source: ext.verification === undefined ? "core" : file,
     value: {
+      timeout_ms: positiveInteger("timeout_ms", defaultVerificationTimeout, 2_147_483_647),
+      failure_log_retention_days: positiveInteger("failure_log_retention_days", 7, Number.MAX_SAFE_INTEGER),
       environment: str(v.environment === undefined ? "isolated" : v.environment, loc + ".verification.environment"),
       stages: stageRefs(v.stages, ["verify"], "verification"),
     },
@@ -253,7 +254,6 @@ export function resolveInstance(root: string, kitRoot?: string) {
     value: {
       endpoint: str(d.endpoint === undefined ? "pr" : d.endpoint, loc + ".delivery.endpoint"),
       stages: stageRefs(d.stages, ["ship"], "delivery"),
-      atomic_pr_hosts: atomicHosts as string[],
     },
   };
   const overrides = section("skills");
@@ -329,7 +329,7 @@ export function verificationStageCwd(root: string, repo: string, checkout: strin
 export function runInstanceStage(
   root: string,
   id: string,
-  verification?: { checkout: string; head: string; repo: string; env: NodeJS.ProcessEnv; config?: ReturnType<typeof resolveInstance> },
+  verification?: { checkout: string; head: string; task: string; repo: string; log: VerificationLog; env: NodeJS.ProcessEnv; config?: ReturnType<typeof resolveInstance> },
   onOutput?: (stdout: Uint8Array, stderr: Uint8Array) => void,
 ) {
   const cfg = verification?.config ?? resolveInstance(root),
@@ -345,8 +345,7 @@ export function runInstanceStage(
     deliveryPurposes.has(action.value.purpose) || /ship|deploy|deliver|release|prod.write/i.test(action.value.purpose)
   )
     throw Error(`Stage ${id} requires the authorized forge ship executor`);
-  if (process.env.FORGE_ACTIVE_STAGE)
-    throw Error(`Recursive stage invocation: ${process.env.FORGE_ACTIVE_STAGE} -> ${id}`);
+  const scopes = enterVerificationScope(root, {stage: id, task: verification?.task, head: verification?.head}, verification?.env);
   const { argv, cwd } = action.value;
   let directory: string;
   if (verification) {
@@ -359,15 +358,11 @@ export function runInstanceStage(
       ? verificationStageCwd(root, repo, current?.repo === repo ? current.checkoutDir : localPath(root, repo), cwd, cfg.repos)
       : localPath(root, cwd);
   }
-  const proc = Bun.spawnSync([...argv, ...stage.value.options], {
-    cwd: directory,
-    stdin: "ignore",
-    stdout: onOutput ? "pipe" : "inherit",
-    stderr: onOutput ? "pipe" : "inherit",
-    env: {
+  const env = {
       PATH: process.env.PATH,
       LANG: process.env.LANG,
       ...verification?.env,
+      FORGE_VERIFICATION_SCOPES: scopes,
       FORGE_ACTIVE_STAGE: id,
       ...(cfg.verification.value.stages.includes(id) ? {FORGE_VERIFY_ENVIRONMENT:cfg.verification.value.environment}:{}),
       ...(verification ? { FORGE_VERIFY_HEAD: verification.head } : {}),
@@ -375,8 +370,22 @@ export function runInstanceStage(
         FORGE_VERIFY_CHECKOUT: verification.checkout,
         FORGE_VERIFY_SHA: verification.head,
       }),
-    },
-  });
-  if (onOutput) onOutput(proc.stdout ?? new Uint8Array(), proc.stderr ?? new Uint8Array());
-  return proc.exitCode ?? 1;
+  };
+  const command = [...argv, ...stage.value.options];
+  if (action.value.purpose !== "verify" && !verification)
+    return Bun.spawnSync(command, {cwd: directory, env, stdin: "ignore", stdout: "inherit", stderr: "inherit"}).exitCode ?? 1;
+  const settings = cfg.verification.value;
+  const log = verification?.log ?? new VerificationLog(verificationLogDirectory(root, settings.failure_log_retention_days));
+  try {
+    const result = log.run(command, directory, env, settings.timeout_ms);
+    if (onOutput) log.read(0, chunk => onOutput(chunk, Buffer.alloc(0)));
+    if (!verification) {
+      if (!result.code && !onOutput) log.read(0, chunk => writeSync(1, chunk));
+      const meta = log.finish(result.code !== 0);
+      if (result.code) console.error(id, "exit", result.code, meta.output_excerpt, meta.log_path);
+    }
+    return result.code;
+  } finally {
+    if (!verification) log.dispose();
+  }
 }

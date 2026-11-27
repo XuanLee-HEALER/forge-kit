@@ -1,8 +1,9 @@
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { defaultVerificationTimeout, type VerificationLog } from "./verification-log";
 import { runVerificationProcess } from "./verification-process";
 import { hasNonExecutingGoFlags } from "./shared/go";
-import { splitShellTokens } from "./shared/shell";
+export { isPytestInfoSwitch } from "./verification-test-summary";
 import { parseArgs } from "node:util";
 import { runProcess } from "./git";
 
@@ -128,72 +129,18 @@ export function detectRepoLanguages(targetDir: string): CheckLanguage[] {
   return langs;
 }
 
-export function isPytestInfoSwitch(arg: string): boolean {
-  // pytest accepts grouped switches, including -VV for verbose version information.
-  return /^-[qvsxl]*[Vh]/.test(arg);
-}
-
-export function zeroTestRun(bin: string, code: number, output: string) {
-  const delegated = bin === "bun";
-  // In delegated runs use the underlying runner's summary, not just the manager's name.
-  const collected = /^\s*(?:=+\s*)?(?:no|\d+(?:\/\d+)?)\s+tests?\s+collected(?:\s+in|\s+\(|\s*=+\s*$|\s*$)/im.test(output);
-  const pytestInfo = /^(?:This is pytest version \S+, imported from .+|pytest \d+\.\d+\S*|usage: (?:pytest|py\.test) \[options\].*)$/m.test(output);
-  const pytestOutput = collected || pytestInfo || /(?:^|\n)>\s+[^\n]*\bpytest\b|^platform .+ -- Python .+pytest-/m.test(output);
-  if (bin === "pytest" || (delegated && pytestOutput)) {
-    const options = splitShellTokens(process.env.PYTEST_ADDOPTS ?? "");
-    const nonExecuting = new Set(["--collect-only","--collectonly","--co","--setup-only","--setuponly","--setup-plan","--setupplan",
-      "--markers","--fixtures","--funcargs","--fixtures-per-test","--version","--help","-V","-h"]);
-    if (code === 5) return true;
-    if (code !== 0) return false;
-    const executed = /^\s*(?:=+\s*)?\d+ passed\b/m.test(output) || /^\s*[1-9]\d* pass\s*$/m.test(output);
-    if (pytestInfo && !executed) return true;
-    if (!options || options.some(a => nonExecuting.has(a.split("=")[0]) || isPytestInfoSwitch(a)) || collected) return true;
-  }
-  if (delegated && code === 5 && /no tests (?:ran|collected)/i.test(output)) return true;
-  if (code !== 0) return false;
-  if (bin === "cargo" || delegated) {
-    const summaries = [...output.matchAll(/^\s*(?:test result: [^\n]*?\b)?(\d+)\s+passed;\s*(\d+)\s+failed\b/gm)];
-    if (summaries.length) return summaries.every(match => Number(match[1]) + Number(match[2]) === 0);
-    const zero = /^\s*running 0 tests\b/m.test(output);
-    const ran = /^\s*running [1-9]\d* tests?\b/m.test(output);
-    if (zero || ran) return zero && !ran;
-  }
-  if (delegated) {
-    if (/^# tests 0\s*$/m.test(output) || (/^# pass 0\s*$/m.test(output) && /^# fail 0\s*$/m.test(output))) return true;
-  }
-  if (bin === "go" || delegated) {
-    let skipped = false, ran = false;
-    for (const line of output.split("\n")) {
-      if (/^(?:ok\s|\?\s)/.test(line) && /\[no (?:test files|tests to run)\]\s*$/.test(line)) skipped = true;
-      else if (/^ok\s+\S|^\s*--- PASS:/.test(line)) ran = true;
-      if (!line.startsWith("{") || !line.includes('"Package"')) continue;
-      try {
-        const event = JSON.parse(line);
-        if (typeof event.Package !== "string") continue;
-        if (event.Action === "pass" && event.Test) ran = true;
-        if (event.Action === "skip" || /\[no (?:test files|tests to run)\]\s*$/.test(event.Output ?? "")) skipped = true;
-      } catch { /* A delegated runner can also emit unrelated JSON. */ }
-    }
-    if (bin === "go" || skipped || ran) return !ran;
-  }
-  if (!delegated || /^\s*[1-9]\d* pass\s*$/m.test(output)) return false;
-  return (/^\s*0 pass\s*$/m.test(output) && /^\s*0 fail\s*$/m.test(output)) ||
-    /^\s*(?:Ran\s+)?0 tests?(?: across \d+ files?\.?)?\s*$/im.test(output);
-}
-
 type OutputObserver = (phase: "static" | "dynamic", stdout: Uint8Array, stderr: Uint8Array) => void;
 
 function executeCheck(
-  baseEnv: NodeJS.ProcessEnv | undefined,
-  onOutput: OutputObserver | undefined,
+  options: CheckOptions,
   language: CheckLanguage,
   phase: "static" | "dynamic",
   name: string,
   argv: string[],
   cwd: string,
   extraEnv?: Record<string, string>,
-  timeoutMs = 120_000,
 ): LangCheckItem {
+  const {onOutput, baseEnv} = options;
   const bin = basename(argv[0]);
   const blocked = (bin === "go" && hasNonExecutingGoFlags(argv[0], cwd, argv.slice(1), baseEnv));
   if (blocked) {
@@ -207,12 +154,13 @@ function executeCheck(
     cwd,
     baseEnv,
     env: extraEnv,
-    timeoutMs,
+    timeoutMs: options.timeoutMs ?? defaultVerificationTimeout,
+    log: options.log?.(phase),
     onOutput: (stdout, stderr) => onOutput?.(phase, stdout, stderr),
   });
   const duration_ms = Date.now() - started;
   const combined = `${res.stdout}${res.stderr}`.trim();
-  const skipped = res.noPytestCalls || (phase === "dynamic" && zeroTestRun(basename(argv[0]), res.code, combined));
+  const skipped = res.noTests;
   return {
     language,
     phase,
@@ -225,8 +173,15 @@ function executeCheck(
   };
 }
 
-function bindCheck(observer?: OutputObserver, baseEnv?: NodeJS.ProcessEnv) {
-  return executeCheck.bind(null, baseEnv, observer);
+interface CheckOptions {
+  onOutput?: OutputObserver;
+  baseEnv?: NodeJS.ProcessEnv;
+  timeoutMs?: number;
+  log?: (phase: "static" | "dynamic") => VerificationLog;
+}
+
+function bindCheck(options: CheckOptions) {
+  return executeCheck.bind(null, options);
 }
 
 function runGoChecks(targetDir: string, mode: CheckMode, execCheck: ReturnType<typeof bindCheck>): LangCheckItem[] {
@@ -440,9 +395,7 @@ export function runLangChecks(opts: {
   targetDir: string;
   mode?: CheckMode;
   lang?: "auto" | CheckLanguage;
-  onOutput?: OutputObserver;
-  baseEnv?: NodeJS.ProcessEnv;
-}): LangCheckReport {
+} & CheckOptions): LangCheckReport {
   const mode: CheckMode = opts.mode ?? "all";
   const resolvedDir = existsSync(opts.targetDir)
     ? realpathSync(opts.targetDir)
@@ -457,7 +410,7 @@ export function runLangChecks(opts: {
       : detectRepoLanguages(resolvedDir);
 
   const checks: LangCheckItem[] = [];
-  const execCheck = bindCheck(opts.onOutput, opts.baseEnv);
+  const execCheck = bindCheck(opts);
   for (const lang of detected) {
     if (lang === "go") checks.push(...runGoChecks(resolvedDir, mode, execCheck));
     else if (lang === "ts") checks.push(...runTsChecks(resolvedDir, mode, execCheck));

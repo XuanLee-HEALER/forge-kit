@@ -37,6 +37,8 @@ guard:
   protected_branches:
     - "main"
     - "master"
+  # Protected branches eligible for an exact, approved fast-forward update.
+  allow_protected_ff: []
   prod_tag_patterns:
     - "^release-v"
     - '^v[0-9]+\.[0-9]+\.[0-9]+'
@@ -58,12 +60,12 @@ guard:
 #     smoke:
 #       action: smoke-check
 #   verification:
+#     timeout_ms: 120000
+#     failure_log_retention_days: 7
 #     environment: isolated
 #     stages: [smoke]
 #   delivery:
 #     endpoint: pr
 #     stages: [ship]
-#     # Only trust hosts implementing the server-side forge.atomic-pr.v1 transaction.
-#     atomic_pr_hosts: []
 #   skills:
 #     ready: .workbench/overrides/ready

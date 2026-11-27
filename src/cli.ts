@@ -37,6 +37,7 @@ import {
   loadModelsConfig,
   loadWorkbenchConfig,
   parseTomlFile,
+  parseYamlFile,
 } from "./config";
 import { runGit } from "./git";
 import { Ledger } from "./ledger";
@@ -279,6 +280,7 @@ export function syncWorkbench(opts?: { targetDir?: string; kitRoot?: string }): 
   root: string;
   lock: KitLock;
   preserved: string[];
+  diagnostics?: string[];
 } {
   const root = findWorkbenchRoot(opts?.targetDir, opts?.targetDir !== undefined);
   const kitRoot = opts?.kitRoot ?? findKitRoot();
@@ -289,7 +291,14 @@ export function syncWorkbench(opts?: { targetDir?: string; kitRoot?: string }): 
     loadDbEnvironments(root, { strict: true, validateShadowed: true });
     recoverInstall(root);
     const previous = JSON.parse(readRequired(path).toString()) as KitLock;
-    return install(root, kitRoot, previous);
+    const result = install(root, kitRoot, previous);
+    const config = parseYamlFile<{extensions?: {delivery?: Record<string, unknown>; skills?: Record<string, unknown>}}>(localPath(root, ".workbench/workbench.yaml"));
+    const diagnostics: string[] = [];
+    if (config?.extensions?.delivery && Object.hasOwn(config.extensions.delivery, "atomic_pr_hosts"))
+      diagnostics.push("Ignored retired extensions.delivery.atomic_pr_hosts. Open PRs require a merge-time base condition or operator handoff.");
+    if (config?.extensions?.skills?.ship && previous.kit_version !== result.lock.kit_version)
+      diagnostics.push("Preserved private ship skill. Review the updated fast-track and operator handoff workflow in core/.agents/skills/ship/SKILL.md.");
+    return diagnostics.length ? {...result, diagnostics} : result;
   });
 }
 

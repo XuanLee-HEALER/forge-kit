@@ -1,27 +1,31 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { DIFF_BYTE_LIMIT, Repo } from "./repo";
-import { FindingLocationError, ReportTextError, validateReport } from "./report";
+import { Repo } from "./repo";
+import { cleanReport, ReportTextError } from "./report";
 import { roles, instructions, type Role } from "./roles";
-import { CredentialConfigError } from "./config";
-import { BackendFailure, invoke, type Backend, type Model } from "./backend";
+import { BackendFailure, invoke } from "./backend";
+import { modelPair, type Model } from "./models";
+import { prepareMaterials, batchChanges, batches, loadChunk, type Chunk, type Material } from "./materials";
 
 export type Status = "pass" | "blocked" | "incomplete" | "error";
 export const reviewExitCode = (status: Status) => ({ pass: 0, blocked: 1, incomplete: 3, error: 2 })[status];
 const modes = ["parallel", "serial", "ordered"] as const;
 type Mode = typeof modes[number];
-type Option = { roles?: string; mode?: string; order?: string; backend?: string };
-type Finding = ReturnType<typeof validateReport>["findings"][number];
-type Attempt = { backend: Backend; status: Status; reason?: string };
+type Option = { roles?: string; mode?: string; order?: string };
+type Finding = ReturnType<typeof cleanReport>["findings"][number];
+type Attempt = { backend: "codex"; status: Status; reason?: string };
 type RoleReport = {
-  role: Role; base: string; head: string; status: Status; backend: Backend | null;
+  role: Role; base: string; head: string; status: Status; backend: "codex" | null;
+  coverage: { expected: number; reviewed: number; missing: Array<{id:string; path:string}> };
   missing_materials?: string[]; findings: Finding[]; limitations: string[]; summary: string; attempts: Attempt[];
 };
 
 export const reviewOptions = {
   repo: { type: "string" }, base: { type: "string" }, head: { type: "string" },
-  roles: { type: "string" }, order: { type: "string" }, mode: { type: "string" }, backend: { type: "string" },
+  roles: { type: "string" }, order: { type: "string" }, mode: { type: "string" }, model: { type: "string" }, effort: { type: "string" },
 } as const;
 
 function selection(csv: string, available: readonly Role[]) {
@@ -31,7 +35,7 @@ function selection(csv: string, available: readonly Role[]) {
   return list;
 }
 
-function options(opts: Option, available: readonly Role[]) {
+export function reviewSelection(opts: Option, available: readonly Role[]) {
   const requested = selection(opts.roles ?? available.join(","), available);
   const mode = (opts.mode ?? "parallel") as Mode;
   if (!modes.includes(mode)) throw Error("Invalid mode");
@@ -42,97 +46,139 @@ function options(opts: Option, available: readonly Role[]) {
     if (order.length !== sequence.length || !order.every(r => sequence.includes(r))) throw Error("--order must cover the selected roles");
     sequence = order;
   } else if (opts.order !== undefined) throw Error("--order requires ordered mode");
-  const backend = opts.backend ?? "auto";
-  if (backend !== "auto" && backend !== "codex" && backend !== "api") throw Error("Invalid backend");
-  return { mode, sequence, backend } as const;
+  return { mode, sequence };
 }
 
-function materials(repo: Repo) {
-  const diff: Record<string, string> = Object.create(null);
-  const missing = [...repo.excludedFiles];
-  let bytes = 0;
-  for (const file of repo.files) {
-    if (bytes >= DIFF_BYTE_LIMIT) break;
+const PROMPT_BYTES = 160_000;
+const RESPONSE_RESERVE = 20_000;
+const SPEC_BYTES = 60_000;
+function specification(params: {spec?:string; specSha256?:string}) {
+  if (!params.spec) return;
+  try {
+    if (statSync(params.spec).size > SPEC_BYTES) return;
+    const bytes = readFileSync(params.spec);
+    if (!params.specSha256 || createHash("sha256").update(bytes).digest("hex") === params.specSha256)
+      return bytes.toString("utf8").trim() || undefined;
+  } catch { /* Missing or changed specifications become explicit gaps. */ }
+}
+
+async function reviewRole(role: Role, repo: Repo, material: Material, model: Model, spec?:string, requiredSpec = false): Promise<RoleReport> {
+  const { base, head } = repo;
+  const checked = new Set<string>();
+  const findings = new Map<string, Finding>();
+  const limitations = new Set(material.limitations);
+  const gaps = new Set(material.missing);
+  const attempts: Attempt[] = [];
+  const summaries = new Set<string>();
+  if (requiredSpec && !spec) gaps.add("spec");
+  const envelope = {role, base, head, spec: spec ?? null, index: material.index,
+    instructions: instructions(role, repo.files) + "\nReview every supplied chunk, including deletions and metadata. Return the supplied role. For every chunk return its exact id, path and conclusion in checked. Use reviewed only after inspecting its actual patch. Files in the global index outside this batch are reviewed separately. For findings use the new-file range, or the old-file range for deleted lines."};
+
+  async function batch(chunks: Chunk[]): Promise<void> {
+    const items = chunks.map(c => loadChunk(material, c));
+    const related = batchChanges(material.byPath, chunks);
+    const diff: Record<string, string> = Object.create(null);
+    for (const item of items) diff[item.path] = (diff[item.path] ?? "") + item.patch;
+    let context: ReturnType<Repo["context"]>;
+    try { context = repo.context(diff); }
+    catch { context = {revision:head, files:[], omitted:Object.keys(diff)}; }
+    const render = () => JSON.stringify({...envelope, related, context, chunks:items});
+    let prompt = render();
+    while (Buffer.byteLength(prompt) + RESPONSE_RESERVE > PROMPT_BYTES && context.files.length) {
+      context.omitted.push(context.files.pop()!.path);
+      prompt = render();
+    }
+    if (Buffer.byteLength(prompt) + RESPONSE_RESERVE > PROMPT_BYTES) {
+      if (chunks.length === 1) { limitations.add("Prompt budget exceeded for " + chunks[0].id); return; }
+      const half = Math.ceil(chunks.length / 2);
+      await batch(chunks.slice(0, half));
+      await batch(chunks.slice(half));
+      return;
+    }
     try {
-      let next = 0;
-      const chunks = [];
-      do {
-        const page = repo.diff(file, next, DIFF_BYTE_LIMIT - bytes);
-        bytes += Buffer.byteLength(page.text) + (next ? 1 : 0);
-        if (bytes > DIFF_BYTE_LIMIT) throw Error("material limit");
-        chunks.push(page.text);
-        next = page.truncated ? page.nextOffset : 0;
-      } while (next);
-      diff[file] = chunks.join("\n");
-    } catch {
-      missing.push(file);
-      break; // repo.missing() also lists the unread suffix, without opening its diffs.
+      const paths = related.map(c => c.path);
+      const report = cleanReport(await invoke(prompt, model), paths);
+      if (report.role !== role) throw new BackendFailure("Codex receipt role mismatch");
+      const receipts = new Set<string>();
+      const completed = new Set<string>();
+      for (const ack of report.checked) {
+        if (receipts.has(ack.id) || !chunks.some(c => c.id === ack.id && c.path === ack.path))
+          throw new BackendFailure("Codex receipt contains duplicate or undelivered material");
+        receipts.add(ack.id);
+        if (ack.conclusion === "reviewed") completed.add(ack.id);
+      }
+      for (const f of report.findings) {
+        const located = chunks.some(c => c.path === f.path &&
+          ((c.newStart > 0 && f.line >= c.newStart && f.line <= c.newEnd) ||
+          (c.oldStart > 0 && f.line >= c.oldStart && f.line <= c.oldEnd)));
+        if (!located) throw new BackendFailure("Finding location outside delivered patch");
+      }
+      for (const f of report.findings) {
+        const key = JSON.stringify([f.path,f.line,f.title]);
+        if (f.severity === "blocking" || !findings.has(key)) findings.set(key, f);
+      }
+      for (const l of report.limitations) limitations.add(l);
+      summaries.add(report.summary);
+      for (const id of completed) checked.add(id);
+      if (report.status === "incomplete") limitations.add("Batch reported incomplete: " + report.summary);
+      const status = report.status === "incomplete" || completed.size < chunks.length ? "incomplete" :
+        report.findings.some(f => f.severity === "blocking") ? "blocked" : "pass";
+      attempts.push({backend:"codex", status});
+    } catch (error) {
+      const reason = error instanceof BackendFailure || error instanceof ReportTextError ? error.message : "Invalid Codex structured response";
+      limitations.add(reason);
+      attempts.push({backend:"codex", status:"incomplete", reason});
+      // A failed process can leave the rest of a run undelivered. The final
+      // difference is computed against the original inventory, including it.
+      throw new BackendFailure(reason);
     }
   }
-  return { diff, missing: [...new Set([...missing, ...repo.missing()])] };
+
+  if (!requiredSpec || spec) {
+    try {
+      for (const group of batches(material.chunks)) await batch(group);
+    } catch (error) {
+      if (!(error instanceof BackendFailure)) throw error;
+    }
+  }
+  const missing = material.chunks.filter(c => !checked.has(c.id)).map(({path,id}) => ({path,id}));
+  if (!requiredSpec || spec) for (const c of missing) gaps.add(c.path);
+  const list = [...findings.values()];
+  const status = gaps.size || attempts.some(a => a.status === "incomplete") ? "incomplete" : list.some(f => f.severity === "blocking") ? "blocked" : "pass";
+  const summary = status === "incomplete" ? "Incomplete review: " + [...limitations, ...gaps].join(", ") : [...summaries].join("\n");
+  return {role, base, head, backend:attempts.length ? "codex" : null, attempts, status, summary, findings:list,
+    limitations:[...limitations], ...(gaps.size && {missing_materials:[...gaps]}),
+    coverage:{expected:material.chunks.length, reviewed:checked.size, missing}};
 }
 
 export async function runReview(params: Option & {
   repo: string; base: string; head: string; spec?: string; specSha256?: string;
-  models?: Partial<Record<Role, Model>>; model?: Model;
+  models?: Partial<Record<Role, {model:string;effort:string}>>; model?: {model:string;effort:string};
   legacyPerformanceRetry?: boolean;
 }) {
-  const { mode, sequence, backend } = options(params, params.legacyPerformanceRetry ? ["performance"] : roles);
+  const { mode, sequence } = reviewSelection(params, params.legacyPerformanceRetry ? ["performance"] : roles);
+  const models = sequence.map(role => {
+    const pair = params.models?.[role] ?? params.model;
+    return modelPair(pair?.model, pair?.effort);
+  });
   const repo = new Repo(params.repo, params.base, params.head);
-  const { base, head } = repo;
-  repo.git(["merge-base", "--is-ancestor", base, head]);
+  repo.git(["merge-base", "--is-ancestor", repo.base, repo.head]);
   if (!repo.files.length && !repo.excludedFiles.length) throw Error("Empty review diff; select a range containing changes");
-  const material = materials(repo);
-  let context: ReturnType<Repo["context"]> | undefined;
-  if (!material.missing.length) {
-    try { context = repo.context(material.diff); }
-    catch { material.missing.push("pinned source context"); }
-  }
-  let spec: string | undefined;
-  if (params.spec) {
-    try {
-      const bytes = readFileSync(params.spec);
-      if (!params.specSha256 || createHash("sha256").update(bytes).digest("hex") === params.specSha256)
-        spec = bytes.toString("utf8").trim() || undefined;
-    } catch { /* The business role reports missing material. */ }
-  }
-  async function run(role: Role): Promise<RoleReport> {
-    const common = { role, base, head };
-    const missing = [...material.missing];
-    if (role === "business" && !spec) missing.push("spec");
-    if (missing.length) return { ...common, backend: null, missing_materials: missing, limitations: [], findings: [], attempts: [], summary: "Missing review material: " + missing.join(", "), status: "incomplete" };
-    const prompt = JSON.stringify({ role, base, head, instructions: instructions(role, repo.files), spec: spec ?? null, diff: material.diff, context });
-    const model = params.models?.[role] ?? params.model ?? { model: process.env.REVIEW_MODEL || "gpt-6.2-sol", effort: "medium" };
-    const attempts: Attempt[] = [];
-    const backends: Backend[] = backend === "auto" ? ["codex", "api"] : [backend];
-    for (const active of backends) {
-      try {
-        const report = validateReport(await invoke(active, prompt, model), repo.files, [], path => repo.lineCount(path));
-        const status = report.status === "findings" ? "blocked" : report.status;
-        attempts.push({ backend: active, status });
-        return { ...common, backend: active, attempts, limitations: report.limitations, findings: report.findings, summary: report.summary, status };
-      } catch (error) {
-        const summary = (error instanceof BackendFailure || error instanceof CredentialConfigError || error instanceof FindingLocationError || error instanceof ReportTextError) ? error.message : "Unable to execute backend or validate report";
-        attempts.push({ backend: active, status: "error", reason: summary });
-        if (backend === "auto" && active === "codex" && error instanceof BackendFailure && error.upstream) continue;
-        return { ...common, backend: active, attempts, limitations: [], findings: [], summary, status: "error" };
-      }
-    }
-    throw Error("No review backend selected");
-  }
-  const reports: RoleReport[] = [];
-  if (mode === "parallel") reports.push(...await Promise.all(sequence.map(run)));
-  else for (const role of sequence) reports.push(await run(role));
-  const status = (["error", "incomplete", "blocked", "pass"] as const).find(s => reports.some(r => r.status === s))!;
-  return { schemaVersion: 1, base, head, mode, status, roles: reports };
+  const spec = specification(params);
+  const tmp = mkdtempSync(join(tmpdir(), "forge-review-material-"));
+  try {
+    const material = prepareMaterials(repo, tmp);
+    const run = (role: Role, idx:number) => reviewRole(role, repo, material, models[idx], spec, role === "business" || !!params.spec);
+    const reports: RoleReport[] = [];
+    if (mode === "parallel") reports.push(...await Promise.all(sequence.map(run)));
+    else for (const [idx,role] of sequence.entries()) reports.push(await run(role,idx));
+    const status = (["incomplete", "blocked", "pass"] as const).find(s => reports.some(r => r.status === s))!;
+    return {schemaVersion:2, base:repo.base, head:repo.head, mode, status, roles:reports};
+  } finally { rmSync(tmp, {recursive:true, force:true}); }
 }
 
 export async function standalone(args: string[]) {
-  const { values } = parseArgs({ args, options: {
-    ...reviewOptions, spec: { type: "string" }, model: { type: "string" }, effort: { type: "string" },
-  } });
+  const { values } = parseArgs({ args, options: {...reviewOptions, spec: { type:"string" } } });
   if (!values.repo || !values.base || !values.head) throw Error("Expected --repo, --base and --head");
-  return runReview({ ...values, repo: values.repo, base: values.base, head: values.head,
-    model: { model: values.model || process.env.REVIEW_MODEL || "gpt-6.2-sol", effort: values.effort || "medium" },
-  });
+  return runReview({...values, repo:values.repo, base:values.base, head:values.head, model:modelPair(values.model, values.effort)});
 }

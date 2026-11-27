@@ -17,10 +17,11 @@ beforeEach(() => {
   writeFileSync(codex, [
     "#!/usr/bin/env bun",
     'const args = process.argv.slice(2), data = JSON.parse(await Bun.stdin.text());',
+    'await Bun.write(import.meta.path + "." + data.role, JSON.stringify({model:args[args.indexOf("-m")+1],effort:args.find(a=>a.startsWith("model_reasoning_effort="))}));',
     'if (!data.spec?.includes("Fixture requirements") || !args.includes("--ephemeral")) process.exit(2);',
     'if (await Bun.file(import.meta.path + ".mutate").exists()) await Bun.write(' + JSON.stringify(join(f.repo, "edit")) + ', "modified");',
     'const preset = Bun.file(import.meta.path + ".report");',
-    'await Bun.write(args[args.indexOf("-o")+1], await preset.exists() ? await preset.text() : JSON.stringify({status:"pass",summary:"reviewed fixture",findings:[],checked:[],limitations:["Runtime coverage unavailable"]}));',
+    'await Bun.write(args[args.indexOf("-o")+1], JSON.stringify({...(await preset.exists() ? await preset.json() : {status:"pass",summary:"reviewed fixture",findings:[],limitations:["Runtime coverage unavailable"]}),role:data.role,checked:data.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"}))}));',
   ].join("\n"));
   chmodSync(codex, 0o755);
 });
@@ -64,7 +65,33 @@ test("a nonexistent finding line records a real provider error instead of a bloc
   writeFileSync(codex + ".report", JSON.stringify({status:"findings",summary:"fixture",checked:["code.txt"],limitations:[],
     findings:[{severity:"blocking",path:"code.txt",line:900,title:"Fixture",evidence:"Fixture",recommendation:"Fixture"}]}));
   const result = run(["--roles", "quality"]);
-  expect(result.exitCode).toBe(2);
-  expect(f.evidence().at(-1)).toMatchObject({source:"tool", meta:{backend:"codex",report_status:"error",
-    findings:[],attempts:[{backend:"codex",status:"error",reason:"Finding line exceeds the pinned file length"}]}});
+  expect(result.exitCode).toBe(3);
+  expect(f.evidence().at(-1)).toMatchObject({source:"tool", meta:{backend:"codex",report_status:"incomplete",
+    missing_materials:["code.txt"],findings:[],attempts:[{backend:"codex",status:"incomplete",reason:expect.stringMatching(/location/i)}]}});
 });
+
+test("forge resolves each role through explicit pair, tier, role mapping and defaults", async () => {
+  const config=join(f.root,".workbench/models.toml");
+  const tiers='[tiers.mechanical]\nmodel="gpt-6.1-terra"\neffort="low"\n[tiers.standard]\nmodel="gpt-6.2-sol"\neffort="medium"\n[tiers.deep]\nmodel="gpt-6.2-astra"\neffort="high"\n';
+  const roles=["business","quality","simplify","comments"];
+  for(const [mapping, options, expected] of [
+    ["",[],["deep","deep","standard","mechanical"]],
+    ['[review.roles]\nquality="mechanical"\n',[],["deep","mechanical","standard","mechanical"]],
+    ['[review.roles]\nquality="mechanical"\n',["--tier","standard"],roles.map(()=>"standard")],
+    ["",["--model","gpt-6.1-sol","--effort","high"],roles.map(()=>"explicit")],
+  ] as const) {
+    writeFileSync(config,tiers+mapping);
+    const result=run(["--roles",roles.join(","),...options]);
+    expect(result.exitCode,result.stderr.toString()+result.stdout.toString()).toBe(0);
+    const pairs: Record<string,[string,string]>={mechanical:["gpt-6.1-terra","low"],standard:["gpt-6.2-sol","medium"],deep:["gpt-6.2-astra","high"],explicit:["gpt-6.1-sol","high"]};
+    for(const [i,role] of roles.entries()){
+      const [model,effort]=pairs[expected[i]];
+      expect(await Bun.file(codex+"."+role).json()).toEqual({model,effort:"model_reasoning_effort="+JSON.stringify(effort)});
+    }
+  }
+  const before=f.evidence();
+  for(const invalid of [["--model","gpt-6.2-sol"],["--effort","low"],["--tier","absent"],["--model","unknown","--effort","low"]]){
+    expect(run(["--roles","quality",...invalid]).exitCode).not.toBe(0);
+    expect(f.evidence()).toEqual(before);
+  }
+},30_000);

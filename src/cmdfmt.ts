@@ -1,29 +1,13 @@
 import { findWorkbenchRoot, loadDbEnvironments, loadWorkbenchConfig } from "./config";
 
-const SECRET_PATTERNS: Array<[RegExp, string]> = [
-  [/(https?|postgres|postgresql|mysql|redis|clickhouse):\/\/[^\s/@"']+@/gi, "$1://***@"],
-  [/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, "$1***"],
-  [/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}(?:\.[A-Za-z0-9._-]+)?/g, "***"],
-  [
-    /\b(PGPASSWORD|MYSQL_PWD|REDISCLI_AUTH|OPENAI_API_KEY|ANTHROPIC_AUTH_TOKEN|[A-Z_]*(?:SECRET|TOKEN|PASSWORD|API_KEY)[A-Z_]*)=\S+/g,
-    "$1=***",
-  ],
-  [/\bsk-[A-Za-z0-9_-]{16,}\b/g, "sk-***"],
-];
+import { redactSecrets } from "./shared/redact";
+export { redactSecrets } from "./shared/redact";
 
 const DB_CLIENT_RE = /(^|[\s;&|(])(usql|psql|mysql)\s/;
 const SQL_TARGET_RE =
   /\b(?:UPDATE|INTO|FROM|TABLE|JOIN)\s+(?:ONLY\s+|IF\s+(?:NOT\s+)?EXISTS\s+)?([A-Za-z_][\w."]*)/i;
 const SQL_WRITE_WORD_RE =
   /\b(insert|update|delete|merge|replace|alter|drop|create|truncate|grant|revoke)\b/i;
-
-export function redactSecrets(text: string): string {
-  let out = text;
-  for (const [re, repl] of SECRET_PATTERNS) {
-    out = out.replace(re, repl);
-  }
-  return out;
-}
 
 export function summarizeCommand(
   cmd: string,

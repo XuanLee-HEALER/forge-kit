@@ -41,7 +41,7 @@ export function createRunbook(ledger: LedgerReader, params: {
   title: string;
   actions: Partial<RunbookActions>;
   exact_stages?: string[];
-    exact_fat?: string[];
+    exact_push?: string[];
 }): RunbookRecord {
   const title = params.title.trim();
   if (!title) throw new Error("Runbook title is required");
@@ -126,7 +126,7 @@ export function createRunbook(ledger: LedgerReader, params: {
     tags.length === 0 &&
     prs.length === 0 &&
     sql_files.length === 0 &&
-    !params.exact_fat?.length && !params.exact_stages?.length && kubectl_commands.length === 0
+    !params.exact_push?.length && !params.exact_stages?.length && kubectl_commands.length === 0
   ) {
     throw new Error(
       "Runbook must include at least one action (--tag, --pr, --sql, or --kubectl)",
@@ -135,7 +135,7 @@ export function createRunbook(ledger: LedgerReader, params: {
 
   const normalized: RunbookActions = { tags, prs, sql_files, kubectl_commands };
   if (params.actions.release_observers?.length) normalized.release_observers = params.actions.release_observers;
-  const exact = params.exact_stages && params.task_id ? buildPlan(ledger,params.task_id,normalized,params.exact_stages,params.exact_fat) : undefined;
+  const exact = params.exact_stages && params.task_id ? buildPlan(ledger,params.task_id,normalized,params.exact_stages,params.exact_push) : undefined;
   for(const action of exact?.actions ?? []) {
     if(action.kind==="pr") {
       const pr=normalized.prs.find(pr=>pr.repo===action.repo && pr.number===action.number)!;

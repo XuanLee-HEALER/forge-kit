@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
 import { checkoutEnvironment, runProcess } from "./git";
 import { delegatedGoEnvironment } from "./shared/go";
+import { TestRunSummary } from "./verification-test-summary";
+import type { VerificationLog } from "./verification-log";
 import { tscProjectPreload } from "./shared/tsc";
 
 // Pytest's call-phase report distinguishes test execution from collection and setup-only modes,
@@ -38,7 +40,7 @@ export function cargoProjectInCheckout(bin: string, args: string[], dir: string)
   }).exitCode === 0;
 }
 
-type Options = NonNullable<Parameters<typeof runProcess>[1]> & { cwd: string; baseEnv?: NodeJS.ProcessEnv };
+type Options = NonNullable<Parameters<typeof runProcess>[1]> & { cwd: string; baseEnv?: NodeJS.ProcessEnv; log?: VerificationLog };
 
 export function runVerificationProcess(argv: string[], dynamic: boolean, options: Options) {
   const bin = basename(argv[0]);
@@ -55,7 +57,15 @@ export function runVerificationProcess(argv: string[], dynamic: boolean, options
   const observe = dynamic && ["pytest", "bun"].includes(bin);
   const delegated = ["bun", "make"].includes(bin);
   const cargo = delegated ? Bun.which("cargo", {PATH: env.PATH, cwd: options.cwd}) : null;
-  if (!observe && !delegated) return { ...runProcess(argv, {...options, env}), noPytestCalls: false };
+  const run = () => {
+    const tests = dynamic ? new TestRunSummary() : undefined;
+    const result = options.log
+      ? options.log.run(argv, options.cwd, env, options.timeoutMs, tests?.observe)
+      : runProcess(argv, {...options, env});
+    if (!options.log) tests?.observe(result.stdout + "\n" + result.stderr);
+    return {...result, noTests: tests?.skipped(bin, result.code) ?? false};
+  };
+  if (!observe && !delegated) return run();
 
   const dir = mkdtempSync(join(tmpdir(), "forge-verify-"));
   try {
@@ -82,10 +92,10 @@ export function runVerificationProcess(argv: string[], dynamic: boolean, options
       env.PATH = [dir, env.PATH].filter(Boolean).join(delimiter);
       env.CARGO = shim;
     }
-    const result = runProcess(argv, { ...options, env });
-    if (existsSync(join(dir, "outside"))) return {...result, code: 1, stderr: result.stderr + "\nPytest executed a test outside the verified checkout", noPytestCalls: false};
+    const result = run();
+    if (existsSync(join(dir, "outside"))) return {...result, code: 1, stderr: result.stderr + "\nPytest executed a test outside the verified checkout", noTests: false};
     const observedPytest = bin === "pytest" || existsSync(join(dir, "loaded"));
-    return { ...result, noPytestCalls: result.code === 0 && observedPytest && !existsSync(join(dir, "called")) };
+    return { ...result, noTests: result.noTests || (result.code === 0 && observedPytest && !existsSync(join(dir, "called"))) };
   } finally {
     rmSync(dir, {recursive: true, force: true});
   }

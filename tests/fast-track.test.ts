@@ -1,6 +1,7 @@
-import { mergePinnedFat } from "../src/conditional-merge";
-import { diffScope, deliveryDiff } from "../src/ship-diff";
-import { fastTrackCommand } from "../src/ledger/fast-track";
+import { pushFastForward } from "../src/conditional-merge";
+import { canonicalJson, sha256String } from "../src/ledger/types";
+import { diffScope } from "../src/ship-diff";
+import { fastTrackCommand, envelope, validateScope } from "../src/ledger/fast-track";
 import { beforeEach, test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
@@ -9,9 +10,9 @@ import { Ledger } from "../src/ledger";
 import { appendEventInTx } from "../src/ledger/transactions";
 import { handleLedgerHook } from "../src/ledger-hook";
 import { evaluatePreToolUse } from "../src/guard";
-import { loadShipPolicy } from "../src/config";
+import { loadShipPolicy, loadWorkbenchConfig } from "../src/config";
 import { initWorkbench, syncWorkbench, doctorWorkbench } from "../src/cli";
-import { root, ledger, feature, git, remote, verifyFeature, useReleaseFixture } from "./helpers/release";
+import { root, ledger, feature, git, remote, verifyFeature, useReleaseFixture, cmd, rejects } from "./helpers/release";
 
 useReleaseFixture();
 const template = readFileSync(join(import.meta.dir, "../templates/ship-policy.yaml"), "utf8");
@@ -57,6 +58,23 @@ test("init installs the policy and runner, sync preserves edits, doctor and tamp
   initWorkbench({ targetDir: dir, kitRoot: join(import.meta.dir, "..") });
   const p = join(dir, ".workbench/ship-policy.yaml");
   expect(readFileSync(p, "utf8")).toBe(template);
+  expect(loadShipPolicy(dir).policy.forbid_db_rw).toBe(true);
+  for (const command of [
+    "mkdir -p .workbench/specs/archive",
+    "echo archive > .workbench/specs/archive.md",
+    "echo archive >> .workbench/specs/archive.md",
+  ]) {
+    expect(evaluatePreToolUse(dir,{hook_event_name:"PreToolUse",cwd:dir,tool_name:"Bash",tool_input:{command}})).toBeNull();
+    const r=Bun.spawnSync(["sh","-c",command],{cwd:dir});
+    expect(r.exitCode).toBe(0);
+  }
+  expect(readFileSync(join(dir,".workbench/specs/archive.md"),"utf8")).toBe("archive\narchive\n");
+  const mention = "echo 'See .workbench/ship-policy.yaml for the archive policy' >> .workbench/specs/archive.md";
+  expect(evaluatePreToolUse(dir,{hook_event_name:"PreToolUse",cwd:dir,tool_name:"Bash",tool_input:{command:mention}})).toBeNull();
+  expect(Bun.spawnSync(["sh","-c",mention],{cwd:dir}).exitCode).toBe(0);
+  expect(readFileSync(join(dir,".workbench/specs/archive.md"),"utf8")).toContain("See .workbench/ship-policy.yaml");
+  expect(readFileSync(p,"utf8")).toBe(template);
+
   writeFileSync(p, template.replace("enabled: true", "enabled: false"));
   syncWorkbench({ targetDir: dir });
   expect(loadShipPolicy(dir).policy.enabled).toBe(false);
@@ -137,9 +155,6 @@ function human(prompt: string, extra = {}) {
 }
 test("scope-bound runbook activation requires the exact root prompt", () => {
   const { prep, f, rb } = exactFixture();
-  expect(() => fastTrackCommand(ledger, ["prepare", f.task, "--to", "pr", "--paths", "src/**"])).toThrow(
-    "runbook",
-  );
   expect(() => prep("**")).toThrow("unrestricted");
   expect(() => prep("../src")).toThrow();
   expect(() => prep("src/migrations/**")).toThrow();
@@ -179,7 +194,9 @@ for (const [path, content, why] of [
     const head = git(f.wt, "rev-parse", "HEAD");
     const policy = { ...loadShipPolicy(root).policy, forbid_db_rw: true, max_lines_changed: 2 };
     const paths = path.endsWith("package.json") ? ["./package.json"] : ["src/**"];
-    expect(() => deliveryDiff(policy, paths)(f.repo, f.wt, f.base, head)).toThrow(why);
+    const check = () => diffScope(f.wt, {repo:f.repo,base_sha:f.base}, head, true, paths, policy, new Set());
+    if (why === "cap") expect(check()).toBeGreaterThan(policy.max_lines_changed);
+    else expect(check).toThrow(why);
   });
 }
 test("rename checks source and destination; gitlinks are outside file budget", () => {
@@ -193,59 +210,25 @@ test("rename checks source and destination; gitlinks are outside file budget", (
   ).toThrow();
   git(f.wt, "update-index", "--add", "--cacheinfo", "160000", f.base, "src/nested");
   git(f.wt, "commit", "-m", "gitlink");
-  expect(() => deliveryDiff(policy, ["src/**"])(f.repo, f.wt, "HEAD^", "HEAD")).toThrow("Submodule");
+  expect(() => diffScope(f.wt, {repo:f.repo, base_sha:"HEAD^"}, "HEAD", true, ["src/**"], policy, new Set())).toThrow("Submodule");
 });
 
-test("conditional Git merge protects the advertised base and preserves divergent history", () => {
-  const f = feature("api", 1),
-    bare = join(root, "api.git");
-  const url = git(f.dir, "remote", "get-url", "origin");
-  git(f.dir, "remote", "set-url", "--push", "origin", url);
-  git(f.wt, "commit", "--allow-empty", "-m", "next change");
+test("exact fast-forward rejects a concurrent old-value change and a divergent target", () => {
+  const f = feature("api", 1), bare = join(root, "api.git");
+  git(f.dir, "remote", "set-url", "origin", bare);
+  git(f.wt, "push", bare, f.head + ":refs/heads/feature-fixture");
+  git(f.wt, "commit", "--allow-empty", "-m", "second feature change");
   const head = git(f.wt, "rev-parse", "HEAD");
-  // Both the intervening commit and the authorized head fast-forward the
-  // target. Ordinary non-forced Git push alone would accept the stale plan.
-  git(f.wt, "push", bare, f.head + ":refs/heads/intermediate");
-  git(bare, "update-ref", "refs/heads/fat", f.base);
-  const binary = Bun.which("git")!;
-  writeFileSync(
-    join(root, "bin/git"),
-    `#!/usr/bin/env bun
-const args=process.argv.slice(2);
-if(args.includes("push")) {
-  const index=args.indexOf(${JSON.stringify(url)});
-  if(index>=0) args[index]=${JSON.stringify(bare)};
-}
-const result=Bun.spawnSync([${JSON.stringify(binary)},...args],{stdin:"inherit",stdout:"inherit",stderr:"inherit"});process.exit(result.exitCode);
-`,
-    { mode: 0o755 },
-  );
-  expect(() =>
-    mergePinnedFat(
-      f.wt,
-      f.base,
-      head,
-      () => {},
-      () => {
-        git(bare, "update-ref", "refs/heads/fat", f.head, f.base);
-      },
-    ),
-  ).toThrow("Conditional FAT update refused");
-  expect(git(bare, "rev-parse", "fat")).toBe(f.head);
+  const action = {kind:"push" as const, repo:f.repo,remote:"origin" as const,ref:"refs/heads/main",
+    baseOid:f.base,head,originHash:sha256String(canonicalJson([bare,bare]))};
+  expect(() => pushFastForward(f.wt, action, () => git(bare,"update-ref",action.ref,f.head,f.base))).toThrow();
+  expect(git(bare, "rev-parse", "main")).toBe(f.head);
   git(f.dir, "commit", "--allow-empty", "-m", "independent main change");
-  const diverged = git(f.dir, "rev-parse", "main");
-  git(f.dir, "push", bare, diverged + ":refs/heads/staging");
-  git(bare, "update-ref", "refs/heads/fat", diverged, f.head);
-  const target = mergePinnedFat(
-    f.wt,
-    diverged,
-    head,
-    () => {},
-    () => {},
-  );
-  expect(git(bare, "rev-parse", "fat")).toBe(target);
-  expect(git(bare, "show", "-s", "--format=%P", target)).toBe(diverged + " " + head);
-  expect(git(f.wt, "rev-parse", "HEAD")).toBe(head);
+  const divergent = git(f.dir, "rev-parse", "HEAD");
+  git(f.dir, "push", bare, divergent + ":refs/heads/other");
+  git(bare,"update-ref",action.ref,divergent,f.head);
+  expect(() => pushFastForward(f.wt, {...action,baseOid:divergent}, () => {})).toThrow();
+  expect(git(bare, "rev-parse", "main")).toBe(divergent);
 }, 30_000);
 
 test("runbook manifest positions the merge at the declared ship slot and retains its instance override", () => {
@@ -285,27 +268,27 @@ extensions:
 
 for (const outcome of ["success", "drift", "legacy-reviewed", "legacy-no-review", "legacy-stale-review", "legacy-policy-off"]) {
   test(
-    "FAT-only conditional delivery to a local bare remote: " + outcome,
+    "protected fast-forward delivery to a local bare remote: " + outcome,
     () => {
       initWorkbench({ targetDir: root, kitRoot: join(import.meta.dir, "..") });
       const f = feature("api", 1, outcome.startsWith("legacy") ? "0.4" : "0.5"),
         bare = join(root, "api.git");
-      const missingReview = outcome === "legacy-no-review" || outcome === "legacy-stale-review";
+      const missingReview = ["legacy-no-review","legacy-stale-review","legacy-policy-off"].includes(outcome);
       if (outcome === "legacy-policy-off") {
         writeFileSync(policy(), template.replace("require_independent_review: true", "require_independent_review: false"));
       }
       git(f.dir, "remote", "set-url", "origin", bare);
-      git(f.dir, "push", "origin", f.base + ":refs/heads/fat");
+      git(f.dir, "push", "origin", f.base + ":refs/heads/release");
       writeFileSync(
         join(root, ".workbench/workbench.yaml"),
-        "name: fixture\nrepos: [api]\nextensions:\n  delivery: {endpoint: fat, stages: [ship]}\n",
+        "name: fixture\nrepos: [api]\nguard: {protected_branches: [release], allow_protected_ff: [release]}\nextensions:\n  delivery: {endpoint: push, stages: [ship]}\n",
       );
-      ledger.updateEndpoint({ task_id: f.task, endpoint: "fat", reason: "Isolated test branch only" });
+      ledger.updateEndpoint({ task_id: f.task, endpoint: "push", reason: "Isolated test branch only" });
       if (outcome.startsWith("legacy")) {
         const spec = join(root, ".workbench/specs", f.task);
         mkdirSync(spec, {recursive: true});
         for (const file of ["ssot.md", "tech-spec.md", "test-spec.md"]) {
-          writeFileSync(join(spec, file), "Deliver the feature commit only to the FAT ref.");
+          writeFileSync(join(spec, file), "Deliver the feature commit only to the release branch.");
         }
       }
       if (outcome === "legacy-stale-review") {
@@ -318,7 +301,7 @@ for (const outcome of ["success", "drift", "legacy-reviewed", "legacy-no-review"
         title: "Update the exact test branch",
         actions: {},
         exact_stages: [],
-        exact_fat: ["api:fat"],
+        exact_push: ["api:release"],
       });
       const { envelope_id: id } = fastTrackCommand(ledger, [
         "prepare",
@@ -326,7 +309,7 @@ for (const outcome of ["success", "drift", "legacy-reviewed", "legacy-no-review"
         "--runbook",
         rb.runbook_id,
         "--to",
-        "fat",
+        "push",
         "--paths",
         "src/**",
       ]) as { envelope_id: string };
@@ -335,7 +318,7 @@ for (const outcome of ["success", "drift", "legacy-reviewed", "legacy-no-review"
       if (outcome === "drift") {
         git(f.dir, "commit", "--allow-empty", "-m", "external target change");
         expected = git(f.dir, "rev-parse", "HEAD");
-        git(f.dir, "push", "origin", expected + ":refs/heads/fat");
+        git(f.dir, "push", "origin", expected + ":refs/heads/release");
       }
       const trace = join(root, "ship-git.trace");
       const cli = () =>
@@ -356,7 +339,7 @@ for (const outcome of ["success", "drift", "legacy-reviewed", "legacy-no-review"
         json = JSON.parse(result.stdout.toString());
       expect(json.ok, result.stderr.toString() + result.stdout.toString()).toBe(outcome !== "drift" && !missingReview);
       expect(git(bare, "rev-parse", "main")).toBe(f.base);
-      expect(git(bare, "rev-parse", "fat")).toBe(expected);
+      expect(git(bare, "rev-parse", "release")).toBe(expected);
       const remoteCall = /built-in: git (?:ls-remote|fetch|push) /;
       const calls = readFileSync(trace, "utf8");
       if (missingReview) {
@@ -371,16 +354,16 @@ for (const outcome of ["success", "drift", "legacy-reviewed", "legacy-no-review"
           .getTaskEvents(f.task)
           .map((e) => JSON.parse(e.payload_json))
           .filter((p) => p.meta?.envelope_id === id);
-        expect(receipts.map((p) => p.kind)).toEqual(["fat"]);
+        expect(receipts).toHaveLength(1);
         expect(receipts[0].meta).toMatchObject({
-          ref: "refs/heads/fat",
+          ref: "refs/heads/release",
           old_sha: f.base,
           new_sha: f.head,
-          delivery_endpoint: "fat",
+          delivery_endpoint: "push",
         });
       } else {
         expect(json.receipts).toHaveLength(0);
-        expect(json.reason.message).toContain("FAT target changed");
+        expect(json.reason.message).toMatch(/changed|drift|mismatch/i);
       }
     },
     60_000,
@@ -408,3 +391,80 @@ test("prune previews and removes ordinary closed tasks while retaining exact aut
   ).toEqual({ envelope_id });
   expect(ledger.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
 }, 30_000);
+
+test("single-user instance may explicitly empty the protected-branch list", () => {
+  initWorkbench({targetDir:root,kitRoot:join(import.meta.dir,"..")});
+  writeFileSync(join(root,".workbench/workbench.yaml"),"name: single\nrepos: []\nguard: {protected_branches: []}\n");
+  syncWorkbench({targetDir:root});
+  expect(doctorWorkbench(root).ok).toBe(true);
+  expect(loadWorkbenchConfig(root).guard.protected_branches).toEqual([]);
+});
+
+test("pre-code approval covers B..C when remote main is A and only additive test locks preserve it", () => {
+  initWorkbench({targetDir:root,kitRoot:join(import.meta.dir,"..")});
+  const earlier=feature("api",1);
+  // A..B contains a historical change outside the new task's approved path.
+  const a=earlier.base, b=earlier.head;
+  expect(git(join(root,"api.git"),"rev-parse","main")).toBe(a);
+  git(earlier.wt,"switch","-c","next-task");
+  const task="next-task";
+  const scope=join(root,".workbench/specs",task);
+  mkdirSync(scope,{recursive:true});
+  writeFileSync(join(scope,"scope.md"),"Review the change to src/next.ts.\n");
+  cmd("open","--id",task,"--title","new scope","--repo","api","--branch","next-task","--worktree",earlier.wt,
+    "--base",b,"--head",b,"--endpoint","pr","--depth","targeted");
+  cmd("freeze",task,"--lock-tests","example.test.ts");
+  const id=cmd("fast-track","prepare",task,"--to","pr","--paths","src/next.ts").envelope_id;
+  expect(human("快轨批准 "+id)).toContain("ACTIVE");
+  writeFileSync(join(earlier.wt,"src/next.ts"),"export const next = 3;\n");
+  git(earlier.wt,"add","--","src/next.ts");
+  git(earlier.wt,"commit","-qm","new task","--","src/next.ts");
+  const c=git(earlier.wt,"rev-parse","HEAD");
+  const target={...earlier,task,branch:"next-task",base:b,head:c};
+  verifyFeature(target);
+  const locks=["example.test.ts","value.js"];
+  cmd("freeze",task,...locks.flatMap(path=>["--lock-tests",path]));
+  const policy=validateScope(ledger,envelope(ledger,id));
+  const paths=new Set<string>();
+  expect(diffScope(target.wt,{repo:"api",base_sha:b},c,true,["src/next.ts"],policy,paths)).toBe(1);
+  expect(paths.size).toBe(1);
+  expect(()=>diffScope(target.wt,{repo:"api",base_sha:a},c,true,["src/next.ts"],policy,new Set())).toThrow(/scope/i);
+  expect(git(join(root,"api.git"),"rev-parse","main")).toBe(a);
+  const missing=ledger.checkPushReadiness({task_id:task,repo:"api",branch:"next-task",head_sha:c});
+  expect(missing.ready).toBe(false);
+  verifyFeature(target,{review:false});
+  const staleReview=ledger.checkPushReadiness({task_id:task,repo:"api",branch:"next-task",head_sha:c});
+  expect(staleReview.ready).toBe(false);
+  expect(staleReview.missing.join(" ")).toMatch(/review/i);
+  verifyFeature(target);
+  expect(ledger.checkPushReadiness({task_id:task,repo:"api",branch:"next-task",head_sha:c}).ready).toBe(true);
+  expect(()=>validateScope(ledger,envelope(ledger,id))).not.toThrow();
+  cmd("amend",task,"--scope","test_spec","--reason","operator revises the test locks");
+  cmd("freeze",task,"--lock-tests","value.js");
+  expect(()=>validateScope(ledger,envelope(ledger,id))).toThrow();
+},60_000);
+
+test("exact protected update needs instance permission for its concrete branch",()=>{
+  initWorkbench({targetDir:root,kitRoot:join(import.meta.dir,"..")});
+  const f=feature("api",1),bare=join(root,"api.git");
+  git(f.dir,"remote","set-url","origin",bare);
+  writeFileSync(join(root,".workbench/workbench.yaml"),"name: fixture\nrepos: [api]\nguard: {protected_branches: [main], allow_protected_ff: [other]}\nextensions: {delivery: {endpoint: push, stages: [ship]}}\n");
+  ledger.updateEndpoint({task_id:f.task,endpoint:"push",reason:"single-user protected branch"});
+  verifyFeature(f);
+  expect(rejects("runbook","create","--task",f.task,"--exact","--push","api:main","--title","main")).toMatch(/protected branch/i);
+  expect(git(bare,"rev-parse","main")).toBe(f.base);
+  const configPath=join(root,".workbench/workbench.yaml");
+  const permitted=readFileSync(configPath,"utf8").replace("allow_protected_ff: [other]","allow_protected_ff: [main]");
+  writeFileSync(configPath,permitted);
+  const book=cmd("runbook","create","--task",f.task,"--exact","--push","api:main","--title","main");
+  const id=cmd("fast-track","prepare",f.task,"--to","push","--runbook",book.runbook_id,"--paths","src/**").envelope_id;
+  const run=()=>Bun.spawnSync([process.execPath,join(import.meta.dir,"../src/bin/cli.ts"),"ship","run","--envelope",id],{
+    cwd:root,env:{...process.env,FORGE_WORKBENCH_ROOT:root,FORGE_SESSION_ID:"test-session"}
+  });
+  expect(run().exitCode).not.toBe(0);
+  expect(git(bare,"rev-parse","main")).toBe(f.base);
+  expect(human("快轨批准 "+id)).toContain("ACTIVE");
+  writeFileSync(configPath,permitted.replace("allow_protected_ff: [main]","allow_protected_ff: []"));
+  expect(run().exitCode).not.toBe(0);
+  expect(git(bare,"rev-parse","main")).toBe(f.base);
+},30_000);

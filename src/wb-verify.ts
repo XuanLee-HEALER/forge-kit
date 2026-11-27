@@ -1,10 +1,13 @@
+import { enterVerificationScope } from "./verification-scope";
+import { defaultVerificationTimeout, VerificationLog, verificationLogDirectory } from "./verification-log";
+import { redactArguments, redactSecrets } from "./shared/redact";
 import { copyVerificationFixtures } from "./verification-fixtures";
 import { checkMigration } from "./managed-assets";
 import { checkoutLocalRevision, materializeGitlinks } from "./verification-gitlinks";
-import { verificationPolicy } from "./workflow-config";
+import { installedInstance, verificationPolicy } from "./workflow-config";
 import { createHash } from "node:crypto";
 import { runVerificationProcess } from "./verification-process";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { mkdtempSync, mkdirSync, existsSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { runProcess } from "./git";
@@ -13,12 +16,11 @@ import { resolveInstance, runInstanceStage, verificationStageCwd } from "./insta
 import { isVerificationCommand, type VerificationKind as Kind } from "./verify-command";
 import { parseArgs } from "node:util";
 import { findWorkbenchRoot } from "./config";
-import { zeroTestRun, runLangChecks, type CheckMode } from "./lang-check";
+import { runLangChecks, type CheckMode } from "./lang-check";
 import { executionSnapshot, recheckExecution, targetOptions } from "./ledger/execution";
 import { Ledger } from "./ledger/store";
 
 export function verifyCli(args: string[]) {
-  if (process.env.FORGE_ACTIVE_STAGE) throw Error("A configured stage cannot recursively run forge verify");
   const split = args.indexOf("--");
   const argv = split < 0 ? [] : args.slice(split + 1);
   const { values } = parseArgs({
@@ -43,15 +45,30 @@ export function verifyCli(args: string[]) {
   checkMigration(root);
   const ledger = new Ledger(root);
   let temporary: string | undefined;
-  let recordAborted: (() => void) | undefined;
+  let recordAborted: ((error: unknown) => Error) | undefined;
+  const logs = new Map<string, VerificationLog>();
   try {
     const snap = executionSnapshot(ledger, values);
     const modern = usesV05(ledger, snap.task_id);
     let dir = snap.dir;
     let baseEnv: NodeJS.ProcessEnv | undefined;
-    if (process.env.FORGE_VERIFY_ACTIVE_SHA === snap.head) throw Error("Recursive verification of the same commit");
+    const scopes = enterVerificationScope(root, {task: snap.task_id, head: snap.head});
+    let logDir: string | undefined;
+    function log(key: string) {
+      let journal = logs.get(key);
+      if (!journal) {
+        journal = new VerificationLog(logDir ??= verificationLogDirectory(root, 7));
+        logs.set(key, journal);
+      }
+      return journal;
+    }
+    function finishLog(key: string, failed: boolean) {
+      const meta = log(key).finish(failed);
+      logs.delete(key);
+      return meta;
+    }
     const started = Date.now();
-    const results: { kind: Kind | "verify"; stage?: string; action?: string; options_sha256?: string; command: string[]; exit_code: number; output_sha256: string }[] = [];
+    const results: { kind: Kind | "verify"; stage?: string; action?: string; options_sha256?: string; command: string[]; exit_code: number; output_sha256: string; output_excerpt?: string; log_path?: string }[] = [];
     let environment: string | undefined;
     let fixtures: ReturnType<typeof copyVerificationFixtures> | undefined;
     const fixtureMetadata = () => fixtures ? { fixture_sha256: fixtures.digests } : {};
@@ -66,16 +83,32 @@ export function verifyCli(args: string[]) {
         freeze_seq: snap.freeze_seq, started_at: new Date(started).toISOString(), duration_ms: Date.now() - started,
         ...(aborted && { startup_failure: true, failed_phase: phase }) },
     });
-    if (fullRun && snap.freeze_seq) {
-      recordAborted = () => ledger.db.transaction(() => {
+    recordAborted = (error) => {
+      const message = redactSecrets(error instanceof Error ? error.message : String(error));
+      const key = logs.has(phase) ? phase : [...logs.keys()].at(-1) ?? phase;
+      log(key).note(message);
+      const failure = finishLog(key, true);
+      results.push({kind: "verify", stage: phase, command: ["forge", "verify"], exit_code: 1, ...failure});
+      if (snap.freeze_seq) ledger.db.transaction(() => {
         recheckExecution(ledger, snap);
-        recordRun(false, true);
+        if (fullRun) recordRun(false, true);
+        else ledger.recordEvidence({
+          task_id: snap.task_id, repo: snap.repo, branch: snap.branch, sha: snap.head, kind: kind ?? "verify",
+          source: "tool", actor: "tool", status: "fail", summary: "Verification failed during " + phase,
+          meta: { ...failure, stage: phase, exit_code: 1, freeze_seq: snap.freeze_seq, review_task_id: snap.task_id, mode },
+        });
       }).immediate();
-    }
+      return Error(phase + " (exit 1): " + failure.output_excerpt + "\n" + failure.log_path);
+    };
+    phase = "instance configuration";
+    const config = modern ? (kind ? installedInstance(root) : resolveInstance(root)) : undefined;
+    const timeoutMs = config?.verification.value.timeout_ms ?? defaultVerificationTimeout;
+    logDir = verificationLogDirectory(root, config?.verification.value.failure_log_retention_days ?? 7);
+    phase = "checkout preparation";
     function isolatedGit(cwd: string, args: string[]) {
       if (!baseEnv) throw Error("Missing isolated verification environment");
       return runProcess(["git", "-c", "core.hooksPath=/dev/null", ...args], {
-        cwd, timeoutMs: 0, env: { ...baseEnv, GIT_CONFIG_GLOBAL: "/dev/null", GIT_ALLOW_PROTOCOL: "file", GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" },
+        cwd, timeoutMs, env: { ...baseEnv, GIT_CONFIG_GLOBAL: "/dev/null", GIT_ALLOW_PROTOCOL: "file", GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" },
       });
     }
     if (modern) {
@@ -85,7 +118,7 @@ export function verifyCli(args: string[]) {
       const home = join(temporary, "home");
       mkdirSync(home, { mode: 0o700 });
       baseEnv = { PATH: process.env.PATH, LANG: process.env.LANG, HOME: home, TMPDIR: temporary,
-        FORGE_VERIFY_ACTIVE_SHA: snap.head, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" };
+        FORGE_VERIFICATION_SCOPES: scopes, FORGE_VERIFY_ACTIVE_SHA: snap.head, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" };
       mkdirSync(dir);
       checkoutLocalRevision(snap.dir, dir, snap.head, isolatedGit);
       phase = "gitlink preparation";
@@ -96,10 +129,12 @@ export function verifyCli(args: string[]) {
         const installArgs = [process.execPath, "install", "--frozen-lockfile", "--ignore-scripts"];
         if (cache) installArgs.push("--cache-dir", resolve(cache), "--backend=copyfile");
         if (values.offline) installArgs.push("--offline");
-        const install = runProcess(installArgs, { cwd: dir, env: baseEnv, timeoutMs: 120_000 });
-        if (install.code) throw Error("Cannot install locked verification dependencies: " + install.stderr);
+        const install = log(phase).run(installArgs, dir, baseEnv, timeoutMs);
+        if (install.code) throw Error("Cannot install locked verification dependencies (exit " + install.code + ")");
+        finishLog(phase, false);
       }
     }
+    baseEnv ??= {...process.env, FORGE_VERIFICATION_SCOPES: scopes};
     if (values["fixture-env"]?.length) {
       if (!temporary || !baseEnv) throw Error("--fixture-env requires an isolated v0.5 verification checkout");
       phase = "fixture preparation";
@@ -107,27 +142,22 @@ export function verifyCli(args: string[]) {
       Object.assign(baseEnv, fixtures.env);
     }
     let skipped = false;
-    function result(k: Kind, command: string[], code: number, output_sha256: string) {
-      results.push({ kind: k, command, exit_code: code, output_sha256 });
-    }
+    const skippedPhases = new Set<string>();
     if (kind) {
+      phase = kind;
       if (!isVerificationCommand(kind, argv, dir, snap.head, baseEnv))
         throw Error("Expected an executable verification runner for " + kind);
-      const hash = createHash("sha256");
-      const child = runVerificationProcess(argv, kind === "test", {
-        cwd: dir,
-        baseEnv,
-        timeoutMs: 0,
-        onOutput(stdout, stderr) {
-          hash.update(stdout).update(stderr);
-        },
-      });
-      if (child.noPytestCalls || (kind === "test" && zeroTestRun(basename(argv[0]), child.code, child.stdout + "\n" + child.stderr)))
-        skipped = true;
-      else result(kind, argv, child.code, hash.digest("hex"));
+      const child = runVerificationProcess(argv, kind === "test", {cwd: dir, baseEnv, timeoutMs, log: log(phase)});
+      skipped = child.noTests;
+      if (skipped) {
+        skippedPhases.add(phase);
+        log(phase).note("No applicable checks executed for a requested phase");
+      }
+      if (child.stderr) log(phase).note(child.stderr);
+      results.push({kind, stage: phase, command: redactArguments(argv), exit_code: skipped ? 1 : child.code,
+        ...finishLog(phase, skipped || child.code !== 0)});
     } else {
       phase = "instance configuration";
-      const config = modern ? resolveInstance(ledger.workbenchRoot) : undefined;
       environment = config?.verification.value.environment;
       if (config) policyDigest = verificationPolicy(ledger.workbenchRoot, snap.repo, snap.head, config, dir);
       const stages = config?.verification.value.stages ?? ["verify"];
@@ -144,38 +174,34 @@ export function verifyCli(args: string[]) {
         if (custom?.source !== "core" && config && custom) {
           const action = config.actions.get(custom.value.action);
           if (!action) throw Error("Missing verification action for stage " + stage);
-          const hash = createHash("sha256");
-          const code = runInstanceStage(ledger.workbenchRoot, stage, { checkout: dir, head: snap.head, repo: snap.repo, config, env: baseEnv! },
-            (stdout, stderr) => { hash.update(stdout).update(stderr); });
+          const code = runInstanceStage(ledger.workbenchRoot, stage, { checkout: dir, head: snap.head, task: snap.task_id, repo: snap.repo, config, env: baseEnv, log: log(phase) });
           results.push({ kind: "verify", stage, action: custom.value.action, command: ["forge", "instance", "run", stage],
             options_sha256: createHash("sha256").update(JSON.stringify([action.value, custom.value.options])).digest("hex"),
-            exit_code: code, output_sha256: hash.digest("hex") });
+            exit_code: code, ...finishLog(phase, code !== 0) });
           if (code !== 0) break;
           continue;
         }
         if (stage !== "verify") throw Error("Core stage cannot run as verification: " + stage);
-        const hashes = { static: createHash("sha256"), dynamic: createHash("sha256") };
         const report = runLangChecks({
           targetDir: dir,
           baseEnv,
           mode,
-          onOutput(phase, stdout, stderr) {
-            hashes[phase].update(stdout).update(stderr);
-          },
+          timeoutMs,
+          log: key => { phase = key; return log(key); },
         });
         for (const phase of ["static", "dynamic"] as const) {
           if (mode !== "all" && mode !== phase) continue;
           const checks = report.checks.filter((c) => c.phase === phase && c.status !== "skipped");
           if (!checks.length) {
             skipped = true;
-            continue;
+            skippedPhases.add(phase);
+            log(phase).note("No applicable checks executed for a requested phase");
           }
-          result(
-            phase === "static" ? "lint" : "test",
-            ["forge", "lang-check", "--mode", phase],
-            checks.some((c) => c.status === "fail") ? 1 : 0,
-            hashes[phase].digest("hex"),
-          );
+          const failure = checks.find(check => check.status === "fail");
+          if (failure) log(phase).note([failure.name, "exit", failure.exit_code ?? 1, failure.output_excerpt].filter(Boolean).join(" "));
+          const code = failure?.exit_code || (!checks.length || failure ? 1 : 0);
+          results.push({kind: phase === "static" ? "lint" : "test", stage: phase,
+            command: ["forge", "lang-check", "--mode", phase], exit_code: code, ...finishLog(phase, code !== 0)});
         }
         if (skipped || results.some(item => item.exit_code)) break;
       }
@@ -197,7 +223,7 @@ export function verifyCli(args: string[]) {
     ledger.db
       .transaction(() => {
         recheckExecution(ledger, snap);
-        for (const { kind, ...meta } of results.filter(r => r.kind !== "verify"))
+        for (const { kind, ...meta } of results.filter(r => r.kind !== "verify" && !skippedPhases.has(r.stage!)))
           ledger.recordEvidence({
             task_id: snap.task_id,
             repo: snap.repo,
@@ -217,7 +243,7 @@ export function verifyCli(args: string[]) {
               review_floor_seq: snap.floors.review,
             },
           });
-        if (fullRun) recordRun(ok);
+        if (fullRun || (!ok && results.some(item => item.kind === "verify"))) recordRun(ok);
       })
       .immediate();
     return {
@@ -228,9 +254,9 @@ export function verifyCli(args: string[]) {
       ...(skipped ? { error: "No applicable checks executed for a requested phase" } : {}),
     };
   } catch (error) {
-    recordAborted?.();
-    throw error;
+    throw recordAborted ? recordAborted(error) : error;
   } finally {
+    for (const journal of logs.values()) journal.dispose();
     ledger.closeDb();
     if (temporary) rmSync(temporary, { recursive: true, force: true });
   }

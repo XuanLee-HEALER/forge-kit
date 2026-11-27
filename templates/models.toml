@@ -6,9 +6,15 @@ model = "gpt-6.1-terra"
 effort = "medium"
 
 [tiers.standard]
-model = "gpt-6.2-astra"
+model = "gpt-6.2-sol"
 effort = "medium"
 
 [tiers.deep]
 model = "gpt-6.2-astra"
 effort = "high"
+
+[review.roles]
+business = "deep"
+quality = "deep"
+simplify = "standard"
+comments = "mechanical"

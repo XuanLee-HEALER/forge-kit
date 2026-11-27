@@ -1,5 +1,6 @@
 import { z } from "zod";
 export const Report = z.object({
+  role: z.enum(["business", "quality", "simplify", "comments", "performance"]),
   status: z.enum(["pass", "findings", "incomplete"]),
   summary: z.string(),
   findings: z.array(
@@ -12,7 +13,7 @@ export const Report = z.object({
       recommendation: z.string(),
     }),
   ),
-  checked: z.array(z.string()),
+  checked: z.array(z.object({ id: z.string(), path: z.string(), conclusion: z.enum(["reviewed", "incomplete"]) })),
   limitations: z.array(z.string()),
 });
 
@@ -82,7 +83,7 @@ export function cleanReport(raw: unknown, paths: string[] = []) {
     finding.evidence = plainText(finding.evidence, `${field}.evidence`);
     finding.recommendation = plainText(finding.recommendation, `${field}.recommendation`);
   });
-  r.checked = r.checked.map((text, i) => plainText(text, `checked[${i}]`));
+
   r.limitations = r.limitations.map((text, i) => plainText(text, `limitations[${i}]`));
   return r;
 }

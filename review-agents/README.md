@@ -1,26 +1,28 @@
 # review-agents
 
-Run a fixed-commit review from a Bun workspace or its standalone distribution. The launcher runs the built bundle when present. In a source checkout, use `bun src/review.ts` to run changes directly or `bun run build` to refresh the bundle.
+Review changes between two Git commits with a fresh read-only Codex CLI process for each role and batch. Supply both the model and reasoning effort.
 
 ```sh
-review-agents/bin/review --repo ./project --base "$BASE" --head "$HEAD" --spec ./requirements.md --roles business,quality --mode ordered --order quality,business
+review-agents/bin/review --repo ./project --base "$BASE" --head "$HEAD" \
+  --spec ./requirements.md --roles business,quality --mode ordered \
+  --order quality,business --model gpt-6.2-sol --effort medium
 ```
 
-The default runs business, quality, simplify (including performance), and comments in parallel. Serial mode uses the listed role order. Ordered mode requires an exact permutation of the requested roles. Every role starts with the same pinned materials; business also requires a readable specification. Both backends receive identical repository data. For up to eight changed source files the engine selects relative module dependencies and searches the pinned head for callers of changed declarations. It attaches numbered snippets from up to twelve unchanged source files (4 KiB each), excluding private workspace data and instruction files. The engine limits each changed blob and the combined numbered diff to 1,500,000 bytes. If material cannot fit, it stops opening subsequent diffs and lists unread paths in the incomplete result. Private directories are recognized at any workspace depth. A changed public `.agents/skills/<id>/SKILL.md` remains reviewable outside private ancestors. Private or binary material also yields an incomplete result. The report includes every selected role. An empty `attempts` array means that no backend started for that role. Forge records these unstarted selections as `review_selection` with `missing_materials`. The review history lists them alongside executed `review` records. Delivery waits for a successful execution of the same role and range. Each finding must identify a line in the pinned head file, or its base version for deletions. Invalid locations produce a role execution error. Each role returns its validated `limitations` alongside the findings. Forge retains these limitations in review evidence and displays them in `forge ledger reviews <task-id>`.
+The default runs business, quality, simplify (including performance), and comments in parallel. Serial mode uses the canonical role order. Ordered mode requires an exact permutation of the selected roles. Business requires a readable specification. Set `FORGE_CODEX_BIN` to select a Codex executable. The subprocess runs in its own temporary directory with project instructions, user configuration and tools disabled.
 
-Auto starts a fresh ephemeral read-only Codex CLI for each role. A recognized provider outage or quota failure allows a single API attempt. Explicit `--backend codex` and `--backend api` select one backend. The Codex executable comes from PATH or `FORGE_CODEX_BIN`. Its subprocess receives an allowlist of runtime, proxy/TLS and provider-authentication settings, including `HOME`, `CODEX_HOME`, `CODEX_API_KEY` and `OPENAI_API_KEY`. The API expects `OPENAI_API_KEY` or a private TOML file at `REVIEW_CONFIG` (default `~/.config/review-agents/config.toml`) with `openai.api_key`. A compatible Responses endpoint can be configured with `OPENAI_BASE_URL`. Use `--model` and `--effort` to select the runtime model. Exit codes are 0 for pass, 1 for blocked, 2 for execution error and 3 for incomplete.
+The engine inventories changed paths, rename pairs, Git modes and line counts at the selected commits. Each batch includes an inventory summary, related changes, numbered fixed-revision caller or dependency excerpts where available, and the actual patch chunks. Deletion chunks carry the old-file positions. Large files and long lines span multiple chunks. Every role acknowledges its own chunks. Excluded private files, binary changes and missing or invalid batch receipts appear in an incomplete report. The report retains validated findings from earlier batches. Each finding identifies a line within a delivered patch range.
+
+Exit codes are 0 for pass, 1 for blocking findings with complete coverage, 2 for invalid invocation, and 3 for incomplete review. Forge records role selections, executions, versions, findings and gaps in its task ledger.
 
 ## Running and developing the package
 
-The built archive includes `bin/review` and its self-contained `dist/review.js`. Unpack it and invoke `./bin/review` with Bun and Git on PATH. You can skip dependency installation and compilation for this entry point. A real review also requires access to the selected provider.
+The archive includes the launcher and self-contained bundle. Unpack it and run `./bin/review` with Bun, Git and authenticated Codex CLI on PATH. In a source checkout use `bun src/review.ts` to run source changes or `bun run build` to refresh the bundle.
 
-For source development in forge-kit, run `bun install --frozen-lockfile` once at the workspace root. Bun uses the root lockfile to install both packages. For a standalone copy outside a workspace, run these commands in the review package directory. The nested lockfile travels with the archive because Bun 1.4.4 excludes a package-root `bun.lock` when packing.
+For workspace development, run `bun install --frozen-lockfile` at the forge-kit root. For a standalone copy, install with the packaged lockfile.
 
 ```sh
 cp standalone/bun.lock bun.lock
 bun install --frozen-lockfile
 ```
 
-The source entry point, build, tests and evaluation use OpenAI and Zod from `node_modules`. A production-only install (`bun install --production --frozen-lockfile` with the appropriate lockfile in place) supplies those libraries. Static checking also needs TypeScript and the Bun type definitions from the full development install.
-
-From this directory run `bun run check`, `bun run build`, and `bun test tests`. Run `bun run eval` to score four labeled defects and their clean controls through the Codex subprocess adapter and a loopback Responses API. Offline results use deterministic simulated providers. Run `bun run eval --live` to score the same inputs with real models. Each returned record includes the exact material revision, role, actual provider, result, and score.
+Run `bun run check`, `bun run build` and `bun test tests` from this directory. Run `bun run eval` to exercise delivery and scoring through a deterministic subprocess. Run `bun run eval --live` to measure Codex on the four labeled defects and four clean controls. Both modes use the same material, location, severity and diagnosis criteria.

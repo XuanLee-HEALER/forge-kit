@@ -1,3 +1,5 @@
+import { efforts, type Model } from "../review-agents/src/models";
+import { roles, type Role } from "../review-agents/src/roles";
 import { parse as parseStrictYaml } from "yaml";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -23,6 +25,7 @@ export interface GuardConfig {
   prod_db_targets: ProdDbTarget[];
   require_prod_db_hosts: boolean;
   protected_branches: string[];
+  allow_protected_ff: string[];
   prod_tag_patterns: string[];
   custom_block_patterns?: string[];
   block_shared_worktree_ops: boolean;
@@ -37,17 +40,9 @@ export interface WorkbenchConfig {
   guard: GuardConfig;
 }
 
-export interface ModelTier {
-  model: string;
-  effort: "low" | "medium" | "high" | "xhigh";
-}
-
 export interface ModelsConfig {
-  tiers: {
-    mechanical: ModelTier;
-    standard: ModelTier;
-    deep: ModelTier;
-  };
+  tiers: Record<string, {model:string; effort:Model["effort"]}>;
+  review: { roles: Record<Role, string> };
 }
 
 export interface DbCredentialPair {
@@ -106,6 +101,7 @@ const DEFAULT_GUARD: GuardConfig = {
   prod_db_targets: [],
   require_prod_db_hosts: false,
   protected_branches: ["main", "master"],
+  allow_protected_ff: [],
   prod_tag_patterns: ["^release-v", "^v[0-9]+\\.[0-9]+\\.[0-9]+"],
   block_shared_worktree_ops: true,
   block_ledger_direct_edits: true,
@@ -357,28 +353,41 @@ export function productionHosts(cfg: WorkbenchConfig, envs: Record<string,DbEnvE
 export function decodeModelsConfig(parsed: object, file: string): ModelsConfig {
   const tiers: ModelsConfig["tiers"] = {
     mechanical: { model: "gpt-6.1-terra", effort: "medium" },
-    standard: { model: "gpt-6.2-astra", effort: "medium" },
+    standard: { model: "gpt-6.2-sol", effort: "medium" },
     deep: { model: "gpt-6.2-astra", effort: "high" },
   };
   for (const key of Object.keys(parsed))
-    if (key !== "tiers") throw Error(file + ": Unknown field " + key);
-  const overrides = "tiers" in parsed ? parsed.tiers : undefined;
+    if (key !== "tiers" && key !== "review") throw Error(file + ": Unknown field " + key);
+  const overrides = "tiers" in parsed ? parsed.tiers : {};
   if (!overrides || typeof overrides !== "object" || Array.isArray(overrides))
     throw Error(file + ": tiers must be a mapping");
   // A v0.4 instance may override one tier and inherit every other default.
   for (const [name, tier] of Object.entries(overrides)) {
     const field = "tiers." + name;
-    if (!Object.hasOwn(tiers, name)) throw Error(file + ": Unknown field " + field);
+    if (!/^[a-z][a-z0-9_-]*$/.test(name) || name in Object.prototype) throw Error(file + ": Invalid " + field);
     if (!tier || typeof tier !== "object" || Array.isArray(tier)) throw Error(file + ": " + field + " must be a mapping");
     for (const key of Object.keys(tier))
       if (key !== "model" && key !== "effort") throw Error(file + ": Unknown field " + field + "." + key);
     const { model, effort } = tier as Record<string, unknown>;
-    if (typeof model !== "string" || !model.trim()) throw Error(file + ": " + field + ".model must be a nonempty string");
-    if (effort !== "low" && effort !== "medium" && effort !== "high" && effort !== "xhigh")
-      throw Error(file + ": Invalid " + field + ".effort");
-    tiers[name as keyof typeof tiers] = { model, effort };
+    if (typeof model !== "string" || !model.trim()) throw Error(file + ": Invalid " + field + ".model");
+    if (!efforts.some(e => e === effort)) throw Error(file + ": Invalid " + field + ".effort");
+    tiers[name] = {model, effort: effort as Model["effort"]};
   }
-  return { tiers };
+  const mapping: Record<Role, string> = { business: "deep", quality: "deep", simplify: "standard", comments: "mechanical", performance: "deep" };
+  if ("review" in parsed) {
+    const review = parsed.review;
+    if (!review || typeof review !== "object" || Array.isArray(review) || Object.keys(review).some(k => k !== "roles"))
+      throw Error(file + ": Invalid review mapping");
+    if ("roles" in review) {
+      if (!review.roles || typeof review.roles !== "object" || Array.isArray(review.roles)) throw Error(file + ": Invalid review.roles");
+      for (const [role, tier] of Object.entries(review.roles)) {
+        if (!roles.some(r => r === role) || typeof tier !== "string" || !Object.hasOwn(tiers, tier))
+          throw Error(file + ": Invalid review.roles." + role);
+        mapping[role as Role] = tier;
+      }
+    }
+  }
+  return { tiers, review: { roles: mapping } };
 }
 
 export function loadModelsConfig(root: string): ModelsConfig {

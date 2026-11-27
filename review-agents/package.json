@@ -9,14 +9,13 @@
     "eval": "bun scripts/evaluate.ts"
   },
   "dependencies": {
-    "openai": "7.51.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "~6.0.0"
   },
-  "version": "0.5.1",
+  "version": "0.5.2",
   "bin": {
     "review-agents": "./bin/review"
   },
@@ -26,7 +25,7 @@
     "src",
     "prompts",
     "scripts",
-    "evals/paired.json",
+    "evals/quality.json",
     "standalone/bun.lock",
     "tests",
     "tsconfig.json"

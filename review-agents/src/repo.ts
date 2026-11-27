@@ -5,25 +5,24 @@ export function snapshotGitEnv() {
   const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat" } as NodeJS.ProcessEnv;
   for (const key of ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX",
-    "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE"]) delete env[key];
+    "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_ATTR_SOURCE"]) delete env[key];
   return env;
 }
 
 const privateDirectories = new Set([".workbench", ".codex", ".agents", ".ssh"]);
 
-export const DIFF_BYTE_LIMIT = 1_500_000;
+export type Change = {
+  path: string; oldPath: string; status: string; oldMode: string; newMode: string;
+  oldOid: string; newOid: string; added: number | null; deleted: number | null;
+};
 
 export class Repo {
   root: string;
   base: string;
   head: string;
   files: string[];
-  coverage = new Map<string, Set<number>>();
-  diffs = new Map<string, string[]>();
+  changes: Change[];
   excludedFiles: string[];
-  readFiles = new Set<string>();
-  private lineCounts = new Map<string, number>();
-  searches = 0;
   constructor(root: string, base: string, head: string) {
     this.root = realpathSync(root);
     this.base = this.git([
@@ -38,19 +37,30 @@ export class Repo {
       "--end-of-options",
       `${head}^{commit}`,
     ]).trim();
-    this.files = this.git([
-      "diff",
-      "--name-only",
-      "-z",
-      "--no-renames",
-      this.base,
-      this.head,
-      "--",
-    ])
-      .split("\0")
-      .filter(Boolean);
-    this.excludedFiles = this.files.filter(isPrivatePath);
-    this.files = this.files.filter((p) => !isPrivatePath(p));
+    const fields = this.git(["diff", "--raw", "--numstat", "--no-abbrev", "--find-renames", "-l0", "--no-ext-diff",
+      "--no-textconv", "--ignore-submodules=none", "-z", this.base, this.head, "--"]).split("\0");
+    const changes: Change[] = [];
+    let n = 0;
+    while (fields[n]?.startsWith(":")) {
+      const [oldMode, newMode, oldOid, newOid, status] = fields[n++].slice(1).split(" ");
+      const oldPath = fields[n++];
+      const path = /^[RC]/.test(status) ? fields[n++] : oldPath;
+      changes.push({ path, oldPath, status, oldMode, newMode, oldOid, newOid, added: null, deleted: null });
+    }
+    for (const change of changes) {
+      const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(fields[n++]);
+      if (!match) throw Error("Incomplete Git change statistics");
+      const oldPath = match[3] || fields[n++];
+      const path = match[3] || fields[n++];
+      if (oldPath !== change.oldPath || path !== change.path) throw Error("Inconsistent Git change inventory");
+      change.added = match[1] === "-" ? null : Number(match[1]);
+      change.deleted = match[2] === "-" ? null : Number(match[2]);
+    }
+    if (fields[n] !== "" || n !== fields.length - 1) throw Error("Unexpected Git change inventory");
+    const privateChange = (c: Change) => isPrivatePath(c.path) || isPrivatePath(c.oldPath);
+    this.excludedFiles = changes.filter(privateChange).map(c => c.path);
+    this.changes = changes.filter(c => !privateChange(c));
+    this.files = this.changes.map(c => c.path);
   }
   git(args: string[], allowNoMatch = false, maxBytes = 32 * 1024 * 1024) {
     const p = Bun.spawnSync(
@@ -58,7 +68,7 @@ export class Repo {
       {
         stdout: "pipe",
         stderr: "pipe",
-        env: snapshotGitEnv(),
+        env: { ...snapshotGitEnv(), ...(this.head && {GIT_ATTR_SOURCE:this.head}) },
         timeout: 20000,
         maxBuffer: maxBytes + 1,
       },
@@ -78,55 +88,7 @@ export class Repo {
     )
       throw new Error("Invalid repository-relative path");
     if (isPrivatePath(path)) throw new Error("Private file excluded");
-    
     return path;
-  }
-  lineCount(path: string) {
-    const cached = this.lineCounts.get(path);
-    if (cached !== undefined) return cached;
-    this.path(path);
-    const headEntry = this.git(["--literal-pathspecs", "ls-tree", "-z", this.head, "--", path]);
-    // A file can be replaced by a directory. Its deleted lines belong to base.
-    const entry = !headEntry || /^040000 tree /.test(headEntry)
-      ? this.git(["--literal-pathspecs", "ls-tree", "-z", this.base, "--", path]) : headEntry;
-    const blob = /^\d+ blob ([0-9a-f]+)\t/.exec(entry);
-    const content = blob ? this.git(["cat-file", "blob", blob[1]], false, DIFF_BYTE_LIMIT) : "";
-    let lines = content.length && !content.endsWith("\n") ? 1 : 0;
-    for (let i = 0; i < content.length; i++) if (content.charCodeAt(i) === 10) lines++;
-    this.lineCounts.set(path, lines);
-    return lines;
-  }
-  diff(path: string, offset = 0, remainingBytes = DIFF_BYTE_LIMIT) {
-    this.path(path);
-    if (!this.files.includes(path))
-      throw new Error("Path outside changed files");
-    let lines = this.diffs.get(path);
-    if (!lines) {
-      // Cap Git's blob inputs as well as its output. A tiny textual change in a
-      // very large blob can otherwise allocate much more than the prompt budget.
-      for (const rev of [this.base, this.head]) {
-        const entry = this.git(["--literal-pathspecs", "ls-tree", "-l", "-z", rev, "--", path]);
-        const blobSize = /^\d+ blob [0-9a-f]+ +([0-9]+)\t/.exec(entry);
-        if (blobSize && Number(blobSize[1]) > DIFF_BYTE_LIMIT) throw Error("Changed blob exceeds review material limit");
-      }
-      lines = this.git([
-        "--literal-pathspecs", "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-renames",
-        "--unified=5",
-        this.base,
-        this.head,
-        "--",
-        path,
-      ], false, remainingBytes).split("\n");
-      this.diffs.set(path, lines);
-    }
-    const page = this.page(lines, offset);
-    const seen = this.coverage.get(path) ?? new Set<number>();
-    for (let i = offset; i < page.nextOffset; i++) seen.add(i);
-    this.coverage.set(path, seen);
-    return page;
   }
   page(lines: string[], offset: number) {
     if (!Number.isInteger(offset) || offset < 0 || offset > lines.length)
@@ -161,10 +123,9 @@ export class Repo {
       throw new Error("Invalid revision");
     const sha = revision === "base" ? this.base : this.head;
     const result = this.page(
-      this.git(["show", `${sha}:${path}`]).split("\n"),
+      this.git(["show", `${sha}:${path}`], false, 96 * 1024).split("\n"),
       offset,
     );
-    this.readFiles.add(`${revision}:${path}`);
     return result;
   }
   trackedPaths() {
@@ -178,7 +139,7 @@ export class Repo {
       ...terms.flatMap(term => ["-e", term]), this.head, "--", ...globs,
       ...Array.from(privateDirectories, dir => ":(exclude,glob)**/" + dir + "/**"),
       ":(exclude)**/.env*", ":(exclude).env*", ":(exclude)**/config.toml", ":(exclude)config.toml",
-      ":(exclude)*.pem", ":(exclude)*.key"], true);
+      ":(exclude)*.pem", ":(exclude)*.key"], true, 96 * 1024);
     const hits: {path: string; line: number; text: string}[] = [];
     for (const row of raw.split("\n")) {
       const [name, line, text] = row.split("\0");
@@ -192,7 +153,6 @@ export class Repo {
   search(query: string, glob: string, offset: number) {
     if (typeof query !== "string" || typeof glob !== "string" || query.length > 200 || glob.length > 200)
       throw new Error("Invalid search");
-    this.searches++;
     if (!query) {
       const matcher = new Bun.Glob(glob || "**");
       return this.page(this.trackedPaths().filter(p => matcher.match(p)), offset);
@@ -205,7 +165,7 @@ export class Repo {
     const publicSource = (p: string) => extensions.includes(posix.extname(p).slice(1)) &&
       !/(^|\/)(?:\.workbench|\.agents|\.codex|\.ssh|node_modules|vendor)\//.test(p);
     const changedPaths = new Set(this.files);
-    const changed = this.files.filter(publicSource).slice(0, 8);
+    const changed = Object.keys(diff).filter(publicSource).slice(0, 8);
     const files: { path: string; text: string }[] = [];
     const omitted: string[] = [];
     if (!changed.length) return { revision: this.head, files, omitted };
@@ -219,7 +179,8 @@ export class Repo {
       const stem = posix.parse(file).name;
       if (/^[a-zA-Z_]\w{2,}$/.test(stem) && !["index","main","mod"].includes(stem)) names.add(stem);
       if (!paths.has(file)) continue;
-      const header = this.read(file, "head", 0).text;
+      let header = "";
+      try { header = this.read(file, "head", 0).text; } catch { /* The patch still provides changed imports. */ }
       for (const m of (header + "\n" + patch).matchAll(/["'](\.\.?\/[^"'\s]+)["']/g)) {
         const target = posix.join(posix.dirname(file), m[1]);
         // TS sources commonly refer to a .js module in their emitted imports.
@@ -255,14 +216,7 @@ export class Repo {
     }
     return { revision: this.head, files, omitted };
   }
-  missing() {
-    return this.files.filter(
-      (f) =>
-        !this.diffs.has(f) ||
-        this.coverage.get(f)?.size !== this.diffs.get(f)!.length ||
-        this.diffs.get(f)!.some((l) => l.startsWith("Binary files ")),
-    );
-  }
+
 }
 
 function isInstructionFile(path: string) {

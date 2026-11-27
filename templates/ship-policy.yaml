@@ -1,9 +1,9 @@
 fast_track:
   enabled: true
-  # The instance delivery path and its human-approved exact runbook select the endpoint.
+  # The approved task scope and instance delivery path select the endpoint.
   max_endpoint: prod
   allow_prod: true
-  forbid_db_rw: false
+  forbid_db_rw: true
   max_files_changed: 25
   max_lines_changed: 800
   max_steward_rounds: 3

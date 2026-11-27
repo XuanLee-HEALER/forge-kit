@@ -42,6 +42,10 @@ async function main() {
       return;
     }
     case "review": {
+      if (args.includes("--help")) {
+        console.log("forge review --task <id> --repo <repo> [--base <sha>] [--head <sha>] [--roles business,quality,simplify,comments] [--mode parallel|serial|ordered] [--order <roles>] [--model <id> --effort <level> | --tier <name>]");
+        return;
+      }
       const { reviewCli, reviewExitCode } = await import("../forge-review");
       const result = await reviewCli(args);
       console.log(JSON.stringify(result));

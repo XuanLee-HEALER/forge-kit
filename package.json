@@ -1,6 +1,6 @@
 {
   "name": "forge-kit",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "private": true,
   "type": "module",
   "files": [
@@ -16,7 +16,7 @@
     "review-agents/src",
     "templates",
     "review-agents/README.md",
-    "review-agents/evals/paired.json",
+    "review-agents/evals/quality.json",
     "review-agents/scripts",
     "review-agents/tests",
     "review-agents/tsconfig.json"
@@ -25,7 +25,7 @@
     "forge": "./bin/forge"
   },
   "scripts": {
-    "build": "bun build --target=bun --outfile=dist/cli.js src/bin/cli.ts && (cd review-agents && bun run build)",
+    "build": "bun scripts/build.ts && (cd review-agents && bun run build)",
     "check": "bun --bun run tsc --noEmit",
     "test": "bun test ./tests",
     "test:all": "bun test ./tests && (cd review-agents && bun test)",

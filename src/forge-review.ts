@@ -1,7 +1,9 @@
+import { roles, type Role } from "../review-agents/src/roles";
+import { modelPair, type Model } from "../review-agents/src/models";
 import { checkMigration } from "./managed-assets";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { reviewOptions, runReview } from "../review-agents/src/engine";
+import { reviewOptions, reviewSelection, runReview } from "../review-agents/src/engine";
 import { canonicalRepoPath, findWorkbenchRoot, loadModelsConfig } from "./config";
 import { runGit } from "./git";
 import { executionSnapshot, recheckExecution, targetOptions } from "./ledger/execution";
@@ -43,9 +45,20 @@ function performanceFailure(ledger: Ledger, snap: ReturnType<typeof executionSna
 }
 
 export async function reviewCli(args: string[]) {
-  const { values } = parseArgs({ args, options: { ...reviewOptions, ...targetOptions } });
+  const { values } = parseArgs({ args, options: { ...reviewOptions, ...targetOptions, tier: {type:"string"} } });
   const root = findWorkbenchRoot(values.cwd);
   checkMigration(root);
+  const config = loadModelsConfig(root);
+  const {sequence} = reviewSelection(values, values.roles === "performance" ? ["performance"] : roles);
+  const explicit = values.model !== undefined || values.effort !== undefined;
+  if (explicit && values.tier !== undefined) throw Error("Use either --model with --effort or --tier");
+  if (values.tier !== undefined && !Object.hasOwn(config.tiers, values.tier)) throw Error("Unknown --tier");
+  const override = explicit ? modelPair(values.model, values.effort) : undefined;
+  const models: Partial<Record<Role, Model>> = {};
+  for (const role of sequence) {
+    const tier = config.tiers[values.tier ?? config.review.roles[role]];
+    models[role] = override ?? modelPair(tier.model, tier.effort);
+  }
   const ledger = new Ledger(root);
   try {
     const snap = executionSnapshot(ledger, values);
@@ -54,7 +67,6 @@ export async function reviewCli(args: string[]) {
     if (!base || head !== snap.head || !snap.base || runGit(snap.dir, ["merge-base", "--is-ancestor", snap.base, base]).code)
       throw Error("Expected an attached review range ending at the current delivery HEAD");
     const priorFailure = values.roles === "performance" ? performanceFailure(ledger, snap, base) : undefined;
-    const config = loadModelsConfig(root);
     const spec = ledger.getSpecState(snap.task_id);
     const specPath = spec.state === "FROZEN" && (spec.files?.ssot ?? spec.files?.scope);
     const started = new Date().toISOString();
@@ -63,7 +75,7 @@ export async function reviewCli(args: string[]) {
       ...values, repo: snap.dir, base, head, spec: specPath ? join(root, specPath) : undefined,
       specSha256: spec.hashes?.ssot ?? spec.hashes?.scope,
       legacyPerformanceRetry: priorFailure !== undefined,
-      models: { performance: config.tiers.deep, business: config.tiers.deep, quality: config.tiers.deep, simplify: config.tiers.standard, comments: config.tiers.mechanical },
+      models, model:undefined,
     });
     ledger.db.transaction(() => {
       recheckExecution(ledger, snap);
@@ -80,7 +92,7 @@ export async function reviewCli(args: string[]) {
             review_task_id: snap.task_id, review_floor_seq: snap.floors.review, freeze_seq: snap.freeze_seq,
             ...(result.missing_materials ? { missing_materials: result.missing_materials } : {}),
             backend: result.backend, attempts: result.attempts, report_status: result.status,
-            limitations: result.limitations, findings: result.findings, findings_count: result.findings.length, fallback_used: result.attempts.length > 1,
+            limitations: result.limitations, findings: result.findings, findings_count: result.findings.length, coverage: result.coverage, model: models[result.role],
           },
           tool_use_id: (selectedOnly ? "review-selection:" : "review-execution:") + execution + ":" + result.role,
         });

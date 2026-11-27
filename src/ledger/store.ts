@@ -121,7 +121,10 @@ export class Ledger {
   }
 
   private validEndpoint(endpoint: string) {
-    return VALID_ENDPOINTS.has(endpoint) || (!!endpoint && installedInstance(this.workbenchRoot)?.delivery.value.endpoint === endpoint);
+    if (VALID_ENDPOINTS.has(endpoint)) return true;
+    const instance = installedInstance(this.workbenchRoot);
+    // Standalone historical ledgers may retain this metadata without an installed executor.
+    return instance ? instance.delivery.value.endpoint === endpoint : endpoint === "fat";
   }
 
   openTask(params: {
@@ -138,7 +141,7 @@ export class Ledger {
     actor?: string;
     session_id?: string | null;
   }): { task: TaskRecord; event: EventRecord } {
-    if (!this.validEndpoint(params.endpoint)) {
+    if (!(params.workflow_version === "0.4" && params.endpoint === "fat") && !this.validEndpoint(params.endpoint)) {
       throw new Error(`Invalid endpoint: ${params.endpoint}`);
     }
     if (!VALID_DEPTHS.has(params.depth)) {
@@ -1063,7 +1066,7 @@ export class Ledger {
         }
         if (
           (task.endpoint === "pr" && p.kind === "pr" && attachments.length === 1 && ev.branch === attachments[0].branch) ||
-          (task.endpoint === "fat" && (p.kind === "fat" ||
+          (task.endpoint === "fat" && !rolloutStages.length && (p.kind === "fat" ||
             (p.kind === "hurl" && evidenceSource(p, ev.actor) === "hook"))) ||
           (isRolloutEndpoint(task.endpoint) && p.kind === "prod" && (task.endpoint === "prod" ||
             (evidenceSource(p, ev.actor) === "tool" && p.meta?.delivery_endpoint === task.endpoint)))
@@ -1084,7 +1087,7 @@ export class Ledger {
               continue;
             }
           }
-          const endpointFloor = task.endpoint === "fat" ? floors.fat : 0;
+          const endpointFloor = task.endpoint === "fat" && !rolloutStages.length ? floors.fat : 0;
           if (ev.seq >= endpointFloor && (p.status === "pass" || p.status === "fail")) {
             evidence.endpoint = p.status;
           }
@@ -1596,7 +1599,7 @@ export class Ledger {
     title: string;
     actions: Partial<RunbookActions>;
     exact_stages?: string[];
-    exact_fat?: string[];
+    exact_push?: string[];
   }): RunbookRecord {
     return createRunbook(this, params);
   }

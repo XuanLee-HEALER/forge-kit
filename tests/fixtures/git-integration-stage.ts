@@ -3,42 +3,27 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const [route, ...args] = process.argv.slice(2);
-const root = process.env.TARGET_GIT!,
-  statusFile = process.env.PR_STATE!;
+const [operation, host] = process.argv.slice(2);
+const root = join(host, "remote.git"), statusFile = join(host,"host-pr.json");
 const pr = JSON.parse(readFileSync(statusFile, "utf8"));
-const protocol = "forge.atomic-pr.v1",
-  repository = "https://forge.example.test:8443/fixture/app";
-const required = [
-  "base_branch",
-  "base_oid",
-  "head_oid",
-  "merge_tree",
-  "open_pr",
-  "protected_branch_rules",
-  "required_checks",
-];
-if (route.endsWith("/capabilities")) {
-  if (process.env.WITHHOLD_CAPABILITY) {
-    console.log(JSON.stringify({atomic:true}));
-    process.exit(0);
-  }
-  console.log(JSON.stringify({ protocol, repository, preconditions: required }));
+const [target] = JSON.parse(process.env.FORGE_APPROVED_TARGETS!);
+const versions = JSON.parse(process.env.FORGE_APPROVED_HEADS!);
+const {head, baseOid:base, tree:approvedTree} = target;
+if (target.url !== pr.url || target.base !== "main" || target.number !== 1 || target.repo !== "app" ||
+    versions.length !== 1 || versions[0].head !== head || versions[0].repo !== target.repo) process.exit(2);
+const fact = {action_id: process.env.FORGE_ACTION_ID, endpoint:process.env.FORGE_ENDPOINT, versions};
+const record = git(["cat-file","-p","refs/fixture/pr/1/state"]);
+if (operation === "observe") {
+  const accepted = record.startsWith("{") && JSON.parse(record);
+  const complete = accepted && accepted.fact.action_id === fact.action_id && pr.state === "MERGED" &&
+    pr.mergeCommit.oid === accepted.result && git(["rev-parse","refs/heads/main"]) === accepted.result &&
+    git(["rev-parse",accepted.result+"^{tree}"]) === approvedTree;
+  const optimistic = accepted && existsSync(join(host,"optimistic-observer"));
+  console.log(JSON.stringify(complete || optimistic ? {...accepted.fact,state:"completed"} : {...fact,state:"absent"}));
   process.exit(0);
 }
-const fields = Object.fromEntries(args.filter((x) => x.includes("=")).map((x) => x.split("=")));
-if (
-  !route.endsWith("/pulls/1/merge") ||
-  !args.includes("POST") ||
-  fields.protocol !== protocol ||
-  fields.pull_request !== pr.url ||
-  fields.expected_state !== "OPEN" ||
-  fields.expected_base_branch !== pr.baseRefName ||
-  fields.policy !== "protected_branch_rules_and_required_checks" ||
-  pr.state !== "OPEN" ||
-  readFileSync(process.env.CI_STATE!, "utf8") !== "pass"
-)
-  process.exit(2);
+if (operation !== "submit" || pr.state !== "OPEN") process.exit(2);
+appendFileSync(join(host,"submit-attempts"), JSON.stringify({target, fact}) + "\n");
 function git(args: string[], stdin?: string) {
   const p = Bun.spawnSync(["git", "-C", root, ...args], {
     stdin: stdin === undefined ? undefined : Buffer.from(stdin),
@@ -56,12 +41,10 @@ if (existsSync(gate + ".armed")) {
 }
 const digest = (s: string) => git(["hash-object", "-w", "--stdin"], s);
 const open = digest(JSON.stringify(["OPEN", pr.url, pr.baseRefName, pr.headRefName]));
-const merged = digest(JSON.stringify(["MERGED", pr.url, pr.baseRefName, pr.headRefName]));
+
 const stateRef = "refs/fixture/pr/1/state",
   featureRef = "refs/heads/" + pr.headRefName,
   mainRef = "refs/heads/" + pr.baseRefName;
-const base = fields.expected_base_oid,
-  head = fields.expected_head_oid;
 const raceInput = existsSync(race) ? JSON.parse(readFileSync(race, "utf8")) : null;
 if (raceInput && raceInput.when !== "before-transaction") {
   const { when, other } = raceInput;
@@ -71,10 +54,13 @@ if (raceInput && raceInput.when !== "before-transaction") {
   } else if (when === "head-change") {
     git(["update-ref", featureRef, other, head]);
     writeFileSync(statusFile, JSON.stringify({ ...pr, headRefOid: other }));
-  } else git(["update-ref", mainRef, other, base]);
+  } else if (when === "protection") git(["update-ref","refs/fixture/protection",digest("disabled")]);
+  else if (when === "checks") git(["update-ref","refs/fixture/checks/"+head,digest("fail")]);
+  else if (when === "rejected") process.exit(6);
+  else git(["update-ref", mainRef, other, base]);
 }
 const tree = git(["merge-tree", "--write-tree", base, head]);
-if (tree !== fields.expected_merge_tree) process.exit(5);
+if (tree !== approvedTree) process.exit(5);
 const ff = Bun.spawnSync(["git", "-C", root, "merge-base", "--is-ancestor", base, head]).exitCode === 0;
 const result = ff
   ? head
@@ -92,6 +78,7 @@ const result = ff
       "-m",
       "Hosted merge",
     ]);
+const merged = digest(JSON.stringify({fact,target,result}));
 if (raceInput?.when === "before-transaction") git(["update-ref", mainRef, raceInput.other, base]);
 git(
   ["update-ref", "--stdin"],
@@ -107,8 +94,8 @@ git(
     "",
   ].join("\n"),
 );
-appendFileSync(process.env.TARGET_LOG!, "merge " + result + "\n");
-if (!process.env.WITHHOLD_PR_RECEIPT)
+appendFileSync(join(host,"host-effects"), "merge " + result + "\n");
+if (!existsSync(join(host,"hide-receipt")))
   writeFileSync(
     statusFile,
     JSON.stringify({
