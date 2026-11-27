@@ -189,7 +189,7 @@ export class Ledger {
         payload: {
           title: params.title,
           endpoint: params.endpoint,
-          ...(params.workflow_version !== "0.4" && { workflow_version: "0.5" }),
+          ...(params.workflow_version !== "0.4" && { workflow_version: "0.5", specs_only: true }),
           verification_depth: params.depth,
           base_sha: base,
         },

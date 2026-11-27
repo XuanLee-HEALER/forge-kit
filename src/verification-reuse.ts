@@ -12,6 +12,6 @@ export function verificationReuseKey(policy: string, offline: boolean, fixtures:
   });
   return createHash("sha256").update(JSON.stringify([
     1, Bun.version, process.platform, process.arch, policy, offline, tools,
-    process.env.PATH, process.env.BUN_INSTALL_CACHE_DIR, Object.entries(fixtures).sort(),
+    process.env.PATH, process.env.LANG, process.env.BUN_INSTALL_CACHE_DIR, Object.entries(fixtures).sort(),
   ])).digest("hex");
 }

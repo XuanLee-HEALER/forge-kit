@@ -42,6 +42,10 @@ export function writeTargets(input: CodexHookInput): string[] {
     if (bin === "tar") {
       const dest = tarCreateDestination(args);
       if (dest) add(dest);
+      if (args.some(a => a === "--extract" || /^-[a-zA-Z]*x/.test(a))) {
+        const directory = args.findIndex(a => a === "-C" || a === "--directory");
+        add(directory >= 0 ? args[directory + 1] ?? "." : ".");
+      }
     }
     if (bin === "dd") args.filter(a => a.startsWith("of=")).forEach(a => add(a.slice(3)));
     if (bin === "sqlite3") {

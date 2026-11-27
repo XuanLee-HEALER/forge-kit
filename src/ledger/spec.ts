@@ -95,10 +95,11 @@ export function freezeSpec(ledger: LedgerReader, params: {
       : task.verification_depth === "targeted" && usesV05(ledger, params.task_id);
     const fileNames: Record<string, string> = lightweight ? { scope: "scope.md" }
       : { ssot: "ssot.md", tech_spec: "tech-spec.md", test_spec: "test-spec.md" };
-    const previousFreeze = previous.freeze_seq && ledger.db.query<{payload_json: string}, [string, number]>(
-      "SELECT payload_json FROM events WHERE task_id=? AND seq=?"
-    ).get(params.task_id, previous.freeze_seq);
-    const specsOnly = previousFreeze ? JSON.parse(previousFreeze.payload_json).specs_only === true : usesV05(ledger, params.task_id);
+    // Existing tasks retain the directory policy they opened or last froze with.
+    const policy = ledger.db.query<{payload_json: string}, [string, number | null]>(
+      "SELECT payload_json FROM events WHERE task_id=? AND (event_type='TASK_OPENED' OR seq=?) ORDER BY seq DESC LIMIT 1"
+    ).get(params.task_id, previous.freeze_seq ?? null);
+    const specsOnly = !!policy && JSON.parse(policy.payload_json).specs_only === true;
     if (specsOnly) {
       const extras = readdirSync(realDir).filter(name => !Object.values(fileNames).includes(name));
       if (extras.length) throw Error("Move non-specification files to .workbench/runs/" + params.task_id + ": " + extras.join(", "));

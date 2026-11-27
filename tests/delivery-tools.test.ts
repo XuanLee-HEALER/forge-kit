@@ -428,7 +428,9 @@ test("PR lookup reports silent failures and obeys the caller's remaining deadlin
 test("a v0.5 task can close at the PR endpoint only with confirmed membership in remote main", () => {
   const head = commit("change");
   ledger.openTask({task_id:"fix",title:"Ship reviewed revision",repo:"svc",branch:"feature",endpoint:"pr",depth:"targeted",base_sha:base,head_sha:head});
-  writeFileSync(join(root, ".workbench/specs/fix/scope.md"), "Fix one covered behavior.");
+  const specs = join(root, ".workbench/specs/fix");
+  for (const name of ["ssot", "tech-spec", "test-spec"]) rmSync(join(specs, name + ".md"));
+  writeFileSync(join(specs, "scope.md"), "Fix one covered behavior.");
   ledger.freezeSpec({task_id:"fix"});
   tool("gh", 'if [ "$1" = pr ]; then printf "%s" "$TEST_PR"; elif [ "$6" = .object.sha ]; then printf "%s" "$MAIN_OID"; else printf "%s" "$COMPARISON"; fi');
   const url="https://github.com/acme/svc/pull/23";

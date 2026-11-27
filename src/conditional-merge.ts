@@ -13,9 +13,9 @@ export function pushFastForward(dir: string, action: Extract<ShipAction, {kind: 
     throw Error("Expected a strict fast-forward to a registered branch");
   git(dir, ["check-ref-format", action.ref]);
   git(dir, ["--no-replace-objects", "merge-base", "--is-ancestor", action.baseOid, action.head]);
+  authorize();
   const before = remoteBranch(dir, action.ref);
   if (before !== action.baseOid) throw Error("Approved remote branch changed: " + action.ref + " is " + before + ", expected " + action.baseOid);
-  authorize();
   const refspec = action.head + ":" + action.ref;
   const result = runGit(dir, ["--no-replace-objects", "push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no",
     write, refspec]);

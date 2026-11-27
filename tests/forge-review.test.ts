@@ -3,12 +3,12 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSy
 import { join } from "node:path";
 import { executorFixture } from "./helpers/executor";
 
-const f = executorFixture();
+const f = executorFixture("0.5");
 let codex: string;
 beforeEach(() => {
   const docs = join(f.root, ".workbench/specs/task");
   mkdirSync(docs, { recursive: true });
-  for (const name of ["scope", "ssot", "tech-spec", "test-spec"]) writeFileSync(join(docs, name + ".md"), "Fixture requirements");
+  writeFileSync(join(docs, "scope.md"), "Fixture requirements");
   const frozen = f.cli("ledger", [ "freeze", "task"]);
   expect(frozen.exitCode, frozen.stderr.toString()).toBe(0);
   writeFileSync(join(f.repo, "code.txt"), "updated");

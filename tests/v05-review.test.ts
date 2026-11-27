@@ -227,7 +227,7 @@ test("ledger reviews preserves selected roles that could not start and their mis
   s.ok([s.forge, "ledger", "open", "--id", "selection", "--title", "Check review coverage", "--repo", "app",
     "--branch", "main", "--base", base, "--depth", "targeted"]);
   s.env.FORGE_CODEX_BIN = codex;
-  const args = [s.forge, "review", "--task", "selection", "--repo", "app", "--roles", "business,quality", "--model", "gpt-6.2-sol", "--effort", "medium"];
+  const args = [s.forge, "review", "--task", "selection", "--repo", "app", "--full", "--roles", "business,quality", "--model", "gpt-6.2-sol", "--effort", "medium"];
   const prior = s.run([s.forge, "review", "--task", "selection", "--repo", "app", "--roles", "quality", "--model", "gpt-6.2-sol", "--effort", "medium"], app);
   expect(prior.code, prior.out + prior.err).toBe(0);
   const result = s.run(args, app);

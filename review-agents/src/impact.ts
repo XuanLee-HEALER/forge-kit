@@ -15,7 +15,7 @@ function addTo<K,V>(groups: Map<K,Set<V>>, key: K, value: V) {
 
 function surfaces(source: string) {
   const result = new Map<string,string[]>();
-  const declarations = [...source.matchAll(/(?:^|(?<=[;}]))[ \t]*export\s+(?:(?:default|async|abstract|declare)\s+)*(function|class|interface|type|enum|const|let|var)\s+([\w$]+)/gm)];
+  const declarations = [...source.matchAll(/(?:^|(?<=[;}]))[ \t]*export\s+(?:(?:default|async|abstract|declare)\s+)*(function|class|interface|type|enum|const|let|var)(?:\s*\*\s*|\s+)([\w$]+)/gm)];
   for (const [i, match] of declarations.entries()) {
     const end = declarations[i+1]?.index ?? source.length;
     let text = source.slice(match.index, end).split(/\n(?=(?:import|const|class|function|interface|type|let|var)\s)/)[0].trim();

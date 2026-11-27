@@ -81,7 +81,7 @@ export function verifyCli(args: string[]) {
       task_id: snap.task_id, repo: snap.repo, branch: snap.branch, sha: snap.head, kind: "verify",
       source: "tool", actor: "tool", status: passed ? "pass" : "fail",
       summary: aborted ? "Verification failed during " + phase : "Configured verification stages",
-      meta: { mode, reuse_key: reuseKey, ...fixtureMetadata(), ...(environment && {environment}), ...(policyDigest && {policy_sha256:policyDigest}), stages: results, review_task_id: snap.task_id,
+      meta: { mode, ...(reuseKey && {reuse_key: reuseKey}), ...fixtureMetadata(), ...(environment && {environment}), ...(policyDigest && {policy_sha256:policyDigest}), stages: results, review_task_id: snap.task_id,
         freeze_seq: snap.freeze_seq, started_at: new Date(started).toISOString(), duration_ms: Date.now() - started,
         ...(aborted && { startup_failure: true, failed_phase: phase }) },
     });
