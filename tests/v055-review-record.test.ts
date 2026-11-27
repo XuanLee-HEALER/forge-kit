@@ -251,3 +251,32 @@ test("native reassessment clears a historical selection and close needs a full f
   expect(f.ledger.getTask(task)?.status).toBe("CLOSED");
   expect(ok("verify", "--task", task).ok).toBe(true);
 });
+
+test("each failure from the same reviewer needs its own reassessment", () => {
+  const previous = head;
+  function recordQuality(status: string, from: string, reviewSummary: string, filename: string) {
+    report = join(f.root, filename);
+    writeFileSync(report, reviewSummary + "\n");
+    ok(...args("quality", status, from, head, reviewSummary));
+  }
+  recordQuality("blocked", base, "The parser loses empty values", "parser.md");
+  recordQuality("blocked", base, "The writer truncates values", "writer.md");
+  const failures = ok("reviews", task);
+  expect(failures).toHaveLength(2);
+  const [parser, writer] = failures;
+  expect(parser.seq).not.toBe(writer.seq);
+  head = change("repair the parser and writer");
+  checks();
+  ok(...args("business"));
+  recordQuality("pass", previous, `Verified parser fix #${parser.seq}`, "parser-recheck.md");
+  expect(ready().ready).toBe(false);
+  expect(ready().missing.join(" ")).toContain("quality");
+  expect(command("close", task, "--no-archive").exitCode).not.toBe(0);
+  expect(f.ledger.getTask(task)?.status).toBe("OPEN");
+  recordQuality("pass", previous, `Verified writer fix #${writer.seq}`, "writer-recheck.md");
+  expect(ready().ready).toBe(true);
+  ok("close", task, "--no-archive");
+  expect(f.ledger.getTask(task)?.status).toBe("CLOSED");
+  expect(ok("reviews", task).slice(0, 2)).toEqual(failures);
+  expect(ok("verify", "--task", task).ok).toBe(true);
+}, 30_000);
