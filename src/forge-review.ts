@@ -101,7 +101,9 @@ export async function reviewCli(args: string[]) {
       ...values, repo: snap.dir, base, head, spec: specPath ? join(root, specPath) : undefined,
       specSha256: spec.hashes?.ssot ?? spec.hashes?.scope,
       ruleContext: reviewSkill && [reviewSkill.description, reviewSkill.body],
-      taskHistory: modern ? (values.full ? {} : reviewHistory(ledger,snap,base,sequence)) : undefined,
+      // A legacy task can acquire coverage proofs from this engine. Its historical
+      // performance retry must still execute against the original failed range.
+      taskHistory: priorFailure !== undefined ? undefined : values.full ? {} : reviewHistory(ledger,snap,base,sequence),
       legacyPerformanceRetry: priorFailure !== undefined,
       models, model:undefined,
     });
