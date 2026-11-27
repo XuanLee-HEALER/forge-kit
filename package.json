@@ -1,6 +1,6 @@
 {
   "name": "forge-kit",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "private": true,
   "type": "module",
   "files": [
@@ -28,7 +28,8 @@
     "build": "bun scripts/build.ts && (cd review-agents && bun run build)",
     "check": "bun --bun run tsc --noEmit",
     "test": "bun test ./tests",
-    "test:all": "bun test ./tests && (cd review-agents && bun test)",
+    "test:unit": "bun run test:all",
+    "test:all": "bun scripts/test-all.ts",
     "forge": "bun src/bin/cli.ts"
   },
   "devDependencies": {

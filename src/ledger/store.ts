@@ -1,3 +1,4 @@
+import { removeTaskRunDirectory } from "./task-runs";
 import { usesV05, isRolloutEndpoint } from "./types";
 import { installedInstance, verificationPolicy } from "../workflow-config";
 import {
@@ -1509,7 +1510,10 @@ export class Ledger {
     const result = withImmediateTx(this.db, () => {
       const candidates = selectCandidates();
       const remove = this.db.query(`DELETE FROM tasks WHERE task_id = ? AND ${eligible}`);
-      const deleted = candidates.filter((id) => remove.run(id, cutoff).changes > 0);
+      const deleted = candidates.filter(id => {
+        removeTaskRunDirectory(this.workbenchRoot, id);
+        return remove.run(id, cutoff).changes > 0;
+      });
       this.db.query("DELETE FROM exemptions WHERE expires_at IS NOT NULL AND expires_at < ?").run(nowIso());
       return { cutoff, candidates, deleted };
     });

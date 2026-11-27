@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { closeSync, openSync, readSync, writeFileSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { Repo, snapshotGitEnv } from "./repo";
+import { Repo, snapshotGitEnv, type Change } from "./repo";
 
-const CHUNK_BYTES = 12_000;
+const CHUNK_BYTES = 24_000;
 const INDEX_BYTES = 20_000;
 const digest = (s: string) => createHash("sha256").update(s).digest("hex");
 export type Chunk = {
@@ -95,12 +95,13 @@ function moduleKey(path: string) {
   return basename(path).replace(/\.[^.]+$/, "").replace(/(?:[._-](?:spec|tests?))$/i, "").replace(/^test[_-]/i, "").toLowerCase();
 }
 
-export function prepareMaterials(repo: Repo, dir: string) {
+export function prepareMaterials(repo: Repo, dir: string, extra: Change[] = [], dependencies = new Map<string,string>(), anchors = new Map<string,Set<number>>(), contracts = new Map<string,{path:string; name:string; before:string; after:string}[]>()) {
   const chunks: Chunk[] = [];
   const missing = [...repo.excludedFiles];
   const limitations: string[] = [];
   const left = join(dir, "base"), right = join(dir, "head"), patchFile = join(dir, "patch");
-  const changes = repo.changes.toSorted((a, b) => moduleKey(a.path).localeCompare(moduleKey(b.path)) || a.path.localeCompare(b.path));
+  const inventory = [...repo.changes, ...extra];
+  const changes = inventory.toSorted((a, b) => moduleKey(a.path).localeCompare(moduleKey(b.path)) || a.path.localeCompare(b.path));
   for (const change of changes) {
     try {
       if (change.added === null || change.deleted === null) throw Error("binary change");
@@ -109,34 +110,55 @@ export function prepareMaterials(repo: Repo, dir: string) {
         if (/^0+$/.test(oid)) writeFileSync(file, "");
         else gitToFile(repo.root, ["cat-file", "blob", oid], file, [0]);
       }
-      gitToFile(dir, ["-c", "diff.noprefix=false", "diff", "--no-index", "--no-color", "--no-ext-diff", "--no-textconv",
+      if (change.status !== "caller") gitToFile(dir, ["-c", "diff.noprefix=false", "diff", "--no-index", "--no-color", "--no-ext-diff", "--no-textconv",
         "--text", "--unified=5", "--", "base", "head"], patchFile, [0, 1]);
       let part = 0;
       function record(p: Omit<Chunk, "id" | "receiptId" | "size" | "path"> & {patch: string}) {
         const {patch, ...bounds} = p;
-        const id = digest(JSON.stringify([repo.base, repo.head, change, part++, bounds, digest(patch)]));
+        const id = digest(JSON.stringify([repo.base, change, dependencies.get(change.path), part++, bounds, digest(patch)]));
         writeFileSync(join(dir, id), patch, {mode:0o600});
         // The full digest remains the storage and coverage key. The ordinal
         // makes receipt handles unique even when two digest prefixes coincide.
         const receiptId = (chunks.length + 1) + "-" + id.slice(0, 4);
         chunks.push({id, receiptId, path:change.path, ...bounds, size:Buffer.byteLength(JSON.stringify(patch))});
       }
-      for (const p of patchChunks(patchFile)) record(p);
+      const inPatch: Array<[number,number]> = [];
+      if (change.status !== "caller") {
+        for (const p of patchChunks(patchFile)) { record(p); inPatch.push([p.newStart,p.newEnd]); }
+      }
+      const sites = [...(anchors.get(change.path) ?? [])].filter(n=>!inPatch.some(([a,b])=>a<=n && n<=b)).sort((a,b)=>a-b);
+      if (sites.length) {
+        const lines = readFileSync(right, "utf8").split("\n");
+        const ranges: Array<[number,number]> = [];
+        for (const n of sites) {
+          const lo = Math.max(1,n-3), hi = Math.min(lines.length,n+3);
+          const previous = ranges.at(-1);
+          if (previous && lo <= previous[1]+1) previous[1] = Math.max(hi,previous[1]);
+          else ranges.push([lo,hi]);
+        }
+        for (const [lo,hi] of ranges) {
+          // A synthetic context hunk preserves actual source line numbers.
+          // Mark it as caller material so the reviewer sees unchanged usage.
+          const excerpt = lines.slice(lo-1,hi).map(line=>" "+line).join("\n");
+          writeFileSync(patchFile, "Caller context at HEAD\n@@ -"+lo+","+(hi-lo+1)+" +"+lo+","+(hi-lo+1)+" @@\n"+excerpt+"\n");
+          for (const p of patchChunks(patchFile)) record(p);
+        }
+      }
       if (!part) record({patch:JSON.stringify(change), oldStart:0, oldEnd:0, newStart:0, newEnd:0, deletedRanges:[], continued:false});
     } catch (error) {
       missing.push(change.path);
       limitations.push(change.path + " (" + (error instanceof Error ? error.message : "unreadable material") + ")");
     }
   }
-  const manifest = repo.changes.map(({oldOid, newOid, ...change}) => change);
-  const hash = digest(JSON.stringify(manifest));
+  const manifest = inventory.map(({oldOid, newOid, ...change}) => change);
+  const hash = digest(JSON.stringify(chunks.map(c=>c.id)));
   const summary = {files: manifest.length + repo.excludedFiles.length, excluded: repo.excludedFiles.length, digest: hash};
   const fullIndex = {...summary, changes:manifest};
   // Positions address the same immutable sequence in the full index, its
   // page directory, and the complete entries attached to individual batches.
-  const byPath = new Map(repo.changes.map((c, position) => [c.path, {...c, position}]));
+  const byPath = new Map(inventory.map((c, position) => [c.path, {...c, position}]));
   if (Buffer.byteLength(JSON.stringify(fullIndex)) <= INDEX_BYTES)
-    return {dir, chunks, missing, limitations, index:fullIndex, byPath};
+    return {dir, chunks, missing, limitations, index:fullIndex, byPath, contracts};
   // The fixed Git inventory order is also the page order.
   const pageSize = Math.max(1, Math.ceil(manifest.length / 48));
   const pages = [];
@@ -158,7 +180,7 @@ export function prepareMaterials(repo: Repo, dir: string) {
       ...(Buffer.byteLength(JSON.stringify(last)) <= 96 && {last})});
   }
   const index = {...summary, pages};
-  return {dir, chunks, missing, limitations, index, byPath};
+  return {dir, chunks, missing, limitations, index, byPath, contracts};
 }
 
 // Give each related file a turn before taking the next chunk from the same file.
@@ -178,7 +200,7 @@ function* interleaveFiles(group: Chunk[]) {
 
 // Keep small source/test groups together even when the preceding batch is nearly full.
 export function* batches(chunks: Chunk[]) {
-  const maxBytes = 56_000, maxCount = 32;
+  const maxBytes = 106_000, maxCount = 32;
   let pending: Chunk[] = [], bytes = 0;
   for (let i = 0; i < chunks.length;) {
     const start = i, group = moduleKey(chunks[i].path);

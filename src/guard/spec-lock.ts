@@ -1,25 +1,12 @@
 import { type WorkbenchConfig } from "../config";
-import { extractGitSubcommand, resolveGitDirFlags } from "../shared/git-cmd";
+import { writeTargets } from "./write-targets";
 import { runGit } from "../git";
-import {
-  extractShellCommand,
-  extractToolWorkdir,
-  extractTouchedFilePaths,
-  type CodexHookInput,
-} from "../hook-io";
+import type { CodexHookInput } from "../hook-io";
 import { activeSpecTaskIds, listActiveSpecLocks } from "../ledger/spec";
 import { Ledger } from "../ledger/store";
-import { existsSync, statSync } from "node:fs";
-import { basename, join, relative, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import { canonicalizeMaybePath, matchesGlob } from "../shared/path";
-import {
-  unwrapShellPrefix,
-  resolveSegmentCwd,
-  splitShellSegments,
-  splitShellTokens,
-  stripUnquotedShellRedirections,
-} from "../shared/shell";
-
 export function checkSpecAndTestLocks(
   workbenchRoot: string,
   input: CodexHookInput,
@@ -30,12 +17,8 @@ export function checkSpecAndTestLocks(
   if (!existsSync(dbPath)) return null;
 
   const wbReal = canonicalizeMaybePath(workbenchRoot);
-  const baseWorkdir = extractToolWorkdir(input);
-  const touchedFilePaths = extractTouchedFilePaths(input).map((p) =>
-    canonicalizeMaybePath(resolve(baseWorkdir, p)),
-  );
-  const cmd = extractShellCommand(input);
-  if (touchedFilePaths.length === 0 && !cmd) return null;
+  const touchedFilePaths = writeTargets(input);
+  if (!touchedFilePaths.length) return null;
 
   let ledger: Ledger | null = null;
   try {
@@ -134,7 +117,7 @@ export function checkSpecAndTestLocks(
     const matchLockedPath = (absTarget: string): string | null => {
       for (const lock of resolvedLocks) {
         for (const sf of lock.lockedSpecFiles) {
-          if (absTarget === sf.abs) {
+          if (absTarget === sf.abs || sf.abs.startsWith(absTarget + "/")) {
             const suggestedScope =
               sf.kind === "ssot" || sf.kind === "scope" ? "requirement|invariant" : sf.kind;
             return (
@@ -165,33 +148,6 @@ export function checkSpecAndTestLocks(
       if (hit) return hit;
     }
 
-    const segments = splitShellSegments(cmd ?? "");
-    for (const [index, segment] of segments.entries()) {
-      const cwd = resolveSegmentCwd(segments, index, baseWorkdir);
-      const targets: string[] = [];
-      const redirects: string[] = [];
-      const command = stripUnquotedShellRedirections(segment, redirects);
-      targets.push(...redirects.map(p => resolve(cwd, p)));
-      const prefix = unwrapShellPrefix(splitShellTokens(command) ?? []);
-      const git = prefix.bin === "git" ? extractGitSubcommand(["git", ...prefix.args]) : null;
-      const bin = git && ["mv", "rm"].includes(git.subcmd) ? git.subcmd : prefix.bin;
-      const commandDir = resolveGitDirFlags(cwd, [...prefix.dirs, ...(git?.gitDirFlags ?? [])]) ?? cwd;
-      const args = git?.subArgs ?? prefix.args;
-      const operands = args.filter(arg => !arg.startsWith("-")).map(p => resolve(commandDir, p));
-      if (bin === "chmod" || bin === "tee" || bin === "rm" || bin === "mv" ||
-          ((bin === "sed" || bin === "perl") && args.some(a => /^-[A-Za-z]*i/.test(a)))) targets.push(...operands);
-      if ((bin === "cp" || bin === "mv") && operands.length >= 2) {
-        const dest = operands.at(-1)!;
-        targets.push(dest);
-        if (statSync(dest, { throwIfNoEntry: false })?.isDirectory()) {
-          for (const source of operands.slice(0, -1)) targets.push(join(dest, basename(source)));
-        }
-      }
-      for (const target of targets) {
-        const hit = matchLockedPath(canonicalizeMaybePath(target));
-        if (hit) return hit;
-      }
-    }
   } finally {
     ledger?.closeDb();
   }

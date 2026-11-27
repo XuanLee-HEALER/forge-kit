@@ -3,6 +3,7 @@ import { readFileSync, statSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { contractImpact } from "./impact";
 import { Repo } from "./repo";
 import { cleanReport, ReportTextError, type Finding } from "./report";
 import { roles, instructions, type Role } from "./roles";
@@ -16,14 +17,19 @@ const modes = ["parallel", "serial", "ordered"] as const;
 type Mode = typeof modes[number];
 type Option = { roles?: string; mode?: string; order?: string };
 type Attempt = { backend: "codex"; status: Status; reason?: string };
+export type ReviewProof = { rules: string; uncertain: string; passed: string[] };
+export type PreviousReview = { head: string; proof: ReviewProof };
+const MAX_CONCURRENT_BATCHES = 3;
 type RoleReport = {
   role: Role; base: string; head: string; status: Status; backend: "codex" | null;
-  coverage: { inventory_digest?:string; inventory_files?:number; expected: number; reviewed: number; missing: Array<{id:string; path:string}> };
+  proof?: ReviewProof;
+  scheduling?: { planned_batches:number; backend_calls:number; concurrency_limit:number; elapsed_ms?:number };
+  coverage: { reused?:number; reused_from?:string; executed?:number; inventory_digest?:string; inventory_files?:number; expected: number; reviewed: number; missing: Array<{id:string; path:string}> };
   missing_materials?: string[]; findings: Finding[]; limitations: string[]; summary: string; attempts: Attempt[];
 };
 
 export const reviewOptions = {
-  repo: { type: "string" }, base: { type: "string" }, head: { type: "string" },
+  full: { type:"boolean" }, repo: { type: "string" }, base: { type: "string" }, head: { type: "string" },
   roles: { type: "string" }, order: { type: "string" }, mode: { type: "string" }, model: { type: "string" }, effort: { type: "string" },
 } as const;
 
@@ -65,10 +71,19 @@ function specification(params: {spec?:string; specSha256?:string}): Specificatio
   return {};
 }
 
-async function reviewRole(role: Role, repo: Repo, material: Material, model: Model, specification: Specification, requiredSpec = false): Promise<RoleReport> {
+async function reviewRole(role: Role, repo: Repo, material: Material, model: Model, specification: Specification, requiredSpec = false,
+  task?: {previous?:PreviousReview; uncertain:string; ruleContext?:string[]}): Promise<RoleReport> {
   const { base, head } = repo;
   const spec = specification.text;
-  const checked = new Set<string>();
+  const started = performance.now();
+  const roleInstructions = instructions(role,repo.files) + "\nReview every supplied chunk, including deletions, metadata and anchored caller context. Return the supplied role. For every chunk return its exact id, path and conclusion in checked. Use reviewed only after inspecting its actual patch. Each batch reviews only the supplied chunks. Use the specification to identify requirements affected by these lines. Other indexed changes and independent verification/delivery receipts are outside this batch; the engine reconciles all batch receipts against the fixed inventory at the end. If deciding the correctness of a delivered change requires unavailable evidence, mark it incomplete and identify the specific chunk and missing evidence. For findings use the new-file range, or the old-file range for deleted lines.";
+  const rules = createHash("sha256").update(JSON.stringify([roleInstructions, task?.ruleContext, specification.text, model])).digest("hex");
+  const previous = task?.previous;
+  const eligible = previous && previous.proof.rules === rules && previous.proof.uncertain === task?.uncertain
+    ? new Set(previous.proof.passed) : new Set<string>();
+  const reused = material.chunks.filter(c=>eligible.has(c.id)).map(c=>c.id);
+  const checked = new Set(reused);
+  const passed = new Set(reused);
   const findings = new Map<string, Finding>();
   const limitations = new Set(material.limitations);
   const gaps = new Set(material.missing);
@@ -76,8 +91,7 @@ async function reviewRole(role: Role, repo: Repo, material: Material, model: Mod
   const summaries = new Set<string>();
   if (requiredSpec && !spec) gaps.add("spec");
   if (specification.limitation) limitations.add(specification.limitation);
-  const envelope = {role, base, head, spec: spec ?? null,
-    instructions: instructions(role, repo.files) + "\nReview every supplied chunk, including deletions and metadata. Return the supplied role. For every chunk return its exact id, path and conclusion in checked. Use reviewed only after inspecting its actual patch. Each batch reviews only the supplied chunks. Use the specification to identify requirements affected by these lines. Other indexed changes and independent verification/delivery receipts are outside this batch; the engine reconciles all batch receipts against the fixed inventory at the end. If deciding the correctness of a delivered change requires unavailable evidence, mark it incomplete and identify the specific chunk and missing evidence. For findings use the new-file range, or the old-file range for deleted lines."};
+  const envelope = {role, base, head, spec:spec ?? null, instructions:roleInstructions};
 
   async function batch(planned: Chunk[]): Promise<void> {
     const items: ReturnType<typeof loadChunk>[] = [];
@@ -101,7 +115,10 @@ async function reviewRole(role: Role, repo: Repo, material: Material, model: Mod
       context = {revision:head, files:[], omitted:paths};
       contextFailed = true;
     }
-    const render = (index: object = material.index) => JSON.stringify({...envelope, index, related, context, chunks:items});
+    const contractEntries = related.flatMap(change=>material.contracts.get(change.path) ?? []);
+    const contracts = [...new Map(contractEntries.map(c=>[JSON.stringify([c.path,c.name]),c])).values()];
+    const render = (index: object = material.index) => JSON.stringify({...envelope, index, related, context,
+      ...(contracts.length > 0 && {contracts}), chunks:items});
     let prompt = render();
     while (Buffer.byteLength(prompt) + RESPONSE_RESERVE > PROMPT_BYTES && context.files.length) {
       context.omitted.push(context.files.pop()!.path);
@@ -153,7 +170,10 @@ async function reviewRole(role: Role, repo: Repo, material: Material, model: Mod
       }
       for (const l of report.limitations) limitations.add(l);
       summaries.add(report.summary);
+      const blocked = new Set(report.findings.filter(f=>f.severity === "blocking").map(f=>f.path));
       for (const id of completed) checked.add(id);
+      if (!contextFailed && report.status !== "incomplete")
+        for (const c of chunks) if (completed.has(c.id) && !blocked.has(c.path)) passed.add(c.id);
       if (report.status === "incomplete") limitations.add("Batch reported incomplete: " + report.summary);
       const status = contextFailed || report.status === "incomplete" || completed.size < chunks.length ? "incomplete" :
         report.findings.some(f => f.severity === "blocking") ? "blocked" : "pass";
@@ -168,9 +188,23 @@ async function reviewRole(role: Role, repo: Repo, material: Material, model: Mod
     }
   }
 
-  if (!requiredSpec || spec) {
+  const planned = [...batches(material.chunks.filter(c=>!checked.has(c.id)))];
+  if ((!requiredSpec || spec) && planned.length) {
+    // Verify the backend protocol once before dispatching concurrent work.
+    // Recursive budget splits remain on the same worker.
     try {
-      for (const group of batches(material.chunks)) await batch(group);
+      await batch(planned[0]);
+      let cursor = 1, stopped = false;
+      async function worker() {
+        while (!stopped && cursor < planned.length) {
+          try { await batch(planned[cursor++]); }
+          catch (error) {
+            stopped = true;
+            if (!(error instanceof BackendFailure)) throw error;
+          }
+        }
+      }
+      await Promise.all(Array.from({length:Math.min(MAX_CONCURRENT_BATCHES,planned.length-1)},worker));
     } catch (error) {
       if (!(error instanceof BackendFailure)) throw error;
     }
@@ -179,16 +213,21 @@ async function reviewRole(role: Role, repo: Repo, material: Material, model: Mod
   for (const c of missing) gaps.add(c.path);
   const list = [...findings.values()];
   const status = gaps.size || attempts.some(a => a.status === "incomplete") ? "incomplete" : list.some(f => f.severity === "blocking") ? "blocked" : "pass";
-  const summary = status === "incomplete" ? "Incomplete review: " + [...limitations, ...gaps].join(", ") : [...summaries].join("\n");
+  const summary = status === "incomplete" ? "Incomplete review: " + [...limitations, ...gaps].join(", ") : [...summaries].join("\n") || "Verified prior coverage applies to this HEAD";
   return {role, base, head, backend:attempts.length ? "codex" : null, attempts, status, summary, findings:list,
     limitations:[...limitations], ...(gaps.size && {missing_materials:[...gaps]}),
-    coverage:{inventory_digest:material.index.digest, inventory_files:material.index.files, expected:material.chunks.length, reviewed:checked.size, missing}};
+    ...(task && { proof:{rules, uncertain:task.uncertain,
+      passed:material.chunks.filter(c=>passed.has(c.id) && !gaps.has(c.path) && !list.some(f=>f.severity==="blocking" && f.path===c.path)).map(c=>c.id)} }),
+    scheduling:{planned_batches:planned.length,backend_calls:attempts.length,concurrency_limit:MAX_CONCURRENT_BATCHES,
+      ...(task && {elapsed_ms:Math.round(performance.now()-started)})},
+    coverage:{executed:checked.size-reused.length,reused:reused.length,...(reused.length > 0 && {reused_from:previous!.head}),inventory_digest:material.index.digest, inventory_files:material.index.files, expected:material.chunks.length, reviewed:checked.size, missing}};
 }
 
 export async function runReview(params: Option & {
   repo: string; base: string; head: string; spec?: string; specSha256?: string;
   models?: Partial<Record<Role, {model:string;effort:string}>>; model?: {model:string;effort:string};
   legacyPerformanceRetry?: boolean;
+  taskHistory?: Partial<Record<Role,PreviousReview>>; full?:boolean; ruleContext?:string[];
 }) {
   const { mode, sequence } = reviewSelection(params, params.legacyPerformanceRetry ? ["performance"] : roles);
   const models = sequence.map(role => {
@@ -221,8 +260,17 @@ export async function runReview(params: Option & {
   try {
     repo.loadInventory();
     if (!repo.files.length && !repo.excludedFiles.length) throw Error("Empty review diff; select a range containing changes");
-    const material = prepareMaterials(repo, tmp);
-    const run = (role: Role, idx:number) => reviewRole(role, repo, material, models[idx], spec, role === "business" || !!params.spec);
+    let impact: ReturnType<typeof contractImpact> | undefined;
+    let unresolvedImpact = false;
+    if (params.taskHistory) {
+      try { impact = contractImpact(repo); }
+      catch { unresolvedImpact = true; }
+    }
+    const material = prepareMaterials(repo, tmp, impact?.extra, impact?.dependencies, impact?.anchors, impact?.contracts);
+    if (unresolvedImpact) material.limitations.push("Caller scope could not be resolved. Running full role review.");
+    const run = (role: Role, idx:number) => reviewRole(role, repo, material, models[idx], spec, role === "business" || !!params.spec,
+      params.taskHistory && {ruleContext:params.ruleContext,
+        previous:params.full || unresolvedImpact ? undefined : params.taskHistory[role], uncertain:impact?.uncertain ?? repo.head});
     const reports: RoleReport[] = [];
     if (mode === "parallel") reports.push(...await Promise.all(sequence.map(run)));
     else for (const [idx,role] of sequence.entries()) reports.push(await run(role,idx));

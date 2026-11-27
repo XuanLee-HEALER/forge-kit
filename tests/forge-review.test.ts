@@ -1,5 +1,5 @@
 import { beforeEach, test, expect } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { executorFixture } from "./helpers/executor";
 
@@ -20,8 +20,11 @@ beforeEach(() => {
     'await Bun.write(import.meta.path + "." + data.role, JSON.stringify({model:args[args.indexOf("-m")+1],effort:args.find(a=>a.startsWith("model_reasoning_effort="))}));',
     'if (!data.spec?.includes("Fixture requirements") || !args.includes("--ephemeral")) process.exit(2);',
     'if (await Bun.file(import.meta.path + ".mutate").exists()) await Bun.write(' + JSON.stringify(join(f.repo, "edit")) + ', "modified");',
+    'const checked = data.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"}));',
+    'const {appendFileSync} = await import("node:fs"); appendFileSync(import.meta.path+".calls", JSON.stringify(checked.map(c=>c.path))+"\\n");',
+    'if (await Bun.file(import.meta.path+".omit").exists()) checked.pop();',
     'const preset = Bun.file(import.meta.path + ".report");',
-    'await Bun.write(args[args.indexOf("-o")+1], JSON.stringify({...(await preset.exists() ? await preset.json() : {status:"pass",summary:"reviewed fixture",findings:[],limitations:["Runtime coverage unavailable"]}),role:data.role,checked:data.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"}))}));',
+    'await Bun.write(args[args.indexOf("-o")+1], JSON.stringify({...(await preset.exists() ? await preset.json() : {status:"pass",summary:"reviewed fixture",findings:[],limitations:["Runtime coverage unavailable"]}),role:data.role,checked}));',
   ].join("\n"));
   chmodSync(codex, 0o755);
 });
@@ -50,6 +53,64 @@ test("ordered review records only actual roles against the pinned task and versi
     expect(record.meta.backend).toBe("codex");
   }
 });
+test("successor review reuses unchanged files, supports full review and rejects missing coverage", () => {
+  const names = ["a.txt", "b.txt", "c.txt", "d.txt"];
+  for (const path of names) writeFileSync(join(f.repo, path), path + " initial content");
+  f.git("add", "--", ...names);
+  f.git("commit", "-qm", "add four files", "--", ...names);
+  const calls = codex + ".calls";
+  function review(extra: string[] = []) {
+    writeFileSync(calls, "");
+    const result = run(["--roles", "quality", ...extra]);
+    const paths = new Set<string>(readFileSync(calls, "utf8").trim().split("\n").filter(Boolean).flatMap(line => JSON.parse(line)));
+    return { result, paths };
+  }
+  const first = review();
+  expect(first.result.exitCode, first.result.stderr.toString()).toBe(0);
+  expect(first.paths).toEqual(new Set(["code.txt", ...names]));
+  for (const path of names.slice(0, 2)) writeFileSync(join(f.repo, path), path + " revised");
+  f.git("commit", "-qm", "change two files", "--", ...names.slice(0, 2));
+  const incremental = review();
+  expect(incremental.result.exitCode, incremental.result.stderr.toString()).toBe(0);
+  expect(incremental.paths).toEqual(new Set(names.slice(0, 2)));
+  expect(f.evidence().at(-1)?.meta).toMatchObject({ head: f.git("rev-parse", "HEAD"), report_status: "pass" });
+  const full = review(["--full"]);
+  expect(full.result.exitCode, full.result.stderr.toString()).toBe(0);
+  expect(full.paths).toEqual(first.paths);
+  writeFileSync(codex + ".omit", "");
+  const incomplete = review(["--full"]);
+  expect(incomplete.result.exitCode).not.toBe(0);
+  expect(f.evidence().at(-1)?.meta).toMatchObject({ head: f.git("rev-parse", "HEAD"), report_status: "incomplete" });
+  unlinkSync(codex + ".omit");
+  const recovered = review();
+  expect(recovered.result.exitCode, recovered.result.stderr.toString()).toBe(0);
+  expect(recovered.paths.size).toBeGreaterThan(0);
+}, 30_000);
+
+test("changes to a public function require fresh coverage of its unchanged caller", () => {
+  const api = "export function price(value: number) { return value; }\n";
+  writeFileSync(join(f.repo, "api.ts"), api);
+  writeFileSync(join(f.repo, "checkout.ts"), 'import {price} from "./api";\nexport const total = price(2);\n');
+  f.git("add", "--", "api.ts", "checkout.ts");
+  f.git("commit", "-qm", "establish API and caller", "--", "api.ts", "checkout.ts");
+  const base = f.git("rev-parse", "HEAD");
+  writeFileSync(join(f.repo, "api.ts"), api.replace("return value", "return value * 2"));
+  f.git("commit", "-qm", "first update", "--", "api.ts");
+  const args = ["--roles", "quality", "--base", base];
+  const first = run(args);
+  expect(first.exitCode, first.stderr.toString()).toBe(0);
+  writeFileSync(join(f.repo, "api.ts"), 'export function price(value: string) { return Number(value); }\n');
+  f.git("commit", "-qm", "change public contract", "--", "api.ts");
+  const calls = codex + ".calls";
+  writeFileSync(calls, "");
+  const next = run(args);
+  expect(next.exitCode, next.stderr.toString()).toBe(0);
+  expect(f.git("diff", "--name-only", base, "HEAD")).toBe("api.ts");
+  const paths = readFileSync(calls, "utf8").trim().split("\n").flatMap(line => JSON.parse(line));
+  expect(paths).toContain("api.ts");
+  expect(paths).toContain("checkout.ts");
+}, 30_000);
+
 test("a dirty checkout during review produces no trusted evidence", () => {
   writeFileSync(codex + ".mutate", "change checkout during review");
   const r = run(["--roles", "quality"]);

@@ -174,13 +174,14 @@ function validateActionCeiling(policy: ShipPolicy, endpoint: Endpoint, plan: Exa
   if (policy.forbid_db_rw && plan.actions.some(a => a.kind === "sql"))
     throw Error("Policy forbids database writes");
 }
-function frontDefinition(ledger: Ledger, task: string, endpoint: string) {
+function frontDefinition(ledger: Ledger, task: string, endpoint: string, legacy = false) {
   const cfg = resolveInstance(ledger.workbenchRoot);
   if (ledger.getTask(task)?.endpoint !== endpoint || cfg.delivery.value.endpoint !== endpoint || endpoint === "push")
     throw Error("Scope approval requires the registered task endpoint; use an exact runbook for push");
   const stages = deliveryStages(cfg);
-  const commands = stages.filter(s => !s.core).map(s => stagePin(ledger.workbenchRoot, s.id));
+  const commands = stages.filter(s => !s.core).map(s => stagePin(ledger.workbenchRoot, s.id, legacy));
   if (endpoint !== "pr" && !commands.length) throw Error("Named endpoint requires a target observer");
+  if (!legacy) return {endpoint, stages, commands};
   const {protected_branches, allow_protected_ff} = loadWorkbenchConfig(ledger.workbenchRoot).guard;
   return {endpoint, stages, commands, protected_branches, allow_protected_ff};
 }
@@ -190,6 +191,7 @@ interface PreparedAnchor extends Binding {
   base_shas_json: string;
   ttl_minutes: number;
   mode?: string;
+  node_authorization?: true;
   max_files_changed?: number;
   max_lines_changed?: number;
 }
@@ -216,7 +218,7 @@ export function validateScope(ledger: Ledger, e: Envelope) {
   let binding: Binding;
   if (front) {
     ceiling(policy, e.target_endpoint);
-    binding = {endpoint: anchor.endpoint, runbook_id: "", actions_hash: sha256String(canonicalJson(frontDefinition(ledger, e.task_id, anchor.endpoint)))};
+    binding = {endpoint: anchor.endpoint, runbook_id: "", actions_hash: sha256String(canonicalJson(frontDefinition(ledger, e.task_id, anchor.endpoint, !anchor.node_authorization)))};
     const bound = ledger.db.query("SELECT 1 FROM exact_ship_envelopes WHERE envelope_id=?").get(e.envelope_id);
     const event = ledger.getTaskEvents(e.task_id).find(ev => ev.event_type === "SHIP_PLAN_BOUND" &&
       JSON.parse(ev.payload_json).envelope_id === e.envelope_id);
@@ -473,7 +475,7 @@ export function fastTrackCommand(ledger: Ledger, args: string[]) {
     if (rb) ledger.db.query("INSERT INTO exact_ship_envelopes(envelope_id,runbook_id,actions_hash,endpoint) VALUES (?,?,?,?)")
       .run(e.envelope_id, rb.runbook_id, rb.actions_hash, endpoint);
     trackEvent(ledger, e, "FAST_TRACK_PREPARED", {
-      ...binding, ...(!rb && {mode: "frozen-scope-v1"}), scope_hash: scope, base_shas_json: snap.base_shas_json,
+      ...binding, node_authorization: true, ...(!rb && {mode: "frozen-scope-v1"}), scope_hash: scope, base_shas_json: snap.base_shas_json,
       max_files_changed: policy.max_files_changed, max_lines_changed: policy.max_lines_changed, ttl_minutes: ttl,
     });
     return {

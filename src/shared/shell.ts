@@ -220,7 +220,7 @@ function trimAsciiWhitespace(s: string): string {
   return s.replace(/^[ \t\n]+|[ \t\n]+$/g, "");
 }
 
-export function splitShellSegments(cmd: string): string[] {
+export function splitShellSegments(cmd: string, pipedInputs?: Set<number>): string[] {
   const segs: string[] = [];
   let cur = "";
   let quote: "'" | '"' | "$'" | null = null;
@@ -315,6 +315,7 @@ export function splitShellSegments(cmd: string): string[] {
       }
       const trimmed = trimAsciiWhitespace(cur);
       if (trimmed) segs.push(trimmed);
+      pipedInputs?.add(segs.length);
       cur = "";
       atWordStart = true;
       continue;

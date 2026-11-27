@@ -1,4 +1,5 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { developerGit } from "./helpers/git-tool";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -6,7 +7,7 @@ export const kit = resolve(import.meta.dir, "..");
 export const legacyRevision = "eb139c117be733173648abce723b6eaaf975f7bc";
 export const bootstrap = join(kit, "bin", "forge");
 
-export function sandbox() {
+export function sandbox(bundle?: string) {
   const root = mkdtempSync(join(tmpdir(), "forge-v05-"));
   const home = join(root, "home");
   const work = join(root, "instance");
@@ -26,6 +27,22 @@ export function sandbox() {
     HTTP_PROXY: "http://127.0.0.1:1", HTTPS_PROXY: "http://127.0.0.1:1",
     NO_PROXY: "127.0.0.1,localhost", BUN_CONFIG_NO_AUTO_INSTALL: "1",
   };
+  if (developerGit) {
+    const tools = join(root, "git-tools");
+    mkdirSync(tools);
+    symlinkSync(developerGit, join(tools, "git"));
+    env.PATH = [bin, tools, "/usr/bin", "/bin"].join(":");
+  }
+  function fresh() {
+    if (!bundle) return ok([bootstrap, "init", work], root);
+    const release = join(root, "release");
+    mkdirSync(join(release, "dist"), {recursive: true});
+    for (const entry of ["kit.toml", "core", "templates"])
+      cpSync(join(kit, entry), join(release, entry), {recursive: true});
+    const cli = join(release, "dist/cli.js");
+    copyFileSync(bundle, cli);
+    return ok(["bun", cli, "init", work], root);
+  }
   function run(args: string[], cwd = work) {
     const result = Bun.spawnSync(args, { cwd, env, timeout: 60_000 });
     return { code: result.exitCode, out: result.stdout.toString(), err: result.stderr.toString() };
@@ -56,7 +73,7 @@ export function sandbox() {
   return {
     root, home, work, bin, forge, env, run, ok, hook, privateFile, probeLog,
     cleanup: () => rmSync(root, { force: true, recursive: true }),
-    fresh: () => ok([bootstrap, "init", work], root),
+    fresh,
     git: (cwd: string, ...args: string[]) => ok(["git", "-C", cwd, ...args]),
     read: (name: string) => readFileSync(join(work, name), "utf8"),
   };

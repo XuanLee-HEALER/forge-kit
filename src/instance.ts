@@ -6,7 +6,7 @@ import { accessSync, constants, existsSync, lstatSync, readFileSync, statSync, w
 import { basename, isAbsolute, join, normalize, relative } from "node:path";
 import { parse } from "yaml";
 import { locateRepo } from "./git";
-import { decodeModelsConfig, loadShipPolicy, loadWorkbenchConfig } from "./config";
+import { deliverySettings, decodeModelsConfig, loadShipPolicy, loadWorkbenchConfig } from "./config";
 
 export const CORE_SKILLS = [
   "ready",
@@ -227,7 +227,7 @@ export function resolveInstance(root: string, kitRoot?: string) {
     return refs;
   }
   const v = section("verification"),
-    d = section("delivery");
+    d = deliverySettings(section("delivery"));
   function positiveInteger(field: string, fallback: number, max: number) {
     const value = v[field] === undefined ? fallback : v[field];
     if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > max)
@@ -235,7 +235,7 @@ export function resolveInstance(root: string, kitRoot?: string) {
     return value;
   }
   known(v, ["environment", "stages", "timeout_ms", "failure_log_retention_days"], loc + ".verification");
-  known(d, ["endpoint", "stages", "atomic_pr_hosts"], loc + ".delivery");
+  known(d, ["endpoint", "stages"], loc + ".delivery");
   const verification = {
     kind: "verification",
     id: "default",

@@ -37,12 +37,14 @@ guard:
   protected_branches:
     - "main"
     - "master"
-  # Protected branches eligible for an exact, approved fast-forward update.
-  allow_protected_ff: []
   prod_tag_patterns:
     - "^release-v"
     - '^v[0-9]+\.[0-9]+\.[0-9]+'
   custom_block_patterns: []
+  # Match sensitive infrastructure operations by executable and arguments.
+  sensitive_infra_patterns:
+    - '^kubectl\b.*(?:--raw(?:=|\s)|\bport-forward\b|[\s,]secrets?(?:[/.\s,]|$))'
+    - '^redis-cli\b.*\b(?:flushdb|flushall|shutdown|config\s+set)\b'
   block_shared_worktree_ops: true
   block_ledger_direct_edits: true
 

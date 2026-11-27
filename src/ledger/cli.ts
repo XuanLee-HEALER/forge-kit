@@ -6,7 +6,8 @@ import { releaseCommand } from "./release";
 import { handoff, resume } from "./handoff";
 import { telemetryCli } from "./stats";
 import { reviewNative, syncPr } from "./delivery-tools";
-import { findWorkbenchRoot } from "../config";
+import { pruneTaskRuns } from "./task-runs";
+import { findWorkbenchRoot, loadWorkbenchConfig } from "../config";
 import { runReviewFallback } from "./review-fallback";
 import { handedOffOwner, Ledger } from "./store";
 import {
@@ -63,7 +64,7 @@ Commands:
   close     <task_id> [--summary <text>] [--no-archive] [--force-incomplete --reason <text>]
   archive   <task_id>
   cancel    <task_id> --reason <text>
-  prune     --before <days> [--apply]
+  prune     --before <days> [--apply] | --runs-only [--apply]
   runbook   <create|show|list|complete|revoke> [options]`;
 
   const runbookHelp = cmd === "runbook" && (!rest[0] || ["--help", "-h"].includes(rest[0]) ||
@@ -94,7 +95,7 @@ Commands:
         const meta = evidence.meta ?? {};
         return [{ kind, seq: event.seq, repo: event.repo, branch: event.branch, base: meta.base,
           head: event.sha, role: meta.role, status: meta.report_status ?? evidence.status,
-          backend: meta.backend, attempts: meta.attempts, limitations: meta.limitations, missing_materials: meta.missing_materials, source: evidenceSource(evidence, event.actor), summary: evidence.summary }];
+          backend: meta.backend, attempts: meta.attempts, coverage:meta.coverage, scheduling:meta.scheduling, limitations: meta.limitations, missing_materials: meta.missing_materials, source: evidenceSource(evidence, event.actor), summary: evidence.summary }];
       });
       console.log(JSON.stringify(records, null, 2));
       return;
@@ -548,9 +549,16 @@ Commands:
         args: rest,
         options: {
           before: { type: "string" },
+          "runs-only": { type: "boolean" },
           apply: { type: "boolean", default: false },
         },
       });
+      if (values["runs-only"]) {
+        if (values.before) throw Error("--runs-only uses the configured ledger.retention_days");
+        const days = loadWorkbenchConfig(ledger.workbenchRoot).ledger.retention_days;
+        console.log(JSON.stringify(pruneTaskRuns(ledger, days, Boolean(values.apply)), null, 2));
+        return;
+      }
       if (!values.before) {
         throw new Error("Usage: forge ledger prune --before <days> [--apply]");
       }

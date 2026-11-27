@@ -4,6 +4,7 @@ import { redactArguments, redactSecrets } from "./shared/redact";
 import { copyVerificationFixtures } from "./verification-fixtures";
 import { checkMigration } from "./managed-assets";
 import { checkoutLocalRevision, materializeGitlinks } from "./verification-gitlinks";
+import { verificationReuseKey } from "./verification-reuse";
 import { installedInstance, verificationPolicy } from "./workflow-config";
 import { createHash } from "node:crypto";
 import { runVerificationProcess } from "./verification-process";
@@ -57,13 +58,13 @@ export function verifyCli(args: string[]) {
     function log(key: string) {
       let journal = logs.get(key);
       if (!journal) {
-        journal = new VerificationLog(logDir ??= verificationLogDirectory(root, 7));
+        journal = new VerificationLog(logDir ??= verificationLogDirectory(root, 7, snap.task_id));
         logs.set(key, journal);
       }
       return journal;
     }
     function finishLog(key: string, failed: boolean) {
-      const meta = log(key).finish(failed);
+      const meta = log(key).finish(failed, fullRun && (key === "dynamic" || key === "static"));
       logs.delete(key);
       return meta;
     }
@@ -73,13 +74,14 @@ export function verifyCli(args: string[]) {
     let fixtures: ReturnType<typeof copyVerificationFixtures> | undefined;
     const fixtureMetadata = () => fixtures ? { fixture_sha256: fixtures.digests } : {};
     let policyDigest: string | undefined;
+    let reuseKey: string | undefined;
     const fullRun = modern && !kind && mode === "all";
     let phase = "checkout preparation";
     const recordRun = (passed: boolean, aborted = false) => ledger.recordEvidence({
       task_id: snap.task_id, repo: snap.repo, branch: snap.branch, sha: snap.head, kind: "verify",
       source: "tool", actor: "tool", status: passed ? "pass" : "fail",
       summary: aborted ? "Verification failed during " + phase : "Configured verification stages",
-      meta: { mode, ...fixtureMetadata(), ...(environment && {environment}), ...(policyDigest && {policy_sha256:policyDigest}), stages: results, review_task_id: snap.task_id,
+      meta: { mode, reuse_key: reuseKey, ...fixtureMetadata(), ...(environment && {environment}), ...(policyDigest && {policy_sha256:policyDigest}), stages: results, review_task_id: snap.task_id,
         freeze_seq: snap.freeze_seq, started_at: new Date(started).toISOString(), duration_ms: Date.now() - started,
         ...(aborted && { startup_failure: true, failed_phase: phase }) },
     });
@@ -112,7 +114,7 @@ export function verifyCli(args: string[]) {
     phase = "instance configuration";
     const config = modern ? (kind ? installedInstance(root) : resolveInstance(root)) : undefined;
     const timeoutMs = config?.verification.value.timeout_ms ?? defaultVerificationTimeout;
-    logDir = verificationLogDirectory(root, config?.verification.value.failure_log_retention_days ?? 7);
+    logDir = verificationLogDirectory(root, config?.verification.value.failure_log_retention_days ?? 7, snap.task_id);
     phase = "checkout preparation";
     function isolatedGit(cwd: string, args: string[]) {
       if (!baseEnv) throw Error("Missing isolated verification environment");
@@ -171,6 +173,21 @@ export function verifyCli(args: string[]) {
       phase = "instance configuration";
       environment = config?.verification.value.environment;
       if (config) policyDigest = verificationPolicy(ledger.workbenchRoot, snap.repo, snap.head, config, dir);
+      if (fullRun && policyDigest) {
+        reuseKey = verificationReuseKey(policyDigest, Boolean(values.offline), fixtures?.digests ?? {});
+        const receipt = ledger.db.query<{seq: number; payload_json: string}, [string,string,string,string,number]>(
+          `SELECT seq,payload_json FROM events WHERE task_id=? AND repo=? AND branch=? AND sha=? AND seq>?
+           AND event_type='EVIDENCE_CAPTURED' AND actor='tool'
+           AND (json_extract(payload_json,'$.kind')='verify' OR
+             (json_extract(payload_json,'$.kind') IN ('lint','test','build') AND json_extract(payload_json,'$.status')='fail'))
+           ORDER BY seq DESC LIMIT 1`
+        ).get(snap.task_id, snap.repo, snap.branch, snap.head, snap.freeze_seq!);
+        const prior = receipt && JSON.parse(receipt.payload_json);
+        if (prior?.kind === "verify" && prior.status === "pass" && prior.meta?.reuse_key === reuseKey) {
+          recheckExecution(ledger, snap);
+          return {ok: true, reused: true, receipt_seq: receipt!.seq, task_id: snap.task_id, head: snap.head, results: prior.meta.stages};
+        }
+      }
       const stages = config?.verification.value.stages ?? ["verify"];
       if (config) {
         for (const id of stages) {

@@ -21,8 +21,10 @@ export function stageEnvironment(actionId: string, endpoint: string, versions: R
   };
 }
 export function checkStagePin(root: string, stage: Stage) {
-  if (canonicalJson(stagePin(root, stage.stage)) !== canonicalJson(stage))
-    throw Error("Stage inputs or observer changed: " + stage.stage);
+  const current = stagePin(root, stage.stage);
+  if (canonicalJson(current) !== canonicalJson(stage) &&
+      canonicalJson(stagePin(root, stage.stage, true)) !== canonicalJson(stage))
+    throw Error("Stage target, action or observer changed: " + stage.stage);
 }
 
 /** Read one observation from the instance's independently configured target adapter. */

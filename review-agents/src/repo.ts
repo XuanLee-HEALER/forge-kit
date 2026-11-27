@@ -367,7 +367,7 @@ function isInstructionFile(path: string) {
   return /(^|\/)(CLAUDE|AGENTS|SKILL|WORKBENCH)\.md$/i.test(path);
 }
 
-function isPrivatePath(path: string) {
+export function isPrivatePath(path: string) {
   if (/(^|\/)(?:AGENTS\.local\.md(?:$|\/)|\.env(?:$|[./])|config\.toml$)|\.(?:pem|key)$/.test(path)) return true;
   const parts = path.split("/");
   const privateIndex = parts.findIndex(part => privateDirectories.has(part));

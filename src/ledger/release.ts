@@ -291,7 +291,7 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
       }));
       return { ...rb, actions, release_id: id, execution_actions: productionActions(actions), human_merges,
         ...(human_merges.length && { merge_instructions:
-          "审批后请操作者在托管平台打开所列 PR，核对目标分支、HEAD 及必需检查后手动合并，使获批 HEAD 在目标分支上保持可达（例如创建合并提交）。发布线程随后刷新各仓固定目标分支的 origin 跟踪引用，再运行 forge ledger release verify " + id + " 核验远端结果。" }) };
+          "审批后按所列 PR 核对目标分支、HEAD 及必需检查，通过托管平台合并，使获批 HEAD 在目标分支上保持可达（例如创建合并提交）。发布线程随后刷新各仓固定目标分支的 origin 跟踪引用，再运行 forge ledger release verify " + id + " 核验远端结果。" }) };
     }
     const prodItems = checked.items.filter((i) => isRolloutEndpoint(ledger.getTask(i.task_id)!.endpoint));
     if ((prodItems.length || checked.sql_files.length) && !release.runbook_id)

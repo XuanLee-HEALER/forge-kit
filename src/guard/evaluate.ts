@@ -1,8 +1,7 @@
 import { redactSecrets } from "../cmdfmt";
 import { collectProdDbHosts, findWorkbenchRoot, loadWorkbenchConfig } from "../config";
 import { checkGitPhysicalFuse } from "./git-gh";
-import { checkCloudAndRedisOps, checkKubectl } from "./infra";
-import { checkLedgerGate } from "./ledger-gate";
+import { splitShellSegments, splitShellTokens, unwrapShellPrefix } from "../shared/shell";
 import { loadApprovedRunbooksForSession } from "./runbook-state";
 import { checkSpecAndTestLocks } from "./spec-lock";
 import { checkProdDb, isHttpWriteCommand } from "./sql-http";
@@ -49,20 +48,22 @@ function evaluatePolicies(workbenchRoot: string, input: CodexHookInput): string 
   if (
     cfg.guard.require_prod_db_hosts &&
     prodHosts.length === 0 &&
-    (/\b(usql|psql|mysql|sqlite3|clickhouse-client)\b/.test(cmd) || isHttpWriteCommand(cmd))
+    (splitShellSegments(cmd).some(s => ["usql","psql","mysql","sqlite3","clickhouse-client"].includes(unwrapShellPrefix(splitShellTokens(s) ?? []).bin ?? "")) || isHttpWriteCommand(cmd))
   ) {
     return "物理保险丝（fail-closed）：工作台已启用 require_prod_db_hosts，但未配置任何 prod_db_hosts，拒绝执行数据库/HTTP 写命令直至补齐配置。";
   }
-  const approvedRunbooks = loadApprovedRunbooksForSession(workbenchRoot, input.session_id);
-  const fuseReason =
-    checkProdDb(cmd, prodHosts, toolWorkdir, approvedRunbooks, workbenchRoot) ??
-    checkKubectl(cmd, approvedRunbooks) ??
-    checkCloudAndRedisOps(cmd, cfg.guard.custom_block_patterns) ??
-    checkGitPhysicalFuse(workbenchRoot, cmd, toolWorkdir, cfg, approvedRunbooks);
-  if (fuseReason) return fuseReason;
-
-  // Tier 2: Passive dev ledger gate
-  return checkLedgerGate(workbenchRoot, cmd, toolWorkdir, cfg, approvedRunbooks);
+  const git = checkGitPhysicalFuse(cmd, cfg);
+  if (git) return git;
+  for (const segment of splitShellSegments(cmd)) {
+    const { bin, args } = unwrapShellPrefix(splitShellTokens(segment) ?? []);
+    const invocation = [bin, ...args].join(" ");
+    if (cfg.guard.sensitive_infra_patterns.some(pattern => new RegExp(pattern, "i").test(invocation)))
+      return "安全护栏：命中实例敏感基础设施策略 (secret / raw / port-forward / Redis)。";
+  }
+  for (const pattern of cfg.guard.custom_block_patterns ?? []) {
+    if (new RegExp(pattern, "i").test(cmd)) return "安全护栏：命令命中 guard.custom_block_patterns。";
+  }
+  return checkProdDb(cmd, prodHosts, toolWorkdir, () => loadApprovedRunbooksForSession(workbenchRoot, input.session_id), workbenchRoot);
 }
 
 function logGuardError(root: string, err: unknown): void {

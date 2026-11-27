@@ -31,6 +31,26 @@ function verificationInstance(s: Sandbox, days: number) {
   return { sha, configure, verify, ledger, run: () => s.run(verify) };
 }
 
+test("identical verification reuses the first successful suite execution", () => {
+  const s = sandbox();
+  try {
+    const f = verificationInstance(s, 1);
+    const counter = join(s.root, "invocations");
+    const append = 'import {appendFileSync} from "node:fs"; appendFileSync(' + JSON.stringify(counter) + ', "run\\n");';
+    f.configure(append);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = f.run();
+      expect(result.code, result.out + result.err).toBe(0);
+      if (attempt === 1) expect(JSON.parse(result.out)).toMatchObject({ reused: true, head: f.sha });
+      expect(readFileSync(counter, "utf8")).toBe("run\n");
+    }
+    f.configure(append + 'console.log("updated conditions")');
+    const result = f.run();
+    expect(result.code, result.out + result.err).toBe(0);
+    expect(readFileSync(counter, "utf8")).toBe("run\nrun\n");
+  } finally { s.cleanup(); }
+}, 30_000);
+
 test("stage failures and timeouts retain redacted full logs and readable receipts under independent retention periods", () => {
   const one = sandbox(), seven = sandbox();
   try {

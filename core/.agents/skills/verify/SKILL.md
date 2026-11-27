@@ -9,7 +9,7 @@ description: 对待交付版本执行静态、动态与集成验收，记录隔�
 
 1. 用 `forge instance list --json` 查验证环境、手段和阶段，运行 `forge doctor . --json` 定位无效配置。按项目契约选择验证工具，从公开入口检查成功与失败行为。例如，CLI 项目可断言退出码、输出及账本记录。
 2. 零覆写实例在固定 SHA 的干净隔离检出上使用仓库已声明的检查及测试脚本；JS/TS 使用 Bun。隔离运行不引入工作目录中的未提交内容或个人凭据。若必要命令缺失，报告缺少哪一项检查或输入。
-3. 用 `forge instance show stage <id> --json` 核对实例动作与来源。在干净工作树执行 `forge verify --task "$TASK" --cwd "$CHECKOUT" --mode all`，依配置顺序运行完整验证并记录汇总回执。单独运行自定义阶段可用 `forge instance run <id>` 调试；交付采用完整验证回执。按契约使用独立测试、临时数据和端到端入口；编译成功仅证明可编译。
+3. 用 `forge instance show stage <id> --json` 核对实例动作与来源。在干净工作树执行 `forge verify --task "$TASK" --cwd "$CHECKOUT" --mode all`，同一候选与条件只执行一次完整验证；再次调用返回 reused 和原回执序号。核对原回执中的阶段结果。开发中使用受影响用例。单独运行自定义阶段可用 `forge instance run <id>` 调试；交付采用完整验证回执。按契约使用独立测试、临时数据和端到端入口；编译成功仅证明可编译。
 4. 验证阶段的 `cwd: "."` 指向隔离检出根。目标仓名或仓内子目录会映射到该 SHA 的对应目录；实例私有适配器可声明 `cwd: .workbench/actions`，在该目录运行脚本并通过 `FORGE_VERIFY_CHECKOUT`、`FORGE_VERIFY_SHA` 与 `FORGE_VERIFY_ENVIRONMENT` 获取目标。
 5. 复核结果及日志，清除本次创建的检出、服务与夹具；失败也须清理。修复后对新 SHA 重验。
 
@@ -24,3 +24,5 @@ description: 对待交付版本执行静态、动态与集成验收，记录隔�
 通过 `--fixture-env NAME=/absolute/file` 显式为本次隔离验证提供普通文件，可以重复指定不同名称。名称以 `FORGE_FIXTURE_` 开头，或带有 `_TEST_FILE`、`_TEST_ARCHIVE`、`_FIXTURE_FILE`、`_FIXTURE_ARCHIVE` 后缀。验证程序从该环境变量读取私有临时目录中的只读副本。账本记录名称与 SHA-256；涉及版本的夹具由测试核对预期摘要。进程结束后清理副本。
 
 隔离检出只包含待验提交及其目录树，各层子模块按父提交固定的版本取材。需要旧版本数据的测试通过 `--fixture-env 名称=文件` 提供经过校验的本地夹具。TypeScript 静态检查执行项目声明的 check、typecheck 和 lint；存在 tsconfig 与编译器时也核验实际类型检查结果。
+
+任务校验脚本、归档夹具、日志和报告副本统一放在 `.workbench/runs/<task-id>/`。运行 `forge ledger prune --runs-only` 预览超过实例保留期的终态任务目录，携带 `--apply` 清除这些运行产物。规格和正式回执保留。

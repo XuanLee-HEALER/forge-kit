@@ -83,7 +83,7 @@ test("T02 discovery, invocation and repeated sync preserve one effective skill",
   expect(commit[0]).toMatchObject({task_id: "feature", repo: "app", branch: "feature", sha});
   expect(JSON.parse(commit[0].payload_json)).toMatchObject({kind: "commit", source: "hook"});
   const decision = s.hook("PreToolUse", {cwd: repo, tool_name: "Bash", session_id: "test",
-    tool_input: {command: "gh pr merge 1"}});
+    tool_input: {command: "git push --force origin main"}});
   expect(decision.some(reply => reply.code === 2 || /"permissionDecision"\s*:\s*"deny"/.test(reply.text))).toBe(true);
 }, 90_000);
 

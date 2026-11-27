@@ -11,7 +11,7 @@ import {
   type SpecFrozenPayload,
   type TaskSpecState,
 } from "./types";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { matchesGlob, sha256File } from "../shared/path";
 
@@ -95,6 +95,14 @@ export function freezeSpec(ledger: LedgerReader, params: {
       : task.verification_depth === "targeted" && usesV05(ledger, params.task_id);
     const fileNames: Record<string, string> = lightweight ? { scope: "scope.md" }
       : { ssot: "ssot.md", tech_spec: "tech-spec.md", test_spec: "test-spec.md" };
+    const previousFreeze = previous.freeze_seq && ledger.db.query<{payload_json: string}, [string, number]>(
+      "SELECT payload_json FROM events WHERE task_id=? AND seq=?"
+    ).get(params.task_id, previous.freeze_seq);
+    const specsOnly = previousFreeze ? JSON.parse(previousFreeze.payload_json).specs_only === true : usesV05(ledger, params.task_id);
+    if (specsOnly) {
+      const extras = readdirSync(realDir).filter(name => !Object.values(fileNames).includes(name));
+      if (extras.length) throw Error("Move non-specification files to .workbench/runs/" + params.task_id + ": " + extras.join(", "));
+    }
     const files: Record<string, string> = {};
     const hashes: Record<string, string> = {};
     for (const [key, fname] of Object.entries(fileNames)) {
@@ -235,6 +243,7 @@ export function freezeSpec(ledger: LedgerReader, params: {
       }
     }
     const payload: SpecFrozenPayload = {
+      ...(specsOnly && {specs_only: true}),
       spec_dir: relDir,
       files,
       hashes,
@@ -314,6 +323,7 @@ export function getSpecState(ledger: LedgerReader, task_id: string, options: { m
   let freezeSeq: number | null = null;
   let amendSeq: number | null = null;
   let specDir: string | null = null;
+  let specsOnly = false;
   let files: Record<string, string> | null = null;
   let hashes: Record<string, string> | null = null;
   let lockedFiles: Record<string, string> | undefined;
@@ -336,6 +346,7 @@ export function getSpecState(ledger: LedgerReader, task_id: string, options: { m
         const p = readFrozenPayload(ledger.workbenchRoot,row.payload_json);
         freezeSeq = row.seq;
         specDir = p.spec_dir ?? specDir;
+        specsOnly = p.specs_only === true;
         if (p.files) files = p.files;
         lockedFiles = p.locked_test_files;
         gitlinks = p.locked_gitlinks ?? {};
@@ -425,6 +436,13 @@ export function getSpecState(ledger: LedgerReader, task_id: string, options: { m
         } catch {
           realSpecDir = null;
         }
+      }
+    }
+    if (specsOnly && realSpecDir && specDir) {
+      const allowed = new Set(Object.values(files));
+      for (const name of readdirSync(realSpecDir)) {
+        const rel = join(specDir, name);
+        if (!allowed.has(rel)) driftedFiles.push(rel);
       }
     }
     for (const key of Object.keys(files)) {

@@ -1,7 +1,7 @@
 import { reviewExitCode, standalone } from "./engine";
 
 if (process.argv.includes("--help")) {
-  console.log("review-agents --repo <path> --base <commit> --head <commit> [--spec <path>] [--roles business,quality,simplify,comments] [--mode parallel|serial|ordered] [--order <roles>] --model <id> --effort <level>");
+  console.log("review-agents --repo <path> --base <commit> --head <commit> [--spec <path>] [--roles business,quality,simplify,comments] [--full] [--mode parallel|serial|ordered] [--order <roles>] --model <id> --effort <level>");
 } else {
   try {
     const result = await standalone(process.argv.slice(2));

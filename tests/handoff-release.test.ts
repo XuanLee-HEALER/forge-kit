@@ -2,7 +2,6 @@ import { appendEventInTx } from "../src/ledger/transactions";
 import { test, expect } from "bun:test";
 import { mkdirSync, readFileSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { evaluatePreToolUse } from "../src/guard";
 import { handleLedgerHook } from "../src/ledger-hook";
 import { formatDbCred } from "../src/dbcred";
 import {
@@ -231,14 +230,7 @@ test("canonical and legacy repo spellings share one owner across attachment and 
     }),
   ).toThrow("owned");
   expect(cmd("status", "--repo", "services/api/", "--branch", f.branch).tasks[0].task_id).toBe(f.task);
-  expect(
-    evaluatePreToolUse(root, {
-      hook_event_name: "PreToolUse",
-      cwd: f.dir,
-      tool_name: "Bash",
-      tool_input: { command: "git push origin --delete " + f.branch },
-    }),
-  ).toContain("resume");
+  expect(ledger.getTask(f.task)?.status).toBe("HANDED_OFF");
 }, 30000);
 
 test("SQL on one of two verified branches is bound to its owning checkout", () => {
@@ -420,24 +412,11 @@ test("release provides a human merge handoff for the pinned feature worktree ori
     expect(message).toContain("HEAD 在目标分支上保持可达");
     expect(message).toContain("刷新各仓固定目标分支的 origin 跟踪引用");
   }
-  const command = "gh pr merge " + f.url + " --merge --match-head-commit " + f.head;
-  const gate = (cwd: string, cmd = command, sid = "fixture") =>
-    evaluatePreToolUse(root, {
-      hook_event_name: "PreToolUse",
-      cwd,
-      session_id: sid,
-      tool_name: "Bash",
-      tool_input: { command: cmd },
-    });
-  expect(gate(f.wt)).toContain("gh pr merge");
-  expect(gate(root)).toContain("gh pr merge");
-  expect(gate(f.wt, "gh api -X PUT repos/acme/api/forge/atomic-pr/v1/pulls/1/merge")).toBeTruthy();
-  expect(gate(f.wt, "gh api -X GET repos/acme/api/forge/atomic-pr/v1/pulls/1/merge")).toBeNull();
-  expect(gate(f.dir)).toBeTruthy();
-  expect(gate(f.wt, command, "other")).toBeTruthy();
-  expect(gate(f.wt, command.replace(f.head, "a".repeat(40)))).toBeTruthy();
-  remote(f.n, { baseRefName: "retargeted" });
-  expect(gate(f.wt)).toBeTruthy();
+  remote(f.n, { headRefOid: "a".repeat(40) });
+  expect(rejects("release", "verify", id)).toContain("STALE_PR");
+  remote(f.n, { headRefOid: f.head, baseRefName: "retargeted" });
+  expect(rejects("release", "verify", id)).toContain("base branch changed");
+  expect(rejects("release", "complete", id)).toBeTruthy();
 }, 30000);
 
 test("production acceptance from an older handoff or reservation cannot close a new release", () => {

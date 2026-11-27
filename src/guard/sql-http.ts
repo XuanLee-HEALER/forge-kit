@@ -2,11 +2,13 @@ import { normalizeDbHosts, loadDbEnvironments } from "../config";
 import { type ApprovedRunbookEntry } from "./runbook-state";
 import { canonicalizeOsPath, sha256File } from "../shared/path";
 import {
+  resolveSegmentCwd,
   tokenizeSimpleShellCommand,
   hasUnquotedPipe,
   hasUnquotedRedirect,
   splitShellSegments,
   splitShellTokens,
+  splitShellTokensWithMeta,
   stripUnquotedShellRedirections,
   unwrapShellPrefix,
 } from "../shared/shell";
@@ -233,30 +235,57 @@ function literalCurlRead(cmd: string) {
 }
 
 export function checkProdDb(cmd: string, prodHosts: string[], toolWorkdir = process.cwd(),
-  approvedRunbooks: ApprovedRunbookEntry[] = [], workbenchRoot = toolWorkdir): string | null {
+  approvedRunbooks: ApprovedRunbookEntry[] | (() => ApprovedRunbookEntry[]) = [], workbenchRoot = toolWorkdir): string | null {
   if (!prodHosts.length) return null;
-  const host = productionHost(cmd, prodHosts.map(h => h.toLowerCase()));
-  if (!host) return null;
-  const argv = tokenizeSimpleShellCommand(cmd);
-  const ledgerPath = canonicalizeOsPath(workbenchRoot, ".workbench/bin/forge");
-  if (ledgerPath && argv?.[0]?.includes("/") && canonicalizeOsPath(toolWorkdir, argv[0]) === ledgerPath
-      && argv[1] === "ledger" && /^(runbook|open|close|record|decide|blocker|status|query|attach|detach|reopen|set-endpoint|cancel|verify)$/.test(argv[2])) return null;
-  const binaryBody = /(?:^|\s)--data-binary(?:=|\s)/.test(cmd);
-  const readQuery = binaryBody ? literalCurlRead(cmd) :
-    /(?:[?&]query=|(?:-d|--data(?:-raw)?)\s+['"]?)select\b/i.test(cmd) && !SQL_WRITE_RE.test(cmd);
-  if (isHttpWriteCommand(cmd) && !readQuery) {
-    return "物理保险丝：检测到向 prod 数据库 (" + host + ") 发送写请求，禁止自动执行。";
+  const pipedInputs = new Set<number>();
+  const segments = splitShellSegments(cmd, pipedInputs);
+  for (const [index, segment] of segments.entries()) {
+    const words = splitShellTokensWithMeta(stripUnquotedShellRedirections(segment)) ?? [];
+    for (const word of words) {
+      if (!word.hasExpansion) continue;
+      const sub = /(?:\$\(|`)((?:[^\s()`]*\/)?(?:psql|mysql|usql|clickhouse-client|sqlite3|curl|wget|https?)\s+[\s\S]+)[)`]/.exec(word.value);
+      if (sub) {
+        const denied = checkProdDb(sub[1], prodHosts, toolWorkdir, [], workbenchRoot);
+        if (denied) return denied;
+      }
+    }
+    const tokens = words.map(word => word.value);
+    const { bin, args, ambiguous } = unwrapShellPrefix(tokens);
+    if (ambiguous && /\b(?:psql|mysql|usql|clickhouse-client|sqlite3)\b/.test(segment) && productionHost(segment, prodHosts))
+      return "物理保险丝：无法确定 prod 数据库写入目标与输入。";
+    if (["sh", "bash", "zsh"].includes(bin ?? "")) {
+      const index = args.findIndex(a => /^-[a-z]*c$/.test(a));
+      if (index >= 0 && args[index + 1]) {
+        const denied = checkProdDb(args[index + 1], prodHosts, toolWorkdir, approvedRunbooks, workbenchRoot);
+        if (denied) return denied;
+      }
+    }
+    const sqlClient = ["psql", "mysql", "usql", "clickhouse-client", "sqlite3"].includes(bin ?? "");
+    const httpClient = ["curl", "wget", "http", "https"].includes(bin ?? "");
+    if (!sqlClient && !httpClient) continue;
+    const host = productionHost(segment, prodHosts.map(h => h.toLowerCase()));
+    if (!host) continue;
+    if (httpClient) {
+      const binaryBody = /(?:^|\s)--data-binary(?:=|\s)/.test(segment);
+      const readQuery = binaryBody ? literalCurlRead(segment) :
+        /(?:[?&]query=|(?:-d|--data(?:-raw)?)\s+['"]?)select\b/i.test(segment) && !SQL_WRITE_RE.test(segment);
+      const pipedRequest = pipedInputs.has(index) && /^https?$/.test(bin ?? "") && !args.some(a => /^(GET|HEAD|OPTIONS)$/i.test(a));
+      if ((isHttpWriteCommand(segment) || pipedRequest) && !readQuery)
+        return "物理保险丝：检测到向 prod 数据库 (" + host + ") 发送写请求。";
+      continue;
+    }
+    const fileInput = args.some(arg => /^(?:--(?:file|queries-file)(?:=|$)|-[Xq1]*f)/.test(arg)) ||
+      (bin === "psql" && args.some(arg => /^-[^-cdfhLopPUv]*f/.test(arg))) ||
+      /\\i\b|\.read\s|\bsource\s/i.test(segment) || hasUnquotedRedirect(segment, "<");
+    const piped = pipedInputs.has(index);
+    if (fileInput || piped) {
+      const cwd = resolveSegmentCwd(segments, index, toolWorkdir);
+      const approved = typeof approvedRunbooks === "function" ? approvedRunbooks() : approvedRunbooks;
+      if (!piped && approved.some(r => migrationMatches(segment, workbenchRoot, cwd, r, prodHosts))) continue;
+      return "物理保险丝：连接 prod 数据库 (" + host + ") 且 SQL 来自文件或标准输入，请先批准对应 Runbook。";
+    }
+    const write = args.join(" ").match(SQL_WRITE_RE);
+    if (write) return "物理保险丝：连接 prod 数据库 (" + host + ") 且包含写操作关键字 " + write[1].toUpperCase();
   }
-  const sqlClient = /\b(?:psql|mysql|usql|clickhouse-client|sqlite3)\b/.test(cmd);
-  const pipedInput = hasUnquotedPipe(cmd) && /\|\s*(?:(?:env\s+)?(?:\w+=\S+\s+)*)(?:[^\s|]+\/)?(?:psql|mysql|usql|clickhouse-client|sqlite3)\b/.test(cmd);
-  const psqlFile = splitShellSegments(cmd).some(seg => {
-    const { bin, args } = unwrapShellPrefix(splitShellTokens(seg) ?? []);
-    return bin === "psql" && args.some(arg => /^-[^-cdfhLopPUv]*f/.test(arg));
-  });
-  if (sqlClient && (psqlFile || pipedInput || /\s(?:--(?:file|queries-file)(?:=|\s)|-[Xq1]*f)|\\i\b|\.read\s|\bsource\s/i.test(cmd) || hasUnquotedRedirect(cmd, "<"))) {
-    if (approvedRunbooks.some(r => migrationMatches(cmd, workbenchRoot, toolWorkdir, r, prodHosts))) return null;
-    return "物理保险丝：连接 prod 数据库 (" + host + ") 且 SQL 来自文件或标准输入，请先批准对应 Runbook。";
-  }
-  const write = cmd.match(SQL_WRITE_RE);
-  return write ? "物理保险丝：连接 prod 数据库 (" + host + ") 且包含写操作关键字 " + write[1].toUpperCase() : null;
+  return null;
 }

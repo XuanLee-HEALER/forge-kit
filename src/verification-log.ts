@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { chmodSync, closeSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, statSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { taskRunDirectory } from "./ledger/task-runs";
 import { StringDecoder } from "node:string_decoder";
 import { redactSecrets, redactWithPatterns, SECRET_PATTERNS } from "./shared/redact";
 // @ts-expect-error Bun embeds this module for the child interpreter.
@@ -44,9 +45,9 @@ function writerGone(path: string, pid?: string) {
   return check.status === 1 && !check.stdout && !check.stderr && !check.error;
 }
 
-export function verificationLogDirectory(root: string, retentionDays: number) {
-  let dir = join(root, ".workbench");
-  for (const name of ["logs", "verify"]) {
+export function verificationLogDirectory(root: string, retentionDays: number, task?: string) {
+  let dir = task ? taskRunDirectory(root, task) : join(root, ".workbench");
+  for (const name of task ? ["verify"] : ["logs", "verify"]) {
     dir = join(dir, name);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     if (!lstatSync(dir).isDirectory()) throw Error("Expected verification log directory: " + dir);
@@ -123,7 +124,7 @@ export class VerificationLog {
     }
   }
 
-  finish(failed: boolean) {
+  finish(failed: boolean, keepOutput = false) {
     const hash = createHash("sha256");
     let tail = Buffer.alloc(0);
     this.read(0, chunk => {
@@ -133,9 +134,10 @@ export class VerificationLog {
     const result = { output_sha256: hash.digest("hex"), ...(failed && {
       output_excerpt: [tail.toString().trim(), this.unsavedNote].filter(Boolean).join("\n") || "Verification failed without output", log_path: this.path + ".log",
     }) };
-    if (failed) renameSync(this.active, this.path + ".log");
+    const path = this.path + (failed ? ".log" : ".passed.log");
+    if (failed || keepOutput) renameSync(this.active, path);
     this.dispose();
-    return result;
+    return keepOutput ? {...result, log_path: path} : result;
   }
 
   dispose() {

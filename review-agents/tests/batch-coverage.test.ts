@@ -50,6 +50,8 @@ test("every role reviews the pinned text of deletions, large files, renames and 
 import {appendFileSync,readFileSync} from "node:fs";
 const q=JSON.parse(await Bun.stdin.text());
 const mode=readFileSync(import.meta.path+".mode","utf8");
+const mark = delta => appendFileSync(import.meta.path+".workers", JSON.stringify({role:q.role,delta})+"\\n");
+if (mode==="pass") mark(1);
 appendFileSync(import.meta.path+".log", JSON.stringify({role:q.role,index:q.index,chunks:q.chunks})+"\\n");
 const omitted=c=>q.role==="quality" && c.patch.includes("MARK_deleted_17_txt_175_END");
 if(mode==="interrupt" && q.chunks.some(omitted)) process.exit(7);
@@ -58,6 +60,7 @@ const checked=q.chunks.filter(c=>mode!=="omit" || !omitted(c)).map(({id,path})=>
 const source=q.chunks.some(c=>c.path==="widget.ts");
 const findings=(mode!=="pass" && source && q.role==="quality") ? [{severity:"blocking",path:"widget.ts",line:1,title:"fixture finding",evidence:"MODIFIED_SOURCE",recommendation:"fix"}] : [];
 await Bun.write(process.argv[process.argv.indexOf("-o")+1],JSON.stringify({role:q.role,checked,findings,status:partial?"incomplete":findings.length?"findings":"pass",summary:"fixture",limitations:[]}));
+if (mode==="pass") mark(-1);
 `, { mode: 0o755 });
     for (const [mode, status, exit] of [["pass", "pass", 0], ["blocked", "blocked", 1], ["omit", "incomplete", 3], ["interrupt", "incomplete", 3], ["mixed", "incomplete", 3]] as const) {
       writeFileSync(fake + ".mode", mode);
@@ -85,6 +88,24 @@ await Bun.write(process.argv[process.argv.indexOf("-o")+1],JSON.stringify({role:
       for (const role of ["quality", "comments"]) {
         const batches = calls.filter(call => call.role === role);
         expect(batches.length).toBeGreaterThan(1);
+        if (mode === "pass") {
+          // 20b5adb delivered all 335 chunks in 94 calls per role on this fixture.
+          // The marker checks below verify the payload survives the denser packing.
+          expect(batches.length).toBeLessThan(94);
+          const schedule = report.roles.find((entry: {role: string}) => entry.role === role).scheduling;
+          expect(schedule.backend_calls).toBe(batches.length);
+          let active = 0, peak = 0;
+          for (const line of readFileSync(fake + ".workers", "utf8").trim().split("\n")) {
+            const event = JSON.parse(line);
+            if (event.role === role) {
+              active += event.delta;
+              peak = Math.max(active, peak);
+            }
+          }
+          expect(active).toBe(0);
+          expect(peak).toBeGreaterThanOrEqual(1);
+          expect(peak).toBeLessThanOrEqual(schedule.concurrency_limit);
+        }
         const tokens = new Set<string>();
         for (const batch of batches) {
           expect(JSON.stringify(batch.index)).toContain("deleted-17.txt");

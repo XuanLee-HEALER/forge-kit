@@ -69,6 +69,7 @@ const p = Bun.spawnSync([${JSON.stringify(realGit)}, ...args], {stdout:"inherit"
 process.exit(p.exitCode ?? 1);`, {mode: 0o755});
   writeFileSync(join(root, "bin/gh"), `#!/usr/bin/env bun
 import {Database} from "bun:sqlite";
+import {appendFileSync} from "node:fs";
 const [group, cmd, , path] = process.argv.slice(2);
 const pr = await Bun.file(${JSON.stringify(join(root,"pr-2"))}).json();
 function git(...args) {
@@ -78,6 +79,10 @@ function git(...args) {
 }
 if (group === "pr" && cmd === "list") console.log(JSON.stringify([{number:2, baseRefName:"main"}]));
 else if (group === "pr" && cmd === "view") console.log(JSON.stringify(pr));
+else if (group === "pr" && cmd === "merge") {
+  appendFileSync(${JSON.stringify(join(root, "merge-attempts"))}, "refused\\n");
+  process.exit(1);
+}
 else if (group === "pr" && cmd === "checks") console.log('[{"name":"CI","bucket":"pass"}]');
 else if (group === "api" && path.endsWith("/git/ref/heads/main")) console.log(git("rev-parse","main"));
 else if (group === "api" && path.includes("/git/commits/")) console.log(git("show","-s","--format=%T %P",path.split("/").pop()));
@@ -98,17 +103,22 @@ else if (group === "api" && path.includes("/compare/")) {
   });
   const initial = audit();
   for (const args of [["evaluate"], ["run","--dry-run"]]) {
-    const message = (await ship(id,...args)).reason.message;
-    expect(message).toMatch(/Manual merge required/);
-    expect(message.startsWith("Preview only. First run forge ship run --envelope " + id)).toBe(true);
-    expect(message).toContain("Wait for that run's 'Manual merge required' handoff before merging");
+    const preview = await ship(id,...args);
+    expect(preview.status).toBe("ELIGIBLE");
+    expect(preview.plan.ci).toMatchObject([{baseOid: f.base, head: f.head}]);
     expect(audit()).toEqual(initial);
   }
   git(f.dir, "commit", "--allow-empty", "-m", "advance base after preview");
   git(f.dir, "push", bare, "main");
   const base = git(f.dir, "rev-parse","HEAD");
   remote(2, {baseRefOid: base});
-  expect((await ship(id,"run")).reason.message).toContain(base);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const pending = await ship(id, "run");
+    expect(pending.status).toBe("ACTIVE");
+    expect(pending.reason.message).toContain(base);
+    expect(pending.receipts).toMatchObject([{status: "claimed"}]);
+  }
+  expect(readFileSync(join(root, "merge-attempts"), "utf8")).toBe("refused\n");
   expect(audit().bindings).toHaveLength(1);
   git(f.dir, "merge", "--no-ff", "-m", "operator merge", f.branch);
   const merge = git(f.dir, "rev-parse", "HEAD");
@@ -172,7 +182,7 @@ process.exit(result.exitCode ?? 1);`,{mode:0o755});
   expect(events.some(event => JSON.parse(event.payload_json).meta?.delivery_endpoint === "push")).toBe(false);
 }, 40_000);
 
-test("manual handoff waits for all pinned PRs, and a failure in another repository takes priority", async () => {
+test("platform merge waits for checks on every pinned PR before the first write", async () => {
   initWorkbench({targetDir:root, kitRoot:join(import.meta.dir,"..")});
   const first = feature("api",1), second = feature("web",3);
   cmd("cancel",second.task,"--reason","attach both repositories to the first task");
@@ -199,8 +209,8 @@ else if (group==="pr" && cmd==="checks") {
   const id = cmd("fast-track","prepare",first.task,"--runbook",rb.runbook_id,"--paths","src/**").envelope_id;
   approve(id);
   const ready = await ship(id,"evaluate");
-  expect(ready.status).toBe("ACTIVE");
-  for (const f of [first,second]) expect(ready.reason.message).toContain(f.url);
+  expect(ready.status).toBe("ELIGIBLE");
+  expect(ready.plan.ci.map((pr: {url: string}) => pr.url)).toEqual([first.url,second.url]);
   writeFileSync(ci,JSON.stringify({1:"pass",3:"pending"}));
   const pending = await ship(id,"run");
   expect(pending.reason.message).toMatch(/pending/);

@@ -1,10 +1,10 @@
 // An exact plan is frozen with the runbook. Resolving it again detects changed
-// scripts, endpoints or Git identities before an executor claims an item.
+// registered deployment inputs, endpoints or Git identities before an executor claims an item.
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { prospectiveMergeTree } from "../ship-diff";
 import { loadDbEnvironments, loadWorkbenchConfig } from "../config";
-import { localPath, readRequired, resolveInstance } from "../instance";
+import { localPath, resolveInstance } from "../instance";
 import { runGit } from "../git";
 import { interpreterScript } from "../shared/action-program";
 import { sha256File } from "../shared/path";
@@ -43,7 +43,7 @@ export function checkPushPermission(root: string, branch: string) {
 interface PinnedCommand {
   cwd: string;
   argv: string[];
-  files: Record<string, string>;
+  files?: Record<string, string>;
 }
 export type ShipAction =
   | {
@@ -60,6 +60,7 @@ export type ShipAction =
   | { kind: "stage"; stage: string; target: string; execute: PinnedCommand; observe: PinnedCommand }
   | { kind: "sql"; target: DbTarget; path: string; sha256: string };
 export interface ExactPlan {
+  nodeAuthorization?: true;
   endpoint: string;
   pins: CheckoutPin[];
   actions: ShipAction[];
@@ -116,7 +117,7 @@ export function checkDeliveryDefinition(root: string, plan: ExactPlan) {
   )
     throw Error("Delivery endpoint, stage implementation or stage order changed");
 }
-export function stagePin(root: string, id: string): Extract<ShipAction, { kind: "stage" }> {
+export function stagePin(root: string, id: string, legacy = false): Extract<ShipAction, { kind: "stage" }> {
   const cfg = resolveInstance(root),
     stage = cfg.stages.get(id);
   if (!stage || stage.source === "core" || !cfg.delivery.value.stages.includes(id))
@@ -131,38 +132,28 @@ export function stagePin(root: string, id: string): Extract<ShipAction, { kind: 
         id +
         ".observe",
     );
-  const cache = new Map<string, string>();
-  function pin(actionId: string, args: string[], cwdName: string, inputs?: string[]): PinnedCommand {
-    if (!inputs)
-      throw Error(
-        "Declare every deployment input in extensions.actions." +
-          actionId +
-          ".inputs (use [] for no extra files)",
-      );
-    const cwd = localPath(root, cwdName),
-      argv = [...args];
-    const executable = argv[0].includes("/") ? resolve(cwd, argv[0]) : Bun.which(argv[0]);
-    if (!executable) throw Error("Missing executable for " + actionId);
-    argv[0] = realpathSync(executable);
+  function command(cwdName: string, args: string[], inputs: string[] = []): PinnedCommand {
+    const cwd = localPath(root, cwdName);
+    const executable = args[0].includes("/") ? resolve(cwd, args[0]) : Bun.which(args[0]);
+    if (!executable) throw Error("Missing executable for stage " + id);
+    const argv = [realpathSync(executable), ...args.slice(1)];
+    const paths = new Set(inputs.map(input => localPath(cwd, input)));
+    if (legacy) {
+      paths.add(argv[0]);
+      const script = interpreterScript(args);
+      if (script) paths.add(resolve(cwd, script));
+    }
     const files: Record<string, string> = {};
-    const paths = new Set(inputs.map((path) => localPath(cwd, path)));
-    paths.add(argv[0]);
-    const script = interpreterScript(args);
-    if (script) paths.add(resolve(cwd, script));
     for (const path of paths) {
-      const digest = cache.get(path) ?? new Bun.CryptoHasher("sha256").update(readRequired(path)).digest("hex");
-      cache.set(path, digest);
+      const digest = sha256File(path);
+      if (!digest) throw Error("Cannot read registered stage input " + path);
       files[path] = digest;
     }
     return { cwd, argv, files };
+
   }
-  const execute = pin(
-    action.id,
-    [...action.value.argv, ...stage.value.options],
-    action.value.cwd,
-    action.value.inputs,
-  );
-  const observe = pin(observer.id, observer.value.argv, observer.value.cwd, observer.value.inputs);
+  const execute = command(action.value.cwd, [...action.value.argv, ...stage.value.options], action.value.inputs);
+  const observe = command(observer.value.cwd, observer.value.argv, observer.value.inputs);
   if (canonicalJson([execute.cwd, execute.argv]) === canonicalJson([observe.cwd, observe.argv]))
     throw Error("Use a separate read-only target observation for " + id);
   return { kind: "stage", stage: id, target: cfg.delivery.value.endpoint, execute, observe };
@@ -215,7 +206,6 @@ export function buildPlan(
       const row = ledger.getTaskRepos(task).find(r => r.repo === pin.repo)!;
       const {dir} = resolveTaskCheckout(ledger.workbenchRoot, row);
       if (!branch || runGit(dir, ["check-ref-format", ref]).code) throw Error("Invalid push branch");
-      checkPushPermission(ledger.workbenchRoot, branch);
       if (runGit(dir, ["remote", "get-url", "origin"]).stdout !== runGit(dir, ["remote", "get-url", "--push", "origin"]).stdout)
         throw Error("Push and read destinations must match");
       const baseOid = remoteBranch(dir, ref);
@@ -223,7 +213,7 @@ export function buildPlan(
         throw Error("Exact push requires a strict fast-forward from the live remote value");
       return {kind: "push" as const, repo: pin.repo, remote: "origin" as const, ref, head: pin.head, baseOid, originHash: pin.originHash};
     });
-    return { endpoint: "push", pins, actions: updates, ci: [], stages: sequence };
+    return { nodeAuthorization: true, endpoint: "push", pins, actions: updates, ci: [], stages: sequence };
   }
   const expectedStages = sequence.filter((stage) => !stage.core).map((stage) => stage.id);
   if (canonicalJson(expectedStages) !== canonicalJson(stages))
@@ -305,5 +295,5 @@ export function buildPlan(
     }
   }
   requireTargetObservation(cfg.delivery.value.endpoint, items);
-  return { endpoint: cfg.delivery.value.endpoint, pins, actions: items, ci, stages: sequence };
+  return { nodeAuthorization: true, endpoint: cfg.delivery.value.endpoint, pins, actions: items, ci, stages: sequence };
 }

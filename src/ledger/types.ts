@@ -11,11 +11,11 @@ export function normalizeReviewRole(role?: string | null): string {
 
 // Older executors stored preflight selections as failed reviews. Project their original
 // receipts at read time so the immutable event chain and genuine v0.4 reviews survive.
-export function reviewFactKind(evidence: { kind?: string; meta?: { report_status?: unknown; backend?: unknown; attempts?: unknown } }) {
+export function reviewFactKind(evidence: { kind?: string; meta?: { report_status?: unknown; backend?: unknown; attempts?: unknown; coverage?: {reused?:number} } }) {
   if (evidence.kind === "review_selection") return "review_selection";
   if (evidence.kind !== "review") return undefined;
   const meta = evidence.meta;
-  if (meta?.report_status === "incomplete" && meta.backend === null &&
+  if (meta?.report_status === "incomplete" && meta.backend === null && !meta.coverage?.reused &&
       Array.isArray(meta.attempts) && meta.attempts.length === 0) return "review_selection";
   return "review";
 }
@@ -41,6 +41,7 @@ export type LockedTreeEntry = { path: string; mode: string; oid: string };
 export type LockedGitlinks = Record<string, LockedTreeEntry[]>;
 
 export interface SpecFrozenPayload {
+  specs_only?: boolean;
   spec_dir: string;
   files: Record<string, string>;
   hashes: Record<string, string>;

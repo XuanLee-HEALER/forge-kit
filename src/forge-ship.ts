@@ -1,3 +1,4 @@
+import { redactSecrets } from "./cmdfmt";
 import { checkStagePin, observeStage, stageEnvironment } from "./stage-observation";
 import { pushFastForward } from "./conditional-merge";
 import { diffScope, prospectiveMergeTree, git } from "./ship-diff";
@@ -210,11 +211,11 @@ function preflight(ledger: Ledger, e: Envelope, candidate?: ExactPlan) {
           !action.ref.startsWith("refs/heads/") || plan.actions.some(a => a.kind !== "push") ||
           runGit(dir, ["merge-base", "--is-ancestor", action.baseOid, action.head]).code)
         throw Error("Invalid fast-forward binding");
-      checkPushPermission(ledger.workbenchRoot, action.ref.slice("refs/heads/".length));
+      if (!plan.nodeAuthorization) checkPushPermission(ledger.workbenchRoot, action.ref.slice("refs/heads/".length));
       const target = remoteBranch(dir, action.ref);
       const receipt = receipts(ledger, e.envelope_id).find(r => r.action_index === index);
       if (receipt?.status === "confirmed" && target !== action.head) throw Error("Confirmed remote branch no longer points to the approved head: " + action.ref);
-      if (target !== action.baseOid && !(receipt && target === action.head)) throw Error("Remote branch drifted");
+      if (target !== action.baseOid && !(receipt && target === action.head)) throw Error("Remote branch drifted: " + action.ref + " is " + target + ", expected " + action.baseOid);
       continue;
     }
     const pr = plan.actions.find((a): a is PrAction => a.kind === "pr" && a.repo === row.repo);
@@ -234,7 +235,7 @@ function preflight(ledger: Ledger, e: Envelope, candidate?: ExactPlan) {
     try {
       const observation = checkedPr(dir, row.branch, pr);
       if (observation.merged) verifiedMerges.set(row.repo, observation);
-      else manual.push(pr.url + " (base " + pr.baseOid + ", head " + pr.head + ")");
+      else if (!plan.nodeAuthorization || !preparedScope(ledger, e).anchor.node_authorization) manual.push(pr.url + " (base " + pr.baseOid + ", head " + pr.head + ")");
     } catch (err) {
       if (!(err instanceof AwaitingOperator)) throw err;
       waiting.push(err.message);
@@ -281,11 +282,23 @@ function resolveFrontPlan(ledger: Ledger, e: Envelope, execute: boolean) {
     const base = gh(["api","--hostname",origin.host,"repos/" + origin.owner + "/" + origin.repo + "/git/ref/heads/main","--jq",".object.sha"]).trim();
     if (!isOid(base)) throw Error("Cannot identify the target main OID before PR registration");
     targetBases.set(row.repo,base);
-    const selector = list.length ? String(list[0].number) : undefined;
+    let selector = list.length ? String(list[0].number) : undefined;
     if (remote !== pin.head + "\t" + ref || !selector) {
       const destination = slug + " " + row.branch + "@" + pin.head + " -> main@" + base;
-      throw new AwaitingOperator("Manual PR handoff before publication: " + destination +
-        ". This fast-track performs zero external writes on GitHub. Publishing the source branch and opening the PR are separate ordinary delivery operations requiring their own authorization. Once the PR is open, rerun to pin it before the operator merges.");
+      if (!execute || !anchor.node_authorization)
+        throw new AwaitingOperator("Source branch publication and PR creation pending for " + destination);
+      const write = git(dir, ["remote", "get-url", "--push", "--all", "origin"]).trim();
+      if (write !== git(dir, ["remote", "get-url", "--all", "origin"]).trim())
+        throw Error("PR source push and read destinations differ");
+      if (remote !== pin.head + "\t" + ref) {
+        checkEnvelopeApproval(ledger, envelope(ledger, e.envelope_id));
+        git(dir, ["push", "--no-follow-tags", "--recurse-submodules=no", "origin", pin.head + ":" + ref]);
+        if (remoteBranch(dir, ref) !== pin.head) throw Error("Cannot verify published PR source branch");
+      }
+      if (!selector) {
+        checkEnvelopeApproval(ledger, envelope(ledger, e.envelope_id));
+        selector = gh(["pr", "create", "--repo", slug, "--head", row.branch, "--base", "main", "--fill"]).trim();
+      }
     }
     const pr = inspectPr(dir,row.branch,selector,process.env,undefined,{bin:process.env.FORGE_GH_BIN,baseOid:true});
     if (pr.state !== "OPEN" || pr.headRefOid !== pin.head || pr.baseRefName !== "main" || pr.baseRefOid !== base)
@@ -393,14 +406,24 @@ function perform(
 ) {
   if (a.kind === "push") {
     return pushFastForward(dirs.get(a.repo)!, a, () => {
-      checkPushPermission(ledger.workbenchRoot, a.ref.slice("refs/heads/".length));
+      if (!plan.nodeAuthorization) checkPushPermission(ledger.workbenchRoot, a.ref.slice("refs/heads/".length));
       checkAuthorization(ledger, e.envelope_id);
     });
   }
   const state = observed(ledger, e, a, dirs);
   if (state) return state;
-  if (a.kind === "pr")
-    throw new AwaitingOperator("Manual merge required for the pinned PR " + a.url);
+  if (a.kind === "pr") {
+    if (!plan.nodeAuthorization || !preparedScope(ledger, e).anchor.node_authorization)
+      throw new AwaitingOperator("Manual merge required for the pinned PR " + a.url);
+    checkAuthorization(ledger, e.envelope_id);
+    const result = runProcess([process.env.FORGE_GH_BIN || "gh", "pr", "merge", a.url,
+      "--merge", "--match-head-commit", a.head], {cwd: dirs.get(a.repo)!, env: checkoutEnvironment()});
+    const confirmed = observed(ledger, e, a, dirs);
+    if (!confirmed)
+      throw new AwaitingOperator("Manual merge or target confirmation required for " + a.url + " (base " + a.baseOid +
+        ", head " + a.head + "). Platform merge exited " + result.code + "; the PR is still open.");
+    return confirmed;
+  }
   if (a.kind === "tag") {
     checkAuthorization(ledger, e.envelope_id);
     const result = runProcess(["git", "push", "--no-follow-tags", "origin", a.head + ":refs/tags/" + a.tag], {
@@ -566,6 +589,9 @@ export function shipCli(argv: string[]) {
             action.kind === "stage"
               ? reconcileStage(ledger, current, action, plan, index)
               : observed(ledger, current, action, dirs);
+          if (!observation && action.kind === "pr")
+            throw new AwaitingOperator("Manual merge or target confirmation required for " + action.url +
+              " (base " + action.baseOid + ", head " + action.head + "). The PR remains open after the original submission.");
           if (!observation)
             throw Error(
               "Uncertain outcome for a claimed item; inspect target and receipts before manual recovery",
@@ -681,7 +707,7 @@ export function shipCli(argv: string[]) {
       if (!execute && !binding) return state(ledger, id, err instanceof Error ? err.message : String(err));
       return withImmediateTx(ledger.db, () => {
         const current = envelope(ledger, id);
-        const reason = err instanceof Error ? err.message : String(err);
+        const reason = redactSecrets(err instanceof Error ? err.message : String(err));
         if (current.status !== "ACTIVE") return state(ledger, id);
         // Evaluation may fail after an executor has claimed its first external action.
         if (current.run_token !== expectedToken) return state(ledger, id, reason);

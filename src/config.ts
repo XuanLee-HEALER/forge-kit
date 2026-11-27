@@ -28,6 +28,7 @@ export interface GuardConfig {
   allow_protected_ff: string[];
   prod_tag_patterns: string[];
   custom_block_patterns?: string[];
+  sensitive_infra_patterns: string[];
   block_shared_worktree_ops: boolean;
   block_ledger_direct_edits: boolean;
 }
@@ -97,6 +98,11 @@ const DEFAULT_LEDGER: LedgerConfig = {
 
 const DEFAULT_GUARD: GuardConfig = {
   custom_block_patterns: [],
+  // Inherit historical credential and destructive infrastructure protections unless configured.
+  sensitive_infra_patterns: [
+    "^kubectl\\b.*(?:--raw(?:=|\\s)|\\bport-forward\\b|[\\s,]secrets?(?:[/.\\s,]|$))",
+    "^redis-cli\\b.*\\b(?:flushdb|flushall|shutdown|config\\s+set)\\b",
+  ],
   prod_db_hosts: [],
   prod_db_targets: [],
   require_prod_db_hosts: false,
@@ -204,13 +210,19 @@ function validatePolicySection(file: string, section: "guard" | "ledger", fields
       throw Error(label + " must be a nonnegative integer");
     if (!Array.isArray(defaultValue)) continue;
     if (!Array.isArray(value) || !value.every(entry => typeof entry === "string")) throw Error(label + " must be a string list");
-    if (key === "prod_tag_patterns" || key === "custom_block_patterns") {
+    if (key === "prod_tag_patterns" || key === "custom_block_patterns" || key === "sensitive_infra_patterns") {
       for (const [index, pattern] of value.entries()) {
         try { new RegExp(pattern); }
         catch { throw Error(label + "[" + index + "] contains an invalid regular expression"); }
       }
     }
   }
+}
+
+/** Drop the retired host capability hint when reading an older private instance file. */
+export function deliverySettings(raw: Record<string, unknown>): Record<string, unknown> {
+  const { atomic_pr_hosts: _retiredHostHint, ...settings } = raw;
+  return settings;
 }
 
 export function loadWorkbenchConfig(root: string): WorkbenchConfig {

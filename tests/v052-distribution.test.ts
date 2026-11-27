@@ -20,7 +20,7 @@ test("README preserves the byte ranges around the backend sentence from f4a5d03"
   expect(sentence).toContain("无内置上下文");
 });
 
-test("0.5.2 distribution removes stale JS bundles and retired protocol configuration", () => {
+test("current distribution removes stale JS bundles and retired protocol configuration", () => {
   const temp = mkdtempSync(join(tmpdir(), "forge-dist-contract-"));
   try {
     // Build a private copy so a failed or interrupted check cannot alter a developer's dist.
@@ -31,6 +31,10 @@ test("0.5.2 distribution removes stale JS bundles and retired protocol configura
     }
     symlinkSync(join(kit, "node_modules"), join(temp, "node_modules"));
     if (existsSync(join(kit, "review-agents/node_modules"))) symlinkSync(join(kit, "review-agents/node_modules"), join(temp, "review-agents/node_modules"));
+    for (const manifest of ["package.json", "review-agents/package.json"]) {
+      expect(JSON.parse(readFileSync(join(temp, manifest), "utf8")).version).toBe("0.5.3");
+    }
+    expect(readFileSync(join(kit, "kit.toml"), "utf8")).toMatch(/^version = "0\.5\.3"$/m);
     mkdirSync(join(temp, "dist"));
     writeFileSync(join(temp, "dist/stale.js"), "stale");
     const result = Bun.spawnSync([process.execPath, "run", "build"], { cwd: temp });
@@ -54,7 +58,7 @@ test("0.5.2 distribution removes stale JS bundles and retired protocol configura
     expect(readFileSync(join(kit, "core/AGENTS.md")).length).toBeLessThan(8000);
     const guard = join(kit, "src/guard");
     const lines = readdirSync(guard).filter(f => f.endsWith(".ts")).reduce((n, f) => n + (readFileSync(join(guard, f), "utf8").match(/\n/g)?.length ?? 0), 0);
-    expect(lines).toBeLessThanOrEqual(1500);
+    expect(lines).toBeLessThan(1498);
     for (const obsolete of ["docs/designs", "docs", "packs"]) expect(existsSync(join(kit, obsolete))).toBe(false);
   } finally { rmSync(temp, { recursive: true, force: true }); }
 }, 30_000);

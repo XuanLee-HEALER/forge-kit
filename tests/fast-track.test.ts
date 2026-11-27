@@ -444,27 +444,22 @@ test("pre-code approval covers B..C when remote main is A and only additive test
   expect(()=>validateScope(ledger,envelope(ledger,id))).toThrow();
 },60_000);
 
-test("exact protected update needs instance permission for its concrete branch",()=>{
+test("an approved push node performs a fast-forward without a second branch allow-list",()=>{
   initWorkbench({targetDir:root,kitRoot:join(import.meta.dir,"..")});
   const f=feature("api",1),bare=join(root,"api.git");
   git(f.dir,"remote","set-url","origin",bare);
   writeFileSync(join(root,".workbench/workbench.yaml"),"name: fixture\nrepos: [api]\nguard: {protected_branches: [main], allow_protected_ff: [other]}\nextensions: {delivery: {endpoint: push, stages: [ship]}}\n");
   ledger.updateEndpoint({task_id:f.task,endpoint:"push",reason:"single-user protected branch"});
   verifyFeature(f);
-  expect(rejects("runbook","create","--task",f.task,"--exact","--push","api:main","--title","main")).toMatch(/protected branch/i);
-  expect(git(bare,"rev-parse","main")).toBe(f.base);
-  const configPath=join(root,".workbench/workbench.yaml");
-  const permitted=readFileSync(configPath,"utf8").replace("allow_protected_ff: [other]","allow_protected_ff: [main]");
-  writeFileSync(configPath,permitted);
   const book=cmd("runbook","create","--task",f.task,"--exact","--push","api:main","--title","main");
   const id=cmd("fast-track","prepare",f.task,"--to","push","--runbook",book.runbook_id,"--paths","src/**").envelope_id;
   const run=()=>Bun.spawnSync([process.execPath,join(import.meta.dir,"../src/bin/cli.ts"),"ship","run","--envelope",id],{
-    cwd:root,env:{...process.env,FORGE_WORKBENCH_ROOT:root,FORGE_SESSION_ID:"test-session"}
+    cwd:root,env:{...process.env,FORGE_WORKBENCH_ROOT:root,FORGE_SESSION_ID:"test-session",CODEX_SESSION_ID:"test-session"}
   });
   expect(run().exitCode).not.toBe(0);
   expect(git(bare,"rev-parse","main")).toBe(f.base);
   expect(human("快轨批准 "+id)).toContain("ACTIVE");
-  writeFileSync(configPath,permitted.replace("allow_protected_ff: [main]","allow_protected_ff: []"));
-  expect(run().exitCode).not.toBe(0);
-  expect(git(bare,"rev-parse","main")).toBe(f.base);
+  const result = run();
+  expect(result.exitCode, result.stderr.toString() + result.stdout.toString()).toBe(0);
+  expect(git(bare,"rev-parse","main")).toBe(f.head);
 },30_000);

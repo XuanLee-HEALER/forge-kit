@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { evaluatePreToolUse } from "../src/guard";
 import { Ledger } from "../src/ledger";
 import { evidenceSource } from "../src/ledger/types";
 
@@ -1302,16 +1301,10 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         base_sha: baseSha,
         head_sha: cherryFatSha,
       });
-      // Guarded push of `fat-diverged` MUST be blocked before `cherryFatSha` has test + review evidence!
-      expect(
-        evaluatePreToolUse(dir, {
-          hook_event_name: "PreToolUse",
-          cwd: repoDir,
-          tool_name: "Bash",
-          tool_input: { command: "git push origin fat-diverged:fat", workdir: repoDir },
-        }),
-      ).toContain("账本门禁");
-      // Record test + review on `cherryFatSha` -> guarded push is now ALLOWED!
+      const integrationReady = () => ledger.checkPushReadiness({
+        task_id: "20261124-cherry", repo: "web", branch: "fat-diverged", head_sha: cherryFatSha,
+      });
+      expect(integrationReady().ready).toBe(false);
       ledger.recordEvidence({
         source: "tool",
         task_id: "20261124-cherry",
@@ -1333,14 +1326,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         sha: cherryFatSha,
         meta: { role: "business", base: baseSha },
       });
-      expect(
-        evaluatePreToolUse(dir, {
-          hook_event_name: "PreToolUse",
-          cwd: repoDir,
-          tool_name: "Bash",
-          tool_input: { command: "git push origin fat-diverged:fat", workdir: repoDir },
-        }),
-      ).toBeNull();
+      expect(integrationReady().ready).toBe(true);
       // Execute push to origin/fat, then AFTER deployment & acceptance record evidence on canonical `featSha`!
       run(["push", "-f", "origin", "fat-diverged:refs/heads/fat"]);
       run(["fetch", "origin"]);
