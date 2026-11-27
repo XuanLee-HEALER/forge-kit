@@ -22,9 +22,9 @@ function change(text: string) {
   f.git("commit", "-qm", text, "--", "code.txt");
   return f.git("rev-parse", "HEAD");
 }
-function args(role = "quality", status = "pass", from = base, to = head) {
+function args(role = "quality", status = "pass", from = base, to = head, reviewSummary = summary) {
   return ["review-record", task, "--base", from, "--head", to, "--role", role,
-    "--status", status, "--summary", summary, "--report", report];
+    "--status", status, "--summary", reviewSummary, "--report", report];
 }
 function events() {
   return f.ledger.getTaskEvents(task);
@@ -171,6 +171,9 @@ test("fixing one role preserves the other role's unresolved finding through a ne
     ok(...args(role, status));
     expect(ready().missing.join(" ")).toContain(role);
   }
+  const reviews = ok("reviews", task);
+  const qualitySeq = reviews.find((row: {status: string}) => row.status === "blocked").seq;
+  const commentsSeq = reviews.find((row: {status: string}) => row.status === "incomplete").seq;
   const previous = head;
   head = change("repair both findings");
   checks();
@@ -179,15 +182,52 @@ test("fixing one role preserves the other role's unresolved finding through a ne
   expect(ready().missing.join(" ")).toContain("comments");
   report = join(f.root, "quality-recheck.md");
   writeFileSync(report, "Verified the repair against the prior quality finding.\n");
-  ok(...args("quality", "pass", previous));
+  ok(...args("quality", "pass", previous, head, `Verified fix for #${qualitySeq}`));
   expect(ready().missing.join(" ")).not.toContain("quality");
   expect(ready().missing.join(" ")).toContain("comments");
   report = join(f.root, "comments-recheck.md");
   writeFileSync(report, "Verified the updated comments against the original finding.\n");
-  ok(...args("comments"));
+  ok(...args("comments", "pass", base, head, `Verified fix for #${commentsSeq}`));
   expect(ready().ready).toBe(true);
   expect(ok("reviews", task)).toContainEqual(expect.objectContaining({role: "quality", status: "blocked", head: previous}));
 });
+
+test("a single outstanding finding needs its own role and cited failure sequence", () => {
+  ok(...args("quality", "blocked"));
+  const original = ok("reviews", task).at(-1);
+  const previous = head;
+  head = change("repair the quality finding");
+  checks();
+  ok(...args("business"));
+  function stillBlocked() {
+    expect(ready().ready).toBe(false);
+    expect(ready().missing.join(" ")).toContain("quality");
+    expect(command("close", task, "--no-archive").exitCode).not.toBe(0);
+    expect(f.ledger.getTask(task)?.status).toBe("OPEN");
+  }
+  stillBlocked();
+  for (const [role, from, reviewSummary] of [
+    ["quality", previous, "Checked the incremental changes"],
+    ["quality", base, "Checked the entire change"],
+    ["quality", previous, `Checked revision ${original.seq}`],
+    ["business", base, `Reviewed #${original.seq}`],
+    ["quality", previous, `Reviewed #${original.seq + 1000}`],
+  ]) {
+    ok(...args(role, "pass", from, head, reviewSummary));
+    stillBlocked();
+  }
+  const reviewSummary = `Verified the repair for #${original.seq}`;
+  report = join(f.root, "quality-reassessment.md");
+  writeFileSync(report, reviewSummary + "\n");
+  ok(...args("quality", "pass", previous, head, reviewSummary));
+  const history = ok("reviews", task);
+  expect(history).toContainEqual(original);
+  expect(history.at(-1)).toMatchObject({role: "quality", status: "pass", base: previous, head, summary: reviewSummary});
+  expect(ready().ready).toBe(true);
+  ok("close", task, "--no-archive");
+  expect(f.ledger.getTask(task)?.status).toBe("CLOSED");
+  expect(ok("verify", "--task", task).ok).toBe(true);
+}, 30_000);
 
 test("native reassessment clears a historical selection and close needs a full final range", () => {
   const previous = head;

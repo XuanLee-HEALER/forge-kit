@@ -57,18 +57,21 @@ function ancestor(dir: string, older: string, newer: string) {
 
 export function resolveReviewedIssues(issues: Map<number, ReviewIssue>, pass: ReviewIssue, summary: string,
   dir: string, deliveryHead: string) {
-  const candidates = [...issues.values()].filter(issue => issue.role === pass.role);
-  if (!candidates.length || !ancestor(dir, pass.head, deliveryHead)) return;
-  const cited = new Set(Array.from(summary.matchAll(/(?:\bseq\s*[:=#]?\s*|#)([1-9]\d*)\b/gi), match => Number(match[1])));
-  const matched = candidates.filter(issue => {
-    if (!ancestor(dir, issue.head, pass.head)) return false;
-    // Preserve the old executor's exact-range retry semantics for its own receipts.
-    if (pass.source === "tool") return issue.source === "tool" && issue.head === pass.head && issue.base === pass.base;
-    if (cited.size && !cited.has(issue.seq)) return false;
-    return ancestor(dir, pass.base, issue.base) || pass.base === issue.head ||
-      (cited.has(issue.seq) && ancestor(dir, issue.head, pass.base));
-  });
-  if (pass.source === "tool" || matched.length === 1 || cited.size) {
-    for (const issue of matched) issues.delete(issue.seq);
+  if (!issues.size) return;
+  if (pass.source === "tool") {
+    // Historical tool retries resolved failures on their exact role and range.
+    for (const issue of issues.values()) {
+      if (issue.source === "tool" && issue.role === pass.role && issue.head === pass.head &&
+          issue.base === pass.base && ancestor(dir, pass.head, deliveryHead)) issues.delete(issue.seq);
+    }
+    return;
+  }
+
+  const references = summary.matchAll(/(?:\bseq\s+|#)([1-9]\d*)\b/gi);
+  for (const [, seq] of references) {
+    const issue = issues.get(Number(seq));
+    if (!issue || issue.role !== pass.role || !ancestor(dir, pass.head, deliveryHead) ||
+        !ancestor(dir, issue.head, pass.head)) continue;
+    if (ancestor(dir, pass.base, issue.base) || ancestor(dir, issue.head, pass.base)) issues.delete(issue.seq);
   }
 }

@@ -37,7 +37,7 @@ Commands:
   reviews <task_id>
   pr-sync <task_id> --repo <repo> [--pr <number-or-url>] [--branch <branch>]
   review-record <task_id> [--repo <repo>] [--branch <branch>] --role <business|quality|simplify|comments> --base <sha> --head <sha> --status <pass|blocked|incomplete> --report <file> --summary <text> [--session-id <id>] [--model <name>] [--effort <level>]
-                For ambiguous or later incremental rechecks, cite each resolved "seq N" in --summary and explain the fix and coverage in the report.
+                To resolve a failed review, cite its #N or seq N in --summary and explain each fix and its verification in the report.
   exempt    --repo <r> --branch <b> --reason <text> [--sha <sha> --ttl-hours <n>]
   status    [--task <id>] [--repo <r> --branch <b>] [--json]
   query     [--q <fts>] [--repo <r>] [--status <OPEN|HANDED_OFF|CLOSED|CANCELLED>] [--since <iso>] [--json]
