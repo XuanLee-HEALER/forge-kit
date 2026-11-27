@@ -1,27 +1,24 @@
 // Embedded alongside the shared redactor in a separate Bun process. fd 3 is
 // the parent's already-open private log. The project never inherits that fd.
-import { readFileSync, writeFileSync } from "node:fs";
+import { linkSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+declare function verificationRedactor(write: (data: string) => void): {write(data: string): void; finish(): void};
 declare function redactSecrets(text: string): string;
 
-const { argv, cwd, env, timeout } = JSON.parse(readFileSync(0, "utf8"));
+const { argv, cwd, env, timeout, active } = JSON.parse(readFileSync(0, "utf8"));
+// Each writer owns a link. Expiring a dead CLI's link leaves the open
+// supervisor's link in place, including while it is draining child output.
+const writer = active.replace(/\.\d+\.active$/, "." + process.pid + ".active");
+linkSync(active, writer);
+process.on("exit", () => unlinkSync(writer));
 const child = spawn(argv[0], argv.slice(1), {
   cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true,
 });
 function capture(stream: NodeJS.ReadableStream) {
-  let partial = "";
-  // Latin-1 maps each byte reversibly, including non-UTF-8 compiler output.
+  const redactor = verificationRedactor(data => writeFileSync(3, data, "latin1"));
   stream.setEncoding("latin1");
-  stream.on("data", (chunk: string) => {
-    const end = chunk.lastIndexOf("\n");
-    if (end < 0) {
-      partial += chunk;
-      return;
-    }
-    writeFileSync(3, redactSecrets(partial + chunk.slice(0, end + 1)), "latin1");
-    partial = chunk.slice(end + 1);
-  });
-  return () => { if (partial) writeFileSync(3, redactSecrets(partial), "latin1"); };
+  stream.on("data", redactor.write);
+  return redactor.finish;
 }
 const flushStdout = capture(child.stdout!);
 const flushStderr = capture(child.stderr!);
@@ -47,6 +44,9 @@ let reason = "";
 const timer = setTimeout(() => {
   reason = "Verification timed out after " + timeout + " ms";
   if (child.pid) killTree(child.pid);
+  // A reparented process can still own the write end of either pipe.
+  child.stdout!.destroy();
+  child.stderr!.destroy();
 }, timeout);
 child.on("error", error => { reason = error.message; });
 child.on("close", (code, signal) => {

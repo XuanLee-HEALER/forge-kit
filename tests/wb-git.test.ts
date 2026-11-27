@@ -95,5 +95,6 @@ test("retired fat-merge command cannot start a new integration", () => {
     cwd:wb,env:{...process.env,FORGE_WORKBENCH_ROOT:wb}
   });
   expect(result.exitCode).not.toBe(0);
+  expect(result.stderr.toString()).toContain("Unknown forge git command: fat-merge");
   expect(runGit(join(wb,"demo"),["branch","--list","fat"]).stdout).toBe("");
 });

@@ -8,7 +8,7 @@ const CHUNK_BYTES = 12_000;
 const digest = (s: string) => createHash("sha256").update(s).digest("hex");
 export type Chunk = {
   id: string; path: string; oldStart: number; oldEnd: number; newStart: number; newEnd: number;
-  continued: boolean; size: number;
+  deletedRanges: [number, number][]; continued: boolean; size: number;
 };
 export type Material = ReturnType<typeof prepareMaterials>;
 
@@ -46,8 +46,10 @@ function* patchChunks(file: string) {
   let text = "", bytes = 0, continued = false;
   let old = 0, head = 0, oldStart = 0, oldEnd = 0, newStart = 0, newEnd = 0;
   let kind = "", header = "", atLineStart = true, inHunk = false;
+  let deletedRanges: [number, number][] = [];
   function take() {
-    const value = {patch: text, oldStart, oldEnd, newStart, newEnd, continued};
+    const value = {patch: text, oldStart, oldEnd, newStart, newEnd, deletedRanges, continued};
+    deletedRanges = [];
     text = ""; bytes = oldStart = oldEnd = newStart = newEnd = 0;
     return value;
   }
@@ -65,10 +67,15 @@ function* patchChunks(file: string) {
       const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(header);
       if (hunk) { old = Number(hunk[1]); head = Number(hunk[2]); inHunk = true; }
     }
-    const length = Buffer.byteLength(part);
+    const length = Buffer.byteLength(JSON.stringify(part)) - 2;
     if (bytes + length > CHUNK_BYTES && text) {
       yield take();
       continued = !atLineStart;
+    }
+    if (inHunk && kind === "-") {
+      const last = deletedRanges.at(-1);
+      if (last && old <= last[1] + 1) last[1] = old;
+      else deletedRanges.push([old, old]);
     }
     if (inHunk && (kind === " " || kind === "-")) { oldStart ||= old; oldEnd = old; }
     if (inHunk && (kind === " " || kind === "+")) { newStart ||= head; newEnd = head; }
@@ -111,7 +118,7 @@ export function prepareMaterials(repo: Repo, dir: string) {
         chunks.push({id, path:change.path, ...bounds, size:Buffer.byteLength(JSON.stringify(patch))});
       }
       for (const p of patchChunks(patchFile)) record(p);
-      if (!part) record({patch:JSON.stringify(change), oldStart:0, oldEnd:0, newStart:0, newEnd:0, continued:false});
+      if (!part) record({patch:JSON.stringify(change), oldStart:0, oldEnd:0, newStart:0, newEnd:0, deletedRanges:[], continued:false});
     } catch (error) {
       missing.push(change.path);
       limitations.push(change.path + " (" + (error instanceof Error ? error.message : "unreadable material") + ")");

@@ -57,9 +57,25 @@ export class Repo {
       change.deleted = match[2] === "-" ? null : Number(match[2]);
     }
     if (fields[n] !== "" || n !== fields.length - 1) throw Error("Unexpected Git change inventory");
-    const privateChange = (c: Change) => isPrivatePath(c.path) || isPrivatePath(c.oldPath);
-    this.excludedFiles = changes.filter(privateChange).map(c => c.path);
-    this.changes = changes.filter(c => !privateChange(c));
+    this.changes = [];
+    this.excludedFiles = [];
+    for (const change of changes) {
+      const privateOld = isPrivatePath(change.oldPath), privateNew = isPrivatePath(change.path);
+      if (!privateOld && !privateNew) { this.changes.push(change); continue; }
+      this.excludedFiles.push(privateNew ? change.path : change.oldPath);
+      if (privateOld === privateNew) continue;
+      // Re-diff the public endpoint as a whole addition/deletion. A paired
+      // rename's numstat describes only edits between the private/public blobs.
+      const path = privateOld ? change.path : change.oldPath;
+      const stats = this.git(["--literal-pathspecs", "diff", "--no-renames", "--no-textconv", "--no-ext-diff",
+        "--numstat", "-z", this.base, this.head, "--", path]);
+      const row = stats.split("\0").map(s => /^(\d+|-)\t(\d+|-)\t([\s\S]+)$/.exec(s)).find(m => m?.[3] === path);
+      if (!row) throw Error("Missing public rename statistics");
+      const zeroOid = "0".repeat(change.oldOid.length);
+      this.changes.push({...change, path, oldPath:path, added:row[1] === "-" ? null : Number(row[1]),
+        deleted:row[2] === "-" ? null : Number(row[2]), ...(privateOld ?
+          {status:"A", oldOid:zeroOid, oldMode:"000000"} : {status:"D", newOid:zeroOid, newMode:"000000"})});
+    }
     this.files = this.changes.map(c => c.path);
   }
   git(args: string[], allowNoMatch = false, maxBytes = 32 * 1024 * 1024) {
@@ -133,13 +149,16 @@ export class Repo {
       .filter(p => p && !isInstructionFile(p) && !isPrivatePath(p));
   }
 
-  private searchHits(terms: string[], globs: string[], maxPerFile?: number) {
-    // Zero-delimited path and line fields keep literal colons in names unambiguous.
-    const raw = this.git(["grep", "-n", "-z", "-I", "-F", ...(maxPerFile ? ["-m", String(maxPerFile)] : []),
+  private grepArgs(terms: string[], globs: string[], maxPerFile?: number) {
+    return ["grep", "-n", "-z", "-I", "-F", ...(maxPerFile ? ["-m", String(maxPerFile)] : []),
       ...terms.flatMap(term => ["-e", term]), this.head, "--", ...globs,
       ...Array.from(privateDirectories, dir => ":(exclude,glob)**/" + dir + "/**"),
       ":(exclude)**/.env*", ":(exclude).env*", ":(exclude)**/config.toml", ":(exclude)config.toml",
-      ":(exclude)*.pem", ":(exclude)*.key"], true, 96 * 1024);
+      ":(exclude)*.pem", ":(exclude)*.key"];
+  }
+
+  private parseHits(raw: string) {
+    // Zero-delimited path and line fields keep literal colons in names unambiguous.
     const hits: {path: string; line: number; text: string}[] = [];
     for (const row of raw.split("\n")) {
       const [name, line, text] = row.split("\0");
@@ -150,6 +169,27 @@ export class Repo {
     return hits;
   }
 
+  private async callerHits(terms: string[], globs: string[]) {
+    // Caller snippets are sampled. Drain Git to its actual exit status even
+    // when common identifiers produce many more matches than fit in a prompt.
+    const proc = Bun.spawn(["git", "-C", this.root, ...this.grepArgs(terms, globs, 4)], {
+      stdout:"pipe", stderr:"ignore", stdin:"ignore", timeout:20_000,
+      env:{...snapshotGitEnv(), GIT_ATTR_SOURCE:this.head},
+    });
+    const prefix = Buffer.alloc(96 * 1024);
+    let used = 0, truncated = false;
+    for await (const part of proc.stdout) {
+      const n = Math.min(part.length, prefix.length - used);
+      prefix.set(part.subarray(0, n), used);
+      used += n;
+      if (n < part.length) truncated = true;
+    }
+    const code = await proc.exited;
+    if (code !== 0 && code !== 1) throw Error("Cannot search pinned caller context");
+    const end = truncated ? prefix.lastIndexOf(10) + 1 : used;
+    return this.parseHits(prefix.toString("utf8", 0, end));
+  }
+
   search(query: string, glob: string, offset: number) {
     if (typeof query !== "string" || typeof glob !== "string" || query.length > 200 || glob.length > 200)
       throw new Error("Invalid search");
@@ -157,10 +197,10 @@ export class Repo {
       const matcher = new Bun.Glob(glob || "**");
       return this.page(this.trackedPaths().filter(p => matcher.match(p)), offset);
     }
-    return this.page(this.searchHits([query], [glob || "*"]).map(h => h.path + ":" + h.line + ":" + h.text), offset);
+    return this.page(this.parseHits(this.git(this.grepArgs([query], [glob || "*"]), true, 96 * 1024)).map(h => h.path + ":" + h.line + ":" + h.text), offset);
   }
 
-  context(diff: Record<string, string>) {
+  async context(diff: Record<string, string>) {
     const extensions = ["ts","tsx","js","jsx","mts","cts","mjs","cjs","go","py","rs","java","kt","swift","rb","c","cc","cpp","h","hpp"];
     const publicSource = (p: string) => extensions.includes(posix.extname(p).slice(1)) &&
       !/(^|\/)(?:\.workbench|\.agents|\.codex|\.ssh|node_modules|vendor)\//.test(p);
@@ -180,7 +220,7 @@ export class Repo {
       if (/^[a-zA-Z_]\w{2,}$/.test(stem) && !["index","main","mod"].includes(stem)) names.add(stem);
       if (!paths.has(file)) continue;
       let header = "";
-      try { header = this.read(file, "head", 0).text; } catch { /* The patch still provides changed imports. */ }
+      try { header = this.read(file, "head", 0).text; } catch { omitted.push(file); }
       for (const m of (header + "\n" + patch).matchAll(/["'](\.\.?\/[^"'\s]+)["']/g)) {
         const target = posix.join(posix.dirname(file), m[1]);
         // TS sources commonly refer to a .js module in their emitted imports.
@@ -190,7 +230,7 @@ export class Repo {
         if (dep && !changedPaths.has(dep) && candidates.size < 6) candidates.set(dep, 0);
       }
     }
-    const hits = names.size ? this.searchHits([...names], extensions.map(ext => "*." + ext), 4) : [];
+    const hits = names.size ? await this.callerHits([...names], extensions.map(ext => "*." + ext)) : [];
     const importLine = (text: string) => /^\s*(?:import\b|from\b.*\bimport\b|(?:const|let|var)\b.*\brequire\s*\()/.test(text);
     // Prefer the call site to its import when the two are far apart.
     hits.sort((a, b) => Number(importLine(a.text)) - Number(importLine(b.text)));

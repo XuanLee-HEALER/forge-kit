@@ -12,6 +12,8 @@ export function offlineCodex(root: string) {
   const executable = join(root, "fixture-codex");
   writeFileSync(executable, `#!/usr/bin/env bun
 const args = process.argv.slice(2);
+const output = args.indexOf("-o");
+if (args[0] !== "exec" || output < 0 || !args[output + 1]) process.exit(2);
 const {role, chunks} = JSON.parse(await Bun.stdin.text());
 const [marker, title] = ${JSON.stringify(samples)}[role];
 const findings = [];
@@ -24,7 +26,7 @@ for (const chunk of chunks) {
   }
 }
 const checked = chunks.map(({id,path}) => ({id,path,conclusion:"reviewed"}));
-await Bun.write(args[args.indexOf("-o")+1], JSON.stringify({role,checked,findings,limitations:[],summary:"Offline fixture",status:findings.length?"findings":"pass"}));
+await Bun.write(args[output+1], JSON.stringify({role,checked,findings,limitations:[],summary:"Offline fixture",status:findings.length?"findings":"pass"}));
 `, {mode:0o755});
   process.env.FORGE_CODEX_BIN = executable;
 }

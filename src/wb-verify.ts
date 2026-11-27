@@ -107,9 +107,11 @@ export function verifyCli(args: string[]) {
     phase = "checkout preparation";
     function isolatedGit(cwd: string, args: string[]) {
       if (!baseEnv) throw Error("Missing isolated verification environment");
-      return runProcess(["git", "-c", "core.hooksPath=/dev/null", ...args], {
+      const result = runProcess(["git", "-c", "core.hooksPath=/dev/null", ...args], {
         cwd, timeoutMs, env: { ...baseEnv, GIT_CONFIG_GLOBAL: "/dev/null", GIT_ALLOW_PROTOCOL: "file", GIT_NO_LAZY_FETCH: "1", GIT_NO_REPLACE_OBJECTS: "1" },
       });
+      if (result.code) log(phase).note(result.stdout + "\n" + result.stderr);
+      return result;
     }
     if (modern) {
       if (!snap.freeze_seq) throw Error("Freeze the confirmed specification before verification");
@@ -223,7 +225,7 @@ export function verifyCli(args: string[]) {
     ledger.db
       .transaction(() => {
         recheckExecution(ledger, snap);
-        for (const { kind, ...meta } of results.filter(r => r.kind !== "verify" && !skippedPhases.has(r.stage!)))
+        for (const { kind, ...meta } of results.filter(r => r.kind !== "verify" && (modern || !skippedPhases.has(r.stage!))))
           ledger.recordEvidence({
             task_id: snap.task_id,
             repo: snap.repo,

@@ -44,13 +44,16 @@ interface Binding {
   actions_hash: string;
   endpoint: string;
 }
-export function exactBinding(ledger: Ledger, id: string) {
-  const binding = ledger.db
+export function findExactBinding(ledger: Ledger, id: string) {
+  return ledger.db
     .query<
       Binding,
       [string]
     >("SELECT runbook_id, actions_hash, endpoint FROM exact_ship_envelopes WHERE envelope_id=?")
     .get(id);
+}
+export function exactBinding(ledger: Ledger, id: string) {
+  const binding = findExactBinding(ledger, id);
   if (!binding)
     throw Error(
       "Missing exact actions for this legacy envelope; create a new runbook and request human approval",
@@ -181,11 +184,30 @@ function frontDefinition(ledger: Ledger, task: string, endpoint: string) {
   const {protected_branches, allow_protected_ff} = loadWorkbenchConfig(ledger.workbenchRoot).guard;
   return {endpoint, stages, commands, protected_branches, allow_protected_ff};
 }
+interface PreparedAnchor extends Binding {
+  envelope_id: string;
+  scope_hash: string;
+  base_shas_json: string;
+  ttl_minutes: number;
+  mode?: string;
+  max_files_changed?: number;
+  max_lines_changed?: number;
+}
+function taskPreparations(ledger: Ledger, task: string) {
+  const events = ledger.db.query<{seq: number; payload_json: string}, [string]>(
+    "SELECT seq,payload_json FROM events WHERE task_id=? AND event_type='FAST_TRACK_PREPARED' ORDER BY seq"
+  ).all(task);
+  const prepared = new Map<string, {record: {seq: number}; anchor: PreparedAnchor}>();
+  for (const record of events) {
+    const anchor: PreparedAnchor = JSON.parse(record.payload_json);
+    if (!prepared.has(anchor.envelope_id)) prepared.set(anchor.envelope_id, {record, anchor});
+  }
+  return prepared;
+}
 export function preparedScope(ledger: Ledger, e: Envelope) {
-  const record = ledger.getTaskEvents(e.task_id).find(ev =>
-    ev.event_type === "FAST_TRACK_PREPARED" && JSON.parse(ev.payload_json).envelope_id === e.envelope_id);
-  if (!record) throw Error("Missing original envelope preparation");
-  return {record, anchor: JSON.parse(record.payload_json)};
+  const prepared = taskPreparations(ledger, e.task_id).get(e.envelope_id);
+  if (!prepared) throw Error("Missing original envelope preparation");
+  return prepared;
 }
 export function validateScope(ledger: Ledger, e: Envelope) {
   const {policy, hash} = loadShipPolicy(ledger.workbenchRoot);
@@ -330,23 +352,23 @@ export function fastTrackCommand(ledger: Ledger, args: string[]) {
       !ledger.db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fast_track_envelopes'").get()
     )
       return [];
+    const hasBindings = Boolean(ledger.db.query("SELECT 1 FROM sqlite_master WHERE name='exact_ship_envelopes'").get());
+    const preparations = new Map<string, ReturnType<typeof taskPreparations>>();
     return ledger.db
       .query<Envelope, [string | null, string | null, string | null, string | null]>(
         "SELECT * FROM fast_track_envelopes WHERE (? IS NULL OR envelope_id=?) AND (? IS NULL OR task_id=?) ORDER BY created_at",
       )
       .all(positionals[0] ?? null, positionals[0] ?? null, values.task ?? null, values.task ?? null)
       .map((row) => {
-        if (!ledger.db.query("SELECT 1 FROM sqlite_master WHERE name='exact_ship_envelopes'").get()) return row;
-        const binding = ledger.db
-          .query<
-            Binding,
-            [string]
-          >("SELECT runbook_id, actions_hash, endpoint FROM exact_ship_envelopes WHERE envelope_id=?")
-          .get(row.envelope_id);
+        if (!hasBindings) return row;
+        const binding = findExactBinding(ledger, row.envelope_id);
         if (binding) return {...row, ...binding, receipts: shipReceipts(ledger, row.envelope_id)};
-        const prepared = ledger.getTaskEvents(row.task_id).find(ev => ev.event_type === "FAST_TRACK_PREPARED" &&
-          JSON.parse(ev.payload_json).envelope_id === row.envelope_id);
-        const scope = prepared && JSON.parse(prepared.payload_json);
+        let prepared = preparations.get(row.task_id);
+        if (!prepared) {
+          prepared = taskPreparations(ledger, row.task_id);
+          preparations.set(row.task_id, prepared);
+        }
+        const scope = prepared.get(row.envelope_id)?.anchor;
         if (scope?.mode === "frozen-scope-v1") return {...row, mode: scope.mode, endpoint: scope.endpoint,
           max_files_changed: scope.max_files_changed, max_lines_changed: scope.max_lines_changed};
         return row;
@@ -376,8 +398,8 @@ export function fastTrackCommand(ledger: Ledger, args: string[]) {
     const { policy, hash } = loadShipPolicy(ledger.workbenchRoot);
     const endpoint = v.to || ledger.getTask(id)?.endpoint;
     if (!endpoint) throw Error("Missing delivery endpoint");
-    const rb = v.runbook ? ledger.getRunbook(v.runbook) : null;
-    if (v.runbook && (!rb || rb.task_id !== id || !["APPROVED","PENDING"].includes(rb.status) ||
+    const rb = v.runbook !== undefined ? ledger.getRunbook(v.runbook) : null;
+    if (v.runbook !== undefined && (!rb || rb.task_id !== id || !["APPROVED","PENDING"].includes(rb.status) ||
         rb.actions_hash !== sha256String(rb.actions_json)))
       throw Error("Expected an exact runbook for this task");
     const plan: ExactPlan | undefined = rb && JSON.parse(rb.actions_json).exact;

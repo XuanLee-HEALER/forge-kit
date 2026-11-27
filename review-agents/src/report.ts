@@ -17,6 +17,8 @@ export const Report = z.object({
   limitations: z.array(z.string()),
 });
 
+export type Finding = z.infer<typeof Report>["findings"][number];
+
 export class ReportTextError extends Error {
   constructor(readonly field: string) {
     super(`Report field ${field} contains unsafe control characters`);
@@ -85,29 +87,5 @@ export function cleanReport(raw: unknown, paths: string[] = []) {
   });
 
   r.limitations = r.limitations.map((text, i) => plainText(text, `limitations[${i}]`));
-  return r;
-}
-
-export class FindingLocationError extends Error {}
-
-export function validateReport(
-  raw: unknown,
-  files: string[],
-  missing: string[],
-  lineCount: (path: string) => number,
-) {
-  const r = cleanReport(raw, files);
-  for (const f of r.findings) {
-    if (!files.includes(f.path)) throw new FindingLocationError("Finding must anchor to a changed file");
-    if (f.line > lineCount(f.path)) throw new FindingLocationError("Finding line exceeds the pinned file length");
-  }
-  if (missing.length) {
-    r.status = "incomplete";
-    r.limitations.push(`Unread diff: ${missing.join(", ")}`);
-  }
-  if (r.status !== "incomplete")
-    r.status = r.findings.some((f) => f.severity === "blocking")
-      ? "findings"
-      : "pass";
   return r;
 }

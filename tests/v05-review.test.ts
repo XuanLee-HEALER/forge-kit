@@ -194,9 +194,9 @@ for (const failure of ["upstream", "local", "unknown"]) {
     const result = await exercise("pass", {failure, roles: "quality", mode: "serial"});
     expect(result.cli.length).toBe(1);
     expect(result.apiRequests).toEqual([]);
-    expect(result.code).not.toBe(0);
+    expect(result.code).toBe(statuses.incomplete);
     const report = JSON.parse(result.out);
-    expect(report.roles[0].backend).toBe("codex");
+    expect(report.roles[0]).toMatchObject({backend:"codex", status:"incomplete"});
   }, 30_000);
 }
 

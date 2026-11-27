@@ -3,7 +3,6 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Repo } from "../src/repo";
-import { validateReport } from "../src/report";
 import { detectDiffPitfallLanguages } from "../src/roles";
 test("pinned reads and no worktree contamination", () => {
   const dir = mkdtempSync(join(tmpdir(), "review-test-"));
@@ -43,38 +42,6 @@ test("pinned reads and no worktree contamination", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
-test("unread diffs never pass and blocking findings determine exit state", () => {
-  const raw = {
-    role:"quality",
-    status: "pass",
-    summary: "ok",
-    findings: [],
-    checked: [],
-    limitations: [],
-  };
-  expect(validateReport(raw, ["a"], ["a"], () => 1).status).toBe("incomplete");
-  expect(
-    validateReport(
-      {
-        ...raw,
-        findings: [
-          {
-            severity: "blocking",
-            path: "a",
-            line: 1,
-            title: "x",
-            evidence: "x",
-            recommendation: "x",
-          },
-        ],
-      },
-      ["a"],
-      [],
-      () => 1,
-    ).status,
-  ).toBe("findings");
-});
-
 test("detectDiffPitfallLanguages selects only matching Go/TS/Python pitfall checklists", () => {
   expect(detectDiffPitfallLanguages(["internal/service.go"])).toEqual(["go"]);
   expect(detectDiffPitfallLanguages(["src/app.tsx", "web/Page.svelte"])).toEqual(["ts"]);

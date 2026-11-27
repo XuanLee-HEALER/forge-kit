@@ -3,6 +3,7 @@ import { canonicalRepoPath } from "../config";
 import { runGit } from "../git";
 import { sha256File } from "../shared/path";
 import { reachableFromRefs, resolveTaskCheckout } from "./checkout";
+import { deliveryStages } from "./ship-actions";
 import { inspectPr, PrUnavailable } from "./pr";
 import { getSpecState } from "./spec";
 import {
@@ -58,7 +59,7 @@ export function requireReleaseBase(ledger: LedgerReader, taskId: string, branch:
 
 export function deploymentStages(config: ReturnType<typeof installedInstance>, endpoint: string) {
   if (config?.delivery.value.endpoint !== endpoint) return [];
-  return config.delivery.value.stages.filter(id => config.stages.get(id)?.source !== "core");
+  return deliveryStages(config).filter(stage => !stage.core).map(stage => stage.id);
 }
 
 export function currentHandoff(ledger: ReleaseLedger, task: string) {

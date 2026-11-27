@@ -896,3 +896,13 @@ export function resolveCdTarget(
     return null;
   }
 }
+
+/** Resolve the destination operand of a cp command, including GNU target-directory options. */
+export function copyDestination(args: string[]): string | undefined {
+  for (const [index, option] of args.entries()) {
+    if (option === "--") break;
+    const target = /^(?:--target-directory(?:=|$)|-[^-]*?t)(.*)$/.exec(option);
+    if (target) return target[1] || args[index + 1];
+  }
+  return args.at(-1);
+}

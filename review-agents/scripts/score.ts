@@ -1,6 +1,4 @@
-import type { validateReport } from "../src/report";
-
-type Finding = ReturnType<typeof validateReport>["findings"][number];
+import type { Finding } from "../src/report";
 
 export function matchesDefect(sample: {line: number; concepts: string[]; after: string}, finding: Finding) {
   if (finding.severity !== "blocking" || finding.path !== "sample.ts" || finding.line !== sample.line) return false;

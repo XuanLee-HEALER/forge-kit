@@ -12,6 +12,7 @@ import {
   checkPushPermission,
   checkDeliveryDefinition,
   deliveryStages,
+  buildPlan,
   pinCheckouts,
   databaseTarget,
   isOid,
@@ -24,7 +25,7 @@ import { Ledger } from "./ledger/store";
 import {
   shipReceipts as receipts,
   preparedScope,
-  exactBinding,
+  findExactBinding,
   exactRunbook,
   envelope,
   validateScope,
@@ -34,7 +35,7 @@ import {
 import { resolveTaskCheckout } from "./ledger/checkout";
 import { inspectPr } from "./ledger/pr";
 
-import { sha256String, canonicalJson, nowIso, type TaskRepoRecord } from "./ledger/types";
+import { sha256String, canonicalJson, nowIso, type RunbookRecord, type TaskRepoRecord } from "./ledger/types";
 import { withImmediateTx } from "./ledger/transactions";
 
 function live(e: Envelope) {
@@ -97,7 +98,7 @@ function checkedPr(dir: string, branch: string, a: PrAction) {
     if (pr.mergeable === "UNKNOWN" || pr.mergeStateStatus === "UNKNOWN")
       throw new AwaitingOperator("Mergeability is still being computed for " + a.url + "; rerun to observe it");
     if (pr.mergeable !== "MERGEABLE" || pr.mergeStateStatus !== "CLEAN") throw Error("PR is blocked by target policy");
-    return { merged: false, oid: pr.baseRefOid as string };
+    return { merged: false as const };
   }
   const oid = pr.mergeCommit?.oid;
   if (!isOid(oid) || !isOid(pr.baseRefOid)) throw Error("Missing remote merge receipt");
@@ -115,7 +116,7 @@ function checkedPr(dir: string, branch: string, a: PrAction) {
       throw Error("Remote merge tree or parents differ from approved result");
   }
   if (pendingCi) throw new AwaitingOperator("Awaiting final required checks on merged PR " + a.url);
-  return { merged: true, oid: String(oid) };
+  return { merged: true as const, oid: String(oid), targetOid: target.stdout.trim() };
 }
 function checkEnvelopeApproval(ledger: Ledger, e: Envelope) {
   if (e.status !== "ACTIVE") throw Error("Envelope is " + e.status);
@@ -166,11 +167,16 @@ function approvedCheckouts(ledger: Ledger, e: Envelope) {
   }
   return {checkouts, pins};
 }
-function preflight(ledger: Ledger, e: Envelope) {
-  const {rb, plan} = exactRunbook(ledger, e);
-  const {checkouts, pins} = approvedCheckouts(ledger, e);
+function checkRunbookApproval(rb: RunbookRecord, e: Envelope) {
   if (rb.status !== "APPROVED" || rb.approved_session_id !== e.approved_session_id ||
       !rb.expires_at || Date.parse(rb.expires_at) <= Date.now()) throw Error("Runbook approval expired, revoked or changed");
+}
+function preflight(ledger: Ledger, e: Envelope, candidate?: ExactPlan) {
+  const exact = candidate ? undefined : exactRunbook(ledger, e);
+  const plan = candidate ?? exact!.plan;
+  const rb = exact?.rb;
+  const {checkouts, pins} = approvedCheckouts(ledger, e);
+  if (rb) checkRunbookApproval(rb, e);
   if (canonicalJson(pins) !== canonicalJson(plan.pins)) throw Error("Approved commit or remote changed");
   checkDeliveryDefinition(ledger.workbenchRoot, plan);
   for (const a of plan.actions) {
@@ -184,7 +190,7 @@ function preflight(ledger: Ledger, e: Envelope) {
       throw Error("SQL target or content changed, or writes forbidden");
   }
   const dirs = new Map(checkouts.map(({row, dir}) => [row.repo, dir]));
-  const verifiedMerges = new Map<string,string>();
+  const verifiedMerges = new Map<string, {oid: string; targetOid: string}>();
   for (const {row, pin, dir} of checkouts) {
     if (plan.endpoint === "push") {
       const index = plan.actions.findIndex(a => a.kind === "push" && a.repo === row.repo);
@@ -209,13 +215,14 @@ function preflight(ledger: Ledger, e: Envelope) {
     if (!observation.merged)
       throw new AwaitingOperator("Manual merge required for " + pr.url +
         ": the host cannot bind base " + pr.baseOid + " when merging head " + pr.head +
-        ". After the operator merges, rerun forge ship run to verify the remote receipt.");
-    verifiedMerges.set(row.repo, observation.oid);
+        (candidate ? ". Preview only: run forge ship run --envelope " + e.envelope_id + " to pin the open PR before the operator merges."
+          : ". After the operator merges, rerun forge ship run to verify the remote receipt."));
+    verifiedMerges.set(row.repo, observation);
   }
   return { plan, dirs, verifiedMerges };
 }
 class AwaitingOperator extends Error {}
-function resolveFrontPlan(ledger: Ledger, e: Envelope) {
+function resolveFrontPlan(ledger: Ledger, e: Envelope, execute: boolean) {
   const {anchor} = preparedScope(ledger, e);
   if (anchor.mode !== "frozen-scope-v1") return;
   const bound = ledger.db.query("SELECT runbook_id FROM exact_ship_envelopes WHERE envelope_id=?").get(e.envelope_id);
@@ -253,13 +260,21 @@ function resolveFrontPlan(ledger: Ledger, e: Envelope) {
       throw Error("Task PR differs from the authorized version or target");
     prs.push({repo:row.repo, number:Number(pr.url.split("/").pop())});
   }
+  function checkCandidate(plan: ExactPlan) {
+    if (canonicalJson(plan.pins) !== canonicalJson(pins) || plan.ci.some(pr => targetBases.get(pr.repo) !== pr.baseOid))
+      throw Error("Task or target version changed during plan registration");
+    return plan;
+  }
+  if (!execute) {
+    const actions = {prs, tags: [], sql_files: [], kubectl_commands: []};
+    return checkCandidate(buildPlan(ledger, e.task_id, actions, stages));
+  }
   withImmediateTx(ledger.db, () => {
     checkEnvelopeApproval(ledger, envelope(ledger, e.envelope_id));
     if (ledger.db.query("SELECT 1 FROM exact_ship_envelopes WHERE envelope_id=?").get(e.envelope_id)) return;
     const rb = ledger.createRunbook({task_id:e.task_id, title:"Realize frozen scope " + e.envelope_id, exact_stages:stages, actions:{prs}});
     const plan: ExactPlan = JSON.parse(rb.actions_json).exact;
-    if (canonicalJson(plan.pins) !== canonicalJson(pins) || plan.ci.some(pr => targetBases.has(pr.repo) && targetBases.get(pr.repo) !== pr.baseOid))
-      throw Error("Task or target version changed during plan registration");
+    checkCandidate(plan);
     ledger.db.query("UPDATE runbooks SET status='APPROVED',approved_session_id=?,approved_at=?,expires_at=? WHERE runbook_id=?")
       .run(e.approved_session_id,e.approved_at,e.expires_at,rb.runbook_id);
     ledger.db.query("INSERT INTO exact_ship_envelopes(envelope_id,runbook_id,actions_hash,endpoint) VALUES(?,?,?,?)")
@@ -292,8 +307,7 @@ function checkAuthorization(ledger: Ledger, id: string) {
   const current = envelope(ledger, id);
   checkEnvelopeApproval(ledger, current);
   const {rb} = exactRunbook(ledger, current);
-  if (rb.status !== "APPROVED" || rb.approved_session_id !== current.approved_session_id ||
-      !rb.expires_at || Date.parse(rb.expires_at) <= Date.now()) throw Error("Runbook approval changed");
+  checkRunbookApproval(rb, current);
   if (ledger.getTaskBlockers(current.task_id).some((blocker) => blocker.status === "OPEN"))
     throw Error("Task has an open blocker");
 }
@@ -458,11 +472,16 @@ export function shipCli(argv: string[]) {
   try {
     const initial = envelope(ledger, id);
     // Pre-scope envelopes without a registered exact plan never acquire new authority.
-    let front = false;
-    try { front = preparedScope(ledger, initial).anchor.mode === "frozen-scope-v1"; } catch { /* Older envelope without a preparation receipt. */ }
-    if (!front) {
-      try { exactBinding(ledger, id); }
-      catch { return {ok:false,status:initial.status,reason:{message:"Legacy envelope has no exact binding. Register a new plan and request human approval."},receipts:receipts(ledger,id)}; }
+    let binding: ReturnType<typeof findExactBinding>;
+    try {
+      binding = findExactBinding(ledger, id);
+    } catch (error) {
+      return state(ledger, id, error instanceof Error ? error.message : String(error));
+    }
+    if (!binding) {
+      const prepared = ledger.db.query("SELECT 1 FROM events WHERE task_id=? AND event_type='FAST_TRACK_PREPARED' AND json_extract(payload_json,'$.envelope_id')=? AND json_extract(payload_json,'$.mode')='frozen-scope-v1'")
+        .get(initial.task_id,id);
+      if (!prepared) return {ok:false,status:initial.status,reason:{message:"Legacy envelope has no exact binding. Register a new plan and request human approval."},receipts:receipts(ledger,id)};
     }
     if (initial.status !== "ACTIVE") return state(ledger, id);
     // A wrong session cannot revoke another session's approved envelope.
@@ -471,15 +490,15 @@ export function shipCli(argv: string[]) {
     } catch (err) {
       if (Date.parse(initial.expires_at!) > Date.now()) return state(ledger, id, String(err));
     }
+    const execute = cmd === "run" && !values["dry-run"];
     let expectedToken: string | null = null;
     try {
-      const execute = cmd === "run" && !values["dry-run"];
       if (execute) {
         if (!acquireRunner(ledger, id)) return state(ledger, id);
         expectedToken = String(process.pid);
       }
-      resolveFrontPlan(ledger, envelope(ledger, id));
-      const { plan } = preflight(ledger, envelope(ledger, id));
+      const candidate = resolveFrontPlan(ledger, envelope(ledger, id), execute);
+      const { plan } = preflight(ledger, envelope(ledger, id), candidate);
       if (cmd === "evaluate" || values["dry-run"]) return { ok: true, status: "ELIGIBLE", plan };
       for (const [index, action] of plan.actions.entries()) {
         const current = envelope(ledger, id);
@@ -544,14 +563,23 @@ export function shipCli(argv: string[]) {
             });
         });
       }
+      const {verifiedMerges} = preflight(ledger, envelope(ledger, id));
       return withImmediateTx(ledger.db, () => {
         const current = envelope(ledger, id);
         if (current.status !== "ACTIVE") return state(ledger, id);
-        const {verifiedMerges} = preflight(ledger, current);
-        const { rb } = exactRunbook(ledger, current);
-        if (rb.status !== "APPROVED" || !rb.expires_at || Date.parse(rb.expires_at) <= Date.now())
-          throw Error("Approval expired or revoked");
+        if (current.run_token !== expectedToken) throw Error("Delivery runner changed before confirmation");
+        const {pins} = approvedCheckouts(ledger, current);
+        const exact = exactRunbook(ledger, current);
+        checkRunbookApproval(exact.rb, current);
+        if (canonicalJson(pins) !== canonicalJson(plan.pins)) throw Error("Approved checkout changed before confirmation");
+        if (canonicalJson(exact.plan) !== canonicalJson(plan)) throw Error("Approved plan changed before confirmation");
+        const rb = exact.rb;
         const allReceipts = receipts(ledger, id);
+        if (allReceipts.length !== plan.actions.length || plan.actions.some((action, index) => {
+          const receipt = allReceipts[index];
+          return receipt?.action_index !== index || receipt.status !== "confirmed" ||
+            receipt.action_hash !== sha256String(canonicalJson(action));
+        })) throw Error("Missing or changed delivery receipts");
         const versions = plan.pins.map(({ repo, head }) => ({ repo, head }));
         const stageReceipts = plan.actions.flatMap((action, index) => {
           if (action.kind !== "stage") return [];
@@ -583,8 +611,8 @@ export function shipCli(argv: string[]) {
             continue;
           }
           const pr = plan.ci.find((a) => a.repo === pin.repo)!;
-          const mergeOid = verifiedMerges.get(pin.repo);
-          if (!mergeOid) throw Error("Missing independent remote PR merge receipt");
+          const merge = verifiedMerges.get(pin.repo);
+          if (!merge) throw Error("Missing independent remote PR merge receipt");
           const meta = {
             runbook_id: rb.runbook_id,
             envelope_id: id,
@@ -592,8 +620,8 @@ export function shipCli(argv: string[]) {
             pr_url: pr.url,
             pr_head_oid: pr.head,
             base_branch: pr.base,
-            merge_commit: mergeOid,
-            target_oid: mergeOid,
+            merge_commit: merge.oid,
+            target_oid: merge.targetOid,
             state: "MERGED",
           };
           ledger.recordEvidence({
@@ -630,6 +658,7 @@ export function shipCli(argv: string[]) {
         return state(ledger, id);
       });
     } catch (err) {
+      if (!execute && !binding) return state(ledger, id, err instanceof Error ? err.message : String(err));
       return withImmediateTx(ledger.db, () => {
         const current = envelope(ledger, id);
         const reason = err instanceof Error ? err.message : String(err);

@@ -1,5 +1,5 @@
 import { beforeEach, test, expect } from "bun:test";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { executorFixture } from "./helpers/executor";
 
@@ -89,9 +89,11 @@ test("forge resolves each role through explicit pair, tier, role mapping and def
       expect(await Bun.file(codex+"."+role).json()).toEqual({model,effort:"model_reasoning_effort="+JSON.stringify(effort)});
     }
   }
+  unlinkSync(codex + ".quality");
   const before=f.evidence();
   for(const invalid of [["--model","gpt-6.2-sol"],["--effort","low"],["--tier","absent"],["--model","unknown","--effort","low"]]){
     expect(run(["--roles","quality",...invalid]).exitCode).not.toBe(0);
+    expect(existsSync(codex + ".quality")).toBe(false);
     expect(f.evidence()).toEqual(before);
   }
 },30_000);

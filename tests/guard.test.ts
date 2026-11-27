@@ -974,3 +974,11 @@ describe("Tier 2 Passive Dev Ledger Gate & Detached FAT Support", () => {
 
   });
 });
+
+test("policy checks use the command's effective directory and copy destination", () => {
+  const decision = (command: string) => evaluatePreToolUse(wb, shellInput(command));
+  expect(decision("git -C .workbench diff -- ship-policy.yaml")).toBeNull();
+  expect(decision("git -C .workbench add -- ship-policy.yaml")).toContain("ship-policy.yaml");
+  expect(decision("cp --target-directory=.workbench archive")).toContain("ship-policy.yaml");
+  expect(decision("cp -t .workbench/specs archive")).toBeNull();
+});

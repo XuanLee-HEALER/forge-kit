@@ -1,5 +1,6 @@
 import { type WorkbenchConfig } from "../config";
 import { canonicalizeMaybePath } from "../shared/path";
+import { extractGitSubcommand, resolveGitDirFlags } from "../shared/git-cmd";
 import { SQL_WRITE_RE } from "./sql-http";
 import {
   extractShellCommand,
@@ -9,6 +10,7 @@ import {
 } from "../hook-io";
 import { dirname, resolve } from "node:path";
 import {
+  copyDestination,
   hasUnquotedPipe,
   hasUnquotedRedirect,
   splitShellSegments,
@@ -24,11 +26,7 @@ const LEDGER_HOOK_READONLY_INSPECTORS = new Set([
 ]);
 const ALLOWED_INSPECTOR_DIRS = new Set(["/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin"]);
 
-function isReadonlyLedgerHookInspection(
-  cmd: string,
-  seg: string,
-  toks: string[],
-): boolean {
+function isReadonlyLedgerHookInspection(cmd: string, seg: string, toks: string[]): boolean {
   if (hasUnquotedPipe(cmd)) return false;
   if (hasUnquotedRedirect(seg, ">")) return false;
   if (seg.includes("$(") || seg.includes("`")) return false;
@@ -79,16 +77,19 @@ export function checkLedgerTamper(
     const command = stripUnquotedShellRedirections(seg, redirects);
     const words = splitShellTokens(command) ?? [];
     const { bin, args, dirs } = unwrapShellPrefix(words);
-    const commandDir = resolve(cwd, ...dirs);
-    const paths = args.filter(t => !t.startsWith("-")).map(t => canonicalizeMaybePath(resolve(commandDir, t)));
+    const git = bin === "git" ? extractGitSubcommand(["git", ...args]) : null;
+    const commandDir = resolveGitDirFlags(cwd, [...dirs, ...(git?.gitDirFlags ?? [])]) ?? cwd;
+    const absolute = (path: string) => canonicalizeMaybePath(resolve(commandDir, path));
+    const paths = (git?.subArgs ?? args).filter(t => !t.startsWith("-")).map(absolute);
     const removesTree = ["rm", "mv", "rmdir", "rsync", "tar", "unzip", "ditto", "cp"].includes(bin ?? "") ||
       (bin === "find" && args.includes("-delete"));
     if (bin === "find" && args[0]?.startsWith("-")) paths.push(canonicalizeMaybePath(commandDir));
-    const ancestors = bin === "cp" || bin === "rsync" || bin === "ditto" ? paths.slice(-1) : paths;
+    const copyTarget = bin === "cp" ? copyDestination(args) : undefined;
+    const ancestors = copyTarget ? [absolute(copyTarget)] : bin === "rsync" || bin === "ditto" ? paths.slice(-1) : paths;
     const textOutput = (bin === "echo" || bin === "printf") && !/\$\(|`/.test(command);
     const targetsPolicy = paths.includes(policyPath) || (!textOutput && command.includes(".workbench/ship-policy.yaml"));
     const readsOnly = textOutput || isReadonlyLedgerHookInspection(command, command, words) ||
-      (bin === "git" && args[0] === "diff" && args.slice(1).every(t => t === "--" || canonicalizeMaybePath(resolve(commandDir, t)) === policyPath));
+      (git?.subcmd === "diff" && git.subArgs.every(t => t === "--" || absolute(t) === policyPath));
     if (redirects.some(p => canonicalizeMaybePath(resolve(cwd, p)) === policyPath) ||
         (removesTree && ancestors.some(p => policyPath.startsWith(p + "/"))) || (targetsPolicy && !readsOnly))
       return "ship-policy.yaml requires an operator edit.";

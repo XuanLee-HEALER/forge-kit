@@ -20,7 +20,11 @@ export function redactSecrets(text: string) {
 }
 
 export function redactArguments(argv: string[]) {
-  return argv.map((arg, index) =>
-    index > 0 && /^--(?:password|passwd|token|secret|api[-_]key|auth[-_]token)$/i.test(argv[index - 1])
-      ? "***" : redactSecrets(arg));
+  const option = /^--(?:password|passwd|token|secret|api[-_]key|auth[-_]token)$/i;
+  return argv.map((arg, index) => {
+    if (index > 0 && option.test(argv[index - 1])) return "***";
+    const end = arg.indexOf("=");
+    if (end >= 0 && option.test(arg.slice(0, end))) return arg.slice(0, end + 1) + "***";
+    return redactSecrets(arg);
+  });
 }

@@ -7,11 +7,27 @@ import { redactSecrets, redactWithPatterns, SECRET_PATTERNS } from "./shared/red
 // @ts-expect-error Bun embeds this module for the child interpreter.
 import supervisor from "./verification-supervisor.ts" with {type: "text"};
 
+// @ts-expect-error Bun embeds the streaming redactor alongside the supervisor.
+import streamRedactor from "./verification-redactor.ts" with {type: "text"};
+
 export const defaultVerificationTimeout = 120_000;
 const patterns = SECRET_PATTERNS.map(([pattern, replacement]) => `[${pattern}, ${JSON.stringify(replacement)}]`);
 const supervisorSource = `const patterns = [${patterns}];
 const redactSecrets = text => (${redactWithPatterns.toString()})(text, patterns);
+${streamRedactor}
 ${supervisor}`;
+
+function writerGone(path: string, pid?: string) {
+  if (pid) {
+    try { process.kill(Number(pid), 0); return false; }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+  }
+  // Older names have no owner. Remove only when the OS confirms no open fd.
+  const lsof = Bun.which("lsof", { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" });
+  if (!lsof) return false;
+  const check = spawnSync(lsof, ["-nP", "-t", "--", path], {timeout: 1000, encoding: "utf8"});
+  return check.status === 1 && !check.stdout && !check.stderr && !check.error;
+}
 
 export function verificationLogDirectory(root: string, retentionDays: number) {
   let dir = join(root, ".workbench");
@@ -25,41 +41,45 @@ export function verificationLogDirectory(root: string, retentionDays: number) {
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
   const cutoff = Date.now() - retentionDays * 86_400_000;
   for (const name of readdirSync(dir)) {
-    if (!/^verify-[0-9a-f-]{36}\.log$/.test(name)) continue;
+    const owned = /^verify-[0-9a-f-]{36}(?:\.([1-9][0-9]{0,9}))?\.(active|log)$/.exec(name);
+    if (!owned) continue;
     const path = join(dir, name);
     const stat = lstatSync(path, {throwIfNoEntry: false});
-    if (stat?.isFile() && stat.mtimeMs < cutoff) rmSync(path, {force: true});
+    if (stat?.isFile() && stat.mtimeMs < cutoff && (owned[2] === "log" || writerGone(path, owned[1]))) rmSync(path, {force: true});
   }
   return dir;
 }
 
 export class VerificationLog {
   private readonly path: string;
+  private readonly active: string;
   private readonly fd: number;
   private closed = false;
   constructor(dir: string) {
     this.path = join(dir, "verify-" + randomUUID());
-    this.fd = openSync(this.path + ".active", "wx+", 0o600);
+    this.active = this.path + "." + process.pid + ".active";
+    this.fd = openSync(this.active, "wx+", 0o600);
   }
 
   run(argv: string[], cwd: string, env: NodeJS.ProcessEnv, timeout = defaultVerificationTimeout, inspect?: (lines: string) => void) {
     const start = fstatSync(this.fd).size;
     const proc = spawnSync(process.execPath, ["-e", supervisorSource], {
+      timeout: Math.min(2_147_483_647, timeout + 2500), killSignal: "SIGKILL",
       cwd: dirname(process.execPath), env: {PATH: process.env.PATH}, stdio: ["pipe", "ignore", "pipe", this.fd],
-      input: JSON.stringify({argv, cwd, env, timeout}), encoding: "utf8",
+      input: JSON.stringify({argv, cwd, env, timeout, active: this.active}), encoding: "utf8",
     });
-    const termination = redactSecrets(proc.error?.message || proc.stderr || "");
+    const termination = (proc.error as NodeJS.ErrnoException)?.code === "ETIMEDOUT"
+      ? "Verification supervisor timed out after " + timeout + " ms" : redactSecrets(proc.error?.message || proc.stderr || "");
     if (termination) this.note(termination);
     let partial = "";
     const decoder = new StringDecoder("utf8");
     if (inspect) {
       this.read(start, chunk => {
         const text = decoder.write(chunk);
-        const end = text.lastIndexOf("\n");
-        if (end >= 0) {
-          inspect(partial + text.slice(0, end + 1));
-          partial = text.slice(end + 1);
-        } else partial += text;
+        for (const line of text.split(/(?<=\n)/)) {
+          if (partial.length < 65536) partial += line.slice(0, 65536 - partial.length);
+          if (line.endsWith("\n")) { inspect(partial); partial = ""; }
+        }
       });
       inspect(partial + decoder.end());
     }
@@ -92,7 +112,7 @@ export class VerificationLog {
     const result = { output_sha256: hash.digest("hex"), ...(failed && {
       output_excerpt: tail.toString().trim() || "Verification failed without output", log_path: this.path + ".log",
     }) };
-    if (failed) renameSync(this.path + ".active", this.path + ".log");
+    if (failed) renameSync(this.active, this.path + ".log");
     this.dispose();
     return result;
   }
@@ -101,6 +121,6 @@ export class VerificationLog {
     if (this.closed) return;
     this.closed = true;
     closeSync(this.fd);
-    rmSync(this.path + ".active", {force: true});
+    rmSync(this.active, {force: true});
   }
 }
