@@ -5,7 +5,7 @@ import { executorFixture } from "./helpers/executor";
 
 const f = executorFixture("0.5");
 
-test("an interrupted Git comparison cannot turn identical trees into a passing review", () => {
+test("an interrupted Git comparison cannot register a passing review", () => {
   const base = f.head;
   f.ledger.attachRepo({task_id: "task", repo: "service", branch: "feature", base_sha: base});
   const specs = join(f.root, ".workbench/specs/task");
@@ -20,7 +20,7 @@ test("an interrupted Git comparison cannot turn identical trees into a passing r
   if (!git) throw Error("Git is required by the fixture");
   writeFileSync(join(bin, "git"), [
     "#!/bin/sh",
-    'for arg do [ "$arg" != diff ] || kill -TERM "$$"; done',
+    'for arg do case "$arg" in diff|*\'^{tree}\') kill -TERM "$$";; esac; done',
     'exec "$FIXTURE_REAL_GIT" "$@"', "",
   ].join("\n"), {mode: 0o755});
   const env = {PATH: bin + delimiter + process.env.PATH, FIXTURE_REAL_GIT: git};
@@ -32,16 +32,20 @@ test("an interrupted Git comparison cannot turn identical trees into a passing r
   writeFileSync(join(f.repo, "code.txt"), "changed");
   f.git("commit", "-qm", "change tracked content", "--", "code.txt");
   const changed = f.git("rev-parse", "HEAD");
+  const before = f.ledger.getTaskEvents("task");
+  const interrupted = record(changed, env);
+  expect(interrupted.exitCode).not.toBe(0);
+  expect(f.ledger.getTaskEvents("task")).toEqual(before);
   const control = record(changed);
   expect(control.exitCode, control.stderr.toString()).toBe(0);
   f.git("revert", "--no-edit", changed);
   const sameTree = f.git("rev-parse", "HEAD");
   expect(sameTree).not.toBe(base);
   expect(f.git("rev-parse", sameTree + "^{tree}")).toBe(f.git("rev-parse", base + "^{tree}"));
-  const probe = Bun.spawnSync(["git", "diff", "--quiet", base, sameTree], {cwd: f.repo, env: {...process.env, ...env}});
+  const probe = Bun.spawnSync(["git", "rev-parse", sameTree + "^{tree}"], {cwd: f.repo, env: {...process.env, ...env}});
   expect(probe.signalCode).toBe("SIGTERM");
   const previous = f.ledger.getTaskEvents("task");
-  const rejected = record(sameTree, env);
+  const rejected = record(sameTree);
   expect(rejected.exitCode).not.toBe(0);
   expect(f.ledger.getTaskEvents("task")).toEqual(previous);
 }, 20_000);

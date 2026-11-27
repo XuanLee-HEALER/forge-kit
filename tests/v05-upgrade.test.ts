@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { snapshot } from "./helpers/ledger-snapshot";
 import { digest, historicalKit, releaseCLI } from "./helpers/historical-kit";
 import { createHash } from "node:crypto";
@@ -49,12 +50,18 @@ function oldInstance() {
   s.git(join(s.work, "app"), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture", "--", "tests/example.test.ts");
   const head = s.git(join(s.work, "app"), "rev-parse", "HEAD").trim();
   for (const task of ["archived", "active"]) {
-    ledger("open", "--id", task, "--title", "synthetic upgrade witness", "--repo", "app", "--branch", task, "--endpoint", "pr", "--depth", "full", "--base", head, "--head", head);
+    const endpoint = task === "archived" ? "investigation" : "pr";
+    ledger("open", "--id", task, "--title", "synthetic upgrade witness", "--repo", "app", "--branch", task, "--endpoint", endpoint, "--depth", "full", "--base", head, "--head", head);
     ledger("decide", task, "--key", "migration", "--summary", "portable witness");
     ledger("record", task, "--kind", "note", "--status", "info", "--summary", "upgrade rehearsal");
   }
   ledger("record","archived","--kind","fat","--status","pass","--summary","historical FAT acceptance","--repo","app","--branch","archived","--sha",head);
-  ledger("close", "archived", "--force-incomplete", "--reason", "baseline lifecycle", "--no-archive");
+  const closed = JSON.parse(ledger("close", "archived"));
+  expect(closed.task.status).toBe("CLOSED");
+  const archivePath = closed.archivePath as string;
+  expect(existsSync(archivePath)).toBe(true);
+  const archiveDigest = digest(archivePath);
+  expect(readFileSync(archivePath, "utf8")).toContain(closed.task.tip_hash);
   ledger("blocker", "active", "open", "--id", "hold", "--summary", "pending decision");
   const specs = join(s.work, ".workbench/specs/active");
   for (const name of ["ssot.md", "tech-spec.md", "test-spec.md"]) s.privateFile(`.workbench/specs/active/${name}`, "fixed contract\n");
@@ -106,7 +113,7 @@ else process.exit(2);
   const search = JSON.parse(ledger("query", "--q", "rehearsal", "--json"));
   expect(search.events.length).toBeGreaterThan(0);
   expect(JSON.parse(ledger("verify", "--json")).ok).toBe(true);
-  return { tips, search, envelopes };
+  return { tips, search, envelopes, archivePath, archiveDigest };
 }
 
 function tree() {
@@ -153,7 +160,7 @@ test("direct sync rejects the installed 0.4.1 lock before writing to the target"
 
 test("a migrated 0.5.3 instance preserves 0.4 archives, in-flight tasks and bound history", () => {
   const bootstrap = releaseCLI(s);
-  const {tips, envelopes} = oldInstance();
+  const {tips, envelopes, archivePath, archiveDigest} = oldInstance();
   const app = join(s.work, "app");
   const base = s.git(app, "rev-parse", "HEAD").trim();
   s.privateFile("app/change.ts", "export const answer = 42;\n");
@@ -208,6 +215,7 @@ await Bun.write(args[args.indexOf("-o")+1], JSON.stringify(native ? {passed:true
   renameSync(sameSource, s.work);
   s.ok([bootstrap, "sync", s.work]);
   expect(snapshot(s.work, initial.schema)).toEqual(initial);
+  expect(digest(archivePath)).toBe(archiveDigest);
   const restoredReviews = JSON.parse(ledger("reviews", "active"));
   expect(restoredReviews).toMatchObject(migratedReviews);
   for (const key of ["report_path", "report_sha256", "session_id", "model", "effort"]) {
@@ -225,9 +233,27 @@ await Bun.write(args[args.indexOf("-o")+1], JSON.stringify(native ? {passed:true
   expect(JSON.parse(ledger("query", "--q", "rehearsal", "--json"))).toEqual(search);
   const historical = JSON.parse(ledger("query", "--q", "historical", "--json"));
   expect(historical.events.some((e:{payload_json:string})=>JSON.parse(e.payload_json).kind==="fat")).toBe(true);
+  expect(snapshot(s.work, initial.schema)).toEqual(initial);
+  expect(digest(archivePath)).toBe(archiveDigest);
   for (const id of envelopes) {
     const result = s.run([s.forge, "ship", "run", "--envelope", id]);
     expect(result.code).not.toBe(0);
     expect(result.out + result.err).toMatch(/re.?register|re.?approv|register a new plan|new.*runbook|重新登记|重新批准/i);
   }
+
+  const damaged = sandbox();
+  try {
+    const path = ".workbench/ledger";
+    cpSync(join(s.work, path), join(damaged.work, path), {recursive: true});
+    damaged.privateFile(".workbench/workbench.yaml", s.read(".workbench/workbench.yaml"));
+    const db = new Database(join(damaged.work, path, "ledger.sqlite"));
+    try {
+      const changed = db.query("UPDATE tasks SET tip_hash = ? WHERE task_id = ?").run("0".repeat(64), "active");
+      expect(changed.changes).toBe(1);
+    } finally { db.close(); }
+    const result = damaged.run([bootstrap, "ledger", "verify", "--task", "active", "--json"]);
+    expect(result.code, result.err).toBe(1);
+    expect(JSON.parse(result.out)).toMatchObject({ok: false, errors: [expect.stringContaining("tip_hash")]});
+    expect(JSON.parse(ledger("verify", "--json")).ok).toBe(true);
+  } finally { damaged.cleanup(); }
 }, 120_000);

@@ -1,4 +1,5 @@
 import { isolateHome } from "./helpers/hermetic";
+import { nativeReview } from "./helpers/native-review";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -29,8 +30,18 @@ function fixtureHistory(repo: string, branch: string) {
   git("init", "-b", branch);
   git("commit", "--allow-empty", "-m", "base");
   const base = git("rev-parse", "HEAD");
-  git("commit", "--allow-empty", "-m", "head");
+  writeFileSync(join(path, "change.txt"), "feature change");
+  git("add", "--", "change.txt");
+  git("commit", "-m", "head");
   return { base, head: git("rev-parse", "HEAD") };
+}
+
+function freezeFixture(ledger: Ledger, task_id: string) {
+  const specs = join(dir, ".workbench/specs", task_id);
+  mkdirSync(specs, { recursive: true });
+  for (const document of ["ssot", "tech-spec", "test-spec"])
+    writeFileSync(join(specs, document + ".md"), "Exercise the ledger workflow.");
+  ledger.freezeSpec({ task_id });
 }
 
 describe("SQLite WAL Hash-Chained Ledger", () => {
@@ -43,19 +54,23 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
     const ledger = new Ledger(dir);
     const task_id = "legacy-branch";
     const repo = "svc";
-    const sha = "abcdef00";
+    const { base, head: sha } = fixtureHistory(repo, "feat");
+    const branch = Bun.spawnSync(["git", "-C", join(dir, repo), "branch", "sibling"]);
+    expect(branch.exitCode).toBe(0);
     const record = (branch: string | null, status: "pass" | "fail") =>
       ledger.recordEvidence({ task_id, repo, sha, branch, kind: "test", status, source: "hook", summary: "test" });
     const ready = () => ledger.checkPushReadiness({ task_id, repo, branch: "feat", head_sha: sha }).ready;
     try {
-      ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, endpoint: "local", depth: "targeted", repo, branch: "feat", head_sha: sha });
+      ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, endpoint: "local", depth: "targeted", repo, branch: "feat", base_sha: base, head_sha: sha });
+      freezeFixture(ledger, task_id);
+      nativeReview(ledger, task_id, { repo, branch: "feat", base, head: sha });
       record(null, "fail");
       expect(ready()).toBe(false);
       record("feat", "pass");
       expect(ready()).toBe(true);
       record(null, "fail");
       expect(ready()).toBe(false);
-      ledger.attachRepo({ task_id, repo, branch: "sibling", head_sha: sha });
+      ledger.attachRepo({ task_id, repo, branch: "sibling", base_sha: base, head_sha: sha });
       record("sibling", "pass");
       record(null, "pass");
       expect(ready()).toBe(false);
@@ -134,7 +149,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       let head = commit("initial");
       const reviewBase = head;
       writeFileSync(join(repo, "new-contract.hurl"), "pending\r\n");
-      ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, endpoint: "local", depth: "targeted", repo: "svc", worktree: repo, branch: "feat", head_sha: head });
+      ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, endpoint: "local", depth: "targeted", repo: "svc", worktree: repo, branch: "feat", base_sha: reviewBase, head_sha: head });
       const docs = join(dir, ".workbench/specs", task_id);
       mkdirSync(docs, { recursive: true });
       for (const doc of ["ssot", "tech-spec", "test-spec"]) writeFileSync(join(docs, doc + ".md"), doc);
@@ -202,9 +217,10 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       expect(ledger.checkPushReadiness({ task_id, repo: "svc", head_sha: next }).missing.join(" ")).toContain("suite.hurl");
       next = commit("publish authorized contract");
       expect(ledger.getSpecState(task_id).drift_detected).toBe(false);
-      for (const kind of ["test", "review"] as const) ledger.recordEvidence({
-        task_id, kind, status: "pass", source: "tool", repo: "svc", sha: next, summary: "verified", meta: { base: reviewBase, review_task_id: task_id, review_floor_seq: ledger.getSpecState(task_id).evidence_floor_seq.review },
+      ledger.recordEvidence({
+        task_id, kind: "test", status: "pass", source: "tool", repo: "svc", sha: next, summary: "verified",
       });
+      nativeReview(ledger, task_id, { repo: "svc", branch: "feat", base: reviewBase, head: next });
       ledger.recordEvidence({ task_id, source: "hook", kind: "commit", status: "pass", repo: "svc", branch: "feat", sha: next, summary: "committed" });
       ledger.updateEndpoint({ task_id, endpoint: "fat", reason: "FAT delivery" });
       ledger.recordEvidence({ task_id, kind: "fat", status: "pass", repo: "svc", sha: next, summary: "accepted" });
@@ -343,7 +359,8 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         }).ready,
       ).toBe(false);
 
-      // Re-pass test + static lint + fallback review + FAT delivery evidence on BOTH repos
+      // Re-pass executable checks and register each branch review before FAT delivery.
+      freezeFixture(ledger, "20261121-audio-billing");
       for (const [repo, sha] of [
         ["canvas", canvas.head],
         ["web-app", web.head],
@@ -368,16 +385,8 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
           branch: "fix/audio-billing",
           sha,
         });
-        ledger.recordEvidence({
-          source: "tool",
-          task_id: "20261121-audio-billing",
-          kind: "review",
-          status: "fallback",
-          summary: "review-quality native_fallback",
-          repo,
-          branch: "fix/audio-billing",
-          sha,
-          meta: { role: "review-quality", base: repo === "canvas" ? canvas.base : web.base },
+        nativeReview(ledger, "20261121-audio-billing", {
+          repo, branch: "fix/audio-billing", head: sha, base: repo === "canvas" ? canvas.base : web.base,
         });
       }
 
@@ -611,6 +620,8 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
     runGit(repoPath, ["init", "-b", "main"]);
     runGit(repoPath, ["config", "user.email", "dev@example.com"]);
     runGit(repoPath, ["config", "user.name", "Dev"]);
+    runGit(repoPath, ["commit", "--allow-empty", "-m", "chore: baseline"]);
+    const start = runGit(repoPath, ["rev-parse", "HEAD"]).stdout.trim();
     writeFileSync(join(repoPath, "a.ts"), "export const v = 1;\n");
     runGit(repoPath, ["add", "a.ts"]);
     runGit(repoPath, ["commit", "-m", "chore: init"]);
@@ -626,9 +637,10 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         depth: "targeted",
         repo: "live-svc",
         branch: "feat/live-check",
-        base_sha: sha1,
+        base_sha: start,
         head_sha: sha1,
       });
+      freezeFixture(ledger, "20261121-live");
       ledger.recordEvidence({
         source: "tool",
         task_id: "20261121-live",
@@ -639,16 +651,8 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         branch: "feat/live-check",
         sha: sha1,
       });
-      ledger.recordEvidence({
-        source: "tool",
-        task_id: "20261121-live",
-        kind: "review",
-        status: "pass",
-        summary: "review ok", meta: { base: sha1 },
-        repo: "live-svc",
-        branch: "feat/live-check",
-        sha: sha1,
-      });
+      nativeReview(ledger, "20261121-live", { repo: "live-svc", branch: "feat/live-check", base: start, head: sha1 });
+      expect(ledger.checkPushReadiness({ task_id: "20261121-live", repo: "live-svc", head_sha: sha1 }).ready).toBe(true);
 
       // Now make an UNRECORDED new commit on feat/live-check!
       writeFileSync(join(repoPath, "a.ts"), "export const v = 2;\n");
@@ -669,7 +673,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         depth: "targeted",
         repo: "live-svc",
         branch: "feat/does-not-exist",
-        base_sha: sha1,
+        base_sha: start,
         head_sha: sha1,
       });
       ledger.recordEvidence({
@@ -678,16 +682,6 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         kind: "test",
         status: "pass",
         summary: "bun test",
-        repo: "live-svc",
-        branch: "feat/does-not-exist",
-        sha: sha1,
-      });
-      ledger.recordEvidence({
-        source: "tool",
-        task_id: "20261121-missing-branch",
-        kind: "review",
-        status: "pass",
-        summary: "review ok", meta: { base: sha1 },
         repo: "live-svc",
         branch: "feat/does-not-exist",
         sha: sha1,
@@ -714,9 +708,10 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         depth: "targeted",
         repo: "live-svc",
         branch: "main",
-        base_sha: sha1,
+        base_sha: start,
         head_sha: sha1,
       });
+      freezeFixture(ledger, "20261121-fat-revoke");
       ledger.recordEvidence({
         source: "tool",
         task_id: "20261121-fat-revoke",
@@ -727,16 +722,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         branch: "main",
         sha: sha1,
       });
-      ledger.recordEvidence({
-        source: "tool",
-        task_id: "20261121-fat-revoke",
-        kind: "review",
-        status: "pass",
-        summary: "review ok", meta: { base: sha1 },
-        repo: "live-svc",
-        branch: "main",
-        sha: sha1,
-      });
+      nativeReview(ledger, "20261121-fat-revoke", { repo: "live-svc", branch: "main", base: start, head: sha1 });
       ledger.recordEvidence({
         source: "tool",
         task_id: "20261121-fat-revoke",
@@ -813,16 +799,10 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         repo: "api-svc",
         sha: api.head,
       });
-      ledger.recordEvidence({
-        source: "tool",
-        task_id: "20261123-cycle",
-        kind: "review",
-        status: "pass",
-        summary: "quality ok",
-        repo: "api-svc",
-        sha: api.head,
-        meta: { role: "quality", base: api.base, review_task_id: "20261123-cycle", review_floor_seq: frozen.spec.evidence_floor_seq.review },
+      const reviewCycle = () => nativeReview(ledger, "20261123-cycle", {
+        repo: "api-svc", branch: "feat/cycle", ...api,
       });
+      reviewCycle();
       const missingLint = ledger.checkPushReadiness({
         task_id: "20261123-cycle",
         repo: "api-svc",
@@ -880,7 +860,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         }).ready,
       ).toBe(false);
 
-      // Revise test-spec.md and re-freeze -> preserves lint & review, but invalidates prior test/hurl/fat!
+      // Revise test-spec.md and re-freeze. The prior lint still satisfies static verification.
       writeFileSync(join(specDir, "test-spec.md"), "# Test Spec\nHurl case 1 & 2\n");
       const refrozen = ledger.freezeSpec({ task_id: "20261123-cycle" });
       expect(refrozen.spec.state).toBe("FROZEN");
@@ -892,12 +872,12 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         checkEndpoint: true,
       });
       expect(postAmend.ready).toBe(false);
-      // Prior lint & review remain valid (NOT in missing!), while test/fat must be re-run!
       expect(postAmend.missing.join(" ")).not.toContain("static check (lint)");
-      expect(postAmend.missing.join(" ")).not.toContain("review");
+      expect(postAmend.missing.join(" ")).toMatch(/review/i);
       expect(postAmend.missing.join(" ")).toContain("hurl");
 
-      // Re-run Hurl after re-freeze -> task is ready again & hash chain verifies!
+      // Register a current review and re-run Hurl and FAT acceptance.
+      reviewCycle();
       ledger.recordEvidence({
         source: "tool",
         task_id: "20261123-cycle",
@@ -943,7 +923,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         head_sha: api.head,
       });
 
-      // Record lint + hurl + quality review BEFORE first freeze
+      // Record executable evidence before first freeze.
       ledger.recordEvidence({
         source: "tool",
         task_id: "20261123-hard",
@@ -962,23 +942,10 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         repo: "api-svc",
         sha: api.head,
       });
-      ledger.recordEvidence({
-        source: "tool",
-        task_id: "20261123-hard",
-        kind: "review",
-        status: "pass",
-        summary: "pre-freeze review",
-        repo: "api-svc",
-        sha: api.head,
-        meta: { role: "quality", base: api.base },
+      const reviewHard = () => nativeReview(ledger, "20261123-hard", {
+        repo: "api-svc", branch: "feat/hard", ...api,
       });
-      expect(
-        ledger.checkPushReadiness({
-          task_id: "20261123-hard",
-          repo: "api-svc",
-          head_sha: api.head,
-        }).ready,
-      ).toBe(true);
+      expect(() => reviewHard()).toThrow("FROZEN specification");
 
       // Symlink pointing inside workbench root (AGENTS.md) but OUTSIDE spec_dir MUST be rejected!
       symlinkSync(join(dir, "AGENTS.md"), join(specDir, "ssot.md"));
@@ -1004,13 +971,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       expect(afterFirstFreeze.ready).toBe(false);
       expect(afterFirstFreeze.missing.join(" ")).toContain("lint");
 
-      const floorEvent = ledger.getTaskEvents("20261123-hard").find(e => e.event_type === "SPEC_FROZEN")!;
-      // Record post-freeze evidence -> ready=true
-      for (const [kind, role] of [
-        ["lint", undefined],
-        ["hurl", undefined],
-        ["review", "quality"],
-      ] as const) {
+      for (const kind of ["lint", "hurl"] as const) {
         ledger.recordEvidence({
           source: "tool",
           task_id: "20261123-hard",
@@ -1019,9 +980,9 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
           summary: `post-freeze ${kind}`,
           repo: "api-svc",
           sha: api.head,
-          meta: role ? { role, base: api.base, review_task_id: "20261123-hard", review_floor_seq: floorEvent.seq } : undefined,
         });
       }
+      reviewHard();
       expect(
         ledger.checkPushReadiness({
           task_id: "20261123-hard",
@@ -1030,7 +991,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         }).ready,
       ).toBe(true);
 
-      // Lock-only re-freeze adding --lock-tests preserves post-freeze evidence and rejects dropping locks
+      // Lock-only re-freeze preserves executable evidence and rejects dropping locks.
       const fLock = ledger.freezeSpec({
         task_id: "20261123-hard",
         locked_test_globs: ["tests/**/*.hurl"],
@@ -1042,8 +1003,9 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
           task_id: "20261123-hard",
           repo: "api-svc",
           head_sha: api.head,
-        }).ready,
-      ).toBe(true);
+        }).missing,
+      ).toEqual([expect.stringMatching(/review/i)]);
+      reviewHard();
       expect(() =>
         ledger.freezeSpec({ task_id: "20261123-hard", locked_test_globs: [] }),
       ).toThrow("Cannot remove locked test glob");
@@ -1166,6 +1128,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       });
       expect(upd.task.endpoint).toBe("fat");
 
+      freezeFixture(ledger, "20261124-retry");
       // The two branches point to the same SHA. An unlabelled receipt cannot identify either branch.
       ledger.recordEvidence({
         source: "tool", task_id: "20261124-retry", kind: "test", status: "pass",
@@ -1173,12 +1136,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       });
       expect(() => ledger.closeTask({ task_id: "20261124-retry", archive: false })).toThrow("no passing");
       for (const branch of ["feat/retry", "integrate/retry-fat"]) {
-        for (const [kind, role] of [
-          ["lint", undefined],
-          ["test", undefined],
-          ["review", "business"],
-          ["fat", undefined],
-        ] as const) {
+        for (const kind of ["lint", "test", "fat"] as const) {
           ledger.recordEvidence({
             source: "tool",
             task_id: "20261124-retry",
@@ -1188,9 +1146,9 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
             repo: "web",
             branch,
             sha: featSha,
-            meta: role ? { role, base: baseSha } : undefined,
           });
         }
+        nativeReview(ledger, "20261124-retry", { repo: "web", branch, base: baseSha, head: featSha, role: "business" });
       }
 
       // Push delivered commit to origin/fat before deleting temporary FAT integration branch on disk
@@ -1301,6 +1259,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         base_sha: baseSha,
         head_sha: cherryFatSha,
       });
+      freezeFixture(ledger, "20261124-cherry");
       const integrationReady = () => ledger.checkPushReadiness({
         task_id: "20261124-cherry", repo: "web", branch: "fat-diverged", head_sha: cherryFatSha,
       });
@@ -1315,27 +1274,15 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         branch: "fat-diverged",
         sha: cherryFatSha,
       });
-      ledger.recordEvidence({
-        source: "tool",
-        task_id: "20261124-cherry",
-        kind: "review",
-        status: "pass",
-        summary: "fat integration review pass",
-        repo: "web",
-        branch: "fat-diverged",
-        sha: cherryFatSha,
-        meta: { role: "business", base: baseSha },
+      nativeReview(ledger, "20261124-cherry", {
+        repo: "web", branch: "fat-diverged", base: baseSha, head: cherryFatSha, role: "business",
       });
       expect(integrationReady().ready).toBe(true);
       // Execute push to origin/fat, then AFTER deployment & acceptance record evidence on canonical `featSha`!
       run(["push", "-f", "origin", "fat-diverged:refs/heads/fat"]);
       run(["fetch", "origin"]);
       run(["checkout", "main"]);
-      for (const [kind, role] of [
-        ["test", undefined],
-        ["review", "business"],
-        ["fat", undefined],
-      ] as const) {
+      for (const kind of ["test", "fat"] as const) {
         ledger.recordEvidence({
           source: "tool",
           task_id: "20261124-cherry",
@@ -1345,9 +1292,9 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
           repo: "web",
           branch: "feat/retry",
           sha: featSha,
-          meta: role ? { role, base: baseSha } : undefined,
         });
       }
+      nativeReview(ledger, "20261124-cherry", { repo: "web", branch: "feat/retry", base: baseSha, head: featSha, role: "business" });
       // Without detaching divergent cherry-pick branch (which lacks fat acceptance on cherryFatSha), close fails closed;
       // after detaching temp branch per ship/SKILL.md, close succeeds cleanly!
       expect(() => ledger.closeTask({ task_id: "20261124-cherry", archive: false })).toThrow();
@@ -1388,13 +1335,11 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         depth: "targeted",
         repo: "web",
         branch: "feat/local-tag-only",
+        base_sha: baseSha,
         head_sha: tagOnlySha,
       });
-      for (const [kind, role] of [
-        ["test", undefined],
-        ["review", "business"],
-        ["fat", undefined],
-      ] as const) {
+      freezeFixture(ledger, "20261124-tag-only");
+      for (const kind of ["test", "fat"] as const) {
         ledger.recordEvidence({
           source: "tool",
           task_id: "20261124-tag-only",
@@ -1403,9 +1348,9 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
           summary: `${kind} pass`,
           repo: "web",
           sha: tagOnlySha,
-          meta: role ? { role, base: baseSha } : undefined,
         });
       }
+      nativeReview(ledger, "20261124-tag-only", { repo: "web", branch: "feat/local-tag-only", base: baseSha, head: tagOnlySha, role: "business" });
       run(["branch", "-D", "feat/local-tag-only"]);
       expect(() => ledger.closeTask({ task_id: "20261124-tag-only", archive: false })).toThrow(
         "could not be resolved on disk",
@@ -1447,7 +1392,7 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
       ledger.cancelTask({ task_id: "20261124-dg", reason: "cleanup" });
 
       // Local-endpoint task with deleted branch MUST STILL fail closed!
-      run(["checkout", "-b", "feat/local-del"]);
+      run(["checkout", "-b", "feat/local-del", featSha]);
       const localSha = run(["rev-parse", "HEAD"]);
       run(["checkout", "main"]);
       ledger.openTask({ workflow_version: "0.4",
@@ -1457,8 +1402,10 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         depth: "targeted",
         repo: "web",
         branch: "feat/local-del",
+        base_sha: baseSha,
         head_sha: localSha,
       });
+      freezeFixture(ledger, "20261124-local-del");
       ledger.recordEvidence({
         source: "tool",
         task_id: "20261124-local-del",
@@ -1468,15 +1415,8 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
         repo: "web",
         sha: localSha,
       });
-      ledger.recordEvidence({
-        source: "tool",
-        task_id: "20261124-local-del",
-        kind: "review",
-        status: "pass",
-        summary: "ok",
-        repo: "web",
-        sha: localSha,
-        meta: { role: "business", base: baseSha },
+      nativeReview(ledger, "20261124-local-del", {
+        repo: "web", branch: "feat/local-del", base: baseSha, head: localSha, role: "business",
       });
       run(["branch", "-D", "feat/local-del"]);
       expect(() => ledger.closeTask({ task_id: "20261124-local-del", archive: false })).toThrow(

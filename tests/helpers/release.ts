@@ -124,10 +124,10 @@ export function feature(repo: string, n: number, workflow_version: "0.4" | "0.5"
     headRepository: { name: basename(repo) },
     headRepositoryOwner: { login: "acme" },
   });
-  return { repo, n, task, branch, wt, dir, head, base, url, workflow_version };
+  return { repo, n, task, branch, wt, dir, head, base, url };
 }
 export type Feature = ReturnType<typeof feature>;
-export function verifyFeature(f: Feature, { review = true } = {}) {
+export function verifyFeature(f: Feature, { review = true }: { review?: boolean | "historical" } = {}) {
   if (ledger.getSpecState(f.task).state!=="FROZEN") {
     const spec=join(root,".workbench/specs",f.task);
     mkdirSync(spec,{recursive:true});
@@ -138,7 +138,7 @@ export function verifyFeature(f: Feature, { review = true } = {}) {
   cli("verify",[...target,"--kind","lint","--","tsc","--noEmit","--allowJs","--checkJs","--skipLibCheck","value.js"]);
   cli("verify", [...target, "--kind", "test", "--", process.execPath, "test", "./example.test.ts"]);
   if (!review) return;
-  if (f.workflow_version === "0.4") {
+  if (review === "historical") {
     const spec = ledger.getSpecState(f.task);
     ledger.recordEvidence({task_id: f.task, repo: f.repo, branch: f.branch, sha: f.head,
       kind: "review", status: "pass", source: "tool", summary: "Historical release review",
@@ -150,7 +150,7 @@ export function verifyFeature(f: Feature, { review = true } = {}) {
   writeFileSync(report, "Reviewed the fixed release range. No blockers.\n");
   cmd("review-record", f.task, "--repo", f.repo, "--branch", f.branch, "--role", "quality", "--base", f.base, "--head", f.head,
     "--status", "pass", "--summary", "Reviewed release", "--report", report,
-    "--model", "fixture-model", "--effort", "medium");
+    "--session-id", "release-review-fixture", "--model", "fixture-model", "--effort", "medium");
 }
 export function merge(f: Feature) {
   git(f.dir, "merge", "--no-edit", f.branch);

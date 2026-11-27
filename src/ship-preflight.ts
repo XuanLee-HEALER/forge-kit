@@ -119,8 +119,6 @@ export function approvedCheckouts(ledger: Ledger, e: Envelope, plan?: ExactPlan)
     pin: pins.find(p => p.repo === row.repo && p.branch === row.branch)!,
     dir: resolveTaskCheckout(ledger.workbenchRoot, row).dir,
   }));
-  const reviewRequired = policy.require_independent_review || e.target_endpoint === "pr" ||
-    ledger.getTask(e.task_id)?.verification_depth === "full";
   // Check every local review gate before observing even the first remote repository.
   for (const {row, pin, dir} of checkouts) {
     const mergeIndex = plan?.actions.findIndex(a => a.kind === "pr" && a.repo === row.repo) ?? -1;
@@ -128,7 +126,6 @@ export function approvedCheckouts(ledger: Ledger, e: Envelope, plan?: ExactPlan)
       (mergeIndex < 0 || !plan.actions.slice(0, mergeIndex).some(a => a.kind !== "pr"));
     const check = ledger.checkPushReadiness({
       task_id: e.task_id, repo: row.repo, branch: row.branch, checkoutDir: dir, head_sha: pin.head,
-      requireFrozenToolReview: reviewRequired,
       requireDeploymentCi: !!plan && policy.require_ci_green_for_prod && e.target_endpoint === "prod" && !hostedCi,
     });
     if (!check.ready) throw Error(check.missing.join(", "));

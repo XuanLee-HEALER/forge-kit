@@ -2,6 +2,7 @@ import { test, expect } from "bun:test";
 import { join } from "node:path";
 import { existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { executorFixture } from "./helpers/executor";
+import { nativeReview } from "./helpers/native-review";
 const f = executorFixture();
 const verify = (kind: string, ...cmd: string[]) => f.cli("verify", ["--kind", kind, "--", ...cmd]);
 test("pinned tool passes count for readiness and a failing command supersedes a pass", () => {
@@ -12,16 +13,21 @@ test("pinned tool passes count for readiness and a failing command supersedes a 
   );
   f.git("add", ".");
   f.git("commit", "-m", "verification suite");
+  const docs = join(f.root, ".workbench/specs/task");
+  mkdirSync(docs, { recursive: true });
+  for (const file of ["ssot", "tech-spec", "test-spec"]) writeFileSync(join(docs, file + ".md"), file);
+  const freeze = f.ledger.freezeSpec({ task_id: "task" });
+  const head = f.git("rev-parse", "HEAD");
   const ready = () =>
-    f.ledger.checkPushReadiness({ task_id: "task", repo: "service", head_sha: f.git("rev-parse", "HEAD") })
-      .ready;
+    f.ledger.checkPushReadiness({ task_id: "task", repo: "service", head_sha: head }).ready;
   expect(verify("test", "bun", "test").exitCode).toBe(0);
   expect(verify("build", "bun", "build", "app.ts").exitCode).toBe(0);
   expect(f.evidence()[0]).toMatchObject({
     source: "tool",
     kind: "test",
-    meta: { review_task_id: "task", review_floor_seq: 0, exit_code: 0 },
+    meta: { review_task_id: "task", review_floor_seq: freeze.spec.evidence_floor_seq.review, exit_code: 0 },
   });
+  nativeReview(f.ledger, "task", { repo: "service", branch: "feature", base: f.head, head });
   expect(ready()).toBe(true);
   expect(f.cli("verify", ["--kind", "test", "--", "bun", "test"], { TEST_FAILURE: "yes" }).exitCode).toBe(1);
   expect(f.evidence().at(-1)).toMatchObject({ status: "fail", meta: { exit_code: 1 } });

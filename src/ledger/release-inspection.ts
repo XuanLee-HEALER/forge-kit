@@ -5,6 +5,7 @@ import { sha256File } from "../shared/path";
 import { reachableFromRefs, resolveTaskCheckout } from "./checkout";
 import { deliveryStages } from "./ship-actions";
 import { inspectPr, PrUnavailable } from "./pr";
+import { checkReviewReadiness } from "./review-readiness";
 import { getSpecState } from "./spec";
 import {
   nowIso,
@@ -208,6 +209,8 @@ export function inspect(
         },
       });
       if (spec.state === "AMENDED" || spec.drift_detected) throw Error("Frozen specification or tests drifted");
+      const review = checkReviewReadiness(ledger, row, expected_head_sha, spec, checkout.dir);
+      if (review.missing) throw Error(review.missing + ". Resume the task, register a native review, and hand it off again.");
       const pr = observations.get(item.pr_url);
       if (pr instanceof Error) throw pr;
       if (!pr || pr.dir !== checkout.dir || pr.branch !== branch)

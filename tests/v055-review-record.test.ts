@@ -29,8 +29,8 @@ function args(role = "quality", status = "pass", from = base, to = head, reviewS
 function events() {
   return f.ledger.getTaskEvents(task);
 }
-function ready() {
-  return f.ledger.checkPushReadiness({ task_id: task, repo: "service", branch: "feature",
+function ready(id = task) {
+  return f.ledger.checkPushReadiness({ task_id: id, repo: "service", branch: "feature",
     head_sha: head, checkEndpoint: true });
 }
 function rejected(argv: string[]) {
@@ -41,9 +41,9 @@ function rejected(argv: string[]) {
   expect(events()).toHaveLength(count);
   expect(ready()).toEqual(before);
 }
-function checks() {
+function checks(id = task) {
   for (const kind of ["lint", "test"] as const)
-    f.ledger.recordEvidence({ task_id: task, repo: "service", branch: "feature", sha: head,
+    f.ledger.recordEvidence({ task_id: id, repo: "service", branch: "feature", sha: head,
       kind, source: "tool", status: "pass", summary: `Fixture ${kind} passed` });
 }
 beforeEach(() => {
@@ -133,13 +133,15 @@ test("review-record rejects invalid parameters and Git ranges without changing r
 }, 30_000);
 
 test("review-record requires an open task with its specification frozen", () => {
-  ok(...args());
+  ok(...args("quality"));
+  const oldFailure = ok(...args("comments", "blocked"));
   ok("amend", task, "--scope", "requirement", "--reason", "Update the contract");
   rejected(args());
   ok("freeze", task);
   checks();
   expect(ready().ready).toBe(false);
-  expect(ok("reviews", task)).toHaveLength(1);
+  expect(ready().missing.join(" ")).not.toContain(`#${oldFailure.seq}`);
+  expect(ok("reviews", task)).toHaveLength(2);
   ok(...args());
   expect(ready().ready).toBe(true);
   ok("close", task, "--no-archive");
@@ -154,129 +156,98 @@ test("attachment selectors must identify exactly one repository and branch", () 
   ok("attach", task, "--repo", "mirror", "--branch", "feature", "--base", base, "--head", head);
   for (const selector of [[], ["--repo", "service"], ["--branch", "feature"], ["--repo", "missing"],
     ["--branch", "missing"], ["--repo", "mirror", "--branch", "other"]]) rejected([...args(), ...selector]);
+  checks();
   for (const [repo, branch, selector] of [
     ["mirror", "feature", ["--repo", "mirror"]],
     ["service", "other", ["--branch", "other"]],
-    ["service", "feature", ["--repo", "service", "--branch", "feature"]],
   ] as const) {
     ok(...args(), ...selector);
     expect(events().at(-1)).toMatchObject({ repo, branch, sha: head });
-  }
-});
-
-test("fixing one role preserves the other role's unresolved finding through a new HEAD", () => {
-  checks();
-  ok(...args("business"));
-  for (const [role, status] of [["quality", "blocked"], ["comments", "incomplete"]]) {
-    ok(...args(role, status));
-    expect(ready().missing.join(" ")).toContain(role);
-  }
-  const reviews = ok("reviews", task);
-  const qualitySeq = reviews.find((row: {status: string}) => row.status === "blocked").seq;
-  const commentsSeq = reviews.find((row: {status: string}) => row.status === "incomplete").seq;
-  const previous = head;
-  head = change("repair both findings");
-  checks();
-  ok(...args("business"));
-  expect(ready().missing.join(" ")).toContain("quality");
-  expect(ready().missing.join(" ")).toContain("comments");
-  report = join(f.root, "quality-recheck.md");
-  writeFileSync(report, "Verified the repair against the prior quality finding.\n");
-  ok(...args("quality", "pass", previous, head, `Verified fix for #${qualitySeq}`));
-  expect(ready().missing.join(" ")).not.toContain("quality");
-  expect(ready().missing.join(" ")).toContain("comments");
-  report = join(f.root, "comments-recheck.md");
-  writeFileSync(report, "Verified the updated comments against the original finding.\n");
-  ok(...args("comments", "pass", base, head, `Verified fix for #${commentsSeq}`));
-  expect(ready().ready).toBe(true);
-  expect(ok("reviews", task)).toContainEqual(expect.objectContaining({role: "quality", status: "blocked", head: previous}));
-});
-
-test("a single outstanding finding needs its own role and cited failure sequence", () => {
-  ok(...args("quality", "blocked"));
-  const original = ok("reviews", task).at(-1);
-  const previous = head;
-  head = change("repair the quality finding");
-  checks();
-  ok(...args("business"));
-  function stillBlocked() {
     expect(ready().ready).toBe(false);
-    expect(ready().missing.join(" ")).toContain("quality");
-    expect(command("close", task, "--no-archive").exitCode).not.toBe(0);
-    expect(f.ledger.getTask(task)?.status).toBe("OPEN");
+    const foreignFailure = ok(...args("comments", "blocked"), ...selector);
+    expect(ready().missing.join(" ")).not.toContain(`#${foreignFailure.seq}`);
   }
-  stillBlocked();
+  ok(...args(), "--repo", "service", "--branch", "feature");
+  expect(events().at(-1)).toMatchObject({ repo: "service", branch: "feature", sha: head });
+  expect(ready().ready).toBe(true);
+});
+
+test("the same repository, branch and range need a report bound to the current task", () => {
+  ok(...args());
+  const failure = ok(...args("comments", "blocked"));
+  ok("cancel", task, "--reason", "A separate task owns the same change");
+  const next = "separate-task";
+  ok("open", "--id", next, "--title", next, "--repo", "service", "--branch", "feature",
+    "--base", base, "--head", head, "--endpoint", "local", "--depth", "targeted");
+  mkdirSync(join(f.root, ".workbench/specs", next));
+  writeFileSync(join(f.root, ".workbench/specs", next, "scope.md"), "Review this task's range.\n");
+  ok("freeze", next);
+  checks(next);
+  expect(ready(next).ready).toBe(false);
+  expect(ready(next).missing.join(" ")).not.toContain(`#${failure.seq}`);
+  expect(ok("reviews", next)).toEqual([]);
+  ok("review-record", next, ...args().slice(2));
+  expect(ready(next).ready).toBe(true);
+});
+
+test("native findings list every unresolved sequence by role until explicitly reassessed", () => {
+  const middle = head;
+  head = change("complete the change under review");
+  const failedHead = head;
+  ok(...args("quality", "blocked", base, head, "The parser loses empty values"));
+  ok(...args("quality", "blocked", base, head, "The writer truncates values"));
+  ok(...args("comments", "incomplete", base, head, "Missing public example"));
+  const original = ok("reviews", task);
+  expect(original).toHaveLength(3);
+  const [parser, writer, example] = original.map((row: {seq: number}) => row.seq);
+  const initial = {quality: [parser, writer], comments: [example]};
+
+  function unresolved(expected: Record<string, number[]>) {
+    const result = command("close", task, "--no-archive");
+    expect(result.exitCode).not.toBe(0);
+    expect(f.ledger.getTask(task)?.status).toBe("OPEN");
+    const diagnostic = result.stdout.toString() + result.stderr.toString();
+    const groups = Array.from(diagnostic.matchAll(/\b(quality|comments)\b([^\n]*?)(?=\b(?:quality|comments)\b|\n|$)/g));
+    const byRole = Object.fromEntries(groups.flatMap(([, role, text]) => {
+      const sequences = Array.from(text.matchAll(/#(\d+)\b/g), ([, n]) => Number(n)).sort((a, b) => a - b);
+      return sequences.length ? [[role, sequences]] : [];
+    }));
+    expect(byRole, diagnostic).toEqual(expected);
+  }
+  checks();
+  ok(...args("business"));
+  unresolved(initial);
+  head = change("repair parser, writer and public example");
+  checks();
+  ok(...args("business"));
+  unresolved(initial);
   for (const [role, from, reviewSummary] of [
-    ["quality", previous, "Checked the incremental changes"],
+    ["quality", failedHead, "Checked the incremental changes"],
     ["quality", base, "Checked the entire change"],
-    ["quality", previous, `Checked revision ${original.seq}`],
-    ["business", base, `Reviewed #${original.seq}`],
-    ["quality", previous, `Reviewed #${original.seq + 1000}`],
+    ["quality", failedHead, `Checked revision ${parser}`],
+    ["business", base, `Reviewed #${parser}`],
+    ["quality", failedHead, `Reviewed #${parser + writer + example + 1000}`],
+    ["quality", middle, `Reviewed #${parser}`],
   ]) {
     ok(...args(role, "pass", from, head, reviewSummary));
-    stillBlocked();
+    unresolved(initial);
   }
-  const reviewSummary = `Verified the repair for #${original.seq}`;
-  report = join(f.root, "quality-reassessment.md");
-  writeFileSync(report, reviewSummary + "\n");
-  ok(...args("quality", "pass", previous, head, reviewSummary));
-  const history = ok("reviews", task);
-  expect(history).toContainEqual(original);
-  expect(history.at(-1)).toMatchObject({role: "quality", status: "pass", base: previous, head, summary: reviewSummary});
-  expect(ready().ready).toBe(true);
-  ok("close", task, "--no-archive");
-  expect(f.ledger.getTask(task)?.status).toBe("CLOSED");
-  expect(ok("verify", "--task", task).ok).toBe(true);
-}, 30_000);
 
-test("native reassessment clears a historical selection and close needs a full final range", () => {
-  const previous = head;
-  head = change("incremental repair");
-  checks();
-  const spec = f.ledger.getSpecState(task);
-  f.ledger.recordEvidence({task_id: task, repo: "service", branch: "feature", sha: head, source: "tool",
-    kind: "review_selection", status: "info", summary: "Prior selection could not start",
-    meta: {role: "quality", base: previous, head, report_status: "incomplete", backend: null, attempts: [],
-      freeze_seq: spec.freeze_seq, review_task_id: task, review_floor_seq: spec.evidence_floor_seq.review}});
-  expect(ready().missing.join(" ")).toContain("quality");
-  ok(...args("quality", "pass", previous));
-  expect(ok("reviews", task).at(-1)).toMatchObject({base: previous, head});
-  expect(ready().missing.join(" ")).not.toContain("quality");
-  expect(ready().ready).toBe(false);
-  expect(command("close", task, "--no-archive").exitCode).not.toBe(0);
-  expect(f.ledger.getTask(task)?.status).toBe("OPEN");
-  ok(...args("business"));
-  expect(ready().ready).toBe(true);
-  ok("close", task, "--no-archive");
-  expect(f.ledger.getTask(task)?.status).toBe("CLOSED");
-  expect(ok("verify", "--task", task).ok).toBe(true);
-});
-
-test("each failure from the same reviewer needs its own reassessment", () => {
-  const previous = head;
-  function recordQuality(status: string, from: string, reviewSummary: string, filename: string) {
-    report = join(f.root, filename);
-    writeFileSync(report, reviewSummary + "\n");
-    ok(...args("quality", status, from, head, reviewSummary));
+  function reassess(role: string, from: string, seq: number, description: string) {
+    const reviewSummary = `Verified ${description} #${seq}`;
+    report = join(f.root, `recheck-${seq}.md`);
+    writeFileSync(report, reviewSummary + " against the original report.\n");
+    ok(...args(role, "pass", from, head, reviewSummary));
+    expect(ok("reviews", task).at(-1)).toMatchObject({role, status: "pass", base: from, head, summary: reviewSummary});
   }
-  recordQuality("blocked", base, "The parser loses empty values", "parser.md");
-  recordQuality("blocked", base, "The writer truncates values", "writer.md");
-  const failures = ok("reviews", task);
-  expect(failures).toHaveLength(2);
-  const [parser, writer] = failures;
-  expect(parser.seq).not.toBe(writer.seq);
-  head = change("repair the parser and writer");
-  checks();
-  ok(...args("business"));
-  recordQuality("pass", previous, `Verified parser fix #${parser.seq}`, "parser-recheck.md");
-  expect(ready().ready).toBe(false);
-  expect(ready().missing.join(" ")).toContain("quality");
-  expect(command("close", task, "--no-archive").exitCode).not.toBe(0);
-  expect(f.ledger.getTask(task)?.status).toBe("OPEN");
-  recordQuality("pass", previous, `Verified writer fix #${writer.seq}`, "writer-recheck.md");
+  reassess("quality", failedHead, parser, "parser repair");
+  unresolved({quality: [writer], comments: [example]});
+  reassess("comments", base, example, "public example");
+  unresolved({quality: [writer]});
+  reassess("quality", failedHead, writer, "writer repair");
   expect(ready().ready).toBe(true);
   ok("close", task, "--no-archive");
   expect(f.ledger.getTask(task)?.status).toBe("CLOSED");
-  expect(ok("reviews", task).slice(0, 2)).toEqual(failures);
+  expect(ok("reviews", task).slice(0, original.length)).toEqual(original);
   expect(ok("verify", "--task", task).ok).toBe(true);
 }, 30_000);

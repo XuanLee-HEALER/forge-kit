@@ -7,7 +7,7 @@ import { kit, sandbox } from "./v05-sandbox";
 import { releaseCLI, digest, historicalKit, type HistoricalVersion } from "./helpers/historical-kit";
 import { snapshot as ledgerSnapshot } from "./helpers/ledger-snapshot";
 
-for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4"] satisfies HistoricalVersion[]) test(
+for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4", "0.5.5"] satisfies HistoricalVersion[]) test(
   `upgrade from ${version} preserves history and renders configured reviewer tiers on repeated sync`, () => {
   const s = sandbox();
   try {
@@ -62,21 +62,31 @@ for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4"] satisfies Hi
       "--worktree", app, "--base", base, "--head", head, "--endpoint", "local", "--depth", "targeted");
     ledger("decide", "history", "--key", "contract", "--summary", "Run the local project check on this revision");
     ledger("freeze", "history", "--lock-tests", "check.ts");
-    // Seed an authentic event through this release's writer, then query it through both CLIs.
-    symlinkSync(join(kit, "node_modules"), join(s.root, "node_modules"));
-    s.ok(["bun", "-e", `
-      import {Ledger} from ${JSON.stringify(join(old, "historical-src/ledger/store.ts"))};
-      const [root, base, head] = process.argv.slice(1);
-      const db = new Ledger(root);
-      const spec = db.getSpecState("history");
-      db.recordEvidence({task_id:"history", repo:"app", branch:"development", sha:head, kind:"review",
-        actor:"tool", source:"tool", status:"pass", summary:"Historical quality review",
-        meta:{role:"quality", base, head, report_status:"pass", review_task_id:"history",
-          freeze_seq:spec.freeze_seq, review_floor_seq:spec.evidence_floor_seq.review}});
-      db.closeDb();
-    `, s.work, base, head]);
+    if (version === "0.5.5") {
+      const report = s.privateFile(".workbench/runs/history/quality.md", "Quality review of the complete fixture change.\n");
+      ledger("review-record", "history", "--repo", "app", "--branch", "development", "--base", base, "--head", head,
+        "--role", "quality", "--status", "pass", "--summary", "Reviewed the full fixture range", "--report", report,
+        "--session-id", "v055-fixture-session");
+      files.push(report);
+      before.push(digest(report));
+    } else {
+      // Use the installed version's ledger writer to bind a historical tool receipt.
+      symlinkSync(join(kit, "node_modules"), join(s.root, "node_modules"));
+      s.ok(["bun", "-e", `
+        import {Ledger} from ${JSON.stringify(join(old, "historical-src/ledger/store.ts"))};
+        const [root, base, head] = process.argv.slice(1);
+        const db = new Ledger(root);
+        const spec = db.getSpecState("history");
+        db.recordEvidence({task_id:"history", repo:"app", branch:"development", sha:head, kind:"review",
+          actor:"tool", source:"tool", status:"pass", summary:"Historical quality review",
+          meta:{role:"quality", base, head, report_status:"pass", review_task_id:"history",
+            freeze_seq:spec.freeze_seq, review_floor_seq:spec.evidence_floor_seq.review}});
+        db.closeDb();
+      `, s.work, base, head]);
+    }
     const historicalReview = JSON.parse(ledger("reviews", "history"));
-    expect(historicalReview).toMatchObject([{source:"tool", role:"quality", status:"pass", base, head, repo:"app", branch:"development"}]);
+    const source = version === "0.5.5" ? "subagent" : "tool";
+    expect(historicalReview).toMatchObject([{source, role:"quality", status:"pass", base, head, repo:"app", branch:"development"}]);
     const verify = [s.forge, "verify", "--task", "history", "--cwd", app, "--mode", "all"];
     expect(JSON.parse(s.ok(verify))).toMatchObject({ok: true, head});
     const snapshot = () => ({
@@ -125,7 +135,7 @@ for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4"] satisfies Hi
     for (let i = 0; i < 3; i++) {
       if (i === 1) writeFileSync(models, renderModels(true));
       s.ok([bootstrap, "sync", s.work]);
-      expect(lockVersion()).toBe("0.5.5");
+      expect(lockVersion()).toBe("0.5.6");
       expect(readFileSync(models, "utf8")).toBe(renderModels(i > 0));
       const roles = Object.entries(roleTiers).map(([role, tier]) => {
         const path = join(s.work, ".codex/agents/reviewer-" + role + ".toml");
@@ -156,6 +166,10 @@ for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4"] satisfies Hi
     expect(JSON.parse(event.payload_json).summary).toBe("Recorded after upgrading");
     expect(event.prev_hash).toBe(initial.tip.trim().split("@").at(-1));
     expect(JSON.parse(ledger("verify", "--task", "history", "--json")).ok).toBe(true);
+    if (version === "0.5.5") {
+      expect(JSON.parse(ledger("close", "history", "--no-archive")).task.status).toBe("CLOSED");
+      expect(JSON.parse(ledger("reviews", "history"))).toEqual(historicalReview);
+    }
     if (version === "0.5.3") {
       const calls = join(s.root, "hurl.json");
       const hurl = join(s.bin, "hurl");

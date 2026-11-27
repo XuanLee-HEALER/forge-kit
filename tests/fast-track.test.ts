@@ -266,14 +266,14 @@ extensions:
   expect(order(true)).toEqual(["precheck", "ship", "pr", "postcheck"]);
 }, 30_000);
 
-for (const outcome of ["success", "drift", "legacy-reviewed", "legacy-no-review", "legacy-stale-review", "legacy-policy-off"]) {
+for (const outcome of ["success", "drift", "legacy-native-review", "legacy-tool-review", "legacy-no-review", "legacy-stale-review", "legacy-policy-off"] as const) {
   test(
     "protected fast-forward delivery to a local bare remote: " + outcome,
     () => {
       initWorkbench({ targetDir: root, kitRoot: join(import.meta.dir, "..") });
       const f = feature("api", 1, outcome.startsWith("legacy") ? "0.4" : "0.5"),
         bare = join(root, "api.git");
-      const missingReview = ["legacy-no-review","legacy-stale-review","legacy-policy-off"].includes(outcome);
+      const missingReview = ["legacy-tool-review", "legacy-no-review", "legacy-stale-review", "legacy-policy-off"].includes(outcome);
       if (outcome === "legacy-policy-off") {
         writeFileSync(policy(), template.replace("require_independent_review: true", "require_independent_review: false"));
       }
@@ -295,7 +295,7 @@ for (const outcome of ["success", "drift", "legacy-reviewed", "legacy-no-review"
         verifyFeature(f);
         ledger.amendSpec({ task_id: f.task, scope: "requirement", reason: "Operator changed the approved scope" });
       }
-      verifyFeature(f, { review: !missingReview && outcome !== "legacy-policy-off" });
+      verifyFeature(f, { review: outcome === "legacy-tool-review" ? "historical" : !missingReview });
       const rb = ledger.createRunbook({
         task_id: f.task,
         title: "Update the exact test branch",
@@ -344,7 +344,7 @@ for (const outcome of ["success", "drift", "legacy-reviewed", "legacy-no-review"
       const calls = readFileSync(trace, "utf8");
       if (missingReview) {
         expect(calls).not.toMatch(remoteCall);
-        expect(json.reason.message).toContain("independent review");
+        expect(json.reason.message).toMatch(/independent review/i);
         expect(json.receipts).toHaveLength(0);
       } else if (outcome !== "drift") {
         expect(calls).toMatch(remoteCall);

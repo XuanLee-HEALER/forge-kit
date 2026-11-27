@@ -1,4 +1,4 @@
-import { appendEventInTx } from "../src/ledger/transactions";
+import { appendEventInTx, withImmediateTx } from "../src/ledger/transactions";
 import { test, expect } from "bun:test";
 import { mkdirSync, readFileSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -150,6 +150,40 @@ test("release refuses previously handed-off v0.5 PRs pinned to staging", () => {
   const batch = cmd("release", "create", "--tasks", f.task, "--title", "historical staging handoff");
   expect(rejects("release", "verify", batch.release_id)).toContain("targeting main");
   expect(ledger.getTask(f.task)?.status).toBe("HANDED_OFF");
+}, 30_000);
+
+test("batch verification requires a native review for a historical handoff", () => {
+  const f = feature("api", 1);
+  verifyFeature(f, { review: "historical" });
+  cmd("pr-sync", f.task, "--repo", f.repo, "--branch", f.branch, "--pr", String(f.n));
+  expect(rejects("handoff", f.task)).toMatch(/independent review/i);
+
+  // Reproduce the durable handoff accepted when tool reviews qualified.
+  const items = [{
+    repo: f.repo, branch: f.branch, base_sha: f.base, base_branch: "main",
+    verified_head: f.head, pr_url: f.url, pr_number: f.n,
+  }];
+  withImmediateTx(ledger.db, () => {
+    const event = appendEventInTx(ledger.db, {
+      task_id: f.task, event_type: "HANDOFF_RECORDED", actor: "agent",
+      payload: { items, sql_files: [], sql_owners: [], rollback_plan: null },
+    });
+    ledger.db.query("INSERT INTO task_handoffs VALUES (?,?,?,?,?,?)")
+      .run(f.task, event.ts, f.task + "@" + event.entry_hash, JSON.stringify(items), "[]", null);
+    ledger.db.query("UPDATE tasks SET status='HANDED_OFF' WHERE task_id=?").run(f.task);
+  });
+  const prior = cmd("release", "create", "--tasks", f.task, "--title", "historical tool review");
+  expect(rejects("release", "verify", prior.release_id)).toMatch(/independent review/i);
+  expect(ledger.getTask(f.task)?.status).toBe("HANDED_OFF");
+  expect(git(join(root, "api.git"), "rev-parse", "main")).toBe(f.base);
+  expect(ledger.verify(f.task).ok).toBe(true);
+
+  cmd("resume", f.task, "--reason", "Register a native review");
+  const current = train(f);
+  merge(f);
+  expect(cmd("release", "complete", current).status).toBe("COMPLETED");
+  expect(git(join(root, "api.git"), "rev-parse", "main")).toBe(f.head);
+  expect(ledger.getTask(f.task)?.status).toBe("CLOSED");
 }, 30_000);
 
 test("v0.4 local branch drift blocks approval, verification and close; deleted merged branch uses pinned non-default base", () => {

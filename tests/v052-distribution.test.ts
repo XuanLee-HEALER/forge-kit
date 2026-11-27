@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { kit } from "./v05-sandbox";
+import { parse, stringify } from "yaml";
+import { kit, sandbox } from "./v05-sandbox";
 
 test("README preserves content outside the approved review and installation changes", () => {
   // SHA-256 of the same protected text at 0e252c19, usable in shallow offline checkouts.
@@ -28,9 +29,9 @@ test("current distribution removes stale JS bundles and retired protocol configu
     }
     symlinkSync(join(kit, "node_modules"), join(temp, "node_modules"));
     const manifest = JSON.parse(readFileSync(join(temp, "package.json"), "utf8"));
-    expect(manifest.version).toBe("0.5.5");
+    expect(manifest.version).toBe("0.5.6");
     expect(JSON.stringify(manifest)).not.toContain("review-agents");
-    expect(readFileSync(join(kit, "kit.toml"), "utf8")).toMatch(/^version = "0\.5\.5"$/m);
+    expect(readFileSync(join(kit, "kit.toml"), "utf8")).toMatch(/^version = "0\.5\.6"$/m);
     mkdirSync(join(temp, "dist"));
     writeFileSync(join(temp, "dist/stale.js"), "stale");
     const result = Bun.spawnSync([process.execPath, "run", "build"], { cwd: temp });
@@ -55,4 +56,45 @@ test("current distribution removes stale JS bundles and retired protocol configu
     expect(lines).toBeLessThanOrEqual(750);
     for (const obsolete of ["docs/designs", "docs", "packs"]) expect(existsSync(join(kit, obsolete))).toBe(false);
   } finally { rmSync(temp, { recursive: true, force: true }); }
+}, 30_000);
+
+test("effective skills and read-only reviewer roles can load the installed review rubric", () => {
+  const s = sandbox();
+  const resource = "references/risk-rubric.md";
+  const installed = `.agents/skills/review/${resource}`;
+  try {
+    s.fresh();
+    const skill = (id: string) => JSON.parse(s.ok([s.forge, "instance", "show", "skill", id, "--json"]));
+    const review = skill("review");
+    const referencePath = join(dirname(review.value.path), resource);
+    expect(review.source).toBe("core");
+    expect(review.value.body).toContain(`](${resource})`);
+    const core = readFileSync(referencePath, "utf8");
+    expect(core).toBe(readFileSync(join(kit, "core", installed), "utf8"));
+    for (const id of ["grill", "feature", "pr-triage"]) expect(skill(id).value.body).toContain(installed);
+    for (const role of ["business", "quality", "simplify", "comments"]) {
+      const values = Bun.TOML.parse(s.read(`.codex/agents/reviewer-${role}.toml`));
+      expect(values).toMatchObject({name: `reviewer-${role}`, sandbox_mode: "read-only", developer_instructions: expect.stringContaining(installed)});
+    }
+
+    const privateDir = ".workbench/overrides/review";
+    const body = "---\nname: review\ndescription: Site review guidance\n---\n[Site rubric](references/risk-rubric.md)\n";
+    const privateSkill = s.privateFile(`${privateDir}/SKILL.md`, body);
+    s.privateFile(`${privateDir}/${resource}`, "Site review rubric.\n");
+    const config = parse(s.read(".workbench/workbench.yaml"));
+    s.privateFile(".workbench/workbench.yaml", stringify({...config, extensions: {...config.extensions, skills: {review: privateDir}}}));
+    const sync = [s.forge, "sync", s.work];
+    for (let i = 0; i < 2; i++) {
+      s.ok(sync);
+      const local = skill("review");
+      expect(local.source).toBe(realpathSync(privateSkill));
+      expect(local.value.description).toBe("Site review guidance");
+      expect(readFileSync(join(dirname(local.value.path), resource), "utf8")).toBe("Site review rubric.\n");
+      expect(s.read(installed)).toBe("Site review rubric.\n");
+      expect(s.read(`${privateDir}/SKILL.md`)).toBe(body);
+    }
+  } finally {
+    s.cleanup();
+    expect(existsSync(s.root)).toBe(false);
+  }
 }, 30_000);

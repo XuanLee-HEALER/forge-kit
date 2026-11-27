@@ -1,21 +1,17 @@
 import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { canonicalRepoPath, reviewRoles } from "../config";
+import { canonicalRepoPath } from "../config";
 import { isOid } from "../git";
 import { installedInstance, verificationPolicy } from "../workflow-config";
 import type { TaskReader } from "./queries";
 import { deploymentStages } from "./release-inspection";
-import { compareReviewTrees, coversReviewBase, resolveReviewedIssues, reviewMeetsFloor, type ReviewIssue } from "./review-range";
+import { checkReviewReadiness } from "./review-readiness";
 import { getSpecState } from "./spec";
 import {
   evidenceSource,
   EXECUTABLE_EVIDENCE,
   isRolloutEndpoint,
-  normalizeReviewRole,
-  reviewFactKind,
   usesV05,
   type EvidenceSource,
-  type TaskRepoRecord,
 } from "./types";
 
 export interface ReadinessParams {
@@ -25,8 +21,6 @@ export interface ReadinessParams {
   branch?: string;
   checkoutDir?: string;
   checkEndpoint?: boolean;
-  /** Apply the v0.4 fast-track policy to this exact branch, SHA and freeze. */
-  requireFrozenToolReview?: boolean;
   requireDeploymentCi?: boolean;
 }
 
@@ -54,7 +48,6 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
 
   params = {...params, repo:canonicalRepoPath(ledger.workbenchRoot,params.repo)};
   const currentWorkflow = usesV05(ledger, params.task_id);
-  const strictLegacyReview = !currentWorkflow && params.requireFrozenToolReview === true;
   const config = currentWorkflow ? installedInstance(ledger.workbenchRoot) : undefined;
   const rolloutStages = currentWorkflow && isRolloutEndpoint(task.endpoint) ? deploymentStages(config, task.endpoint) : [];
   const customVerification = config && (config.verification.source !== "core" ||
@@ -85,16 +78,18 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
     );
   }
 
+  const review = attachments.length === 1
+    ? checkReviewReadiness(ledger, attachments[0], params.head_sha, specState, policyCheckout)
+    : { roles: [], failed: false, missing: "Specify one attached branch to verify delivery evidence" };
   const floors = specState.evidence_floor_seq;
   const events = ledger.db
     .query(
       `SELECT seq, actor, branch, sha, event_type, payload_json FROM events
        WHERE task_id = ? AND canonical_repo(repo) = canonical_repo(?)
-         AND (event_type IN ('REPO_ATTACHED','REPO_DETACHED') OR (event_type='EVIDENCE_CAPTURED' AND
-           (sha=? OR (seq >= ? AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.kind') END = 'review'))))
+         AND (event_type IN ('REPO_ATTACHED','REPO_DETACHED') OR (event_type='EVIDENCE_CAPTURED' AND sha=?))
        ORDER BY seq ASC`,
     )
-    .all(params.task_id, params.repo, params.head_sha, floors.review) as Array<{
+    .all(params.task_id, params.repo, params.head_sha) as Array<{
     seq: number;
     event_type: string;
     branch: string | null;
@@ -103,35 +98,17 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
     payload_json: string;
   }>;
 
-  const reviewFloor = ledger.db.query("SELECT ts FROM events WHERE task_id = ? AND seq = ?")
-    .get(params.task_id, floors.review) as { ts: string } | null;
-  const unresolved = !params.branch && repoAttachments.length > 1 && attachments.length !== 1;
-  if (unresolved) missing.push("Specify the attached branch to verify delivery evidence");
-  if (task.verification_depth === "full" || (task.verification_depth === "targeted" && params.checkEndpoint)) {
-    for (const r of attachments) if (!r.base_sha) {
-      missing.push(`review baseline missing: forge ledger attach ${params.task_id} --repo ${r.repo} --branch ${r.branch} --base <original-start-sha>`);
-    }
-  }
   type BranchEvidence = {
     checks: Map<string, string>;
-    pendingSelections: Map<string, string>;
-    issues: Map<number, ReviewIssue>;
-    nativeAtHead: boolean;
-    reviews: Map<string, {role: string; status: string; baseline: boolean; native: boolean}>;
     endpoint?: string;
   };
   const byBranch = new Map<string | null, BranchEvidence>();
-  type ReviewAttachment = Pick<TaskRepoRecord, "repo" | "branch" | "worktree" | "base_sha">;
-  const attachedAtEvent = new Map<string, ReviewAttachment>();
+  const attachedAtEvent = new Set<string>();
   for (const ev of events) {
     if (ev.event_type === "REPO_ATTACHED" || ev.event_type === "REPO_DETACHED") {
       if (ev.branch) {
-        if (ev.event_type === "REPO_ATTACHED") {
-          const { base_sha, worktree } = JSON.parse(ev.payload_json);
-          attachedAtEvent.set(ev.branch, { repo: params.repo, branch: ev.branch, base_sha, worktree });
-        } else {
-          attachedAtEvent.delete(ev.branch);
-        }
+        if (ev.event_type === "REPO_ATTACHED") attachedAtEvent.add(ev.branch);
+        else attachedAtEvent.delete(ev.branch);
       }
       continue;
     }
@@ -139,27 +116,21 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
     if (params.branch && branch && branch !== params.branch) continue;
     let evidence = byBranch.get(branch);
     if (!evidence) {
-      evidence = { checks: new Map(), reviews: new Map(), pendingSelections: new Map(), issues: new Map(), nativeAtHead: false };
+      evidence = { checks: new Map() };
       byBranch.set(branch, evidence);
     }
     try {
       const p = JSON.parse(ev.payload_json) as {
         source?: EvidenceSource;
         kind?: string;
-        summary?: string;
         status?: string;
         meta?: {
-          report_status?: string; backend?: unknown; attempts?: unknown;
           stage_receipts?: { stage: string; state: string; endpoint: string; versions: { repo: string; head: string }[] }[];
           pr_head_oid?: string;
           state?: string; base_branch?: string; target_oid?: string;
           pr_url?: string;
-          role?: string;
           policy_sha256?: string; startup_failure?: boolean; delivery_endpoint?: string;
           mode?: string; freeze_seq?: number; review_task_id?: string;
-          started_at?: string;
-          review_floor_seq?: number;
-          base?: string; head?: string; report_sha256?: string; report_path?: string;
         };
       };
       if (!p.kind || !p.status) continue;
@@ -177,70 +148,6 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
         if (ev.seq >= floors.test) evidence.checks.set(p.kind, p.status);
       } else if (p.kind === "hurl") {
         if (ev.seq >= floors.test) evidence.checks.set("hurl", p.status);
-      }
-      const fact = reviewFactKind(p);
-      if (fact) {
-        const source = evidenceSource(p, ev.actor);
-        const native = source === "subagent";
-        const atHead = ev.sha === params.head_sha;
-        const legacy = !currentWorkflow && !native;
-        // A historical tool receipt may predate freeze_seq metadata. Its event still belongs to one freeze.
-        const legacyFreeze = legacy && specState.freeze_seq !== null && ev.seq > specState.freeze_seq &&
-          (p.meta?.freeze_seq === undefined || p.meta.freeze_seq === specState.freeze_seq);
-        if (!atHead && legacy && !legacyFreeze) continue;
-        if (native && (fact !== "review" || !ev.branch || !attachedAtEvent.has(ev.branch) ||
-            !ev.sha || p.meta?.head !== ev.sha || !p.meta.base || !isOid(p.meta.base) ||
-            !reviewRoles.some(role => role === p.meta?.role) || !p.meta.report_path ||
-            !/^[a-f0-9]{64}$/.test(p.meta.report_sha256 ?? "") ||
-            !(p.status === "pass" ? p.meta.report_status === "pass" :
-              p.status === "fail" && ["blocked", "incomplete"].includes(p.meta.report_status ?? "")))) continue;
-        // Old receipts may omit freeze_seq. Their event must still follow this freeze and satisfy its review floor.
-        if (strictLegacyReview && fact === "review" && p.status !== "fail" && (
-          (!native && p.source !== "tool") || p.status !== "pass" || ev.branch !== params.branch ||
-          !specState.freeze_seq || ev.seq <= specState.freeze_seq ||
-          (p.meta?.freeze_seq !== undefined && p.meta.freeze_seq !== specState.freeze_seq)
-        )) continue;
-        if ((currentWorkflow || native) && ((!native && source !== "tool") ||
-            p.meta?.review_task_id !== params.task_id || p.meta.freeze_seq !== specState.freeze_seq || p.meta.review_floor_seq !== floors.review)) continue;
-        if (ev.seq < floors.review || !reviewMeetsFloor(p.status, p.meta, params.task_id, floors.review, reviewFloor?.ts, evidenceSource(p, ev.actor))) continue;
-        const roleKey = normalizeReviewRole(p.meta?.role);
-        const rangeKey = JSON.stringify([p.meta?.base, roleKey]);
-        if (fact === "review_selection") {
-          if (atHead && source === "tool") evidence.pendingSelections.set(rangeKey, roleKey);
-          continue;
-        }
-        if (atHead && native) evidence.nativeAtHead = true;
-        const receipt = ev.sha && (!legacy || legacyFreeze)
-          ? { role: roleKey, base: p.meta?.base ?? "", head: ev.sha, seq: ev.seq, source }
-          : undefined;
-        if (receipt && p.status === "fail") {
-          evidence.issues.set(ev.seq, receipt);
-          continue;
-        }
-        const historical = branch ? [attachedAtEvent.get(branch)] : [...attachedAtEvent.values()];
-        const current = branch ? repoAttachments.filter((r) => r.branch === branch) : [];
-        const covered = (row: ReviewAttachment | undefined) =>
-          !!row && coversReviewBase(ledger.workbenchRoot, row, p.meta?.base);
-        const coversBase = historical.length > 0 && historical.every(covered) && current.every(covered);
-        if (receipt) {
-          const legacyFullPass = legacy && coversBase && (p.status === "pass" || p.status === "fallback");
-          if (legacyFullPass) {
-            // Legacy full-range retries replaced earlier legacy results for this role at this HEAD.
-            for (const issue of evidence.issues.values()) {
-              if (issue.source !== "subagent" && issue.role === roleKey && issue.head === ev.sha)
-                evidence.issues.delete(issue.seq);
-            }
-          }
-          if ((legacyFullPass && source === "tool") || (!legacy && p.status === "pass")) {
-            const taskBase = branch ? attachedAtEvent.get(branch)?.base_sha : undefined;
-            resolveReviewedIssues(evidence.issues, receipt, p.summary ?? "", join(ledger.workbenchRoot, params.repo), params.head_sha, taskBase);
-          }
-        }
-        if (!atHead) continue;
-        if (p.status === "pass" && (source === "tool" || native)) evidence.pendingSelections.delete(rangeKey);
-        if (currentWorkflow || p.status === "fail" || coversBase) {
-          evidence.reviews.set(currentWorkflow ? rangeKey : roleKey, { role: roleKey, status: p.status, baseline: coversBase && current.length > 0, native });
-        }
       }
       if (
         (task.endpoint === "pr" && p.kind === "pr" && attachments.length === 1 && ev.branch === attachments[0].branch) ||
@@ -278,33 +185,13 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
   // A detached merge must honor failures at its own SHA before trying a verified parent.
   // Positive evidence is credited only to the selected attachment or its unambiguous legacy receipts.
   const failedKinds = new Set<string>();
-  const incompleteRoles = new Set<string>();
-  const failedRoles = new Set<string>();
   const latestByKind = new Map<string, string>();
-  const passingRoles = new Set<string>();
-  let baselinePassed = false;
-  let fullLegacyReview = false;
   let latestEndpointStatus: string | undefined;
   for (const [branch, evidence] of byBranch) {
     const eligible = attachments.length === 1 && branch === attachments[0].branch;
     for (const [kind, status] of evidence.checks) {
       if (status === "fail") failedKinds.add(kind);
       if (eligible && status === "pass") latestByKind.set(kind, status);
-    }
-    for (const issue of evidence.issues.values()) {
-      // Tool-only v0.4 deliveries used just their selected HEAD. Native reassessment also tracks prior revisions.
-      if (currentWorkflow || evidence.nativeAtHead || issue.source === "subagent" || issue.head === params.head_sha)
-        failedRoles.add(issue.role);
-    }
-    for (const role of evidence.pendingSelections.values()) incompleteRoles.add(role);
-    for (const {role, status, baseline, native} of evidence.reviews.values()) {
-      if (status === "fail") failedRoles.add(role);
-      if (eligible && (status === "pass" || status === "fallback")) {
-        passingRoles.add(role);
-        if (baseline) baselinePassed = true;
-        if (["codex-review", "quality", "business-review", "default"].includes(role) || (native && role === "business"))
-          fullLegacyReview = true;
-      }
     }
     if (evidence.endpoint === "fail" || (eligible && latestEndpointStatus !== "fail" && evidence.endpoint)) {
       latestEndpointStatus = evidence.endpoint;
@@ -350,34 +237,8 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
       params.repo + "@" + params.head_sha);
   }
 
-  if (incompleteRoles.size > 0) {
-    hasExplicitFailure = true;
-    missing.push(`Selected review incomplete (${[...incompleteRoles].join(", ")}) for ${params.repo}@${params.head_sha.slice(0, 8)}`);
-  }
-  if (failedRoles.size > 0) {
-    hasExplicitFailure = true;
-    missing.push(
-      `latest review failed (${[...failedRoles].join(", ")}) for ${params.repo}@${params.head_sha.slice(0, 8)}`,
-    );
-  } else if (currentWorkflow) {
-    // Older executors could record a pass even for distinct commits with identical trees.
-    const base = attachments[0]?.base_sha;
-    if (!baselinePassed || !base || compareReviewTrees(join(ledger.workbenchRoot, params.repo), base, params.head_sha) !== "changed")
-      missing.push("Independent review evidence required for the nonempty task baseline-to-HEAD diff at the current freeze");
-  } else if (task.verification_depth === "targeted") {
-    // Targeted depth requires at least one independent review pass/fallback before delivery/close
-    if ((params.checkEndpoint || strictLegacyReview) && passingRoles.size === 0) {
-      missing.push(
-        `targeted verification requires independent review evidence for ${params.repo}@${params.head_sha.slice(0, 8)}`,
-      );
-    }
-  } else if (task.verification_depth === "full") {
-    if (!fullLegacyReview) {
-      missing.push(
-        `full verification requires business/quality review pass or fallback for ${params.repo}@${params.head_sha.slice(0, 8)}`,
-      );
-    }
-  }
+  if (review.missing) missing.push(review.missing);
+  hasExplicitFailure ||= review.failed;
 
   if (
     params.checkEndpoint &&
@@ -404,6 +265,6 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
     ready: missing.length === 0,
     missing,
     hasExplicitFailure,
-    recordedReviewRoles: [...passingRoles],
+    recordedReviewRoles: review.roles,
   };
 }

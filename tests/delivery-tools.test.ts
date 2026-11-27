@@ -2,13 +2,13 @@ import { beforeEach, afterEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, readFileSync, realpathSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { handleLedgerHook } from "../src/ledger-hook";
 import { appendEventInTx } from "../src/ledger/transactions";
 import { Ledger } from "../src/ledger";
 import { resolveTaskCheckout } from "../src/ledger/checkout";
 import { runGit, withinProcessDeadline } from "../src/git";
 import { inspectPr } from "../src/ledger/pr";
 import { isolateHome } from "./helpers/hermetic";
+import { nativeReview } from "./helpers/native-review";
 
 isolateHome();
 let root: string, repo: string, bin: string, base: string, ledger: Ledger;
@@ -19,7 +19,8 @@ function git(...args: string[]) {
   return result.stdout.trim();
 }
 function commit(message: string) {
-  git("add", "-A"); git("commit", "--allow-empty", "-m", message);
+  writeFileSync(join(repo, "revision.txt"), message);
+  git("add", "-A"); git("commit", "-m", message);
   return git("rev-parse", "HEAD");
 }
 function tool(name: string, body: string) {
@@ -54,11 +55,8 @@ beforeEach(() => {
   ledger = new Ledger(root);
 });
 afterEach(() => { ledger.closeDb(); rmSync(root, { recursive: true, force: true }); });
-function historicalReview(head: string) {
-  const floor = ledger.getSpecState("fix").evidence_floor_seq.review;
-  return ledger.recordEvidence({task_id:"fix", repo:"svc", branch:"feature", sha:head, kind:"review",
-    status:"pass", source:"tool", summary:"historical pinned review",
-    meta:{role:"codex-review", review_task_id:"fix", base, head, review_floor_seq:floor}});
+function review(head: string, from = base, task = "fix") {
+  return nativeReview(ledger, task, { repo: "svc", branch: "feature", base: from, head });
 }
 
 test("v0.5 rejects the legacy native review before executing Codex or writing evidence", () => {
@@ -74,7 +72,7 @@ test("v0.5 rejects the legacy native review before executing Codex or writing ev
   expect(ledger.getTask("fix")!.tip_hash).toBe(tip);
 });
 
-test("review range and launch floor bind historical tool and hook evidence", () => {
+test("reattaching a branch preserves the baseline required by native review", () => {
   open("local");
   expect(ledger.getTaskRepos("fix")[0].base_sha).toBe(base);
   const middle = commit("middle");
@@ -82,28 +80,13 @@ test("review range and launch floor bind historical tool and hook evidence", () 
   ledger.attachRepo({ task_id: "fix", repo: "svc", branch: "feature" });
   expect(ledger.getTaskRepos("fix")[0].base_sha).toBe(base);
   const head = commit("head");
-  ledger.freezeSpec({ task_id: "fix" }); verification(head);
-  const freezeTime = ledger.getTaskEvents("fix").find(e => e.event_type === "SPEC_FROZEN")!.ts;
-  ledger.recordEvidence({ task_id: "fix", repo: "svc", sha: head, kind: "review", status: "pass", source: "hook",
-    summary: "unbound historical pass", meta: { base, review_floor_seq: ledger.getSpecState("fix").evidence_floor_seq.review } });
+  ledger.freezeSpec({ task_id: "fix" });
+  verification(head);
+  review(head, middle);
   expect(readiness(head).ready).toBe(false);
-  for (const [reviewBase, startedAt] of [[base, new Date(Date.parse(freezeTime) + 1000).toISOString()], [base, freezeTime], [middle, new Date().toISOString()], [base, undefined], [base, new Date(0).toISOString()]]) {
-    ledger.recordEvidence({ task_id: "fix", repo: "svc", sha: head, kind: "review", status: "pass", source: "hook",
-      summary: "primary", meta: { role: "quality", base: reviewBase, ...(startedAt && { started_at: startedAt }) } });
-    expect(readiness(head).ready).toBe(false);
-  }
-  ledger.recordEvidence({ task_id: "fix", repo: "svc", sha: head, kind: "review", status: "fail", source: "hook",
-    summary: "provider", meta: { role: "quality", base: middle, report_status: "error", exit_code: 2, error_code: "credit_balance_exhausted" } });
-  expect(readiness(head).ready).toBe(false);
-  const next = commit("advance"); verification(next);
-  expect(readiness(next).recordedReviewRoles).toEqual([]);
-  historicalReview(next);
-  for (const staleLaunch of [{ review_floor_seq: 0 }, { started_at: new Date(0).toISOString() }]) {
-    ledger.recordEvidence({ task_id: "fix", repo: "svc", sha: next, kind: "review", source: "hook", status: "fail",
-      summary: "prior review finished late", meta: { role: "codex-review", base, ...staleLaunch } });
-    expect(readiness(next).ready).toBe(true);
-  }
-}, 20000);
+  review(head);
+  expect(readiness(head).ready).toBe(true);
+});
 
 test("PR follow-up requires remote confirmation for the new branch head", () => {
   const first = commit("initial PR"); open("pr");
@@ -112,7 +95,8 @@ test("PR follow-up requires remote confirmation for the new branch head", () => 
     headRepository: { name: "svc" }, headRepositoryOwner: { login: "acme" }, headRefName: "feature", headRefOid: sha, isCrossRepository: false, state: "OPEN", url: "https://github.com/acme/svc/pull/23" }) });
   expect(sync(first).exitCode).toBe(0);
   const next = commit("follow-up");
-  verification(next); historicalReview(next);
+  ledger.freezeSpec({ task_id: "fix" });
+  verification(next); review(next);
   expect(sync(first).exitCode).not.toBe(0); expect(readiness(next).ready).toBe(false);
   for (const actor of ["manual", "operator", "hook"]) {
     appendEventInTx(ledger.db, { task_id: "fix", event_type: "EVIDENCE_CAPTURED", actor, repo: "svc", branch: "feature",
@@ -145,7 +129,7 @@ test("explicit contracts under build remain locked through worktree cleanup", ()
     expect(readiness(head).missing.join(" ")).toContain(rel);
     expect(() => ledger.closeTask({ task_id: "fix" })).toThrow(rel);
   }
-  writeFileSync(file, "contract"); verification(head); historicalReview(head);
+  writeFileSync(file, "contract"); verification(head); review(head);
   writeFileSync(file, "drift"); git("-C", worktree, "commit", "-am", "drift");
   git("worktree", "remove", worktree);
   expect(() => ledger.closeTask({ task_id: "fix" })).toThrow(rel);
@@ -172,54 +156,49 @@ test("tracked contracts inside pruned dependency fixtures remain locked by wildc
 
 test("an older review completion cannot satisfy an amended freeze", () => {
   open("local");
+  const head = commit("review target");
   const before = ledger.freezeSpec({ task_id: "fix" }).spec;
+  review(head);
   ledger.amendSpec({ task_id: "fix", scope: "requirement", reason: "changed invariant" });
   const after = ledger.freezeSpec({ task_id: "fix" }).spec;
   expect(after.evidence_floor_seq.review).toBeGreaterThan(before.evidence_floor_seq.review);
-  ledger.recordEvidence({ task_id: "fix", repo: "svc", branch: "feature", sha: base,
-    kind: "review", status: "pass", source: "tool", summary: "old execution", meta: {
-      base, role: "quality", review_task_id: "fix", review_floor_seq: before.evidence_floor_seq.review } });
-  expect(readiness(base).recordedReviewRoles).not.toContain("quality");
+  verification(head);
+  expect(readiness(head).recordedReviewRoles).not.toContain("quality");
+  expect(readiness(head).ready).toBe(false);
+  review(head);
+  expect(readiness(head).ready).toBe(true);
 });
 
-test("a replacement task at floor zero requires its own role review", () => {
+test("a replacement task requires its own native review for the shared revision", () => {
   const head = commit("shared revision");
   open("local");
-  const report = { role: "quality", repo, base, head, reviewFloorSeq: 0, status: "pass", findings: [] };
-  const capture = (reviewTaskId?: string) => handleLedgerHook(root, {
-    hook_event_name: "PostToolUse", cwd: repo, tool_name: "exec_command",
-    tool_input: { command: `review-quality --repo ${repo} --base ${base} --head ${head}` },
-    tool_response: { exit_code: 0, output: JSON.stringify({ ...report, reviewTaskId }) }
-  }).recorded;
-  writeFileSync(join(root, ".workbench/workbench.yaml"), "name: fixture\nrepos:\n  - svc\n");
-  expect(capture("fix")).toBe(0);
+  ledger.freezeSpec({ task_id: "fix" });
+  review(head);
   ledger.cancelTask({ task_id: "fix", reason: "new task" });
   const task_id = "replacement";
-  ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, repo: "svc", branch: "feature", base_sha: base, head_sha: head, endpoint: "local", depth: "full" });
-  expect(capture("fix")).toBe(0);
-  expect(capture()).toBe(0);
-  for (const review_task_id of [undefined, "fix"]) {
-    ledger.recordEvidence({ task_id, repo: "svc", sha: head, kind: "review", source: "hook", status: "pass",
-      summary: "legacy receipt", meta: { role: "quality", base, review_floor_seq: 0, review_task_id } });
-  }
+  ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, repo: "svc", branch: "feature", base_sha: base, head_sha: head, endpoint: "local", depth: "targeted" });
+  const specs = join(root, ".workbench/specs", task_id);
+  mkdirSync(specs);
+  for (const name of ["ssot", "tech-spec", "test-spec"]) writeFileSync(join(specs, name + ".md"), name);
+  ledger.freezeSpec({ task_id });
   const roles = () => ledger.checkPushReadiness({ task_id, repo: "svc", head_sha: head }).recordedReviewRoles;
   expect(roles()).toEqual([]);
-  expect(capture(task_id)).toBe(0);
-  ledger.recordEvidence({ task_id, repo: "svc", sha: head, kind: "review", source: "tool", status: "pass",
-    summary: "current review", meta: { role: "quality", base, review_floor_seq: 0, review_task_id: task_id } });
+  review(head, base, task_id);
   expect(roles()).toContain("quality");
 });
 
 test("reviewing from an older ancestor cannot credit the task diff", () => {
   const ancestor = base;
-  writeFileSync(join(repo, "contract"), "check");
-  base = commit("enable check"); open("local");
-  rmSync(join(repo, "contract"));
-  const head = commit("remove check"); verification(head);
-  ledger.recordEvidence({ task_id: "fix", repo: "svc", sha: head, kind: "review", source: "tool", status: "pass",
-    summary: "empty diff", meta: { role: "quality", base: ancestor } });
+  base = commit("enable check");
+  open("local");
+  git("revert", "--no-edit", base);
+  const head = git("rev-parse", "HEAD");
+  expect(git("diff", "--name-only", ancestor, head)).toBe("");
+  ledger.freezeSpec({ task_id: "fix" });
+  verification(head);
+  expect(() => review(head, ancestor)).toThrow("within the task baseline");
   expect(readiness(head).ready).toBe(false);
-  historicalReview(head);
+  review(head);
   expect(readiness(head).ready).toBe(true);
 });
 
@@ -244,7 +223,7 @@ test("frozen executable mode survives delivery and separate worktree removal", (
   expect(readiness(changed).missing.join(" ")).toContain(rel);
   expect(() => ledger.closeTask({ task_id: "fix" })).toThrow(rel);
   git("-C", worktree, "reset", "--hard", head);
-  verification(head); historicalReview(head);
+  verification(head); review(head);
   ledger.recordEvidence({ task_id: "fix", repo: "svc", branch: "feature", sha: head, kind: "pr", status: "pass", source: "tool", summary: "confirmed PR", meta: { pr_url: "https://github.com/acme/svc/pull/9", pr_head_oid: head } });
   git("merge", "--ff-only", head); git("update-ref", "refs/remotes/origin/main", head);
   git("worktree", "remove", worktree); git("branch", "-d", "feature");
@@ -300,7 +279,9 @@ test("attaching an initialized submodule uses its working tree", () => {
 
 test("an explicit PR can verify the recorded head after branch cleanup", () => {
   const head = commit("delivered");
-  open("pr"); verification(head); historicalReview(head);
+  open("pr");
+  ledger.freezeSpec({ task_id: "fix" });
+  verification(head); review(head);
   git("switch", "main"); git("branch", "-D", "feature");
   git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk");
   git("update-ref", "refs/remotes/origin/main", head);

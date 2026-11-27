@@ -1,4 +1,5 @@
 import { isolateHome } from "./helpers/hermetic";
+import { nativeReview } from "./helpers/native-review";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -249,14 +250,16 @@ describe("Tier 1 Physical Fuses & Fail-Closed", () => {
 describe("frozen evidence and delivery readiness", () => {
   test("explicit feature push allows clean sibling main and blocks dirty detached checkout", () => {
     const rel = "frozen.hurl", file = join(repoDir, rel);
+    const base = runGit(repoDir, ["rev-parse", "HEAD"]).stdout.trim();
     writeFileSync(file, "frozen"); runGit(repoDir, ["add", rel]); runGit(repoDir, ["commit", "-m", "contract"]);
     const head = runGit(repoDir, ["rev-parse", "HEAD"]).stdout.trim(), task_id = "detached-checkout";
     const ledger = new Ledger(wb);
     try {
-      ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, endpoint: "fat", depth: "targeted", repo: "app-api", branch: "feat/demo", head_sha: head });
+      ledger.openTask({ workflow_version: "0.4", task_id, title: task_id, endpoint: "fat", depth: "targeted", repo: "app-api", branch: "feat/demo", base_sha: base, head_sha: head });
       const docs = join(wb, ".workbench/specs", task_id); mkdirSync(docs, { recursive: true });
       for (const name of ["ssot", "tech-spec", "test-spec"]) writeFileSync(join(docs, name + ".md"), name);
       ledger.freezeSpec({ task_id, locked_test_globs: [rel] });
+      nativeReview(ledger, task_id, { repo: "app-api", branch: "feat/demo", base, head });
       ledger.recordEvidence({ task_id, repo: "app-api", sha: head, kind: "test", status: "pass", source: "tool", summary: "pass" });
       const readiness = (checkoutDir: string) => ledger.checkPushReadiness({ task_id, repo: "app-api", branch: "feat/demo", head_sha: head, checkoutDir });
       const featureDir = join(wb, "feature-checkout");
