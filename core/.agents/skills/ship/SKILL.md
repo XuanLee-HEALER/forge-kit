@@ -24,7 +24,7 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 
 ## Fast-Track
 
-规格冻结后可立即运行 `forge ledger fast-track prepare <task-id> --to <endpoint> --paths <globs>`，将任务、冻结摘要、仓库、路径、规模上限及有序交付阶段展示给批准人。后期已有精确动作时可另传 `--runbook <rb-id>`。操作者在主会话单独发送 `快轨批准 <ft-id>`。同一会话可单独发送 `快轨撤销 <ft-id>` 撤销 ACTIVE 授权。PENDING 授权可用 revoke 撤销。
+规格冻结后可立即运行 `forge ledger fast-track prepare <task-id> --to <endpoint> --paths <globs>`，将任务、冻结摘要、仓库、路径、规模上限及有序交付阶段展示给批准人。后期已有精确动作时可另传 `--runbook <rb-id>`；此时由操作者在主会话单独发送一次 `快轨批准 <ft-id>` 即可同步批准绑定的 PENDING 发版单，无需先单独 `批准 <rb-id>`。同一会话可单独发送 `快轨撤销 <ft-id>` 撤销 ACTIVE 授权。PENDING 授权可用 revoke 撤销。
 
 按任务 base_sha..HEAD 校验范围，核对冻结测试锁、候选版本、评审、验证与必需 CI。已批准的交付节点覆盖发布对应工作分支、创建 PR 和通过平台合并该候选版本所需的动作。按绑定的目标与 HEAD 调用合并，随后读取平台合并提交与目标引用。独立部署按实际声明的阶段直接查询部署端。直推使用普通 Git 快进推送并独立读取远端 SHA。遇非快进拒绝时记录分叉及当前版本，保留现场。仅登记了标签动作时才核对标签目标。
 
