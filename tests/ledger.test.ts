@@ -85,6 +85,29 @@ describe("SQLite WAL Hash-Chained Ledger", () => {
     } finally { ledger.closeDb(); }
   });
 
+  test("root attachment keeps its frozen file identity across status and re-freeze", () => {
+    const root = join(dir, "workspace");
+    fixtureHistory("workspace", "main");
+    const ledger = new Ledger(root);
+    const task_id = "root-lock";
+    try {
+      const file = "tests/contract.ts";
+      mkdirSync(join(root, "tests"));
+      writeFileSync(join(root, file), "original");
+      const docs = join(root, ".workbench/specs", task_id);
+      mkdirSync(docs, {recursive: true});
+      writeFileSync(join(docs, "scope.md"), "Root CLI contract");
+      ledger.openTask({task_id, title: task_id, endpoint: "local", depth: "targeted", repo: ".", branch: "main"});
+      ledger.freezeSpec({task_id, locked_test_globs: [file]});
+      const frozen = ledger.getSpecState(task_id);
+      expect(Object.keys(frozen.locked_test_files)).toEqual(["./" + file]);
+      expect(frozen.drifted_locked_tests).toEqual([]);
+      expect(ledger.freezeSpec({task_id}).spec.drifted_locked_tests).toEqual([]);
+      writeFileSync(join(root, file), "changed");
+      expect(ledger.getSpecState(task_id).drifted_locked_tests).toEqual(["./" + file]);
+    } finally { ledger.closeDb(); }
+  });
+
   test("locks matching tests on disk and in Git until an authorized amendment is frozen", () => {
     const ledger = new Ledger(dir);
     const task_id = "locked-digests";

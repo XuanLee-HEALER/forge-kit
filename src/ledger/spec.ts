@@ -32,7 +32,8 @@ const VALID_SPEC_AMEND_SCOPES = new Set<string>([
 function readFrozenPayload(root:string, json:string) {
   const payload = JSON.parse(json) as Partial<SpecFrozenPayload>;
   const relativeKey = (path:string) => relative(resolve(root),resolve(root,path));
-  const repos=Object.keys(payload.locked_test_revisions ?? {}).map(relativeKey).sort((a,b)=>b.length-a.length);
+  const recordedRepos = Object.keys(payload.locked_test_revisions ?? {}).sort((a, b) => b.length - a.length);
+  const repos = recordedRepos.map(relativeKey).sort((a, b) => b.length - a.length);
   for (const field of ["locked_test_files","locked_test_blobs","locked_test_modes","tracked_locked_tests","locked_test_revisions","locked_gitlinks"] as const) {
     const map = payload[field];
     if (!map) continue;
@@ -43,9 +44,13 @@ function readFrozenPayload(root:string, json:string) {
         normalized = JSON.stringify([canonicalRepoPath(root,repo),path,oid]);
       } else if (field === "locked_test_revisions") normalized=canonicalRepoPath(root,key);
       else {
-        normalized=relativeKey(key);
-        const repo=repos.find(r=>normalized.startsWith(r+"/"));
-        if(repo) normalized=canonicalRepoPath(root,repo)+normalized.slice(repo.length);
+        // Keys consist of a repository ID and a file path. Resolving both together
+        // would erase the root repository ID in "./tests/contract.ts".
+        normalized = relativeKey(key);
+        const owner = recordedRepos.find(repo => key.startsWith(repo + "/"));
+        const repo = repos.find(r => normalized.startsWith(r + "/"));
+        if (owner !== undefined && relativeKey(owner) === "") normalized = "./" + normalized;
+        else if (repo) normalized = canonicalRepoPath(root, repo) + normalized.slice(repo.length);
       }
       if (normalized !== key) {
         map[normalized] = map[key];
