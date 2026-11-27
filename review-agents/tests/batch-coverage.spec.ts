@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 type Entry = {status:string; oldPath:string; path:string; added:number; deleted:number};
-type Call = {role:string; related:(Entry & {position:number})[]; index:{files:number; excluded:number; digest:string; changes?:Entry[]; pages?:{offset:number;count:number}[]}; chunks:{id:string;path:string;patch:string;newEnd:number;oldEnd:number}[];spec:string|null};
+type Call = {role:string; context:{revision:string;files:{path:string;text:string}[]}; related:(Entry & {position:number})[]; index:{files:number; excluded:number; digest:string; changes?:Entry[]; pages?:{offset:number;count:number}[]}; chunks:{id:string;path:string;patch:string;newEnd:number;oldEnd:number}[];spec:string|null};
 function fixture(run: (f: ReturnType<typeof setup>) => void) {
   const root = mkdtempSync(join(tmpdir(), "receipt-test-"));
   try { run(setup(root)); } finally { rmSync(root, {recursive:true,force:true}); }
@@ -317,4 +317,37 @@ test("a single-chunk batch keeps its inventory identity when a large spec needs 
   expect(result.calls[0].index).toEqual(summary);
   expect(result.calls[0].related[0]).toMatchObject({path:"sample.txt",position:0});
   expect(result.report.roles[0].coverage).toMatchObject({inventory_digest:digest,inventory_files:1,expected:1,reviewed:1});
+}));
+
+test("other batches provide numbered dependency definitions and actual caller sites at the pinned head", () => fixture(f => {
+  const dep = "aaa-library.ts", target = "mmm-service.ts", caller = "zzz-consumer.ts";
+  const padding = Array.from({length:300}, (_,i)=>"// unchanged filler "+i+" "+".".repeat(40)).join("\n");
+  const dependency = (value:number) => "export const unrelated = 0;\n"+padding+"\nexport function convertAmount(x:number) { return x * "+value+"; }\n";
+  const service = (value:number) => 'import {convertAmount as convert} from "./aaa-library";\n'+padding+'\nexport function invoiceTotal(x:number) { return convert(x) + '+value+'; }\n';
+  const consumer = (value:number) => 'import {\n invoiceTotal,\n} from "./mmm-service";\n'+padding+"\nexport const amount = invoiceTotal("+value+");\n";
+  for (const [path, text] of [[dep,dependency(1)],[target,service(1)],[caller,consumer(1)]])
+    writeFileSync(join(f.repo,path),text);
+  f.git("add","--",dep,target,caller);
+  const base = f.commit("baseline");
+  for (const [path, text] of [[dep,dependency(2)],[target,service(2)],[caller,consumer(2)]])
+    writeFileSync(join(f.repo,path),text);
+  const filler = Array.from({length:64},(_,i)=>(i<32?"bbb":"nnn")+i+".txt");
+  for (const path of filler) writeFileSync(join(f.repo,path),path+"\n");
+  f.git("add","--",dep,target,caller,...filler);
+  const head = f.commit("three separate batches");
+  for (const path of [dep,target,caller]) writeFileSync(join(f.repo,path),"DIRTY WORKTREE\n");
+  const result = f.review(base,"quality");
+  expect(result.code).toBe(0);
+  const call = result.calls.find(c=>c.chunks.some(k=>k.path===target))!;
+  const delivered = new Set(call.chunks.map(k=>k.path));
+  expect(delivered.has(dep) || delivered.has(caller)).toBe(false);
+  expect(call.context.revision).toBe(head);
+  const excerpts = call.context.files;
+  expect(excerpts.some(e=>delivered.has(e.path))).toBe(false);
+  expect(excerpts.find(e=>e.path===dep)?.text).toContain("302: export function convertAmount(x:number) { return x * 2; }");
+  expect(excerpts.find(e=>e.path===caller)?.text).toContain("304: export const amount = invoiceTotal(2);");
+  for (const e of excerpts) {
+    expect(Buffer.byteLength(e.text)).toBeLessThanOrEqual(4096);
+    expect(e.text).not.toContain("DIRTY WORKTREE");
+  }
 }));

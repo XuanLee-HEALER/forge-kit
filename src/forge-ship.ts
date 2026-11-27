@@ -35,7 +35,7 @@ import {
 import { resolveTaskCheckout } from "./ledger/checkout";
 import { inspectPr } from "./ledger/pr";
 
-import { sha256String, canonicalJson, nowIso, type RunbookRecord, type TaskRepoRecord } from "./ledger/types";
+import { sha256String, canonicalJson, nowIso, type RunbookRecord } from "./ledger/types";
 import { withImmediateTx } from "./ledger/transactions";
 
 function live(e: Envelope) {
@@ -46,18 +46,21 @@ function live(e: Envelope) {
   if (!sid || sid !== e.approved_session_id) throw Error("Session does not match human approval");
   if (!e.expires_at || !(Date.parse(e.expires_at) >= Date.now())) throw Error("Envelope expired");
 }
-function checkEvidence(ledger: Ledger, e: Envelope, row: TaskRepoRecord, dir: string, head: string, requireFrozenToolReview: boolean) {
-  const check = ledger.checkPushReadiness({
-    task_id: e.task_id,
-    repo: row.repo,
-    branch: row.branch,
-    checkoutDir: dir,
-    head_sha: head,
-    requireFrozenToolReview,
-  });
-  if (!check.ready) throw Error(check.missing.join(", "));
-}
 type PrAction = Extract<ShipAction, { kind: "pr" }>;
+function requiredChecksPending(dir: string, url: string) {
+  const gh = process.env.FORGE_GH_BIN || "gh";
+  const ci = runProcess([gh, "pr", "checks", url, "--required", "--json", "name,bucket"], {
+    cwd: dir,
+    env: checkoutEnvironment(),
+  });
+  if (ci.code && ci.code !== 8) throw Error("Required CI checks unavailable or failed");
+  const checks = JSON.parse(ci.stdout.trim() || "[]");
+  if (!Array.isArray(checks) || checks.some(c => !c.name || !["pass","pending"].includes(c.bucket)))
+    throw Error("Required CI checks missing or failing");
+  const pendingCi = ci.code === 8 || checks.some(c => c.bucket === "pending");
+  if (!pendingCi && !checks.length) throw Error("Required CI checks missing");
+  return pendingCi;
+}
 function checkedPr(dir: string, branch: string, a: PrAction) {
   if (!isOid(a.tree)) throw Error("Runbook lacks the approved merge tree; register and approve a new runbook");
   const gh = process.env.FORGE_GH_BIN || "gh";
@@ -68,16 +71,7 @@ function checkedPr(dir: string, branch: string, a: PrAction) {
   });
   if (pr.url !== a.url || pr.headRefOid !== a.head || pr.baseRefName !== a.base)
     throw Error("PR destination or version drifted");
-  const ci = runProcess([gh, "pr", "checks", a.url, "--required", "--json", "name,bucket"], {
-    cwd: dir,
-    env: checkoutEnvironment(),
-  });
-  if (ci.code && ci.code !== 8) throw Error("Required CI checks unavailable or failed");
-  const checks = JSON.parse(ci.stdout.trim() || "[]");
-  if (!Array.isArray(checks) || checks.some(c => !c.name || !["pass","pending"].includes(c.bucket)))
-    throw Error("Required CI checks missing or failing");
-  const pendingCi = ci.code === 8 || checks.some(c => c.bucket === "pending");
-  if (!pendingCi && !checks.length) throw Error("Required CI checks missing");
+  const pendingCi = requiredChecksPending(dir, a.url);
   const url = new URL(a.url),
     repo = url.pathname.split("/").slice(1, 3).join("/");
   const api = (path: string, jq: string) =>
@@ -136,7 +130,7 @@ function checkEnvelopeApproval(ledger: Ledger, e: Envelope) {
     throw Error("Invalid ledger approval binding");
   return validateScope(ledger, e);
 }
-function approvedCheckouts(ledger: Ledger, e: Envelope) {
+function approvedCheckouts(ledger: Ledger, e: Envelope, plan?: ExactPlan) {
   const policy = checkEnvelopeApproval(ledger, e);
   const paths: string[] = JSON.parse(e.allowed_path_globs_json);
   const repos: string[] = JSON.parse(e.allowed_repos_json);
@@ -152,7 +146,15 @@ function approvedCheckouts(ledger: Ledger, e: Envelope) {
     ledger.getTask(e.task_id)?.verification_depth === "full";
   // Check every local review gate before observing even the first remote repository.
   for (const {row, pin, dir} of checkouts) {
-    checkEvidence(ledger, e, row, dir, pin.head, reviewRequired);
+    const mergeIndex = plan?.actions.findIndex(a => a.kind === "pr" && a.repo === row.repo) ?? -1;
+    const hostedCi = plan?.ci.some(a => a.repo === row.repo) &&
+      (mergeIndex < 0 || !plan.actions.slice(0, mergeIndex).some(a => a.kind !== "pr"));
+    const check = ledger.checkPushReadiness({
+      task_id: e.task_id, repo: row.repo, branch: row.branch, checkoutDir: dir, head_sha: pin.head,
+      requireFrozenToolReview: reviewRequired,
+      requireDeploymentCi: !!plan && policy.require_ci_green_for_prod && e.target_endpoint === "prod" && !hostedCi,
+    });
+    if (!check.ready) throw Error(check.missing.join(", "));
   }
   for (const {row, pin, dir} of checkouts) {
     if (
@@ -175,7 +177,7 @@ function preflight(ledger: Ledger, e: Envelope, candidate?: ExactPlan) {
   const exact = candidate ? undefined : exactRunbook(ledger, e);
   const plan = candidate ?? exact!.plan;
   const rb = exact?.rb;
-  const {checkouts, pins} = approvedCheckouts(ledger, e);
+  const {checkouts, pins} = approvedCheckouts(ledger, e, plan);
   if (rb) checkRunbookApproval(rb, e);
   if (canonicalJson(pins) !== canonicalJson(plan.pins)) throw Error("Approved commit or remote changed");
   checkDeliveryDefinition(ledger.workbenchRoot, plan);
@@ -191,6 +193,13 @@ function preflight(ledger: Ledger, e: Envelope, candidate?: ExactPlan) {
   }
   const dirs = new Map(checkouts.map(({row, dir}) => [row.repo, dir]));
   const verifiedMerges = new Map<string, {oid: string; targetOid: string}>();
+  const confirmed = new Set(receipts(ledger, e.envelope_id).filter(r => r.status === "confirmed").map(r => r.action_index));
+  let next = plan.actions.findIndex((_, i) => !confirmed.has(i));
+  if (next < 0) next = plan.actions.length;
+  // Verify previously reached merge nodes and the entire next contiguous PR group before its handoff.
+  let limit = next;
+  while (plan.actions[limit]?.kind === "pr") limit++;
+  const reached = plan.actions.slice(0, limit);
   const waiting: string[] = [];
   const manual: string[] = [];
   for (const {row, pin, dir} of checkouts) {
@@ -208,10 +217,18 @@ function preflight(ledger: Ledger, e: Envelope, candidate?: ExactPlan) {
       if (target !== action.baseOid && !(receipt && target === action.head)) throw Error("Remote branch drifted");
       continue;
     }
-    const merges = plan.ci.filter((a) => a.repo === row.repo);
-    if (merges.length !== 1)
-      throw Error("Expected one exact CI target per attached branch; recreate the runbook");
-    const pr = merges[0];
+    const pr = plan.actions.find((a): a is PrAction => a.kind === "pr" && a.repo === row.repo);
+    if (!pr) {
+      // Older exact plans can carry a PR solely as their CI source.
+      for (const ci of plan.ci.filter(a => a.repo === row.repo)) {
+        const current = inspectPr(dir, row.branch, String(ci.number), process.env, undefined, {bin:process.env.FORGE_GH_BIN});
+        if (ci.head !== pin.head || current.url !== ci.url || current.headRefOid !== pin.head || current.baseRefName !== ci.base)
+          throw Error("Approved CI target or version drifted");
+        if (requiredChecksPending(dir, ci.url)) waiting.push("Required CI pending on " + ci.url);
+      }
+      continue;
+    }
+    if (!reached.includes(pr)) continue;
     if (prospectiveMergeTree(dir, pr.baseOid, pin.head) !== pr.tree)
       throw Error("Prospective merge tree differs from the approved tree");
     try {
@@ -242,10 +259,12 @@ function resolveFrontPlan(ledger: Ledger, e: Envelope, execute: boolean) {
   if (bound) return;
   const {checkouts, pins} = approvedCheckouts(ledger, e);
   const cfg = resolveInstance(ledger.workbenchRoot);
-  const stages = deliveryStages(cfg).filter(stage => !stage.core).map(stage => stage.id);
+  const sequence = deliveryStages(cfg);
+  const stages = sequence.filter(stage => !stage.core).map(stage => stage.id);
   const prs: {repo: string; number: number}[] = [];
   const targetBases = new Map<string,string>();
-  for (const {dir, row, pin} of checkouts) {
+  const requiresPr = cfg.delivery.value.endpoint === "pr" || sequence.some(stage => stage.core);
+  for (const {dir, row, pin} of requiresPr ? checkouts : []) {
     const origin = repoOrigin(dir);
     if (!origin || row.branch === "main" || row.branch.startsWith("-")) throw Error("Expected a feature branch in the approved repository");
     const slug = [origin.host, origin.owner, origin.repo].join("/");
@@ -577,7 +596,7 @@ export function shipCli(argv: string[]) {
         const current = envelope(ledger, id);
         if (current.status !== "ACTIVE") return state(ledger, id);
         if (current.run_token !== expectedToken) throw Error("Delivery runner changed before confirmation");
-        const {pins} = approvedCheckouts(ledger, current);
+        const {pins} = approvedCheckouts(ledger, current, plan);
         const exact = exactRunbook(ledger, current);
         checkRunbookApproval(exact.rb, current);
         if (canonicalJson(pins) !== canonicalJson(plan.pins)) throw Error("Approved checkout changed before confirmation");
@@ -619,33 +638,24 @@ export function shipCli(argv: string[]) {
                 remote: action.remote, ref: action.ref, old_sha: action.baseOid, new_sha: receipt.observation}});
             continue;
           }
-          const pr = plan.ci.find((a) => a.repo === pin.repo)!;
-          const merge = verifiedMerges.get(pin.repo);
-          if (!merge) throw Error("Missing independent remote PR merge receipt");
-          const meta = {
-            runbook_id: rb.runbook_id,
-            envelope_id: id,
-            delivery_endpoint: plan.endpoint,
-            pr_url: pr.url,
-            pr_head_oid: pr.head,
-            base_branch: pr.base,
-            merge_commit: merge.oid,
-            target_oid: merge.targetOid,
-            state: "MERGED",
+          const meta: Record<string, unknown> = {
+            runbook_id: rb.runbook_id, envelope_id: id, delivery_endpoint: plan.endpoint,
           };
-          ledger.recordEvidence({
-            task_id: current.task_id,
-            repo: pin.repo,
-            branch: pin.branch,
-            sha: pin.head,
-            kind: "pr",
-            status: "pass",
-            source: "tool",
-            actor: "tool",
-            summary: "Verified remote PR merge",
-            meta,
-          });
-          if (current.target_endpoint === "prod")
+          const pr = plan.actions.find((a): a is PrAction => a.kind === "pr" && a.repo === pin.repo);
+          if (pr) {
+            const merge = verifiedMerges.get(pin.repo);
+            if (!merge) throw Error("Missing independent remote PR merge receipt");
+            Object.assign(meta, {pr_url: pr.url, pr_head_oid: pr.head, base_branch: pr.base,
+              merge_commit: merge.oid, target_oid: merge.targetOid, state: "MERGED"});
+            ledger.recordEvidence({
+              task_id: current.task_id, repo: pin.repo, branch: pin.branch, sha: pin.head,
+              kind: "pr", status: "pass", source: "tool", actor: "tool", summary: "Verified remote PR merge",
+              meta,
+            });
+          }
+          if (current.target_endpoint === "prod") {
+            ledger.db.query("UPDATE task_repos SET head_sha=? WHERE task_id=? AND canonical_repo(repo)=canonical_repo(?) AND branch=?")
+              .run(pin.head, current.task_id, pin.repo, pin.branch);
             ledger.recordEvidence({
               task_id: current.task_id,
               repo: pin.repo,
@@ -658,6 +668,7 @@ export function shipCli(argv: string[]) {
               summary: "Confirmed exact delivery steps",
               meta: { ...meta, stage_receipts: stageReceipts },
             });
+          }
         }
         trackEvent(ledger, current, "FAST_TRACK_REDEEMED", {
           runbook_id: rb.runbook_id,

@@ -152,16 +152,15 @@ export class Repo {
       truncated: end < lines.length,
     };
   }
-  read(path: string, revision: "base" | "head", offset: number) {
+  private pinnedLines(path: string, revision: "base" | "head") {
     this.path(path);
     if (revision !== "base" && revision !== "head")
       throw new Error("Invalid revision");
     const sha = revision === "base" ? this.base : this.head;
-    const result = this.page(
-      this.git(["show", `${sha}:${path}`], false, 96 * 1024).split("\n"),
-      offset,
-    );
-    return result;
+    return this.git(["show", `${sha}:${path}`], false, 96 * 1024).split("\n");
+  }
+  read(path: string, revision: "base" | "head", offset: number) {
+    return this.page(this.pinnedLines(path, revision), offset);
   }
   trackedPaths() {
     return this.git(["ls-tree", "-r", "--name-only", "-z", this.head]).split("\0")
@@ -169,7 +168,7 @@ export class Repo {
   }
 
   private grepArgs(terms: string[], globs: string[], maxPerFile?: number) {
-    return ["grep", "-n", "-z", "-I", "-F", ...(maxPerFile ? ["-m", String(maxPerFile)] : []),
+    return ["grep", "-n", "-z", "-I", "-F", ...(maxPerFile ? ["-w", "-m", String(maxPerFile)] : []),
       ...terms.flatMap(term => ["-e", term]), this.head, "--", ...globs,
       ...Array.from(privateDirectories, dir => ":(exclude,glob)**/" + dir + "/**"),
       ":(exclude)**/.env*", ":(exclude).env*", ":(exclude)**/config.toml", ":(exclude)config.toml",
@@ -191,7 +190,7 @@ export class Repo {
   private async callerHits(terms: string[], globs: string[]) {
     // Caller snippets are sampled. Drain Git to its actual exit status even
     // when common identifiers produce many more matches than fit in a prompt.
-    const proc = Bun.spawn(["git", "-c", "core.attributesFile=/dev/null", "-C", this.root, ...this.grepArgs(terms, globs, 4)], {
+    const proc = Bun.spawn(["git", "-c", "core.attributesFile=/dev/null", "-C", this.root, ...this.grepArgs(terms, globs, 16)], {
       stdout:"pipe", stderr:"ignore", stdin:"ignore", timeout:20_000,
       env:{...snapshotGitEnv(), GIT_ATTR_SOURCE:this.head},
     });
@@ -223,59 +222,145 @@ export class Repo {
     const extensions = ["ts","tsx","js","jsx","mts","cts","mjs","cjs","go","py","rs","java","kt","swift","rb","c","cc","cpp","h","hpp"];
     const publicSource = (p: string) => extensions.includes(posix.extname(p).slice(1)) &&
       !/(^|\/)(?:\.workbench|\.agents|\.codex|\.ssh|node_modules|vendor)\//.test(p);
-    const changedPaths = new Set(this.files);
+    const delivered = new Set(Object.keys(diff));
     const changed = Object.keys(diff).filter(publicSource).slice(0, 8);
     const files: { path: string; text: string }[] = [];
     const omitted: string[] = [];
     if (!changed.length) return { revision: this.head, files, omitted };
     const paths = new Set(this.trackedPaths().filter(publicSource));
     const candidates = new Map<string, number>();
-    const names = new Set<string>();
+    const dependencies = new Map<string, Map<string, number>>();
+    const callerNames = new Map<string, number>();
     for (const file of changed) {
       const patch = diff[file] ?? "";
-      for (const m of patch.matchAll(/\b(?:function|class|interface|const|def|fn|func)\s+([A-Za-z_]\w{2,})/g))
-        if (names.size < 24) names.add(m[1]);
+      // Public declarations generally identify callers much more precisely
+      // than local variables introduced in the same function body.
+      const publicName = /\b(?:export\s+(?:async\s+)?(?:function|class|interface|type|const)|def|fn|func)\s+([A-Za-z_]\w{2,})/g;
+      const added = patch.split("\n").filter(line=>line.startsWith("+")).join("\n");
+      const removed = patch.split("\n").filter(line=>line.startsWith("-")).join("\n");
+      const oldExports = new Set([...removed.matchAll(publicName)].map(m=>m[1]));
+      const remember = (name:string, rank:number) => callerNames.set(name, Math.max(rank, callerNames.get(name) ?? 0));
+      for (const m of patch.matchAll(/\b(?:function|class|interface|const)\s+([A-Za-z_]\w{2,})/g)) remember(m[1], 1);
+      for (const m of patch.matchAll(publicName)) remember(m[1], 2);
+      for (const m of added.matchAll(publicName)) remember(m[1], oldExports.has(m[1]) ? 3 : 4);
       const stem = posix.parse(file).name;
-      if (/^[a-zA-Z_]\w{2,}$/.test(stem) && !["index","main","mod"].includes(stem)) names.add(stem);
+      if (/^[a-zA-Z_]\w{2,}$/.test(stem) && !["index","main","mod"].includes(stem)) remember(stem, 1);
       if (!paths.has(file)) continue;
       let header = "";
       try { header = this.read(file, "head", 0).text; } catch { omitted.push(file); }
+      const source = header.replace(/^\d+: /gm, "") + "\n" + patch.replace(/^[+ -]/gm, "");
+      const references = patchReferences(patch);
+      const bindings = new Map<string, Map<string,string>>();
+      for (const [, names, specifier] of source.matchAll(/\bimport\s+(?:type\s+)?\{([^{};"']+)\}\s*from\s*["']([^"']+)["']/g)) {
+        const bound = bindings.get(specifier) ?? new Map<string,string>();
+        for (const field of names.split(",")) {
+          const pair = /^(?:type\s+)?(\w+)(?:\s+as\s+(\w+))?$/.exec(field.trim());
+          if (pair) bound.set(pair[1], pair[2] ?? pair[1]);
+        }
+        bindings.set(specifier,bound);
+      }
       for (const m of (header + "\n" + patch).matchAll(/["'](\.\.?\/[^"'\s]+)["']/g)) {
         const target = posix.join(posix.dirname(file), m[1]);
         // TS sources commonly refer to a .js module in their emitted imports.
         const stem = target.replace(/\.[cm]?js$/, "");
         const dep = [target, ...["ts","tsx","js","jsx","mts","cts","mjs","cjs","py","rs"].flatMap(
           ext => [stem + "." + ext, posix.join(stem, "index." + ext)])].find(p => paths.has(p));
-        if (dep && !changedPaths.has(dep) && candidates.size < 6) candidates.set(dep, 0);
+        if (!dep || delivered.has(dep)) continue;
+        const symbols = dependencies.get(dep) ?? new Map<string, number>();
+        const bound = bindings.get(m[1]);
+        if (bound) {
+          for (const [original,local] of bound) symbols.set(original, Math.max(symbols.get(original) ?? 0, references.get(local) ?? 0));
+        } else {
+          for (const [name, weight] of references) symbols.set(name, Math.max(symbols.get(name) ?? 0, weight));
+        }
+        dependencies.set(dep, symbols);
+
       }
     }
-    const hits = names.size ? await this.callerHits([...names], extensions.map(ext => "*." + ext)) : [];
-    const importLine = (text: string) => /^\s*(?:import\b|from\b.*\bimport\b|(?:const|let|var)\b.*\brequire\s*\()/.test(text);
-    // Prefer the call site to its import when the two are far apart.
-    hits.sort((a, b) => Number(importLine(a.text)) - Number(importLine(b.text)));
+    const modified = new Set(this.files);
+    const relevance = (refs:Map<string,number>) => Math.max(0, ...refs.values());
+    const rankedDeps = [...dependencies].sort(([pa,a],[pb,b]) => relevance(b) - relevance(a) || Number(modified.has(pb)) - Number(modified.has(pa)));
+    for (const [path] of rankedDeps.slice(0,6)) candidates.set(path, 0);
+
+    const names = [...callerNames].sort((a,b) => b[1] - a[1]).slice(0,24);
+    const exported = names.filter(([,rank])=>rank >= 2);
+    const hits = names.length ? await this.callerHits((exported.length ? exported : names).map(([name])=>name), extensions.map(ext => "*." + ext)) : [];
+    // Prefer calls to a changed declaration over imports and incidental text.
+    const callRank = (line:string) => {
+      let rank = 0;
+      for (const [,name] of line.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) rank = Math.max(rank,callerNames.get(name) ?? 0);
+      return rank;
+    };
+    hits.sort((a, b) => callRank(b.text) - callRank(a.text) || Number(modified.has(b.path)) - Number(modified.has(a.path)));
     for (const hit of hits) {
-      if (!paths.has(hit.path) || changedPaths.has(hit.path) || candidates.has(hit.path)) continue;
-      candidates.set(hit.path, Math.max(0, hit.line - 10));
+      if (!paths.has(hit.path) || delivered.has(hit.path) || candidates.has(hit.path)) continue;
+      candidates.set(hit.path, hit.line - 1);
       if (candidates.size >= 12) break;
     }
     for (const [path, offset] of candidates) {
-      // Up to 4 KiB per excerpt, 12 files total. Keep complete numbered lines.
-      let text: string;
-      try { text = this.read(path, "head", offset).text; }
-      catch { omitted.push(path); continue; }
-      const lines: string[] = [];
-      let bytes = 0;
-      for (const line of text.split("\n")) {
-        bytes += Buffer.byteLength(line) + 1;
-        if (bytes > 4096) break;
-        lines.push(line);
-      }
-      if (lines.length) files.push({path, text: lines.join("\n")});
-      else omitted.push(path);
+      try {
+        const lines = this.pinnedLines(path, "head");
+        const definitions: { anchor:number; weight:number }[] = [];
+        const references = dependencies.get(path);
+        if (references) {
+          for (const [i, line] of lines.entries()) {
+            const declaration = /\b(?:function|class|interface|const|let|var|type|enum|struct|trait|def|fn|func)\s+([A-Za-z_]\w*)/.exec(line);
+            const weight = declaration ? references.get(declaration[1]) ?? 0 : 0;
+            if (weight) definitions.push({anchor:i, weight});
+          }
+        }
+        definitions.sort((a,b) => b.weight - a.weight);
+        const anchors = definitions.length ? definitions.filter(d=>d.weight === definitions[0].weight).slice(0,8).map(d=>d.anchor) : [offset];
+        const cap = Math.floor(4096/anchors.length) - 1;
+        const text = anchors.map(anchor=>contextExcerpt(lines,anchor,cap)).filter(Boolean).join("\n");
+        if (text) files.push({path, text});
+        else omitted.push(path);
+      } catch { omitted.push(path); }
     }
     return { revision: this.head, files, omitted };
   }
 
+}
+
+// Prefer symbols invoked by added lines, then calls in surrounding patch
+// context.
+function patchReferences(patch: string) {
+  const names = new Map<string, number>();
+  for (const line of patch.split("\n")) {
+    if (!/^[+ -]/.test(line) || /^(?:\+\+\+|---)/.test(line)) continue;
+    for (const match of line.matchAll(/\b([A-Za-z_]\w*)\b(\s*\()?/g)) {
+      const rank = 1 + Number(line.startsWith("+")) + (match[2] ? 2 : 0);
+      names.set(match[1], Math.max(rank, names.get(match[1]) ?? 0));
+    }
+  }
+  // A newly added named import is stronger evidence than an incidental
+  // existing call in a large hunk. Multiline imports often use one name per line.
+  for (const [, name] of patch.matchAll(/^\+\s*([A-Za-z_]\w*)\s*(?:as\s+\w+)?\s*,\s*$/gm)) {
+    if ((names.get(name) ?? 0) > 2) names.set(name, 5);
+  }
+  return names;
+}
+
+function contextExcerpt(lines: string[], anchor: number, limit: number) {
+  if (anchor >= lines.length) return "";
+  const numbered = (i: number) => (i + 1) + ": " + lines[i];
+  const excerpt = [numbered(anchor)];
+  let bytes = Buffer.byteLength(excerpt[0]);
+  if (bytes > limit) return "";
+  // Keep the anchor visible even when preceding source lines are very long.
+  for (let i = anchor - 1; i >= Math.max(0, anchor - 8); i--) {
+    const line = numbered(i), size = Buffer.byteLength(line) + 1;
+    if (bytes + size > limit / 2) break;
+    excerpt.unshift(line);
+    bytes += size;
+  }
+  for (let i = anchor + 1; i < lines.length && excerpt.length < 160; i++) {
+    const line = numbered(i), size = Buffer.byteLength(line) + 1;
+    if (bytes + size > limit) break;
+    excerpt.push(line);
+    bytes += size;
+  }
+  return excerpt.join("\n");
 }
 
 function isInstructionFile(path: string) {

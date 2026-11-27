@@ -241,9 +241,10 @@ export function buildPlan(
     const pr = actions.prs.find((p) => p.repo === pin.repo);
     if (!pr && (coreShip || cfg.delivery.value.endpoint === "pr"))
       throw Error("Register the exact PR for " + pin.repo);
+    if (!pr) continue;
     const row = ledger.getTaskRepos(task).find((r) => r.repo === pin.repo && r.branch === pin.branch)!;
     const { dir } = resolveTaskCheckout(ledger.workbenchRoot, row);
-    const data = inspectPr(dir, pin.branch, pr ? String(pr.number) : undefined, process.env, undefined, {
+    const data = inspectPr(dir, pin.branch, String(pr.number), process.env, undefined, {
       baseOid: true,
       bin: process.env.FORGE_GH_BIN,
     });
@@ -260,7 +261,7 @@ export function buildPlan(
       tree: prospectiveMergeTree(dir, data.baseRefOid, pin.head),
     };
     ci.push(check);
-    if (pr) items.push(check);
+    items.push(check);
   }
   for (const tag of actions.tags) {
     if (

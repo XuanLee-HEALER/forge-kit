@@ -169,6 +169,7 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const init = run(forge, ["init", bench]);
     expect(init.exitCode, init.stderr.toString()).toBe(0);
     const skills = readdirSync(join(bench, ".agents/skills"));
+    expect(JSON.parse(readFileSync(join(bench, ".workbench/env/environments.example.json"), "utf8"))).not.toHaveProperty("fat");
     const retired = ["form-ux", "dbop", "comm-lark", "work-communication"];
     for (const name of retired) expect(skills).not.toContain(name);
     for (const path of ["AGENTS.md", ...skills.map((name) => `.agents/skills/${name}/SKILL.md`)]) {
@@ -266,7 +267,8 @@ describe("forge CLI: init / add-repo / sync / doctor", () => {
     const policy = join(root, ".workbench/ship-policy.yaml");
     const defaults = readFileSync(join(kit, "templates/ship-policy.yaml"), "utf8");
     expect(readFileSync(policy, "utf8")).toBe(defaults);
-    const custom = defaults.replace("enabled: true", "enabled: false");
+    expect(defaults).not.toContain("max_steward_rounds");
+    const custom = defaults.replace("enabled: true", "enabled: false\n  max_steward_rounds: 3");
     writeFileSync(policy, custom);
     const agents = join(root, "AGENTS.md"),
       skill = join(root, ".agents/skills/ship/SKILL.md"),

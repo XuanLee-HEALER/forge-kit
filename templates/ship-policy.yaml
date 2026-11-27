@@ -6,7 +6,6 @@ fast_track:
   forbid_db_rw: true
   max_files_changed: 25
   max_lines_changed: 800
-  max_steward_rounds: 3
   default_ttl_minutes: 240
   require_independent_review: true
   require_ci_green_for_prod: true

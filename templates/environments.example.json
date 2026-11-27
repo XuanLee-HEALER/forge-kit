@@ -8,15 +8,6 @@
     "database": "app_dev",
     "sslmode": "disable"
   },
-  "fat": {
-    "engine": "postgres",
-    "host": "db-fat.example.internal",
-    "port": 5432,
-    "user": "fat_user",
-    "password": "CHANGE_ME",
-    "database": "app_fat",
-    "sslmode": "disable"
-  },
   "prod": {
     "engine": "postgres",
     "host": "db-prod.example.internal",

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
+import { historicalV050Kit } from "./helpers/v050-kit";
 import { sandbox, type Sandbox } from "./v05-sandbox";
 
 let s: Sandbox;
@@ -27,7 +28,7 @@ for (const update of (await Bun.stdin.text()).trim().split("\\n")) {
   return {gate};
 }
 
-function preparePullRequest(track: "full" | "targeted" = "full", defect = false, endpoint = "pr", early?: "deliver" | "revoke" | "outside" | "oversize") {
+function preparePullRequest(track: "full" | "targeted" = "full", defect = false, endpoint = "pr", early?: "deliver" | "revoke" | "outside" | "oversize" | "deploy-only", availablePr = true) {
   s.fresh();
   const repo = join(s.work, "app");
   const bare = join(s.root, "remote.git");
@@ -47,7 +48,7 @@ function preparePullRequest(track: "full" | "targeted" = "full", defect = false,
   const base = commit("example.test.ts", 'import {expect,test} from "bun:test"; import {message} from "./src/feature"; test("ready output", ()=>expect(message.toLowerCase()).toBe("ready"));\n');
   s.git(s.root, "init", "--bare", "-b", "main", bare);
   // Preserve hosted identity for the forge CLI while restricting every Git push to the bare fixture.
-  git("remote", "add", "origin", "ssh://git@forge.example.test:8443/fixture/app.git");
+  git("remote", "add", "origin", availablePr ? "ssh://git@forge.example.test:8443/fixture/app.git" : bare);
   git("push", bare, "main");
   git("switch", "-c", "feature-fixture");
   const config = join(s.work, ".workbench/workbench.yaml");
@@ -75,7 +76,7 @@ function preparePullRequest(track: "full" | "targeted" = "full", defect = false,
   if (early) {
     enableRollout();
     configureStage("success", "approved-head", base, endpoint, "rollout");
-    includeHostedPr();
+    if (early !== "deploy-only") includeHostedPr();
     const plan = JSON.parse(ledger("fast-track","prepare","ship-task","--to",endpoint,"--paths","src/**"));
     approvalId = plan.envelope_id;
     expect(plan.approval).toBe("快轨批准 " + approvalId);
@@ -106,7 +107,7 @@ esac
   const ci = join(s.root, "ci-result");
   const calls = join(s.root, "host-effects");
   writeFileSync(calls, "");
-  writeFileSync(early ? state+".draft" : state, JSON.stringify(pr));
+  if (availablePr) writeFileSync(early ? state+".draft" : state, JSON.stringify(pr));
   writeFileSync(ci, "pass");
   Object.assign(s.env, {FORGE_SESSION_ID: "operator", FORGE_WORKBENCH_ROOT: s.work, PR_STATE: state, CI_STATE: ci,
     TARGET_GIT: bare, TARGET_LOG: calls});
@@ -121,12 +122,12 @@ esac
   writeFileSync(join(s.bin, "gh"), `#!/usr/bin/env bun
 import {appendFileSync,readFileSync} from "node:fs";
 const args = process.argv.slice(2);
+appendFileSync(process.env.TARGET_LOG+".requests",JSON.stringify(args)+"\\n");
 const selector = args[2] ?? "";
 const file = args[0] === "pr" && /(?:^|\\/)2$/.test(selector) ? process.env.PR_STATE+"-2" : process.env.PR_STATE;
 const published = await Bun.file(file).exists();
 const pr = await Bun.file(published ? file : file+".draft").json();
 const ref = (name) => Bun.spawnSync(["git", "-C", process.env.TARGET_GIT, "rev-parse", "refs/heads/"+name]).stdout.toString().trim();
-appendFileSync(process.env.TARGET_LOG+".requests",JSON.stringify(args)+"\\n");
 if (args[0] === "api" && args.some(arg => arg.includes("/git/commits/"))) {
   const oid=args.find(arg => arg.includes("/git/commits/")).split("/").at(-1);
   if (args.at(-1)!=='[.tree.sha, .parents[].sha] | join(" ")') process.exit(2);
@@ -175,7 +176,7 @@ await Bun.write(args[args.indexOf("-o")+1],JSON.stringify({status:"pass",summary
     "--", "bun", ...(kind === "test" ? ["test"] : ["run", "check"])]);
   s.ok([s.forge, "review", "--task", "ship-task", "--repo", "app", "--cwd", repo, "--base", taskBase, "--head", head,
     "--roles", "quality", "--mode", "serial"]);
-  if (!early) ledger("pr-sync", "ship-task", "--repo", "app", "--branch", "feature-fixture", "--pr", "1");
+  if (!early && availablePr) ledger("pr-sync", "ship-task", "--repo", "app", "--branch", "feature-fixture", "--pr", "1");
   return {ledger, repo, head, base, taskBase, bare, state, ci, calls, approvalId};
 }
 
@@ -236,10 +237,11 @@ function enableRollout() {
   writeFileSync(policy, stringify(policyDoc));
 }
 
-function includeHostedPr() {
+function includeHostedPr(beforeRollout = true) {
   const cfgPath = join(s.work, ".workbench/workbench.yaml");
   const cfg = parse(readFileSync(cfgPath,"utf8"));
-  cfg.extensions.delivery.stages.unshift("ship");
+  if (beforeRollout) cfg.extensions.delivery.stages.unshift("ship");
+  else cfg.extensions.delivery.stages.push("ship");
   writeFileSync(cfgPath,stringify(cfg));
 }
 
@@ -250,9 +252,9 @@ function operatorMerge(f: {head:string}) {
   finally { delete s.env.FIXTURE_HUMAN_MERGE; }
 }
 
-function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "prod" : "pr", includeMerge=true) {
+function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "prod" : "pr", includeMerge=true, availablePr=true, rolloutFirst=false) {
   const rolloutEndpoint = taskEndpoint === "blue-rollout" ? taskEndpoint : "prod";
-  const prepared = preparePullRequest("full", false, taskEndpoint);
+  const prepared = preparePullRequest("full", false, taskEndpoint, undefined, availablePr);
   const {ledger} = prepared;
   const receipt = join(s.work, "stage-effects");
   const stageFile = join(s.work, "release-stage.ts");
@@ -262,7 +264,7 @@ function delivery(localRollout?: RolloutMode, taskEndpoint = localRollout ? "pro
   enableRollout();
   if (localRollout) {
     configureStage(localRollout, prepared.head, prepared.base, rolloutEndpoint, "rollout");
-    if (includeMerge) includeHostedPr();
+    if (includeMerge) includeHostedPr(!rolloutFirst);
   }
   const book = JSON.parse(ledger("runbook", "create", "--exact", "--task", "ship-task", "--title", "local target",
     ...(includeMerge ? ["--pr","app:1"] : []), ...(localRollout ? ["--stage", "rollout"] : [])));
@@ -654,25 +656,40 @@ test("T11 a head-only hosted API leaves the open PR and following rollout for th
   expect(readFileSync(f.calls,"utf8")).toBe("");
 },90_000);
 
-for (const registerPr of [true,false]) test("An untrusted ship stage cannot merge an open PR, explicit PR: " + registerPr, () => {
+test("A private deployment stage named ship executes only the approved deployment node", () => {
   const f = preparePullRequest("full",false,"prod");
   enableRollout();
   configureStage("success",f.head,f.base,"prod","ship");
-  const book = JSON.parse(f.ledger("runbook","create","--exact","--task","ship-task","--title","ordinary rollout",
-    "--stage","ship",...(registerPr ? ["--pr","app:1"] : [])));
+  const book = JSON.parse(f.ledger("runbook","create","--exact","--task","ship-task","--title","ordinary rollout","--stage","ship"));
   const plan = JSON.parse(f.ledger("fast-track","prepare","ship-task","--to","prod","--paths","src/**","--runbook",book.runbook_id));
   s.hook("UserPromptSubmit",{session_id:"operator",prompt:plan.approval});
-  const result = s.run([s.forge,"ship","run","--envelope",plan.envelope_id]);
-  expect(result.code).not.toBe(0);
-  expect(result.out+result.err).toMatch(/manual|operator/i);
-  expect(existsSync(join(s.work,"stage-effects"))).toBe(false);
-  expect(existsSync(f.calls+".transport")).toBe(false);
-  expect(readFileSync(f.calls,"utf8")).toBe("");
-  expect(s.git(f.bare,"rev-parse","main").trim()).toBe(f.base);
-  operatorMerge(f);
-  expect(JSON.parse(s.ok([s.forge,"ship","run","--envelope",plan.envelope_id])).status).toBe("REDEEMED");
+  const run = JSON.parse(s.ok([s.forge,"ship","run","--envelope",plan.envelope_id]));
+  expect(run.status).toBe("REDEEMED");
   expect(s.read("stage-effects")).toBe(f.head+"\n");
-  expect(readFileSync(f.calls,"utf8")).toBe("merge "+f.head+"\n");
+  expect(readFileSync(f.calls,"utf8")).toBe("");
+  expect(JSON.parse(readFileSync(f.state,"utf8")).state).toBe("OPEN");
+  expect(s.git(f.bare,"rev-parse","main").trim()).toBe(f.base);
+},90_000);
+
+test("Deploy before the merge node, then resume without redeploying after the operator merge", () => {
+  const f = delivery("success","prod",true,true,true);
+  f.approve();
+  for (let attempt=0; attempt<2; attempt++) {
+    const wait = s.run(f.shipArgs);
+    expect(wait.code).not.toBe(0);
+    const report = JSON.parse(wait.out);
+    expect(report.reason.message).toContain("Manual merge");
+    expect(report.receipts.filter((r:{status:string})=>r.status==="confirmed")).toMatchObject([{action_index:0}]);
+    expect(s.read("stage-effects")).toBe(f.head+"\n");
+    expect(s.git(f.bare,"rev-parse","main").trim()).toBe(f.base);
+    expect(readFileSync(f.calls,"utf8")).toBe("");
+  }
+  operatorMerge(f);
+  const complete = JSON.parse(s.ok(f.shipArgs));
+  expect(complete.status).toBe("REDEEMED");
+  expect(complete.receipts.map((r:{status:string})=>r.status)).toEqual(["confirmed","confirmed"]);
+  expect(s.read("stage-effects")).toBe(f.head+"\n");
+  expect(s.git(f.bare,"rev-parse","main").trim()).toBe(f.head);
 },90_000);
 
 test("A private ship definition at the PR endpoint cannot submit before or after the human merge", () => {
@@ -1006,23 +1023,100 @@ test("T11 failed observer after submission degrades once with a sanitized diagno
   }
 },90_000);
 
-for (const endpoint of ["prod", "blue-rollout"]) test("T11 a stage-only rollout checks current stages before closing " + endpoint, () => {
-  const f=delivery("success",endpoint,false);
+function checkDeploymentOnly(f: ReturnType<typeof preparePullRequest>, envelope: string, stage: string) {
+  const events = JSON.parse(f.ledger("query","--q","prod OR pr","--repo","app","--json")).events
+    .map((ev:{payload_json:string})=>JSON.parse(ev.payload_json))
+    .filter((ev:{meta?:{envelope_id?:string}})=>ev.meta?.envelope_id === envelope);
+  expect(events.filter((ev:{kind:string})=>ev.kind==="pr")).toHaveLength(0);
+  const deployment = events.filter((ev:{kind:string})=>ev.kind==="prod");
+  expect(deployment).toHaveLength(1);
+  expect(deployment[0].meta.stage_receipts).toMatchObject([{stage,state:"completed",versions:[{repo:"app",head:f.head}]}]);
+  for (const key of ["pr_url","pr_head_oid","base_branch","merge_commit","target_oid","state"])
+    expect(deployment[0].meta).not.toHaveProperty(key);
+  expect(s.read("stage-effects")).toBe(f.head+"\n");
+  expect(s.git(f.bare,"rev-parse","main").trim()).toBe(f.base);
+  expect(readFileSync(f.calls,"utf8")).toBe("");
+  expect(existsSync(f.calls+".transport")).toBe(false);
+}
+
+test("Pre-code deployment approval can reach its target without a PR or hosted repository", () => {
+  const f = preparePullRequest("full",false,"prod","deploy-only",false);
+  const id = f.approvalId!;
+  const args = [s.forge,"ship","run","--envelope",id];
+  expect(JSON.parse(s.ok(args)).status).toBe("REDEEMED");
+  expect(JSON.parse(s.ok(args)).status).toBe("REDEEMED");
+  expect(existsSync(f.calls+".requests")).toBe(false);
+  expect(existsSync(f.state)).toBe(false);
+  checkDeploymentOnly(f,id,"rollout");
+},90_000);
+
+for (const fault of ["head","checks","none"]) test("Previously approved deployment with a CI-only PR: " + fault, () => {
+  const f = preparePullRequest("full",false,"prod");
+  s.privateFile(".workbench/workbench.yaml",stringify({name:"historical fixture",repos:["app"]}));
+  configureStage("success",f.head,f.base,"prod","rollout");
+  const old = historicalV050Kit(s);
+  s.env.FORGE_MODELS_TOML = join(old,"templates/models.toml");
+  s.privateFile(".workbench/ship-policy.yaml",readFileSync(join(old,"templates/ship-policy.yaml"),"utf8"));
+  // Switch the disposable runner, including its installed approval hook, across the authorization boundary.
+  const runner = join(s.work,".workbench/bin/cli.js");
+  const current = readFileSync(runner);
+  let id: string;
+  try {
+    writeFileSync(runner,readFileSync(join(old,"dist/cli.js")));
+    const book = JSON.parse(f.ledger("runbook","create","--exact","--task","ship-task","--title","deploy verified head","--stage","rollout"));
+    expect(book.actions.exact.actions.map((a:{kind:string})=>a.kind)).toEqual(["stage"]);
+    expect(book.actions.exact.ci).toMatchObject([{url:JSON.parse(readFileSync(f.state,"utf8")).url,head:f.head}]);
+    const envelope = JSON.parse(f.ledger("fast-track","prepare","ship-task","--to","prod","--paths","src/**","--runbook",book.runbook_id));
+    s.hook("UserPromptSubmit",{session_id:"operator",prompt:envelope.approval});
+    id = envelope.envelope_id;
+    expect(JSON.parse(f.ledger("fast-track","status",id))[0].status).toBe("ACTIVE");
+  } finally {
+    writeFileSync(runner,current);
+  }
+  if (fault === "head") writeFileSync(f.state,JSON.stringify({...JSON.parse(readFileSync(f.state,"utf8")),headRefOid:f.base}));
+  if (fault === "checks") writeFileSync(f.ci,"fail");
+  const result = s.run([s.forge,"ship","run","--envelope",id]);
+  expect(result.code===0,result.out+result.err).toBe(fault === "none");
+  if (fault === "none") checkDeploymentOnly(f,id,"rollout");
+  else {
+    expect(result.out+result.err).toMatch(fault==="head" ? /head|version|revision/i : /check|CI/i);
+    expect(JSON.parse(result.out).receipts.filter((r:{status:string})=>r.status==="confirmed")).toEqual([]);
+    expect(existsSync(join(s.work,"stage-effects"))).toBe(false);
+  }
+  expect(readFileSync(f.calls,"utf8")).toBe("");
+  expect(s.git(f.bare,"rev-parse","main").trim()).toBe(f.base);
+},90_000);
+
+test("A deployment without a PR stops when the target reports the wrong revision", () => {
+  const f = delivery("wrong-version","prod",false,false);
   f.approve();
-  const handoff = s.run(f.shipArgs);
-  expect(handoff.code).not.toBe(0);
-  expect(handoff.out+handoff.err).toContain("Manual merge");
-  expect(existsSync(f.receipt)).toBe(false);
-  operatorMerge(f);
+  const result = s.run(f.shipArgs);
+  expect(result.code).not.toBe(0);
+  const report = JSON.parse(result.out);
+  expect(report.status).toBe("DEGRADED");
+  expect(report.receipts.filter((r:{status:string})=>r.status==="confirmed")).toHaveLength(0);
+  expect(JSON.parse(s.read("deployment-target.json")).versions).toEqual([{repo:"app",head:f.base}]);
+  expect(existsSync(f.calls+".requests")).toBe(false);
+  expect(readFileSync(f.calls,"utf8")).toBe("");
+  expect(s.git(f.bare,"rev-parse","main").trim()).toBe(f.base);
+},90_000);
+
+for (const endpoint of ["prod","blue-rollout"]) test("T11 independent deployment verifies current stages before closing " + endpoint, () => {
+  const openPr = endpoint === "prod";
+  const f=delivery("success",endpoint,false,openPr);
+  f.approve();
   const run = JSON.parse(s.ok(f.shipArgs));
   expect(run.status).toBe("REDEEMED");
   expect(run.receipts).toHaveLength(1);
-  const events=JSON.parse(f.ledger("query","--q","prod","--repo","app","--json")).events;
-  const evidence=events.map((event:{payload_json:string})=>JSON.parse(event.payload_json)).find((p:{kind:string})=>p.kind==="prod");
-  expect(evidence.meta.stage_receipts[0]).toMatchObject({stage:"rollout",state:"completed",versions:[{repo:"app",head:f.head}]});
-  expect(evidence.meta).toMatchObject({state:"MERGED",base_branch:"main",pr_head_oid:f.head,merge_commit:f.head,target_oid:f.head});
-  expect(JSON.parse(readFileSync(f.state,"utf8")).state).toBe("MERGED");
-  expect(s.git(f.bare,"rev-parse","refs/heads/main").trim()).toBe(f.head);
+  expect(JSON.parse(s.ok(f.shipArgs)).receipts).toEqual(run.receipts);
+  checkDeploymentOnly(f,f.envelope,"rollout");
+  if (openPr) expect(JSON.parse(readFileSync(f.state,"utf8")).state).toBe("OPEN");
+  else {
+    expect(existsSync(f.calls+".requests")).toBe(false);
+    expect(existsSync(f.state)).toBe(false);
+    s.git(f.repo,"switch","--detach",f.head);
+    s.git(f.repo,"branch","-d","feature-fixture");
+  }
   const file = join(s.work, ".workbench/workbench.yaml");
   const original = readFileSync(file, "utf8");
   const cfg = parse(original);

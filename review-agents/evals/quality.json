@@ -33,7 +33,7 @@
     "line": 1,
     "concepts": [
       "indexof|nested (?:scan|loop)|repeated (?:linear )?scan|重复扫描|嵌套",
-      "quadratic|\\bo\\(\\s*n\\s*(?:\\^\\s*2|²|\\*\\s*n)\\s*\\)|each (?:element|id)|every (?:element|id)|per (?:element|id)|平方|二次复杂度|每个元素"
+      "quadratic|\\bo\\(\\s*n\\s*(?:\\^\\s*2|²|\\*\\s*n)\\s*\\)|each (?:element|id)|every (?:element|id)|per (?:element|id)|5,000,050,000 comparisons|平方|二次复杂度|每个元素"
     ]
   },
   {

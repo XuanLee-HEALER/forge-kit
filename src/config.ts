@@ -403,7 +403,6 @@ export interface ShipPolicy {
   forbid_db_rw: boolean;
   max_files_changed: number;
   max_lines_changed: number;
-  max_steward_rounds: number;
   default_ttl_minutes: number;
   require_independent_review: boolean;
   require_ci_green_for_prod: boolean;
@@ -432,7 +431,8 @@ export function loadShipPolicy(root: string) {
     "require_independent_review",
     "require_ci_green_for_prod",
   ];
-  const limits = ["max_files_changed", "max_lines_changed", "max_steward_rounds", "default_ttl_minutes"];
+  const limits = ["max_files_changed", "max_lines_changed", "default_ttl_minutes"];
+  if ("max_steward_rounds" in policy) limits.push("max_steward_rounds"); // Previously required in installed policies.
   const keys = [...bools, ...limits, "max_endpoint", "forbidden_paths"];
   if (
     Object.keys(policy).some((k) => !keys.includes(k)) ||

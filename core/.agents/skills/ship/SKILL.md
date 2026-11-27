@@ -26,7 +26,7 @@ description: 将已验证的版本交付到授权终点，核验回执并关账�
 
 规格冻结后可立即运行 `forge ledger fast-track prepare <task-id> --to <endpoint> --paths <globs>`，将任务、冻结摘要、仓库、路径、规模上限及有序交付阶段展示给批准人。后期已有精确动作时可另传 `--runbook <rb-id>`。操作者在主会话单独发送 `快轨批准 <ft-id>`。同一会话可单独发送 `快轨撤销 <ft-id>` 撤销 ACTIVE 授权。PENDING 授权可用 revoke 撤销。
 
-按任务 base_sha..HEAD 校验范围，按最终冻结测试锁和待交付版本核验评审、验证与 CI。自动合并须由内建原语在目标事务内校验固定 base、head 和分支策略。发布工作分支和创建 PR 由普通 PR 流程按其授权执行。GitHub 快轨在首次外部写入前移交操作者，列出待准备的 PR 或待合并版本。人工合并后独立读取远端回执，再继续已批准的部署阶段。实例覆盖 ship 时同样执行此检查。受控分支直推使用绑定远端、分支、旧值和新值的精确快进单，保护分支还须实例显式许可。写后独立读取远端 SHA。
+按任务 base_sha..HEAD 校验范围，按最终冻结测试锁和待交付版本核验评审、验证与 CI。自动合并须由内建原语在目标事务内校验固定 base、head 和分支策略。发布工作分支和创建 PR 由普通 PR 流程按其授权执行。流程到达 GitHub 合并节点时，列出待合并版本并移交人工。核对合并结果后继续按项目声明的顺序执行。部署节点的批准只覆盖指定环境、动作与版本，main PR 始终由人工合并。实例覆盖 ship 时同样执行此检查。受控分支直推使用绑定远端、分支、旧值和新值的精确快进单，保护分支还须实例显式许可。写后独立读取远端 SHA。
 
 在同一获批会话运行 `forge ship evaluate --envelope <ft-id>` 后用 `forge ship run --envelope <ft-id>` 兑现。每一步核对策略、时效、冻结范围、版本、CI、评审与外部状态。前置授权在已批准边界内解析最终版本和资源。每次写入前重新核验，遇越界、漂移或无法核验的目标即停止。重试前读取逐项回执，外部结果不确定时交还人工核实。存量授权缺精确绑定时重新登记并批准。
 
@@ -45,7 +45,7 @@ stages:
 delivery: {endpoint: rollout, stages: [ship, rollout]}
 ```
 
-两个程序接收相同的 `FORGE_ACTION_ID`、`FORGE_ENDPOINT`、`FORGE_ACTIVE_STAGE` 与 `FORGE_APPROVED_HEADS`。执行器独立核对人工合并的 PR、base、head 和合并结果后，才启动已批准的部署程序。`FORGE_APPROVED_HEADS` 是按仓排列的 `[{repo,head}]`。提交程序使用动作 ID 标记目标作业。观察程序通过只读凭据查询目标端的实际作业、部署版本与终点，在标准输出返回 JSON。例如：
+两个程序接收相同的 `FORGE_ACTION_ID`、`FORGE_ENDPOINT`、`FORGE_ACTIVE_STAGE` 与 `FORGE_APPROVED_HEADS`。独立部署直接执行获批动作，并核对目标侧部署回执。项目使用合并事件触发部署时，按该项目配置先核对合并结果，再观察部署状态。`FORGE_APPROVED_HEADS` 是按仓排列的 `[{repo,head}]`。提交程序使用动作 ID 标记目标作业。观察程序通过只读凭据查询目标端的实际作业、部署版本与终点，在标准输出返回 JSON。例如：
 
 ```json
 {"state":"completed","action_id":"ft-123/1","endpoint":"rollout","versions":[{"repo":"api","head":"0123456789abcdef0123456789abcdef01234567"}]}

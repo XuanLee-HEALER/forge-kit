@@ -16,10 +16,10 @@ import { isAbsolute, join, relative, resolve } from "node:path";
 import { matchesGlob, sha256File } from "../shared/path";
 
 export const SPEC_AMEND_STALE_MAP: Record<SpecAmendScope, string[]> = {
-  requirement: ["ssot", "tech_spec", "test_spec", "lint", "test", "review", "fat"],
-  invariant: ["tech_spec", "test_spec", "lint", "test", "review", "fat"],
-  tech_spec: ["lint", "test", "review", "fat"],
-  test_spec: ["test", "fat"],
+  requirement: ["ssot", "tech_spec", "test_spec", "lint", "test", "review"],
+  invariant: ["tech_spec", "test_spec", "lint", "test", "review"],
+  tech_spec: ["lint", "test", "review"],
+  test_spec: ["test"],
 };
 
 const VALID_SPEC_AMEND_SCOPES = new Set<string>([
@@ -288,7 +288,7 @@ export function amendSpec(ledger: LedgerReader, params: {
     const payload: SpecAmendedPayload = {
       scope: params.scope,
       reason: params.reason.trim(),
-      stale_stages: [...SPEC_AMEND_STALE_MAP[params.scope]],
+      stale_stages: usesV05(ledger, params.task_id) ? [...SPEC_AMEND_STALE_MAP[params.scope]] : [...SPEC_AMEND_STALE_MAP[params.scope], "fat"],
     };
     return appendEventInTx(ledger.db, {
       task_id: params.task_id,

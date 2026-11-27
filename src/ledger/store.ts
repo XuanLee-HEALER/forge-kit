@@ -885,6 +885,7 @@ export class Ledger {
     checkEndpoint?: boolean;
     /** Apply the v0.4 fast-track policy to this exact branch, SHA and freeze. */
     requireFrozenToolReview?: boolean;
+    requireDeploymentCi?: boolean;
   }): {
     ready: boolean;
     missing: string[];
@@ -894,7 +895,7 @@ export class Ledger {
     return this.checkReadiness(params, false);
   }
 
-  private checkReadiness(params: { task_id: string; repo: string; head_sha: string; branch?: string; checkoutDir?: string; checkEndpoint?: boolean; requireFrozenToolReview?: boolean }, closing: boolean) {
+  private checkReadiness(params: { task_id: string; repo: string; head_sha: string; branch?: string; checkoutDir?: string; checkEndpoint?: boolean; requireFrozenToolReview?: boolean; requireDeploymentCi?: boolean }, closing: boolean) {
     const task = this.getTask(params.task_id);
     if (!task) {
       return {
@@ -1157,6 +1158,13 @@ export class Ledger {
       );
     }
 
+    if (params.requireDeploymentCi && latestByKind.get("verify") !== "pass" &&
+        !(latestByKind.get("lint") === "pass" &&
+          (latestByKind.get("test") === "pass" || latestByKind.get("hurl") === "pass"))) {
+      missing.push("Production CI requires passing configured verification or static and executed test receipts for " +
+        params.repo + "@" + params.head_sha);
+    }
+
     if (incompleteRoles.size > 0) {
       hasExplicitFailure = true;
       missing.push(`Selected review incomplete (${[...incompleteRoles].join(", ")}) for ${params.repo}@${params.head_sha.slice(0, 8)}`);
@@ -1258,15 +1266,16 @@ export class Ledger {
             if (liveRes.code === 0 && liveRes.stdout.trim()) {
               effectiveSha = liveRes.stdout.trim();
             } else {
-              // Allow closing a post-delivery cleaned-up branch ONLY when:
-              // 1) endpoint is a delivered remote target (fat/pr/prod),
-              // 2) recorded head_sha resolves to a real commit reachable from `origin`'s exact
-              //    delivery destination ref (NEVER a local-only tag, another remote, or an unmerged feature ref for fat), AND
-              // 3) that exact SHA already has complete verification + endpoint delivery evidence.
+              // A deployment observer witnesses an exact artifact version independently of any Git ref.
+              // Other endpoint types still require reachability from their delivery destination.
               const remoteRefs = task.endpoint === "fat" ? ["refs/remotes/origin/fat"]
                 : task.endpoint === "pr" ? prRemoteRefs(candidateDir, r.branch)
                 : isRolloutEndpoint(task.endpoint) ? ["refs/remotes/origin/main", "refs/remotes/origin/master"] : [];
-              if (r.head_sha && reachableFromRefs(candidateDir, r.head_sha, remoteRefs)) {
+              const observedDeployment = isRolloutEndpoint(task.endpoint) && usesV05(this, params.task_id) &&
+                deploymentStages(installedInstance(this.workbenchRoot), task.endpoint).length > 0 &&
+                r.head_sha && /^[a-f0-9]{40}([a-f0-9]{24})?$/.test(r.head_sha) &&
+                runGit(candidateDir, ["--no-replace-objects", "cat-file", "-e", r.head_sha + "^{commit}"]).code === 0;
+              if (r.head_sha && (observedDeployment || reachableFromRefs(candidateDir, r.head_sha, remoteRefs))) {
                 const deliveredCheck = this.checkReadiness({
                   task_id: params.task_id,
                   repo: r.repo,
