@@ -229,8 +229,9 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
               if (issue.source !== "subagent" && issue.role === roleKey && issue.head === ev.sha)
                 evidence.issues.delete(issue.seq);
             }
-          } else if (!legacy && p.status === "pass") {
-            resolveReviewedIssues(evidence.issues, receipt, p.summary ?? "", join(ledger.workbenchRoot, params.repo), params.head_sha);
+          }
+          if (p.status === "pass" && (!legacy || (source === "tool" && coversBase))) {
+            resolveReviewedIssues(evidence.issues, receipt, p.summary ?? "", join(ledger.workbenchRoot, params.repo), params.head_sha, coversBase);
           }
         }
         if (!atHead) continue;

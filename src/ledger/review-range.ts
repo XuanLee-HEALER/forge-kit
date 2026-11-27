@@ -55,14 +55,19 @@ function ancestor(dir: string, older: string, newer: string) {
     runGit(dir, ["--no-replace-objects", "merge-base", "--is-ancestor", older, newer]).code === 0);
 }
 
+const nativeSuccessors = new Map([["business-review", "business"], ["performance", "simplify"]]);
+
 export function resolveReviewedIssues(issues: Map<number, ReviewIssue>, pass: ReviewIssue, summary: string,
-  dir: string, deliveryHead: string) {
-  if (!issues.size) return;
+  dir: string, deliveryHead: string, coversBaseline: boolean) {
+  if (!issues.size || !ancestor(dir, pass.head, deliveryHead)) return;
   if (pass.source === "tool") {
-    // Historical tool retries resolved failures on their exact role and range.
+    // Old tools could repeat a range at its HEAD or review the full baseline again after a fix.
     for (const issue of issues.values()) {
-      if (issue.source === "tool" && issue.role === pass.role && issue.head === pass.head &&
-          issue.base === pass.base && ancestor(dir, pass.head, deliveryHead)) issues.delete(issue.seq);
+      if (issue.source !== "tool" || issue.role !== pass.role) continue;
+      const covered = issue.head === pass.head
+        ? issue.base === pass.base
+        : coversBaseline && ancestor(dir, pass.base, issue.base) && ancestor(dir, issue.head, pass.head);
+      if (covered) issues.delete(issue.seq);
     }
     return;
   }
@@ -71,9 +76,8 @@ export function resolveReviewedIssues(issues: Map<number, ReviewIssue>, pass: Re
   for (const [, seq] of references) {
     const issue = issues.get(Number(seq));
     if (!issue) continue;
-    const role = issue.role === "business-review" ? "business" : issue.role;
-    if (role !== pass.role || !ancestor(dir, pass.head, deliveryHead) ||
-        !ancestor(dir, issue.head, pass.head)) continue;
+    const role = nativeSuccessors.get(issue.role) ?? issue.role;
+    if (role !== pass.role || !ancestor(dir, issue.head, pass.head)) continue;
     if (ancestor(dir, pass.base, issue.base) || ancestor(dir, issue.head, pass.base)) issues.delete(issue.seq);
   }
 }
