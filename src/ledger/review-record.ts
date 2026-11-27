@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { canonicalRepoPath, efforts, loadModelsConfig, reviewRoleModel, reviewRoles } from "../config";
 import { isOid, runGit } from "../git";
 import { resolveTaskCheckout } from "./checkout";
+import { compareReviewTrees } from "./review-range";
 import { getSpecState } from "./spec";
 import type { Ledger } from "./store";
 import { appendEventInTx, withImmediateTx } from "./transactions";
@@ -72,8 +73,8 @@ export function recordReview(ledger: Ledger, task: string, options: ReviewOption
       if (runGit(dir, ["--no-replace-objects", "merge-base", "--is-ancestor", older, newer]).code)
         throw Error("Review range must lie within the task baseline and attached HEAD");
     }
-    const diff = runGit(dir, ["--no-replace-objects", "diff", "--quiet", "--no-ext-diff", "--ignore-submodules=none", from, to, "--"]);
-    if (diff.code !== 1) throw Error(diff.code ? "Cannot inspect review diff" : "Review diff is empty");
+    const trees = compareReviewTrees(dir, from, to);
+    if (trees !== "changed") throw Error(trees === "equal" ? "Review diff is empty" : "Cannot inspect review trees");
     if (commit(dir, "refs/heads/" + attachment.branch) !== to) throw Error("Review HEAD differs from attached branch HEAD");
     const session = options["session-id"] ?? null;
     return appendEventInTx(ledger.db, {

@@ -1,11 +1,11 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { canonicalRepoPath, reviewRoles } from "../config";
-import { isOid, runGit } from "../git";
+import { isOid } from "../git";
 import { installedInstance, verificationPolicy } from "../workflow-config";
 import type { TaskReader } from "./queries";
 import { deploymentStages } from "./release-inspection";
-import { coversReviewBase, resolveReviewedIssues, reviewMeetsFloor, type ReviewIssue } from "./review-range";
+import { compareReviewTrees, coversReviewBase, resolveReviewedIssues, reviewMeetsFloor, type ReviewIssue } from "./review-range";
 import { getSpecState } from "./spec";
 import {
   evidenceSource,
@@ -336,8 +336,7 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
   } else if (currentWorkflow) {
     // Older executors could record a pass even for distinct commits with identical trees.
     const base = attachments[0]?.base_sha;
-    if (!baselinePassed || !base || runGit(join(ledger.workbenchRoot, params.repo),
-      ["--no-replace-objects", "diff", "--quiet", "--no-ext-diff", "--ignore-submodules=none", base, params.head_sha, "--"]).code !== 1)
+    if (!baselinePassed || !base || compareReviewTrees(join(ledger.workbenchRoot, params.repo), base, params.head_sha) !== "changed")
       missing.push("Independent review evidence required for the nonempty task baseline-to-HEAD diff at the current freeze");
   } else if (task.verification_depth === "targeted") {
     // Targeted depth requires at least one independent review pass/fallback before delivery/close

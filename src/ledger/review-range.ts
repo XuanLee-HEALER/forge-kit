@@ -1,7 +1,19 @@
 import { normalizeReviewRole } from "./types";
-import { runGit } from "../git";
+import { isOid, runGit } from "../git";
 import { resolveTaskCheckout } from "./checkout";
 import type { TaskRepoRecord } from "./types";
+
+export function compareReviewTrees(dir: string, base: string, head: string): "changed" | "equal" | "unavailable" {
+  function tree(sha: string) {
+    const result = runGit(dir, ["--no-replace-objects", "rev-parse", "--verify", "--end-of-options", sha + "^{tree}"]);
+    const oid = result.stdout.trim();
+    return result.code === 0 && isOid(oid) ? oid : undefined;
+  }
+  const before = tree(base);
+  const after = tree(head);
+  if (!before || !after) return "unavailable";
+  return before === after ? "equal" : "changed";
+}
 
 export function coversReviewBase(
   root: string,

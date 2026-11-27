@@ -61,13 +61,15 @@ export const evidenceCommands = {
       const kind = reviewFactKind(evidence);
       if (!kind) return [];
       const meta = evidence.meta ?? {};
+      const model = typeof meta.model === "string" ? meta.model : meta.model?.model;
+      const effort = meta.effort ?? meta.model?.effort;
       return [{ kind, seq: event.seq, repo: event.repo, branch: event.branch, base: meta.base,
         head: event.sha, role: meta.role, status: meta.report_status ?? evidence.status,
         backend: meta.backend, attempts: meta.attempts, coverage: meta.coverage, scheduling: meta.scheduling,
         limitations: meta.limitations, missing_materials: meta.missing_materials,
         source: evidenceSource(evidence, event.actor), summary: evidence.summary,
         report_path: meta.report_path, report_sha256: meta.report_sha256, session_id: meta.session_id,
-        model: meta.model, effort: meta.effort }];
+        model, effort }];
     });
     console.log(JSON.stringify(records, null, 2));
     return;
