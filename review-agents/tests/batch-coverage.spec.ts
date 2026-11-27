@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 type Entry = {status:string; oldPath:string; path:string; added:number; deleted:number};
-type Call = {role:string; index:{changes:Entry[]}; chunks:{path:string;patch:string;newEnd:number;oldEnd:number}[];spec:string|null};
+type Call = {role:string; index:{changes:Entry[]; pages?:{offset:number;count:number}[]}; chunks:{id:string;path:string;patch:string;newEnd:number;oldEnd:number}[];spec:string|null};
 function fixture(run: (f: ReturnType<typeof setup>) => void) {
   const root = mkdtempSync(join(tmpdir(), "receipt-test-"));
   try { run(setup(root)); } finally { rmSync(root, {recursive:true,force:true}); }
@@ -24,10 +24,14 @@ import {appendFileSync,readFileSync} from "node:fs";
 const q=JSON.parse(await Bun.stdin.text()), line=Number(readFileSync(import.meta.path+".line","utf8"));
 appendFileSync(import.meta.path+".calls",JSON.stringify(q)+"\\n");
 const checked=q.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"}));
+const mode=readFileSync(import.meta.path+".mode","utf8");
+if (mode==="duplicate") checked.push(checked[0]);
+if (mode==="invalid") checked[0].id="0-bad";
 const findings=line?[{severity:"blocking",path:"code.ts",line,title:"anchored",evidence:"fixture",recommendation:"fix"}]:[];
 await Bun.write(process.argv[process.argv.indexOf("-o")+1],JSON.stringify({role:q.role,checked,findings,status:"pass",summary:"fixture",limitations:[]}));
 `, {mode:0o755});
-  const review = (base:string, roles:string, line = 0, spec = "", path = process.env.PATH) => {
+  const review = (base:string, roles:string, line = 0, spec = "", path = process.env.PATH, mode = "valid") => {
+    writeFileSync(fake+".mode",mode);
     writeFileSync(fake+".line", String(line));
     writeFileSync(fake+".calls", "");
     const p = Bun.spawnSync([process.execPath,join(import.meta.dir,"../src/review.ts"),"--repo",repo,"--base",base,
@@ -149,3 +153,46 @@ test("actual prompt budget, pinned context errors and old-side finding anchors",
   expect(failedContext.report.roles[0].attempts[0].status).toBe("incomplete");
   expect(failedContext.report.roles[0].limitations.join(" ")).toContain("pinned caller");
 }), 30_000);
+
+test("long Git paths fit the global index and exact compact receipts remain mandatory", () => fixture(f => {
+  // Construct the Git tree without checking it out. Its paths exceed the
+  // host filesystem limit and are still valid at the pinned commit.
+  f.git("commit","--allow-empty","-qm","base");
+  const base = f.git("rev-parse","HEAD");
+  const blob = f.git("hash-object","-w","--stdin");
+  const parent = ("a".repeat(80)+"/").repeat(32);
+  const paths = Array.from({length:80}, (_,i)=>parent+"item-"+i+".txt");
+  const add = Bun.spawnSync(["git","-C",f.repo,"update-index","--index-info"],{
+    stdin:Buffer.from(paths.map(path=>"100644 "+blob+"\t"+path+"\n").join("")),
+  });
+  expect(add.exitCode,add.stderr.toString()).toBe(0);
+  f.commit("long paths");
+  const result = f.review(base,"quality");
+  expect(result.code).toBe(0);
+  const ids = result.calls.flatMap(call=>call.chunks.map(chunk=>chunk.id));
+  expect(new Set(ids).size).toBe(80);
+  expect(ids.every(id=>/^\d{1,2}-[a-f0-9]{4}$/.test(id))).toBe(true);
+  expect(new Set(result.calls.flatMap(c=>c.chunks.map(chunk=>chunk.path)))).toEqual(new Set(paths));
+  for (const call of result.calls) {
+    expect(Buffer.byteLength(JSON.stringify(call.index))).toBeLessThanOrEqual(20_000);
+    const pages = call.index.pages!;
+    let offset = 0;
+    for (const page of pages) {
+      expect(page.offset).toBe(offset);
+      offset += page.count;
+    }
+    expect(offset).toBe(paths.length);
+  }
+  for (const mode of ["duplicate","invalid"]) {
+    const invalid = f.review(base,"quality",0,"",process.env.PATH,mode);
+    expect(invalid.code).toBe(3);
+    expect(invalid.calls).toHaveLength(1);
+    const {coverage} = invalid.report.roles[0];
+    expect(coverage.reviewed).toBe(0);
+    expect(coverage.missing).toHaveLength(80);
+    const first = invalid.calls[0].chunks[0];
+    const missing = coverage.missing.find((chunk:{path:string})=>chunk.path===first.path);
+    expect(missing.id).toMatch(/^[0-9a-f]{64}$/);
+    expect(first.id.endsWith("-"+missing.id.slice(0,4))).toBe(true);
+  }
+}), 60_000);

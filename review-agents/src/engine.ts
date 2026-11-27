@@ -98,7 +98,11 @@ async function reviewRole(role: Role, repo: Repo, material: Material, model: Mod
       context.omitted.push(context.files.pop()!.path);
       prompt = render();
     }
-    if (Buffer.byteLength(prompt) + RESPONSE_RESERVE > PROMPT_BYTES) {
+    // Long paths must fit in the response as well as in the input. Leave room
+    // for findings, summary and limitations beyond the required acknowledgments.
+    const acknowledgments = items.map(({id,path}) => ({id,path,conclusion:"reviewed"}));
+    if (Buffer.byteLength(prompt) + RESPONSE_RESERVE > PROMPT_BYTES ||
+        Buffer.byteLength(JSON.stringify(acknowledgments)) > RESPONSE_RESERVE * 0.75) {
       if (chunks.length === 1) { limitations.add("Prompt budget exceeded for " + chunks[0].id); return; }
       const half = Math.ceil(chunks.length / 2);
       await batch(chunks.slice(0, half));
@@ -114,13 +118,15 @@ async function reviewRole(role: Role, repo: Repo, material: Material, model: Mod
       const paths = related.map(c => c.path);
       const report = cleanReport(await invoke(prompt, model), paths);
       if (report.role !== role) throw new BackendFailure("Codex receipt role mismatch");
+      const delivered = new Map(chunks.map(c => [c.receiptId, c]));
       const receipts = new Set<string>();
       const completed = new Set<string>();
       for (const ack of report.checked) {
-        if (receipts.has(ack.id) || !chunks.some(c => c.id === ack.id && c.path === ack.path))
+        const chunk = delivered.get(ack.id);
+        if (receipts.has(ack.id) || !chunk || chunk.path !== ack.path)
           throw new BackendFailure("Codex receipt contains duplicate or undelivered material");
         receipts.add(ack.id);
-        if (ack.conclusion === "reviewed") completed.add(ack.id);
+        if (ack.conclusion === "reviewed") completed.add(chunk.id);
       }
       for (const f of report.findings) {
         const located = chunks.some(c => c.path === f.path &&

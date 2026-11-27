@@ -46,7 +46,7 @@
     "concepts": [
       "\\bmilliseconds?\\b|毫秒",
       "\\bseconds?\\b|(?<!毫)秒",
-      "\\b(?:comment|documentation|documented|docstring)\\b|文档|注释",
+      "\\b(?:comments?|documentation|documented|docstrings?|jsdoc|docs?)\\b|文档|注释",
       "revers|mismatch|contradict|incorrect|mislead|wrong|instead|requires seconds|seconds as (?:the )?input|seconds (?:to|into) milliseconds|相反|矛盾|错误|不一致|秒转毫秒"
     ]
   }

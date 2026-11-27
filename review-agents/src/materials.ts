@@ -5,9 +5,10 @@ import { spawnSync } from "node:child_process";
 import { Repo, snapshotGitEnv, type Change } from "./repo";
 
 const CHUNK_BYTES = 12_000;
+const INDEX_BYTES = 20_000;
 const digest = (s: string) => createHash("sha256").update(s).digest("hex");
 export type Chunk = {
-  id: string; path: string; oldStart: number; oldEnd: number; newStart: number; newEnd: number;
+  id: string; receiptId: string; path: string; oldStart: number; oldEnd: number; newStart: number; newEnd: number;
   deletedRanges: [number, number][]; continued: boolean; size: number;
 };
 export type Material = ReturnType<typeof prepareMaterials>;
@@ -111,11 +112,14 @@ export function prepareMaterials(repo: Repo, dir: string) {
       gitToFile(dir, ["-c", "diff.noprefix=false", "diff", "--no-index", "--no-color", "--no-ext-diff", "--no-textconv",
         "--text", "--unified=5", "--", "base", "head"], patchFile, [0, 1]);
       let part = 0;
-      function record(p: Omit<Chunk, "id" | "size" | "path"> & {patch: string}) {
+      function record(p: Omit<Chunk, "id" | "receiptId" | "size" | "path"> & {patch: string}) {
         const {patch, ...bounds} = p;
         const id = digest(JSON.stringify([repo.base, repo.head, change, part++, bounds, digest(patch)]));
         writeFileSync(join(dir, id), patch, {mode:0o600});
-        chunks.push({id, path:change.path, ...bounds, size:Buffer.byteLength(JSON.stringify(patch))});
+        // The full digest remains the storage and coverage key. The ordinal
+        // makes receipt handles unique even when two digest prefixes coincide.
+        const receiptId = (chunks.length + 1) + "-" + id.slice(0, 4);
+        chunks.push({id, receiptId, path:change.path, ...bounds, size:Buffer.byteLength(JSON.stringify(patch))});
       }
       for (const p of patchChunks(patchFile)) record(p);
       if (!part) record({patch:JSON.stringify(change), oldStart:0, oldEnd:0, newStart:0, newEnd:0, deletedRanges:[], continued:false});
@@ -126,6 +130,11 @@ export function prepareMaterials(repo: Repo, dir: string) {
   }
   const manifest = repo.changes.map(({oldOid, newOid, ...change}) => change);
   const hash = digest(JSON.stringify(manifest));
+  const summary = {files: manifest.length + repo.excludedFiles.length, excluded: repo.excludedFiles.length, digest: hash};
+  const fullIndex = {...summary, changes:manifest};
+  const byPath = new Map(repo.changes.map(c => [c.path, c]));
+  if (Buffer.byteLength(JSON.stringify(fullIndex)) <= INDEX_BYTES)
+    return {dir, chunks, missing, limitations, index:fullIndex, byPath};
   // For a large inventory, each summary describes a contiguous range in path
   // order. Every file belongs to one range, including very large directories.
   const sorted = manifest.toSorted((a, b) => a.path.localeCompare(b.path));
@@ -141,14 +150,14 @@ export function prepareMaterials(repo: Repo, dir: string) {
       added += change.added ?? 0;
       deleted += change.deleted ?? 0;
     }
-    pages.push({first:page[0].path, last:page.at(-1)!.path, count:page.length, types, added, deleted});
+    const first = page[0].path, last = page.at(-1)!.path;
+    // Each of at most 48 pages uses two optional labels of at most 96 encoded
+    // bytes. Ordinals still locate every range when paths require long labels.
+    pages.push({offset:i, count:page.length, types, added, deleted,
+      ...(Buffer.byteLength(JSON.stringify(first)) <= 96 && {first}),
+      ...(Buffer.byteLength(JSON.stringify(last)) <= 96 && {last})});
   }
-  const index = {
-    files: manifest.length + repo.excludedFiles.length, excluded: repo.excludedFiles.length, digest: hash,
-    ...(Buffer.byteLength(JSON.stringify(manifest)) < 20_000 ? {changes: manifest} :
-      {pages}),
-  };
-  const byPath = new Map(repo.changes.map(c => [c.path, c]));
+  const index = {...summary, pages};
   return {dir, chunks, missing, limitations, index, byPath};
 }
 
@@ -177,7 +186,8 @@ export function* batches(chunks: Chunk[]) {
 }
 
 export function loadChunk(material: Material, chunk: Chunk) {
-  return {...chunk, patch:readFileSync(join(material.dir, chunk.id), "utf8")};
+  const {id, receiptId, ...bounds} = chunk;
+  return {id:receiptId, ...bounds, patch:readFileSync(join(material.dir, id), "utf8")};
 }
 
 export function batchChanges(byPath: Map<string, Change>, chunks: Chunk[]) {
