@@ -1,11 +1,12 @@
-import { realpathSync } from "node:fs";
-import { posix } from "node:path";
+import { realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { join, posix } from "node:path";
 
-export function snapshotGitEnv() {
-  const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat" } as NodeJS.ProcessEnv;
+export function snapshotGitEnv(isolated = true) {
+  const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat",
+    ...(isolated && {GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_ATTR_NOSYSTEM: "1"}) } as NodeJS.ProcessEnv;
   for (const key of ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX",
-    "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_ATTR_SOURCE"]) delete env[key];
+    "GIT_SHALLOW_FILE", "GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE", "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_ATTR_SOURCE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"]) delete env[key];
   return env;
 }
 
@@ -18,12 +19,13 @@ export type Change = {
 
 export class Repo {
   root: string;
+  private isolated = false;
   base: string;
   head: string;
-  files: string[];
-  changes: Change[];
-  excludedFiles: string[];
-  constructor(root: string, base: string, head: string) {
+  files: string[] = [];
+  changes: Change[] = [];
+  excludedFiles: string[] = [];
+  constructor(root: string, base: string, head: string, deferInventory = false) {
     this.root = realpathSync(root);
     this.base = this.git([
       "rev-parse",
@@ -37,6 +39,23 @@ export class Repo {
       "--end-of-options",
       `${head}^{commit}`,
     ]).trim();
+    // Validate ancestry against the source repository (also respects shallow
+    // boundaries). Use only its object database for all subsequent evidence.
+    this.git(["merge-base", "--is-ancestor", this.base, this.head]);
+    if (!deferInventory) this.loadInventory();
+  }
+
+  usePinnedObjectView(materialDir: string) {
+    const objects = this.git(["rev-parse", "--path-format=absolute", "--git-path", "objects"]).trimEnd();
+    const bare = join(materialDir, "pinned.git");
+    this.git(["init", "--quiet", "--bare", "--template=", "--object-format=" + (this.head.length === 64 ? "sha256" : "sha1"), bare]);
+    symlinkSync(objects, join(materialDir, "source-objects"), "dir");
+    writeFileSync(join(bare, "objects/info/alternates"), "../../source-objects\n");
+    this.root = bare;
+    this.isolated = true;
+  }
+
+  loadInventory() {
     const fields = this.git(["diff", "--raw", "--numstat", "--no-abbrev", "--find-renames", "-l0", "--no-ext-diff",
       "--no-textconv", "--ignore-submodules=none", "-z", this.base, this.head, "--"]).split("\0");
     const changes: Change[] = [];
@@ -80,11 +99,11 @@ export class Repo {
   }
   git(args: string[], allowNoMatch = false, maxBytes = 32 * 1024 * 1024) {
     const p = Bun.spawnSync(
-      ["git", "-c", "core.quotePath=false", "-C", this.root, ...args],
+      ["git", "-c", "core.attributesFile=/dev/null", "-c", "core.quotePath=false", "-C", this.root, ...args],
       {
         stdout: "pipe",
         stderr: "pipe",
-        env: { ...snapshotGitEnv(), ...(this.head && {GIT_ATTR_SOURCE:this.head}) },
+        env: { ...snapshotGitEnv(this.isolated), ...(this.head && {GIT_ATTR_SOURCE:this.head}) },
         timeout: 20000,
         maxBuffer: maxBytes + 1,
       },
@@ -172,7 +191,7 @@ export class Repo {
   private async callerHits(terms: string[], globs: string[]) {
     // Caller snippets are sampled. Drain Git to its actual exit status even
     // when common identifiers produce many more matches than fit in a prompt.
-    const proc = Bun.spawn(["git", "-C", this.root, ...this.grepArgs(terms, globs, 4)], {
+    const proc = Bun.spawn(["git", "-c", "core.attributesFile=/dev/null", "-C", this.root, ...this.grepArgs(terms, globs, 4)], {
       stdout:"pipe", stderr:"ignore", stdin:"ignore", timeout:20_000,
       env:{...snapshotGitEnv(), GIT_ATTR_SOURCE:this.head},
     });

@@ -35,12 +35,14 @@ class Input {
     if (!n) return;
     const part = this.text.slice(0, n);
     if (out) out(part);
-    this.previousWord = /\w/.test(part.at(-1)!);
     let i = part.length;
-    while (i && /[A-Z_]/.test(part[i - 1])) i--;
+    while (i && /[A-Z0-9_]/.test(part[i - 1])) i--;
     if (i) {
-      this.uppercaseBoundary = !/\w/.test(part[i - 1]);
+      this.uppercaseBoundary = !/\w/.test(part[i - 1]) && !/[0-9]/.test(part.charAt(i));
+    } else if (!this.previousWord) {
+      this.uppercaseBoundary = !/[0-9]/.test(part[0]);
     }
+    this.previousWord = /\w/.test(part.at(-1)!);
     this.text = this.text.slice(n);
   }
   *until(stop: RegExp, out?: Sink) {
@@ -116,7 +118,7 @@ function verificationRedactor(write: Sink) {
     const allowed = exact ? !input.previousWord : input.uppercaseBoundary;
     input.take(match[0].length, send);
     if (!allowed) return;
-    if (!exact) yield* input.until(/[^A-Z_]/, send);
+    if (!exact) yield* input.until(/[^A-Z0-9_]/, send);
     if (!input.text.startsWith("=")) return;
     input.take(1, send);
     yield* value(input, send);
@@ -129,11 +131,21 @@ function verificationRedactor(write: Sink) {
     send("***");
     yield* input.until(/[^A-Za-z0-9._-]/);
   });
-  prepend(/Bearer(?=[ \t-\r])/i, function*(input, match, send) {
+  // The text rule uses ECMAScript whitespace. Match its UTF-8 encodings
+  // as complete sequences, plus single-byte NBSP in Latin-1 output.
+  const bearerSpace = /^(?:[ \t-\r\xa0]+|\xc2\xa0|\xe1\x9a\x80|\xe2(?:\x80[\x80-\x8a\xa8\xa9\xaf]|\x81\x9f)|\xe3\x80\x80|\xef\xbb\xbf)/;
+  prepend(/Bearer/i, function*(input, match, send) {
     input.take(match[0].length, send);
-    yield* input.until(/[^ \t-\r]/, send);
-    yield* input.ensure(8);
-    if (!/^[A-Za-z0-9._~+/=-]{8}/.test(input.text)) return;
+    let separated = false;
+    for (;;) {
+      yield* input.ensure(3);
+      const space = bearerSpace.exec(input.text);
+      if (!space) break;
+      input.take(space[0].length, send);
+      separated = true;
+    }
+    if (!separated) return;
+    if (!/^[A-Za-z0-9._~+/=-]/.test(input.text)) return;
     send("***");
     yield* input.until(/[^A-Za-z0-9._~+/=-]/);
   });

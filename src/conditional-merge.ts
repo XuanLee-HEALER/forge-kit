@@ -14,8 +14,13 @@ export function pushFastForward(dir: string, action: Extract<ShipAction, {kind: 
   git(dir, ["--no-replace-objects", "merge-base", "--is-ancestor", action.baseOid, action.head]);
   if (remoteBranch(dir, action.ref) !== action.baseOid) throw Error("Approved remote branch changed");
   authorize();
-  git(dir, ["--no-replace-objects", "push", "--no-follow-tags", "--recurse-submodules=no",
-    "--force-with-lease=" + action.ref + ":" + action.baseOid, write, action.head + ":" + action.ref]);
+  const refspec = action.head + ":" + action.ref;
+  const result = git(dir, ["--no-replace-objects", "push", "--porcelain", "--no-follow-tags", "--recurse-submodules=no",
+    "--force-with-lease=" + action.ref + ":" + action.baseOid, write, refspec]);
+  // Git exits successfully for an up-to-date ref even when the expected lease no longer matches.
+  const statuses = result.split("\n").filter(line => /^[ =*+!-]\t/.test(line));
+  if (statuses.length !== 1 || !statuses[0].startsWith(" \t" + refspec + "\t"))
+    throw Error("Git did not perform the approved fast-forward; inspect the remote branch");
   if (remoteBranch(dir, action.ref) !== action.head) throw Error("Cannot verify the exact remote update");
   return action.head;
 }

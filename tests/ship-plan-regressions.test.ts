@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { parse, stringify } from "yaml";
 import { canonicalJson, sha256String } from "../src/ledger/types";
+import { pushFastForward } from "../src/conditional-merge";
+import { resolveInstance } from "../src/instance";
 import { initWorkbench } from "../src/cli";
 import { Ledger } from "../src/ledger/store";
 import { humanFastTrack } from "../src/ledger/fast-track";
@@ -96,7 +98,10 @@ else if (group === "api" && path.includes("/compare/")) {
   });
   const initial = audit();
   for (const args of [["evaluate"], ["run","--dry-run"]]) {
-    expect((await ship(id,...args)).reason.message).toMatch(/Manual merge required/);
+    const message = (await ship(id,...args)).reason.message;
+    expect(message).toMatch(/Manual merge required/);
+    expect(message.startsWith("Preview only. First run forge ship run --envelope " + id)).toBe(true);
+    expect(message).toContain("Wait for that run's 'Manual merge required' handoff before merging");
     expect(audit()).toEqual(initial);
   }
   git(f.dir, "commit", "--allow-empty", "-m", "advance base after preview");
@@ -208,3 +213,27 @@ else if (group==="pr" && cmd==="checks") {
   expect(blocked.receipts).toEqual([]);
   expect(readFileSync(seen,"utf8").trim().split("\n")).toEqual(["1","3","1","3","1","3"]);
 }, 60_000);
+
+test("a concurrent update to the identical head does not count as the executor's fast-forward", () => {
+  const f = feature("api", 1), bare = join(root, "api.git");
+  git(f.dir, "remote", "set-url", "origin", bare);
+  git(f.wt, "push", bare, f.branch);
+  const action = {kind:"push" as const, repo:f.repo, remote:"origin" as const, ref:"refs/heads/main",
+    baseOid:f.base, head:f.head, originHash:sha256String(canonicalJson([bare,bare]))};
+  expect(() => pushFastForward(f.wt, action, () => git(bare, "update-ref", action.ref, f.head, f.base)))
+    .toThrow("Git did not perform the approved fast-forward");
+  expect(git(bare, "rev-parse", "main")).toBe(f.head);
+}, 30_000);
+
+test("PR delivery cannot register a standalone observer as a delivery stage", () => {
+  initWorkbench({targetDir: root, kitRoot: join(import.meta.dir, "..")});
+  const file = join(root, ".workbench/workbench.yaml");
+  const config = parse(readFileSync(file, "utf8"));
+  config.extensions = {
+    actions: {readback:{purpose:"observe", cwd:".", argv:[process.execPath,"-v"], inputs:[]}},
+    stages: {postcheck:{action:"readback"}},
+    delivery: {endpoint:"pr", stages:["ship","postcheck"]},
+  };
+  writeFileSync(file, stringify(config));
+  expect(() => resolveInstance(root)).toThrow("stage postcheck has purpose observe; select a delivery stage");
+});

@@ -18,7 +18,7 @@ type Option = { roles?: string; mode?: string; order?: string };
 type Attempt = { backend: "codex"; status: Status; reason?: string };
 type RoleReport = {
   role: Role; base: string; head: string; status: Status; backend: "codex" | null;
-  coverage: { expected: number; reviewed: number; missing: Array<{id:string; path:string}> };
+  coverage: { inventory_digest?:string; inventory_files?:number; expected: number; reviewed: number; missing: Array<{id:string; path:string}> };
   missing_materials?: string[]; findings: Finding[]; limitations: string[]; summary: string; attempts: Attempt[];
 };
 
@@ -76,11 +76,20 @@ async function reviewRole(role: Role, repo: Repo, material: Material, model: Mod
   const summaries = new Set<string>();
   if (requiredSpec && !spec) gaps.add("spec");
   if (specification.limitation) limitations.add(specification.limitation);
-  const envelope = {role, base, head, spec: spec ?? null, index: material.index,
-    instructions: instructions(role, repo.files) + "\nReview every supplied chunk, including deletions and metadata. Return the supplied role. For every chunk return its exact id, path and conclusion in checked. Use reviewed only after inspecting its actual patch. Files in the global index outside this batch are reviewed separately. For findings use the new-file range, or the old-file range for deleted lines."};
+  const envelope = {role, base, head, spec: spec ?? null,
+    instructions: instructions(role, repo.files) + "\nReview every supplied chunk, including deletions and metadata. Return the supplied role. For every chunk return its exact id, path and conclusion in checked. Use reviewed only after inspecting its actual patch. Each batch reviews only the supplied chunks. Use the specification to identify requirements affected by these lines. Other indexed changes and independent verification/delivery receipts are outside this batch; the engine reconciles all batch receipts against the fixed inventory at the end. If deciding the correctness of a delivered change requires unavailable evidence, mark it incomplete and identify the specific chunk and missing evidence. For findings use the new-file range, or the old-file range for deleted lines."};
 
-  async function batch(chunks: Chunk[]): Promise<void> {
-    const items = chunks.map(c => loadChunk(material, c));
+  async function batch(planned: Chunk[]): Promise<void> {
+    const items: ReturnType<typeof loadChunk>[] = [];
+    const chunks: Chunk[] = [];
+    for (const c of planned) {
+      try { items.push(loadChunk(material, c)); chunks.push(c); }
+      catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        limitations.add("Cannot read pinned chunk " + c.id + " for " + c.path + (code ? " (" + code + ")" : ""));
+      }
+    }
+    if (!chunks.length) return;
     const related = batchChanges(material.byPath, chunks);
     const diff: Record<string, string> = Object.create(null);
     for (const item of items) diff[item.path] = (diff[item.path] ?? "") + item.patch;
@@ -92,11 +101,15 @@ async function reviewRole(role: Role, repo: Repo, material: Material, model: Mod
       context = {revision:head, files:[], omitted:paths};
       contextFailed = true;
     }
-    const render = () => JSON.stringify({...envelope, related, context, chunks:items});
+    const render = (index: object = material.index) => JSON.stringify({...envelope, index, related, context, chunks:items});
     let prompt = render();
     while (Buffer.byteLength(prompt) + RESPONSE_RESERVE > PROMPT_BYTES && context.files.length) {
       context.omitted.push(context.files.pop()!.path);
       prompt = render();
+    }
+    if (chunks.length === 1 && Buffer.byteLength(prompt) + RESPONSE_RESERVE > PROMPT_BYTES) {
+      const {files, excluded, digest} = material.index;
+      prompt = render({files, excluded, digest});
     }
     // Long paths must fit in the response as well as in the input. Leave room
     // for findings, summary and limitations beyond the required acknowledgments.
@@ -169,7 +182,7 @@ async function reviewRole(role: Role, repo: Repo, material: Material, model: Mod
   const summary = status === "incomplete" ? "Incomplete review: " + [...limitations, ...gaps].join(", ") : [...summaries].join("\n");
   return {role, base, head, backend:attempts.length ? "codex" : null, attempts, status, summary, findings:list,
     limitations:[...limitations], ...(gaps.size && {missing_materials:[...gaps]}),
-    coverage:{expected:material.chunks.length, reviewed:checked.size, missing}};
+    coverage:{inventory_digest:material.index.digest, inventory_files:material.index.files, expected:material.chunks.length, reviewed:checked.size, missing}};
 }
 
 export async function runReview(params: Option & {
@@ -182,13 +195,17 @@ export async function runReview(params: Option & {
     const pair = params.models?.[role] ?? params.model;
     return modelPair(pair?.model, pair?.effort);
   });
-  const repo = new Repo(params.repo, params.base, params.head);
-  repo.git(["merge-base", "--is-ancestor", repo.base, repo.head]);
-  if (!repo.files.length && !repo.excludedFiles.length) throw Error("Empty review diff; select a range containing changes");
+  const repo = new Repo(params.repo, params.base, params.head, true);
   const spec = specification(params);
-  let tmp: string;
-  try { tmp = mkdtempSync(join(tmpdir(), "forge-review-material-")); }
+  let tmp: string | undefined;
+  try {
+    tmp = mkdtempSync(join(tmpdir(), "forge-review-material-"));
+    repo.usePinnedObjectView(tmp);
+  }
   catch (error) {
+    if (tmp) rmSync(tmp, {recursive:true, force:true});
+    repo.loadInventory();
+    if (!repo.files.length && !repo.excludedFiles.length) throw Error("Empty review diff; select a range containing changes");
     const code = (error as NodeJS.ErrnoException).code;
     const reason = "Cannot create temporary material directory" + (code ? " (" + code + ")" : "");
     const paths = [...new Set([...repo.changes.flatMap(c => [c.oldPath, c.path]), ...repo.excludedFiles])];
@@ -202,6 +219,8 @@ export async function runReview(params: Option & {
     return {schemaVersion:2, base:repo.base, head:repo.head, mode, status:"incomplete" as const, roles:reports};
   }
   try {
+    repo.loadInventory();
+    if (!repo.files.length && !repo.excludedFiles.length) throw Error("Empty review diff; select a range containing changes");
     const material = prepareMaterials(repo, tmp);
     const run = (role: Role, idx:number) => reviewRole(role, repo, material, models[idx], spec, role === "business" || !!params.spec);
     const reports: RoleReport[] = [];

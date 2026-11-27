@@ -927,3 +927,14 @@ export function tarCreateDestination(args: string[]): string | undefined {
   }
   return create ? output : undefined;
 }
+
+/** Extract quoted and unquoted literal policy paths from shell or inline program arguments. */
+export function policyPathLiterals(words: string[]): string[] {
+  const literals: string[] = [];
+  for (const word of words) {
+    for (const match of word.matchAll(/"([^"\n]*ship-policy\.yaml)"|'([^'\n]*ship-policy\.yaml)'/g))
+      literals.push(match[1] ?? match[2]);
+    literals.push(...word.match(/[^\s'"`(),;=]*ship-policy\.yaml(?=$|[\s'"`(),;])/g) ?? []);
+  }
+  return literals;
+}

@@ -11,6 +11,7 @@ import {
 import { dirname, resolve } from "node:path";
 import {
   copyDestination,
+  policyPathLiterals,
   tarCreateDestination,
   hasUnquotedPipe,
   hasUnquotedRedirect,
@@ -89,9 +90,8 @@ export function checkLedgerTamper(
     const destination = bin === "cp" ? copyDestination(args) : bin === "tar" ? tarCreateDestination(args) : undefined;
     const ancestors = destination ? [absolute(destination)] : bin === "rsync" || bin === "ditto" ? paths.slice(-1) : paths;
     const textOutput = (bin === "echo" || bin === "printf") && !/\$\(|`/.test(command);
-    const policyLiterals = command.match(/[^\s'"`(),;=]*ship-policy\.yaml(?=$|[\s'"`(),;])/g) ?? [];
     const targetsPolicy = paths.includes(policyPath) || (destination && absolute(destination) === policyPath) ||
-      (!textOutput && policyLiterals.some(path => absolute(path) === policyPath));
+      (!textOutput && policyPathLiterals(words).some(path => absolute(path) === policyPath));
     const readsOnly = textOutput || isReadonlyLedgerHookInspection(command, command, words) ||
       (git?.subcmd === "diff" && git.subArgs.every(t => t === "--" || absolute(t) === policyPath));
     if (redirects.some(p => canonicalizeMaybePath(resolve(cwd, p)) === policyPath) ||

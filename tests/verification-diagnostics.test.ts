@@ -67,31 +67,50 @@ test("Git preparation keeps the tool diagnostic in the failure log after cleanup
   expect(readFileSync(meta.log_path, "utf8")).toContain("Cannot enumerate gitlinks");
 });
 
-test("a completed stage with an inherited output pipe returns its timeout receipt", () => {
-  const wb = join(f.root, ".workbench");
-  for (const file of ["models.toml", "ship-policy.yaml"]) copyFileSync(join(import.meta.dir, "../templates", file), join(wb, file));
-  const childPid = join(f.root, "sleep.pid");
-  const code = 'import {spawn} from "node:child_process";import {writeFileSync} from "node:fs";' +
-    'const p=spawn("/bin/sleep",["15"],{detached:true,stdio:"inherit"});writeFileSync(' +
-    JSON.stringify(childPid) + ',String(p.pid));p.unref();console.log("stage finished");process.exit(0)';
-  writeFileSync(join(wb, "workbench.yaml"), stringify({repos:["service"], extensions: {
-    verification: {stages:["probe"], timeout_ms: 400}, stages:{probe:{action:"run"}},
-    actions:{run:{purpose:"verify", cwd:".", argv:[process.execPath, "-e", code]}},
-  }}));
-  freeze();
-  try {
-    const start = Date.now();
-    const r = f.cli("verify", []);
-    expect(Date.now() - start).toBeLessThan(6000);
-    expect(r.exitCode).toBe(1);
-    const stage = f.evidence().at(-1).meta.stages[0];
-    expect(stage.output_excerpt).toMatch(/output drain timed out/i);
-    expect(readFileSync(stage.log_path, "utf8")).toContain("stage finished");
-  } finally {
-    if (existsSync(childPid)) try { process.kill(Number(readFileSync(childPid, "utf8")), "SIGKILL"); }
-    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e; }
-  }
-}, 20_000);
+for (const scenario of ["drains normally", "same-group timeout", "independent-group timeout"]) {
+  test("an inherited stage pipe " + scenario, async () => {
+    const wb = join(f.root, ".workbench");
+    for (const file of ["models.toml", "ship-policy.yaml"]) copyFileSync(join(import.meta.dir, "../templates", file), join(wb, file));
+    const normal = scenario === "drains normally", detached = scenario === "independent-group timeout";
+    const pidFile = join(f.root, "writer.pid"), release = join(f.root, "release-writer");
+    const writer = normal ? 'await Bun.sleep(120);console.log("late output")'
+      : 'const end=Date.now()+10000;while(Date.now()<end&&!require("fs").existsSync(' + JSON.stringify(release) + '))await Bun.sleep(25)';
+    const code = 'console.log("stage finished");const p=require("child_process").spawn(process.execPath,["-e",' +
+      JSON.stringify(writer) + '],{detached:' + detached + ',stdio:"inherit"});require("fs").writeFileSync(' +
+      JSON.stringify(pidFile) + ',String(p.pid));p.unref();process.exit(0)';
+    writeFileSync(join(wb, "workbench.yaml"), stringify({repos:["service"], extensions: {
+      verification: {stages:["probe"], timeout_ms: normal ? 3000 : 600}, stages:{probe:{action:"run"}},
+      actions:{run:{purpose:"verify", cwd:".", argv:[process.execPath, "-e", code]}},
+    }}));
+    freeze();
+    const running = () => {
+      const id = readFileSync(pidFile, "utf8");
+      const ps = spawnSync("/bin/ps", ["-o", "stat=", "-p", id], {encoding:"utf8"});
+      return ps.status === 0 && !ps.stdout.trim().startsWith("Z");
+    };
+    try {
+      const start = Date.now(), r = f.cli("verify", []);
+      expect(Date.now() - start).toBeLessThan(6000);
+      expect(r.exitCode, r.stderr.toString() + r.stdout.toString()).toBe(normal ? 0 : 1);
+      const stage = f.evidence().at(-1).meta.stages[0];
+      if (normal) {
+        expect(stage.output_sha256).toBe(new Bun.CryptoHasher("sha256").update("stage finished\nlate output\n").digest("hex"));
+      } else {
+        expect(stage.output_excerpt).toMatch(/output drain timed out/i);
+        expect(readFileSync(stage.log_path, "utf8")).toContain("stage finished");
+      }
+      expect(running()).toBe(detached);
+    } finally {
+      // Release the independent fixture by its own marker, never a stale PID.
+      writeFileSync(release, "");
+      if (existsSync(pidFile)) {
+        const end = Date.now() + 1500;
+        while (running() && Date.now() < end) await Bun.sleep(25);
+        expect(running()).toBe(false);
+      }
+    }
+  }, 20_000);
+}
 
 test("rotation preserves a live writer and expires its abandoned log after a crash", async () => {
   const dir = verificationLogDirectory(f.root, 1);
@@ -164,4 +183,39 @@ test("a rejected ledger transaction retains the original diagnostic and readable
   expect(path).toBeDefined();
   expect(readFileSync(path!, "utf8")).toContain("Expected an executable verification runner");
   expect(f.evidence()).toEqual([]);
+});
+
+test("Bearer whitespace matches the text rule and preserves the original separator bytes", () => {
+  const log = new VerificationLog(f.root);
+  const spaces = [" ", "\t", "\r\n", "\u00a0", "\u1680", ...Array.from({length:11}, (_, i) => String.fromCharCode(0x2000 + i)),
+    "\u2028", "\u2029", "\u202f", "\u205f", "\u3000", "\ufeff"];
+  const separators = [...spaces.map(s => Buffer.from(s)), Buffer.from([0xa0]), Buffer.from([32,0xa0,9])];
+  const token = "private-token-fixture";
+  const output = (value: string) => Buffer.concat(separators.flatMap(space => [Buffer.from("Bearer"), space, Buffer.from(value + "!\n")]));
+  try {
+    for (const space of spaces) expect(redactSecrets("Bearer" + space + token)).toBe("Bearer" + space + "***");
+    const code = 'process.stdout.write(Buffer.from(' + JSON.stringify(output(token).toString("base64")) + ',"base64"));process.exitCode=1;';
+    expect(log.run([process.execPath,"-e",code], f.root, process.env).code).toBe(1);
+    const receipt = log.finish(true);
+    expect(readFileSync(receipt.log_path!).equals(output("***"))).toBe(true);
+    expect(receipt.output_excerpt).not.toContain(token);
+  } finally { log.dispose(); }
+});
+
+test("numbered credential names and short Bearer tokens are masked across writes", () => {
+  const chunks = ["OAUTH2_TO", "KEN=first UTF8_TOKEN2_V2='two words' 2_TOKEN=public\nAuthorization: Bea",
+    "rer abc", "123,next\nBearer Z!\nBearer ,unchanged\n"];
+  const safe = "OAUTH2_TOKEN=*** UTF8_TOKEN2_V2=*** 2_TOKEN=public\nAuthorization: Bearer ***,next\nBearer ***!\nBearer ,unchanged\n";
+  expect(redactSecrets(chunks.join(""))).toBe(safe);
+  expect(redactArguments(["env","OAUTH2_TOKEN=first second","TOKEN2=third fourth","2_TOKEN=public","service"]))
+    .toEqual(["env","OAUTH2_TOKEN=***","TOKEN2=***","2_TOKEN=public","service"]);
+  const log = new VerificationLog(f.root);
+  try {
+    const code = "for(const chunk of " + JSON.stringify(chunks) +
+      "){require('fs').writeSync(1,chunk);await Bun.sleep(10)}process.exitCode=1";
+    expect(log.run([process.execPath,"-e",code], f.root, process.env).code).toBe(1);
+    const receipt = log.finish(true);
+    expect(readFileSync(receipt.log_path!, "utf8")).toBe(safe);
+    expect(receipt.output_excerpt).toBe(safe.trim());
+  } finally { log.dispose(); }
 });

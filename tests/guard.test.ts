@@ -982,8 +982,16 @@ test("policy checks use the command's effective directory and copy destination",
   expect(decision("cp --target-directory=.workbench archive")).toContain("ship-policy.yaml");
   expect(decision("cp -t .workbench/specs archive")).toBeNull();
   expect(decision("tar -czf .workbench/specs/report.tgz -C .workbench/specs .")).toBeNull();
+  expect(decision("rsync -a archive .workbench/specs/")).toBeNull();
   expect(decision("git rm -r .workbench")).toContain("ship-policy.yaml");
   expect(decision("git mv .workbench archived")).toContain("ship-policy.yaml");
+  const spaced = join(wb, "bench with spaces");
+  const spacedPolicy = join(spaced, ".workbench", "ship-policy.yaml");
+  mkdirSync(join(spaced, ".workbench"), {recursive: true});
+  const inline = "node -e 'audit(" + JSON.stringify(spacedPolicy) + ")'";
+  const { checkLedgerTamper } = require("../src/guard/tamper");
+  const { loadWorkbenchConfig } = require("../src/config");
+  expect(checkLedgerTamper(spaced, shellInput(inline), loadWorkbenchConfig(wb))).toContain("ship-policy.yaml");
   const literal = "node -e 'audit(\"ship-policy.yaml\")'";
   expect(evaluatePreToolUse(wb, shellInput(literal, join(wb, ".workbench")))).toContain("ship-policy.yaml");
   expect(evaluatePreToolUse(wb, shellInput(literal, join(wb, ".workbench/specs")))).toBeNull();

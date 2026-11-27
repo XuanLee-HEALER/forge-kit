@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { closeSync, openSync, readSync, writeFileSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { Repo, snapshotGitEnv, type Change } from "./repo";
+import { Repo, snapshotGitEnv } from "./repo";
 
 const CHUNK_BYTES = 12_000;
 const INDEX_BYTES = 20_000;
@@ -132,16 +132,16 @@ export function prepareMaterials(repo: Repo, dir: string) {
   const hash = digest(JSON.stringify(manifest));
   const summary = {files: manifest.length + repo.excludedFiles.length, excluded: repo.excludedFiles.length, digest: hash};
   const fullIndex = {...summary, changes:manifest};
-  const byPath = new Map(repo.changes.map(c => [c.path, c]));
+  // Positions address the same immutable sequence in the full index, its
+  // page directory, and the complete entries attached to individual batches.
+  const byPath = new Map(repo.changes.map((c, position) => [c.path, {...c, position}]));
   if (Buffer.byteLength(JSON.stringify(fullIndex)) <= INDEX_BYTES)
     return {dir, chunks, missing, limitations, index:fullIndex, byPath};
-  // For a large inventory, each summary describes a contiguous range in path
-  // order. Every file belongs to one range, including very large directories.
-  const sorted = manifest.toSorted((a, b) => a.path.localeCompare(b.path));
-  const pageSize = Math.max(1, Math.ceil(sorted.length / 48));
+  // The fixed Git inventory order is also the page order.
+  const pageSize = Math.max(1, Math.ceil(manifest.length / 48));
   const pages = [];
-  for (let i = 0; i < sorted.length; i += pageSize) {
-    const page = sorted.slice(i, i + pageSize);
+  for (let i = 0; i < manifest.length; i += pageSize) {
+    const page = manifest.slice(i, i + pageSize);
     const types: Record<string, number> = Object.create(null);
     let added = 0, deleted = 0;
     for (const change of page) {
@@ -161,6 +161,21 @@ export function prepareMaterials(repo: Repo, dir: string) {
   return {dir, chunks, missing, limitations, index, byPath};
 }
 
+// Give each related file a turn before taking the next chunk from the same file.
+function* interleaveFiles(group: Chunk[]) {
+  const files = new Map<string, Chunk[]>();
+  for (const chunk of group) {
+    const parts = files.get(chunk.path);
+    if (parts) parts.push(chunk);
+    else files.set(chunk.path, [chunk]);
+  }
+  let active = [...files.values()];
+  for (let offset = 0; active.length; offset++) {
+    for (const parts of active) yield parts[offset];
+    active = active.filter(parts => parts.length > offset + 1);
+  }
+}
+
 // Keep small source/test groups together even when the preceding batch is nearly full.
 export function* batches(chunks: Chunk[]) {
   const maxBytes = 56_000, maxCount = 32;
@@ -173,13 +188,15 @@ export function* batches(chunks: Chunk[]) {
       yield pending;
       pending = []; bytes = 0;
     }
-    for (let n = start; n < i; n++) {
-      if (pending.length && (bytes + chunks[n].size > maxBytes || pending.length === maxCount)) {
+    const groupChunks = chunks.slice(start, i);
+    const ordered = groupBytes > maxBytes || groupChunks.length > maxCount ? interleaveFiles(groupChunks) : groupChunks;
+    for (const chunk of ordered) {
+      if (pending.length && (bytes + chunk.size > maxBytes || pending.length === maxCount)) {
         yield pending;
         pending = []; bytes = 0;
       }
-      pending.push(chunks[n]);
-      bytes += chunks[n].size;
+      pending.push(chunk);
+      bytes += chunk.size;
     }
   }
   if (pending.length) yield pending;
@@ -190,6 +207,6 @@ export function loadChunk(material: Material, chunk: Chunk) {
   return {id:receiptId, ...bounds, patch:readFileSync(join(material.dir, id), "utf8")};
 }
 
-export function batchChanges(byPath: Map<string, Change>, chunks: Chunk[]) {
+export function batchChanges(byPath: Material["byPath"], chunks: Chunk[]) {
   return [...new Set(chunks.map(c => c.path))].map(path => byPath.get(path)!);
 }

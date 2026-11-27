@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 type Entry = {status:string; oldPath:string; path:string; added:number; deleted:number};
-type Call = {role:string; index:{changes:Entry[]; pages?:{offset:number;count:number}[]}; chunks:{id:string;path:string;patch:string;newEnd:number;oldEnd:number}[];spec:string|null};
+type Call = {role:string; related:(Entry & {position:number})[]; index:{files:number; excluded:number; digest:string; changes?:Entry[]; pages?:{offset:number;count:number}[]}; chunks:{id:string;path:string;patch:string;newEnd:number;oldEnd:number}[];spec:string|null};
 function fixture(run: (f: ReturnType<typeof setup>) => void) {
   const root = mkdtempSync(join(tmpdir(), "receipt-test-"));
   try { run(setup(root)); } finally { rmSync(root, {recursive:true,force:true}); }
@@ -20,14 +20,26 @@ function setup(root:string) {
   git("init", "-q");
   const fake = join(root,"codex");
   writeFileSync(fake, `#!/usr/bin/env bun
-import {appendFileSync,readFileSync} from "node:fs";
+import {appendFileSync,readFileSync,readdirSync,unlinkSync,writeFileSync} from "node:fs";
+import {join} from "node:path";
 const q=JSON.parse(await Bun.stdin.text()), line=Number(readFileSync(import.meta.path+".line","utf8"));
 appendFileSync(import.meta.path+".calls",JSON.stringify(q)+"\\n");
 const checked=q.chunks.map(({id,path})=>({id,path,conclusion:"reviewed"}));
 const mode=readFileSync(import.meta.path+".mode","utf8");
 if (mode==="duplicate") checked.push(checked[0]);
 if (mode==="invalid") checked[0].id="0-bad";
-const findings=line?[{severity:"blocking",path:"code.ts",line,title:"anchored",evidence:"fixture",recommendation:"fix"}]:[];
+if (mode==="drop" && q.chunks.some(c=>c.path==="code.ts")) {
+  let remove = false;
+  try { writeFileSync(import.meta.path+".drop","",{flag:"wx"}); remove=true; }
+  catch (e) { if (e.code!=="EEXIST") throw e; }
+  if (remove) {
+    const root = ${JSON.stringify(root)};
+    const dir = join(root,readdirSync(root).find(name=>name.startsWith("forge-review-material-")));
+    const id = readdirSync(dir).find(name=>/^[a-f0-9]{64}$/.test(name) && readFileSync(join(dir,name),"utf8").includes("MISSING_FIXTURE_CHUNK"));
+    unlinkSync(join(dir,id));
+  }
+}
+const findings=line && q.chunks.some(c=>c.path==="code.ts")?[{severity:"blocking",path:"code.ts",line,title:"anchored",evidence:"fixture",recommendation:"fix"}]:[];
 await Bun.write(process.argv[process.argv.indexOf("-o")+1],JSON.stringify({role:q.role,checked,findings,status:"pass",summary:"fixture",limitations:[]}));
 `, {mode:0o755});
   const review = (base:string, roles:string, line = 0, spec = "", path = process.env.PATH, mode = "valid") => {
@@ -36,7 +48,7 @@ await Bun.write(process.argv[process.argv.indexOf("-o")+1],JSON.stringify({role:
     writeFileSync(fake+".calls", "");
     const p = Bun.spawnSync([process.execPath,join(import.meta.dir,"../src/review.ts"),"--repo",repo,"--base",base,
       "--head","HEAD","--roles",roles,"--model","gpt-6.2-sol","--effort","medium", ...(spec ? ["--spec",spec] : [])],
-      {env:{PATH:path, HOME:root, FORGE_CODEX_BIN:fake}, timeout:90_000});
+      {env:{PATH:path, HOME:root, TMPDIR:root, FORGE_CODEX_BIN:fake}, timeout:90_000});
     expect(p.stderr.toString()).toBe("");
     const calls:Call[] = readFileSync(fake+".calls","utf8").trim().split("\n").filter(Boolean).map(l=>JSON.parse(l));
     return {code:p.exitCode, calls, report:JSON.parse(p.stdout.toString())};
@@ -82,7 +94,7 @@ test("the large review delivers the entire Git inventory and pure rename metadat
     const batches = calls.filter(c=>c.role === role);
     expect(batches.length).toBeGreaterThan(1);
     for (const batch of batches) {
-      expect(batch.index.changes.map(({status,oldPath,path})=>({status,oldPath,path}))).toEqual(rows);
+      expect(batch.index.changes!.map(({status,oldPath,path})=>({status,oldPath,path}))).toEqual(rows);
     }
     const chunks = batches.flatMap(c=>c.chunks);
     expect(new Set(chunks.map(c=>c.path))).toEqual(new Set(rows.map(r=>r.path)));
@@ -185,6 +197,12 @@ test("long Git paths fit the global index and exact compact receipts remain mand
   expect(new Set(result.calls.flatMap(c=>c.chunks.map(chunk=>chunk.path)))).toEqual(new Set(paths));
   for (const call of result.calls) {
     expect(Buffer.byteLength(JSON.stringify(call.index))).toBeLessThanOrEqual(20_000);
+    const manifest = [...paths].sort();
+    for (const entry of call.related) {
+      expect(entry.path).toBe(manifest[entry.position]);
+      expect(call.index.pages!.some(p=>p.offset<=entry.position && entry.position<p.offset+p.count)).toBe(true);
+    }
+    expect(result.report.roles[0].coverage.inventory_digest).toBe(call.index.digest);
     const pages = call.index.pages!;
     let offset = 0;
     for (const page of pages) {
@@ -227,4 +245,76 @@ test("an unavailable material directory returns incomplete selections for the pi
       coverage:{reviewed:0},missing_materials:["a.txt","b.txt"]});
     expect(role.limitations.join(" ")).toMatch(/temporary material directory.*ENOTDIR/i);
   }
+}));
+
+test("a lost prepared chunk preserves findings and the remaining material for each role", () => fixture(f => {
+  f.git("commit","--allow-empty","-qm","base");
+  const base = f.git("rev-parse","HEAD");
+  const paths = ["code.ts", ...Array.from({length:35}, (_,i)=>"part-"+i+".txt"), "zz-lost.txt", "zz-sent.txt"];
+  for (const path of paths) writeFileSync(join(f.repo,path),path==="zz-lost.txt"?"MISSING_FIXTURE_CHUNK\n":path+"\n");
+  f.git("add","--",...paths); f.commit("chunks");
+  const result = f.review(base,"quality,comments",1,"",process.env.PATH,"drop");
+  expect(result.code).toBe(3);
+  for (const role of result.report.roles) {
+    expect(role.status).toBe("incomplete");
+    expect(role.missing_materials).toEqual(["zz-lost.txt"]);
+    expect(role.coverage.reviewed).toBe(paths.length-1);
+    expect(role.coverage.missing).toEqual([{id:expect.stringMatching(/^[a-f0-9]{64}$/),path:"zz-lost.txt"}]);
+    expect(role.findings).toHaveLength(1);
+    expect(role.limitations.join(" ")).toMatch(/Cannot read pinned chunk.*zz-lost.txt.*ENOENT/);
+    expect(result.calls.some(c=>c.role===role.role && c.chunks.some(k=>k.path==="zz-sent.txt"))).toBe(true);
+  }
+}));
+
+test("local attribute overrides cannot hide a pinned text deletion or force review of a pinned binary", () => fixture(f => {
+  writeFileSync(join(f.repo,".gitattributes"),"binary.txt -diff\n");
+  for (const path of ["deleted.txt","binary.txt"]) writeFileSync(join(f.repo,path),path+" witness\n");
+  f.git("add","--",".gitattributes","deleted.txt","binary.txt");
+  const base = f.commit("attribute baseline");
+  f.git("rm","--","deleted.txt","binary.txt"); f.commit("delete");
+  const normal = f.review(base,"quality");
+  expect(normal.code).toBe(3);
+  expect(normal.report.roles[0].missing_materials).toEqual(["binary.txt"]);
+  expect(normal.calls.flatMap(c=>c.chunks).map(k=>k.patch).join("")).toContain("-deleted.txt witness");
+  writeFileSync(join(f.repo,".git/info/attributes"),"deleted.txt -diff\nbinary.txt diff\n");
+  const override = f.review(base,"quality");
+  expect(override.report).toEqual(normal.report);
+  expect(override.calls).toEqual(normal.calls);
+}));
+
+test("related implementation and test hunks share a batch across the 32-chunk boundary", () => fixture(f => {
+  mkdirSync(join(f.repo,"src"));
+  mkdirSync(join(f.repo,"tests"));
+  const lines = Array.from({length:500},(_,i)=>"// line "+i+"\n");
+  writeFileSync(join(f.repo,"src/parser.ts"),lines.join(""));
+  f.git("add","--","src/parser.ts");
+  const base = f.commit("parser");
+  for (let i=0;i<32;i++) lines[i*15]="// revised "+i+"\n";
+  writeFileSync(join(f.repo,"src/parser.ts"),lines.join(""));
+  writeFileSync(join(f.repo,"tests/parser.test.ts"),"// regression check\n");
+  f.git("add","--","src/parser.ts","tests/parser.test.ts"); f.commit("32 hunks and a test");
+  const result = f.review(base,"quality");
+  expect(result.code).toBe(0);
+  expect(result.calls).toHaveLength(2);
+  expect(result.calls.flatMap(c=>c.chunks).filter(k=>k.path==="src/parser.ts")).toHaveLength(32);
+  expect(result.calls.some(c=>["src/parser.ts","tests/parser.test.ts"].every(path=>c.chunks.some(k=>k.path===path)))).toBe(true);
+}));
+
+test("a single-chunk batch keeps its inventory identity when a large spec needs the summary", () => fixture(f => {
+  f.git("commit","--allow-empty","-qm","base");
+  const base = f.git("rev-parse","HEAD");
+  writeFileSync(join(f.repo,"sample.txt"),"review this line\n");
+  f.git("add","--","sample.txt"); f.commit("change");
+  const initial = f.review(base,"quality");
+  const prompt = initial.calls[0];
+  const {files,excluded,digest} = prompt.index;
+  const summary = {files,excluded,digest};
+  const compactBytes = Buffer.byteLength(JSON.stringify({...prompt,spec:"",index:summary}));
+  const spec = join(f.root,"requirements");
+  writeFileSync(spec,"x".repeat(140_000-compactBytes-1));
+  const result = f.review(base,"quality",0,spec);
+  expect(result.code).toBe(0);
+  expect(result.calls[0].index).toEqual(summary);
+  expect(result.calls[0].related[0]).toMatchObject({path:"sample.txt",position:0});
+  expect(result.report.roles[0].coverage).toMatchObject({inventory_digest:digest,inventory_files:1,expected:1,reviewed:1});
 }));

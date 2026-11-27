@@ -10,11 +10,15 @@ import supervisor from "./verification-supervisor.ts" with {type: "text"};
 // @ts-expect-error Bun embeds the streaming redactor alongside the supervisor.
 import streamRedactor from "./verification-redactor.ts" with {type: "text"};
 
+// @ts-expect-error Bun embeds the separate process-group leader.
+import groupProgram from "./verification-group.ts" with {type: "text"};
+
 export const defaultVerificationTimeout = 120_000;
 const patterns = SECRET_PATTERNS.map(([pattern, replacement]) => `[${pattern}, ${JSON.stringify(replacement)}]`);
 export const verificationSupervisorSource = `const patterns = [${patterns}];
 const redactSecrets = text => (${redactWithPatterns.toString()})(text, patterns);
 ${streamRedactor}
+const groupProgram = ${JSON.stringify(groupProgram)};
 ${supervisor}`;
 
 function writerGone(path: string, pid?: string) {

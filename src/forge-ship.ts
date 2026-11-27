@@ -224,10 +224,14 @@ function preflight(ledger: Ledger, e: Envelope, candidate?: ExactPlan) {
     }
   }
   if (waiting.length) throw new AwaitingOperator(waiting.join("\n"));
-  if (manual.length) throw new AwaitingOperator("Manual merge required for " + manual.join(", ") +
-    ": the host cannot bind the base on merge." +
-    (candidate ? " Preview only: run forge ship run --envelope " + e.envelope_id + " to pin the open PRs before merging."
-      : " After the operator merges, rerun forge ship run to verify the remote receipts."));
+  if (manual.length) {
+    const run = "forge ship run --envelope " + e.envelope_id;
+    if (candidate)
+      throw new AwaitingOperator("Preview only. First run " + run + " to pin the open PRs. " +
+        "Wait for that run's 'Manual merge required' handoff before merging " + manual.join(", ") + ".");
+    throw new AwaitingOperator("Manual merge required for " + manual.join(", ") +
+      ": the host cannot bind the base on merge. After the operator merges, rerun " + run + " to verify the remote receipts.");
+  }
   return { plan, dirs, verifiedMerges };
 }
 class AwaitingOperator extends Error {}
@@ -292,12 +296,6 @@ function resolveFrontPlan(ledger: Ledger, e: Envelope, execute: boolean) {
   });
 }
 function observed(ledger: Ledger, e: Envelope, a: ShipAction, dirs: Map<string, string>): string | null {
-  if (a.kind === "push") {
-    const target = remoteBranch(dirs.get(a.repo)!, a.ref);
-    if (target === a.head) return target;
-    if (target !== a.baseOid) throw Error("Remote branch drifted");
-    return null;
-  }
   if (a.kind === "pr") {
     const row = ledger.getTaskRepos(e.task_id).find((r) => r.repo === a.repo)!;
     const pr = checkedPr(dirs.get(a.repo)!, row.branch, a);
@@ -374,14 +372,14 @@ function perform(
   index: number,
   plan: ExactPlan,
 ) {
-  const state = observed(ledger, e, a, dirs);
-  if (state) return state;
   if (a.kind === "push") {
     return pushFastForward(dirs.get(a.repo)!, a, () => {
       checkPushPermission(ledger.workbenchRoot, a.ref.slice("refs/heads/".length));
       checkAuthorization(ledger, e.envelope_id);
     });
   }
+  const state = observed(ledger, e, a, dirs);
+  if (state) return state;
   if (a.kind === "pr")
     throw new AwaitingOperator("Manual merge required for the pinned PR " + a.url);
   if (a.kind === "tag") {
@@ -543,6 +541,8 @@ export function shipCli(argv: string[]) {
             if (validOwner(claim.owner_pid) || envelope(ledger, id).status !== "ACTIVE")
               return state(ledger, id, "Action claimed; inspect receipts");
           }
+          if (action.kind === "push")
+            throw Error("Uncertain fast-forward outcome for a claimed push; inspect the remote and recover manually");
           observation =
             action.kind === "stage"
               ? reconcileStage(ledger, current, action, plan, index)
