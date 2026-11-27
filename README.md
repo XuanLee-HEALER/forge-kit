@@ -221,13 +221,14 @@ description: 检查本实例的 smoke 验证阶段是否可用。
 输入是当前工作台。运行 `forge instance show stage smoke --json`，返回动作 ID 和来源后完成。
 ```
 
-在现有的 `.workbench/workbench.yaml` 增加下列配置。只配置验证动作时可省略 skills 一项。
+本例使用已登记的 Bun 项目。目标提交须跟踪 `tests/smoke.test.ts`，其中的测试通过项目公开入口执行操作，并断言实际输出或持久化结果。在现有的 `.workbench/workbench.yaml` 增加下列配置。只配置验证动作时可省略 skills 一项。
 
 ```yaml
 extensions:
   actions:
     smoke-check:
-      argv: ["bun", "-e", "console.log('smoke ok')"]
+      argv: ["bun", "test", "./tests/smoke.test.ts"]
+      inputs: ["tests/smoke.test.ts"]
       cwd: "."
       purpose: verify
   stages:
@@ -240,7 +241,7 @@ extensions:
     ready: .workbench/overrides/ready
 ```
 
-在实例根执行以下命令。最后一个命令打印 `smoke ok`。以后升级时，私有源文件与本地配置继续保留。
+在实例根执行以下命令。将 `TASK` 设为已冻结规格的开放任务 ID，`CHECKOUT` 设为该任务所登记仓库的干净检出绝对路径，HEAD 对应待验收提交。`forge verify` 在该提交的隔离检出运行测试，返回阶段退出码，并将结果记入任务账本。以后升级时，私有技能源文件与本地配置继续保留。
 
 ```bash
 export PATH="$PWD/.workbench/bin:$PATH"
@@ -248,7 +249,8 @@ forge sync .
 forge doctor . --json
 forge instance list --json
 forge instance show skill ready --json
-forge instance run smoke
+forge instance show stage smoke --json
+forge verify --task "$TASK" --cwd "$CHECKOUT" --mode all
 ```
 
 技能正文可用 Markdown 行内链接、引用式链接或图片引用同目录下的资源，链接可带标题。同步时只投影引用的本地文件。技能查询读取实例上次成功同步的受管副本。修改或撤销私有技能覆写后，先运行同步再查询。原发行目录移动后，实例仍可查询和使用已交付的技能；下次同步从所需发行目录运行。
