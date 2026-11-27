@@ -867,8 +867,10 @@ export class Ledger {
    * - Latest post-amend status of each executed verification kind (test/build/lint/hurl) for this exact
    *   (repo, head_sha) must not be `fail`;
    * - Unstarted review selections require a subsequent tool pass for the same role and range;
-   * - For `targeted`: at least one of test/build/lint/hurl must be `pass`;
-   * - For `full`: static check (`lint`) MUST be `pass`, at least one of test/build/hurl MUST be `pass`,
+   * - Current tasks require the configured verification receipt or, for default verification, both a
+   *   passing static check and an executed test. Legacy tasks retain their original evidence rules:
+   * - For legacy `targeted`: at least one of test/build/lint/hurl must be `pass`;
+   * - For legacy `full`: static check (`lint`) MUST be `pass`, at least one of test/build/hurl MUST be `pass`,
    *   and latest review status must be `pass` or `fallback`.
    */
   checkPushReadiness(params: {
@@ -1122,7 +1124,7 @@ export class Ledger {
     const hasPassingVerify = [...latestByKind.values()].some((st) => st === "pass");
     const hasPassingExecVerify =
       latestByKind.get("test") === "pass" ||
-      latestByKind.get("build") === "pass" ||
+      (!currentWorkflow && latestByKind.get("build") === "pass") ||
       latestByKind.get("hurl") === "pass";
 
     if (failedKinds.size > 0) {
@@ -1141,7 +1143,7 @@ export class Ledger {
         );
       }
       if (!hasPassingExecVerify) {
-        const checks = currentWorkflow ? "build or executed test" : "build/test/hurl";
+        const checks = currentWorkflow ? "executed test" : "build/test/hurl";
         missing.push(
           `no passing ${checks} evidence recorded for ${params.repo}@${params.head_sha.slice(0, 8)}`,
         );

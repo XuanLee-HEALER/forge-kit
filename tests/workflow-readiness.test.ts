@@ -113,9 +113,15 @@ test("custom delivery and verification keep the configured receipts and each rev
       delete yaml.extensions.verification;
       writeFileSync(file, stringify(yaml));
       expect(secondCheck().ready).toBe(false);
+      // Default verification still needs evidence of execution after a successful build.
+      for (const kind of ["lint", "build"] as const)
+        db.recordEvidence({ ...bind, sha: next, kind, status: "pass" });
+      expect(secondCheck().ready).toBe(false);
+      db.recordEvidence({ ...bind, sha: next, kind: "test", status: "pass" });
+      expect(secondCheck().ready).toBe(true);
     } finally { db.closeDb(); }
   } finally { s.cleanup(); }
-});
+}, 20_000);
 
 test("a targeted scope stays frozen through test-only and technical amendments", () => {
   const s = sandbox();
