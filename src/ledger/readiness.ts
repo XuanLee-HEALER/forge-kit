@@ -223,14 +223,15 @@ export function checkReadiness(ledger: TaskReader, params: ReadinessParams, clos
           !!row && coversReviewBase(ledger.workbenchRoot, row, p.meta?.base);
         const coversBase = historical.length > 0 && historical.every(covered) && current.every(covered);
         if (receipt) {
-          if (legacy && coversBase && (p.status === "pass" || p.status === "fallback")) {
+          const legacyFullPass = legacy && coversBase && (p.status === "pass" || p.status === "fallback");
+          if (legacyFullPass) {
             // Legacy full-range retries replaced earlier legacy results for this role at this HEAD.
             for (const issue of evidence.issues.values()) {
               if (issue.source !== "subagent" && issue.role === roleKey && issue.head === ev.sha)
                 evidence.issues.delete(issue.seq);
             }
           }
-          if (p.status === "pass" && (!legacy || (source === "tool" && coversBase))) {
+          if ((legacyFullPass && source === "tool") || (!legacy && p.status === "pass")) {
             resolveReviewedIssues(evidence.issues, receipt, p.summary ?? "", join(ledger.workbenchRoot, params.repo), params.head_sha, coversBase);
           }
         }
