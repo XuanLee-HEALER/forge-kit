@@ -69,7 +69,8 @@ export function checkReviewReadiness(ledger: LedgerReader, attachment: TaskRepoR
       resolveReviewedIssues(issues, range, typeof p.summary === "string" ? p.summary : "", dir, head);
       if (range.head !== head) continue;
       roles.add(range.role);
-      coversBaseline ||= coversReviewBase(dir, attachedBase, range.base) && coversReviewBase(dir, base_sha, range.base);
+      coversBaseline ||= coversReviewBase(dir, attachedBase, range.base) &&
+        (attachedBase === base_sha || coversReviewBase(dir, base_sha, range.base));
     }
   }
 

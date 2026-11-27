@@ -18,7 +18,7 @@ for (const file of [...files].sort()) {
 if (!jobs.length || selected.some(path => !jobs.some(job => job.file === path))) throw Error("Unknown test file");
 // Start the baseline's longest files alongside the delivery shards so none
 // becomes a serial tail after the other workers have finished.
-const longest = ["fast-track", "ship-plan-regressions", "release-train"].map(name => "tests/" + name + ".test.ts");
+const longest = ["handoff-release", "fast-track", "ship-plan-regressions", "release-train"].map(name => "tests/" + name + ".test.ts");
 function priority(job: typeof jobs[number]) {
   return longest.includes(job.file) ? 2 : job.file === delivery ? 1 : 0;
 }
