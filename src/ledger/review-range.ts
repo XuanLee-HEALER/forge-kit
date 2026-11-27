@@ -75,6 +75,7 @@ export function reviewCoverageGap(ranges: ReviewRange[], base: string, head: str
   let nextBase: string | undefined;
   const endpoints = [...reached];
   for (const range of ranges) {
+    if (reached.has(range.head) || reached.has(range.base)) continue;
     if (endpoints.some(covered => ancestor(range.base, covered))) continue;
     if (!nextBase || ancestor(range.base, nextBase)) nextBase = range.base;
   }

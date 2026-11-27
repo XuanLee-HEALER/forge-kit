@@ -116,7 +116,9 @@ export function checkReviewReadiness(ledger: LedgerReader, attachment: TaskRepoR
         coverageMissing = required + ". The task baseline and delivery HEAD trees are identical";
       } else {
         const gaps: string[] = [];
-        for (const [role, ranges] of byRole) {
+        // A complete role needs a passing receipt at HEAD, even if its final segment was a repaired failure.
+        const orderedRoles = [...byRole].sort(([a], [b]) => Number(roles.has(b)) - Number(roles.has(a)));
+        for (const [role, ranges] of orderedRoles) {
           const gap = reviewCoverageGap(ranges, base, head, ancestor);
           if (!gap) {
             gaps.length = 0;
