@@ -11,6 +11,7 @@ import {
 import { dirname, resolve } from "node:path";
 import {
   copyDestination,
+  tarCreateDestination,
   hasUnquotedPipe,
   hasUnquotedRedirect,
   splitShellSegments,
@@ -81,13 +82,16 @@ export function checkLedgerTamper(
     const commandDir = resolveGitDirFlags(cwd, [...dirs, ...(git?.gitDirFlags ?? [])]) ?? cwd;
     const absolute = (path: string) => canonicalizeMaybePath(resolve(commandDir, path));
     const paths = (git?.subArgs ?? args).filter(t => !t.startsWith("-")).map(absolute);
-    const removesTree = ["rm", "mv", "rmdir", "rsync", "tar", "unzip", "ditto", "cp"].includes(bin ?? "") ||
+    const fileCommand = git && ["rm", "mv"].includes(git.subcmd) ? git.subcmd : bin;
+    const removesTree = ["rm", "mv", "rmdir", "rsync", "tar", "unzip", "ditto", "cp"].includes(fileCommand ?? "") ||
       (bin === "find" && args.includes("-delete"));
     if (bin === "find" && args[0]?.startsWith("-")) paths.push(canonicalizeMaybePath(commandDir));
-    const copyTarget = bin === "cp" ? copyDestination(args) : undefined;
-    const ancestors = copyTarget ? [absolute(copyTarget)] : bin === "rsync" || bin === "ditto" ? paths.slice(-1) : paths;
+    const destination = bin === "cp" ? copyDestination(args) : bin === "tar" ? tarCreateDestination(args) : undefined;
+    const ancestors = destination ? [absolute(destination)] : bin === "rsync" || bin === "ditto" ? paths.slice(-1) : paths;
     const textOutput = (bin === "echo" || bin === "printf") && !/\$\(|`/.test(command);
-    const targetsPolicy = paths.includes(policyPath) || (!textOutput && command.includes(".workbench/ship-policy.yaml"));
+    const policyLiterals = command.match(/[^\s'"`(),;=]*ship-policy\.yaml(?=$|[\s'"`(),;])/g) ?? [];
+    const targetsPolicy = paths.includes(policyPath) || (destination && absolute(destination) === policyPath) ||
+      (!textOutput && policyLiterals.some(path => absolute(path) === policyPath));
     const readsOnly = textOutput || isReadonlyLedgerHookInspection(command, command, words) ||
       (git?.subcmd === "diff" && git.subArgs.every(t => t === "--" || absolute(t) === policyPath));
     if (redirects.some(p => canonicalizeMaybePath(resolve(cwd, p)) === policyPath) ||

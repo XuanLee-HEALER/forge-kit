@@ -62,9 +62,15 @@ test("the large review delivers the entire Git inventory and pure rename metadat
   f.git("mv","original.txt","renamed.txt");
   const added = [...Array.from({length:17},(_,i)=>"new-"+i+".txt"), "code.test.ts"];
   for (const path of added) writeFileSync(join(f.repo,path), path+"\n");
-  writeFileSync(join(f.repo,"code.ts"),"export const changed = 2;\n");
+  writeFileSync(join(f.repo,"code.ts"),"export const changed = 2; // MODIFIED_SOURCE\n");
+  writeFileSync(join(f.repo,"code.test.ts"),"expect(changed).toBe(2); // NEW_TEST\n");
   f.git("add","--",...added,"code.ts");
-  f.commit("large range");
+  const head = f.commit("large range");
+  const original = f.git("show",base+":code.ts");
+  const modified = f.git("show",head+":code.ts");
+  const addedTest = f.git("show",head+":code.test.ts");
+  writeFileSync(join(f.repo,"code.ts"),"DIRTY_WORKTREE_ONLY\n");
+  writeFileSync(join(f.repo,"code.test.ts"),"DIRTY_WORKTREE_ONLY\n");
   const rows = f.git("diff","-M","--name-status",base,"HEAD").split("\n").map(line=>{
     const [status,oldPath,newPath] = line.split("\t");
     return {status,oldPath,path:newPath ?? oldPath};
@@ -80,6 +86,10 @@ test("the large review delivers the entire Git inventory and pure rename metadat
     }
     const chunks = batches.flatMap(c=>c.chunks);
     expect(new Set(chunks.map(c=>c.path))).toEqual(new Set(rows.map(r=>r.path)));
+    const patchLines = (path:string) => chunks.filter(c=>c.path === path).flatMap(c=>c.patch.split("\n"));
+    expect(patchLines("code.ts")).toEqual(expect.arrayContaining(["-"+original,"+"+modified]));
+    expect(patchLines("code.test.ts")).toContain("+"+addedTest);
+    expect(chunks.some(c=>c.patch.includes("DIRTY_WORKTREE_ONLY"))).toBe(false);
     const rename = chunks.filter(c=>c.path === "renamed.txt");
     expect(rename).toHaveLength(1);
     expect(JSON.parse(rename[0].patch)).toMatchObject({status:"R100",oldPath:"original.txt",path:"renamed.txt"});
@@ -196,3 +206,25 @@ test("long Git paths fit the global index and exact compact receipts remain mand
     expect(first.id.endsWith("-"+missing.id.slice(0,4))).toBe(true);
   }
 }), 60_000);
+
+test("an unavailable material directory returns incomplete selections for the pinned range", () => fixture(f => {
+  f.git("commit","--allow-empty","-qm","base");
+  const base = f.git("rev-parse","HEAD");
+  for (const path of ["a.txt","b.txt"]) writeFileSync(join(f.repo,path),path+"\n");
+  f.git("add","--","a.txt","b.txt");
+  const head = f.commit("changes");
+  const tmp = join(f.root,"not-a-directory");
+  writeFileSync(tmp,"");
+  const result = Bun.spawnSync([process.execPath,join(import.meta.dir,"../src/review.ts"),"--repo",f.repo,
+    "--base",base,"--head",head,"--roles","quality,comments","--mode","ordered","--order","comments,quality",
+    "--model","gpt-6.2-sol","--effort","medium"],{env:{PATH:process.env.PATH,TMPDIR:tmp,HOME:f.root,FORGE_CODEX_BIN:join(f.root,"codex")}});
+  expect(result.exitCode,result.stderr.toString()).toBe(3);
+  const report = JSON.parse(result.stdout.toString());
+  expect(report).toMatchObject({status:"incomplete",base,head,mode:"ordered"});
+  expect(report.roles.map((r:{role:string})=>r.role)).toEqual(["comments","quality"]);
+  for (const role of report.roles) {
+    expect(role).toMatchObject({base,head,status:"incomplete",backend:null,attempts:[],findings:[],
+      coverage:{reviewed:0},missing_materials:["a.txt","b.txt"]});
+    expect(role.limitations.join(" ")).toMatch(/temporary material directory.*ENOTDIR/i);
+  }
+}));

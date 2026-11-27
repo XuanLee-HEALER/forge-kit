@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, closeSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, statSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { redactSecrets, redactWithPatterns, SECRET_PATTERNS } from "./shared/redact";
@@ -12,20 +12,31 @@ import streamRedactor from "./verification-redactor.ts" with {type: "text"};
 
 export const defaultVerificationTimeout = 120_000;
 const patterns = SECRET_PATTERNS.map(([pattern, replacement]) => `[${pattern}, ${JSON.stringify(replacement)}]`);
-const supervisorSource = `const patterns = [${patterns}];
+export const verificationSupervisorSource = `const patterns = [${patterns}];
 const redactSecrets = text => (${redactWithPatterns.toString()})(text, patterns);
 ${streamRedactor}
 ${supervisor}`;
 
 function writerGone(path: string, pid?: string) {
   if (pid) {
-    try { process.kill(Number(pid), 0); return false; }
+    try { process.kill(Number(pid), 0); }
     catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+    if (process.platform === "linux") {
+      // Match the inode because the supervisor opens it via the CLI's link.
+      const directory = "/proc/" + pid + "/fd";
+      try {
+        const file = lstatSync(path);
+        return !readdirSync(directory).some(fd => {
+          const open = statSync(join(directory, fd), {throwIfNoEntry: false});
+          return open?.dev === file.dev && open.ino === file.ino;
+        });
+      } catch { return false; }
+    }
   }
   // Older names have no owner. Remove only when the OS confirms no open fd.
   const lsof = Bun.which("lsof", { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" });
   if (!lsof) return false;
-  const check = spawnSync(lsof, ["-nP", "-t", "--", path], {timeout: 1000, encoding: "utf8"});
+  const check = spawnSync(lsof, ["-nP", ...(pid ? ["-a", "-p", pid] : []), "-t", "--", path], {timeout: 1000, encoding: "utf8"});
   return check.status === 1 && !check.stdout && !check.stderr && !check.error;
 }
 
@@ -55,6 +66,7 @@ export class VerificationLog {
   private readonly active: string;
   private readonly fd: number;
   private closed = false;
+  private unsavedNote = "";
   constructor(dir: string) {
     this.path = join(dir, "verify-" + randomUUID());
     this.active = this.path + "." + process.pid + ".active";
@@ -63,7 +75,7 @@ export class VerificationLog {
 
   run(argv: string[], cwd: string, env: NodeJS.ProcessEnv, timeout = defaultVerificationTimeout, inspect?: (lines: string) => void) {
     const start = fstatSync(this.fd).size;
-    const proc = spawnSync(process.execPath, ["-e", supervisorSource], {
+    const proc = spawnSync(process.execPath, ["-e", verificationSupervisorSource], {
       timeout: Math.min(2_147_483_647, timeout + 2500), killSignal: "SIGKILL",
       cwd: dirname(process.execPath), env: {PATH: process.env.PATH}, stdio: ["pipe", "ignore", "pipe", this.fd],
       input: JSON.stringify({argv, cwd, env, timeout, active: this.active}), encoding: "utf8",
@@ -99,7 +111,12 @@ export class VerificationLog {
   }
 
   note(message: string) {
-    writeFileSync(this.fd, "\n" + redactSecrets(message) + "\n");
+    const clean = redactSecrets(message);
+    try { writeFileSync(this.fd, "\n" + clean + "\n"); }
+    catch (error) {
+      this.unsavedNote = clean.slice(-2048) + "\nCannot append to verification log: " +
+        redactSecrets(error instanceof Error ? error.message : String(error));
+    }
   }
 
   finish(failed: boolean) {
@@ -110,7 +127,7 @@ export class VerificationLog {
       if (failed) tail = Buffer.concat([tail, chunk]).subarray(-2048);
     });
     const result = { output_sha256: hash.digest("hex"), ...(failed && {
-      output_excerpt: tail.toString().trim() || "Verification failed without output", log_path: this.path + ".log",
+      output_excerpt: [tail.toString().trim(), this.unsavedNote].filter(Boolean).join("\n") || "Verification failed without output", log_path: this.path + ".log",
     }) };
     if (failed) renameSync(this.active, this.path + ".log");
     this.dispose();

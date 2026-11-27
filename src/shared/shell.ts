@@ -906,3 +906,24 @@ export function copyDestination(args: string[]): string | undefined {
   }
   return args.at(-1);
 }
+
+/** Return the archive written by a plain tar create command with read-only inputs. */
+export function tarCreateDestination(args: string[]): string | undefined {
+  let create = false, output: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--") break;
+    if (arg === "-C" || arg === "--directory") { i++; continue; }
+    if (arg === "--create") create = true;
+    else if (arg === "--file") output = args[++i];
+    else if (arg.startsWith("--file=")) output = arg.slice(7);
+    else if (/^-[czjJvf]+$/.test(arg)) {
+      create ||= arg.includes("c");
+      if (arg.includes("f")) {
+        if (!arg.endsWith("f")) return;
+        output = args[++i];
+      }
+    } else if (arg.startsWith("-")) return;
+  }
+  return create ? output : undefined;
+}

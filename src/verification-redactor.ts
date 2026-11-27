@@ -91,10 +91,10 @@ function verificationRedactor(write: Sink) {
   });
   function* value(input: Input, send: Sink): Generator<void, void, string | undefined> {
     yield* input.ensure(1);
-    if (!input.text || /^\s/.test(input.text)) return;
+    if (!input.text || /^[ \t-\r]/.test(input.text)) return;
     send("***");
     const quote = input.text[0];
-    if (quote !== "'" && quote !== '"') { yield* input.until(/\s/); return; }
+    if (quote !== "'" && quote !== '"') { yield* input.until(/[ \t-\r]/); return; }
     input.take(1);
     const stop = quote === "'" ? /'/ : /["\\]/;
     for (;;) {
@@ -129,9 +129,9 @@ function verificationRedactor(write: Sink) {
     send("***");
     yield* input.until(/[^A-Za-z0-9._-]/);
   });
-  prepend(/Bearer(?=\s)/i, function*(input, match, send) {
+  prepend(/Bearer(?=[ \t-\r])/i, function*(input, match, send) {
     input.take(match[0].length, send);
-    yield* input.until(/\S/, send);
+    yield* input.until(/[^ \t-\r]/, send);
     yield* input.ensure(8);
     if (!/^[A-Za-z0-9._~+/=-]{8}/.test(input.text)) return;
     send("***");
@@ -140,7 +140,7 @@ function verificationRedactor(write: Sink) {
   prepend(/(?:https?|postgres(?:ql)?|mysql|redis|clickhouse):\/\//i, function*(input, match, send) {
     input.take(match[0].length, send);
     const authority = new Candidate();
-    yield* input.until(/[\s/@"']/, authority.add);
+    yield* input.until(/[ \t-\r/?#@"]/, authority.add);
     if (!input.text.startsWith("@")) {
       const nested = input.text.startsWith("/") && /(?:https?|postgres(?:ql)?|mysql|redis|clickhouse):$/i.exec(authority.end);
       authority.release(send, nested ? nested[0].length : 0);

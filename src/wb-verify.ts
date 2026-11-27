@@ -83,13 +83,22 @@ export function verifyCli(args: string[]) {
         freeze_seq: snap.freeze_seq, started_at: new Date(started).toISOString(), duration_ms: Date.now() - started,
         ...(aborted && { startup_failure: true, failed_phase: phase }) },
     });
+    function saveReceipt(write: () => void) {
+      try { ledger.db.transaction(write).immediate(); }
+      catch (error) {
+        const cause = redactSecrets(error instanceof Error ? error.message : String(error));
+        const paths = results.filter(r => r.log_path).map(r =>
+          (r.stage ?? r.kind) + " (exit " + r.exit_code + "): " + r.output_excerpt + "\n" + r.log_path);
+        throw Error([...paths, "Cannot save verification receipt: " + cause].join("\n"));
+      }
+    }
     recordAborted = (error) => {
       const message = redactSecrets(error instanceof Error ? error.message : String(error));
       const key = logs.has(phase) ? phase : [...logs.keys()].at(-1) ?? phase;
       log(key).note(message);
       const failure = finishLog(key, true);
       results.push({kind: "verify", stage: phase, command: ["forge", "verify"], exit_code: 1, ...failure});
-      if (snap.freeze_seq) ledger.db.transaction(() => {
+      if (snap.freeze_seq) saveReceipt(() => {
         recheckExecution(ledger, snap);
         if (fullRun) recordRun(false, true);
         else ledger.recordEvidence({
@@ -97,7 +106,7 @@ export function verifyCli(args: string[]) {
           source: "tool", actor: "tool", status: "fail", summary: "Verification failed during " + phase,
           meta: { ...failure, stage: phase, exit_code: 1, freeze_seq: snap.freeze_seq, review_task_id: snap.task_id, mode },
         });
-      }).immediate();
+      });
       return Error(phase + " (exit 1): " + failure.output_excerpt + "\n" + failure.log_path);
     };
     phase = "instance configuration";
@@ -222,32 +231,30 @@ export function verifyCli(args: string[]) {
     }
     recordAborted = undefined;
     const ok = !skipped && results.length > 0 && results.every(r => !r.exit_code);
-    ledger.db
-      .transaction(() => {
-        recheckExecution(ledger, snap);
-        for (const { kind, ...meta } of results.filter(r => r.kind !== "verify" && (modern || !skippedPhases.has(r.stage!))))
-          ledger.recordEvidence({
-            task_id: snap.task_id,
-            repo: snap.repo,
-            branch: snap.branch,
-            sha: snap.head,
-            kind,
-            source: "tool",
-            actor: "tool",
-            status: meta.exit_code ? "fail" : "pass",
-            summary: kind + " verification",
-            meta: {
-              ...meta,
-              ...fixtureMetadata(),
-              duration_ms: Date.now() - started,
-              started_at: new Date(started).toISOString(),
-              review_task_id: snap.task_id,
-              review_floor_seq: snap.floors.review,
-            },
-          });
-        if (fullRun || (!ok && results.some(item => item.kind === "verify"))) recordRun(ok);
-      })
-      .immediate();
+    saveReceipt(() => {
+      recheckExecution(ledger, snap);
+      for (const { kind, ...meta } of results.filter(r => r.kind !== "verify" && (modern || !skippedPhases.has(r.stage!))))
+        ledger.recordEvidence({
+          task_id: snap.task_id,
+          repo: snap.repo,
+          branch: snap.branch,
+          sha: snap.head,
+          kind,
+          source: "tool",
+          actor: "tool",
+          status: meta.exit_code ? "fail" : "pass",
+          summary: kind + " verification",
+          meta: {
+            ...meta,
+            ...fixtureMetadata(),
+            duration_ms: Date.now() - started,
+            started_at: new Date(started).toISOString(),
+            review_task_id: snap.task_id,
+            review_floor_seq: snap.floors.review,
+          },
+        });
+      if (fullRun || (!ok && results.some(item => item.kind === "verify"))) recordRun(ok);
+    });
     return {
       ok,
       task_id: snap.task_id,

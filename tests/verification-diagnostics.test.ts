@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, openSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { executorFixture } from "./helpers/executor";
-import { redactArguments } from "../src/shared/redact";
-import { VerificationLog, verificationLogDirectory } from "../src/verification-log";
+import { redactArguments, redactSecrets } from "../src/shared/redact";
+import { VerificationLog, verificationLogDirectory, verificationSupervisorSource } from "../src/verification-log";
 
 const f = executorFixture("0.5");
 function freeze() {
@@ -15,6 +16,7 @@ function freeze() {
 }
 
 test("attached and separate password arguments mask the entire value", () => {
+  expect(redactArguments(["env", "PGPASSWORD=alpha beta", "psql"])).toEqual(["env", "PGPASSWORD=***", "psql"]);
   expect(redactArguments(["--password=two words", "--password", "two words"])).toEqual(["--password=***", "--password", "***"]);
 });
 
@@ -83,7 +85,7 @@ test("a completed stage with an inherited output pipe returns its timeout receip
     expect(Date.now() - start).toBeLessThan(6000);
     expect(r.exitCode).toBe(1);
     const stage = f.evidence().at(-1).meta.stages[0];
-    expect(stage.output_excerpt).toMatch(/timed out/i);
+    expect(stage.output_excerpt).toMatch(/output drain timed out/i);
     expect(readFileSync(stage.log_path, "utf8")).toContain("stage finished");
   } finally {
     if (existsSync(childPid)) try { process.kill(Number(readFileSync(childPid, "utf8")), "SIGKILL"); }
@@ -103,11 +105,63 @@ test("rotation preserves a live writer and expires its abandoned log after a cra
     const name = readdirSync(dir).find(name => name.endsWith(".active"))!;
     const path = join(dir, name), expired = new Date(Date.now() - 2 * 86400000);
     utimesSync(path, expired, expired);
+    const stale = join(dir, "verify-" + crypto.randomUUID() + "." + child.pid + ".active");
+    writeFileSync(stale, "previous writer");
+    utimesSync(stale, expired, expired);
     verificationLogDirectory(f.root, 1);
     expect(existsSync(path)).toBe(true);
+    expect(existsSync(stale)).toBe(false);
     child.kill("SIGKILL");
     await child.exited;
     verificationLogDirectory(f.root, 1);
     expect(existsSync(path)).toBe(false);
   } finally { child.kill(); await child.exited; reader.releaseLock(); }
+});
+
+test("UTF-8 and apostrophes in credentials remain masked in both the receipt excerpt and the log", () => {
+  const log = new VerificationLog(f.root);
+  const data = `PGPASSWORD=pàssFixture https://user:p'assFixture@host.example/db TOKEN="multi word" \n`;
+  const safe = "PGPASSWORD=*** https://***@host.example/db TOKEN=*** \n";
+  expect(redactSecrets(data)).toBe(safe);
+  try {
+    const child = log.run([process.execPath, "-e", "process.stdout.write(" + JSON.stringify(data) + "); process.exitCode=1"], f.root, process.env);
+    const receipt = log.finish(true);
+    expect(child.code).toBe(1);
+    expect(receipt.output_excerpt).toBe(safe.trim());
+    expect(readFileSync(receipt.log_path!, "utf8")).toBe(safe);
+  } finally { log.dispose(); }
+});
+
+test("a rejected write to the log terminates the active verification child", () => {
+  const active = join(f.root, "verify-" + crypto.randomUUID() + "." + process.pid + ".active");
+  writeFileSync(active, "");
+  const descriptor = openSync(active, "r");
+  const marker = join(f.root, "child.pid");
+  const code = 'const fs=require("fs");fs.writeFileSync(' + JSON.stringify(marker) +
+    ',String(process.pid));fs.writeSync(1,"data".repeat(8192));await Bun.sleep(10000)';
+  try {
+    const r = spawnSync(process.execPath, ["-e", verificationSupervisorSource], {
+      input: JSON.stringify({argv:[process.execPath, "-e", code], cwd: f.root, env: process.env, timeout: 8000, active}),
+      stdio: ["pipe", "ignore", "pipe", descriptor], encoding: "utf8", timeout: 4000, killSignal: "SIGKILL",
+    });
+    expect(r.error).toBeUndefined();
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("Cannot write verification log");
+    const pid = Number(readFileSync(marker, "utf8"));
+    expect(() => process.kill(pid, 0)).toThrow();
+  } finally { closeSync(descriptor); }
+});
+
+test("a rejected ledger transaction retains the original diagnostic and readable log path", () => {
+  freeze();
+  f.ledger.db.exec("CREATE TRIGGER fixture_receipt BEFORE INSERT ON events WHEN NEW.event_type='EVIDENCE_CAPTURED' BEGIN SELECT RAISE(ABORT,'receipt fixture rejected'); END");
+  const result = f.cli("verify", ["--kind", "test", "--", "unsupported-runner"]);
+  expect(result.exitCode).toBe(1);
+  const diagnostic = result.stderr.toString();
+  expect(diagnostic).toContain("Expected an executable verification runner");
+  expect(diagnostic).toContain("receipt fixture rejected");
+  const path = diagnostic.split("\n").find(line => line.endsWith(".log"));
+  expect(path).toBeDefined();
+  expect(readFileSync(path!, "utf8")).toContain("Expected an executable verification runner");
+  expect(f.evidence()).toEqual([]);
 });

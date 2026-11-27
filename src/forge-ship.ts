@@ -191,6 +191,8 @@ function preflight(ledger: Ledger, e: Envelope, candidate?: ExactPlan) {
   }
   const dirs = new Map(checkouts.map(({row, dir}) => [row.repo, dir]));
   const verifiedMerges = new Map<string, {oid: string; targetOid: string}>();
+  const waiting: string[] = [];
+  const manual: string[] = [];
   for (const {row, pin, dir} of checkouts) {
     if (plan.endpoint === "push") {
       const index = plan.actions.findIndex(a => a.kind === "push" && a.repo === row.repo);
@@ -201,24 +203,31 @@ function preflight(ledger: Ledger, e: Envelope, candidate?: ExactPlan) {
         throw Error("Invalid fast-forward binding");
       checkPushPermission(ledger.workbenchRoot, action.ref.slice("refs/heads/".length));
       const target = remoteBranch(dir, action.ref);
-      const claimed = receipts(ledger, e.envelope_id).some(r => r.action_index === index);
-      if (target !== action.baseOid && !(claimed && target === action.head)) throw Error("Remote branch drifted");
+      const receipt = receipts(ledger, e.envelope_id).find(r => r.action_index === index);
+      if (receipt?.status === "confirmed" && target !== action.head) throw Error("Confirmed remote branch no longer points to the approved head: " + action.ref);
+      if (target !== action.baseOid && !(receipt && target === action.head)) throw Error("Remote branch drifted");
       continue;
     }
     const merges = plan.ci.filter((a) => a.repo === row.repo);
     if (merges.length !== 1)
       throw Error("Expected one exact CI target per attached branch; recreate the runbook");
     const pr = merges[0];
-    const observation = checkedPr(dir, row.branch, pr);
     if (prospectiveMergeTree(dir, pr.baseOid, pin.head) !== pr.tree)
       throw Error("Prospective merge tree differs from the approved tree");
-    if (!observation.merged)
-      throw new AwaitingOperator("Manual merge required for " + pr.url +
-        ": the host cannot bind base " + pr.baseOid + " when merging head " + pr.head +
-        (candidate ? ". Preview only: run forge ship run --envelope " + e.envelope_id + " to pin the open PR before the operator merges."
-          : ". After the operator merges, rerun forge ship run to verify the remote receipt."));
-    verifiedMerges.set(row.repo, observation);
+    try {
+      const observation = checkedPr(dir, row.branch, pr);
+      if (observation.merged) verifiedMerges.set(row.repo, observation);
+      else manual.push(pr.url + " (base " + pr.baseOid + ", head " + pr.head + ")");
+    } catch (err) {
+      if (!(err instanceof AwaitingOperator)) throw err;
+      waiting.push(err.message);
+    }
   }
+  if (waiting.length) throw new AwaitingOperator(waiting.join("\n"));
+  if (manual.length) throw new AwaitingOperator("Manual merge required for " + manual.join(", ") +
+    ": the host cannot bind the base on merge." +
+    (candidate ? " Preview only: run forge ship run --envelope " + e.envelope_id + " to pin the open PRs before merging."
+      : " After the operator merges, rerun forge ship run to verify the remote receipts."));
   return { plan, dirs, verifiedMerges };
 }
 class AwaitingOperator extends Error {}
@@ -253,7 +262,7 @@ function resolveFrontPlan(ledger: Ledger, e: Envelope, execute: boolean) {
     if (remote !== pin.head + "\t" + ref || !selector) {
       const destination = slug + " " + row.branch + "@" + pin.head + " -> main@" + base;
       throw new AwaitingOperator("Manual PR handoff before publication: " + destination +
-        ". A CLI head match or configured program cannot establish a merge-time base condition. Publish the branch and create the PR in the ordinary delivery flow, then rerun to pin the open PR before merging.");
+        ". This fast-track performs zero external writes on GitHub. Publishing the source branch and opening the PR are separate ordinary delivery operations requiring their own authorization. Once the PR is open, rerun to pin it before the operator merges.");
     }
     const pr = inspectPr(dir,row.branch,selector,process.env,undefined,{bin:process.env.FORGE_GH_BIN,baseOid:true});
     if (pr.state !== "OPEN" || pr.headRefOid !== pin.head || pr.baseRefName !== "main" || pr.baseRefOid !== base)

@@ -186,7 +186,21 @@ export async function runReview(params: Option & {
   repo.git(["merge-base", "--is-ancestor", repo.base, repo.head]);
   if (!repo.files.length && !repo.excludedFiles.length) throw Error("Empty review diff; select a range containing changes");
   const spec = specification(params);
-  const tmp = mkdtempSync(join(tmpdir(), "forge-review-material-"));
+  let tmp: string;
+  try { tmp = mkdtempSync(join(tmpdir(), "forge-review-material-")); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    const reason = "Cannot create temporary material directory" + (code ? " (" + code + ")" : "");
+    const paths = [...new Set([...repo.changes.flatMap(c => [c.oldPath, c.path]), ...repo.excludedFiles])];
+    const reports = sequence.map((role): RoleReport => ({
+      role, base:repo.base, head:repo.head, status:"incomplete", backend:null, attempts:[], findings:[],
+      summary:reason, limitations:spec.limitation ? [reason, spec.limitation] : [reason],
+      missing_materials:!spec.text && (role === "business" || params.spec) ? [...paths,"spec"] : paths,
+      // No chunks exist yet; the inventory above identifies all missing files.
+      coverage:{expected:0, reviewed:0, missing:[]},
+    }));
+    return {schemaVersion:2, base:repo.base, head:repo.head, mode, status:"incomplete" as const, roles:reports};
+  }
   try {
     const material = prepareMaterials(repo, tmp);
     const run = (role: Role, idx:number) => reviewRole(role, repo, material, models[idx], spec, role === "business" || !!params.spec);

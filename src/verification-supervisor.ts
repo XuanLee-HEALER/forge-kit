@@ -14,39 +14,65 @@ process.on("exit", () => unlinkSync(writer));
 const child = spawn(argv[0], argv.slice(1), {
   cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true,
 });
+let live = true;
+let reason = "";
+child.on("exit", () => { live = false; });
+
+function stop(message: string) {
+  if (reason) return;
+  reason = message;
+  if (live && child.pid && child.exitCode === null && child.signalCode === null) killTree(child.pid);
+  child.stdout!.destroy();
+  child.stderr!.destroy();
+}
+
 function capture(stream: NodeJS.ReadableStream) {
   const redactor = verificationRedactor(data => writeFileSync(3, data, "latin1"));
   stream.setEncoding("latin1");
-  stream.on("data", redactor.write);
-  return redactor.finish;
+  function write(chunk?: string) {
+    try {
+      if (chunk === undefined) redactor.finish();
+      else redactor.write(chunk);
+    } catch (error) {
+      stop("Cannot write verification log: " + (error instanceof Error ? error.message : String(error)));
+    }
+  }
+  stream.on("data", write);
+  return () => write();
 }
 const flushStdout = capture(child.stdout!);
 const flushStderr = capture(child.stderr!);
 function killTree(pid: number) {
   // A nested verifier or build tool can start its own process group.
-  const table = spawnSync("/bin/ps", ["-Ao", "pid=,ppid="], {encoding: "utf8", timeout: 1000});
+  const table = spawnSync("/bin/ps", ["-Ao", "pid=,ppid=,pgid="], {encoding: "utf8", timeout: 1000});
   const children = new Map<number, number[]>();
+  const groups = new Map<number, number>();
   for (const row of (table.stdout ?? "").trim().split("\n")) {
-    const [id, parent] = row.trim().split(/\s+/).map(Number);
+    const [id, parent, group] = row.trim().split(/\s+/).map(Number);
     if (!id || !parent) continue;
+    groups.set(id, group);
     const list = children.get(parent) ?? [];
     list.push(id);
     children.set(parent, list);
   }
+  // A finished child can leave inherited pipes open. Its former PID cannot
+  // identify any process after reaping, even if the close event is pending.
+  if (table.status !== 0) { child.kill("SIGKILL"); return; }
+  if (!children.get(process.pid)?.includes(pid)) return;
   const tree = [pid];
   for (const parent of tree) tree.push(...children.get(parent) ?? []);
-  for (const target of [-pid, ...tree.reverse()]) {
+  // Signal detached descendants separately, then the original group once.
+  // Do not reuse its leader's numerical PID after killing that group.
+  for (const target of [...tree.reverse().filter(id => id !== pid && groups.get(id) !== pid), -pid]) {
     try { process.kill(target, "SIGKILL"); }
-    catch (err) { if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err; }
+    catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ESRCH") reason += "; cannot stop verification process (" + code + ")";
+    }
   }
 }
-let reason = "";
 const timer = setTimeout(() => {
-  reason = "Verification timed out after " + timeout + " ms";
-  if (child.pid) killTree(child.pid);
-  // A reparented process can still own the write end of either pipe.
-  child.stdout!.destroy();
-  child.stderr!.destroy();
+  stop((live ? "Verification" : "Verification output drain") + " timed out after " + timeout + " ms");
 }, timeout);
 child.on("error", error => { reason = error.message; });
 child.on("close", (code, signal) => {

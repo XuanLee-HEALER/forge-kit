@@ -13,4 +13,7 @@ for (const entry of entries) if (entry.name !== "cli.js") unlinkSync(join(dist, 
 const build = Bun.spawnSync([process.execPath, "build", "--target=bun", "--outfile=dist/cli.js", "src/bin/cli.ts"], {
   cwd: root, stdout: "inherit", stderr: "inherit",
 });
-process.exit(build.exitCode ?? 1);
+if (build.exitCode !== 0) process.exit(build.exitCode ?? 1);
+const outputs = readdirSync(dist, {withFileTypes: true});
+if (outputs.length !== 1 || !outputs[0].isFile() || outputs[0].name !== "cli.js")
+  throw Error("Expected exactly one regular file at dist/cli.js");
