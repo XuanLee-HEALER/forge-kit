@@ -16,7 +16,43 @@ const usage = `Usage: forge rt <primitive> [options] [--json]
        [--minutes N] [--level <level>] [--trace <id>] [--grep <text>] [--limit N]
   query [--env <env>] [--target <target>] [--expr <expression>] [--param <key=value>]... [--limit N]
   metrics [--env <env>] [--service <service>] [--metric <metric>] [--from <iso|unix>]
-          [--to <iso|unix>] [--minutes N]`;
+          [--to <iso|unix>] [--minutes N]
+
+Configure an adapter in .workbench/workbench.yaml, for example:
+  extensions:
+    actions:
+      read-logs:
+        purpose: observe
+        cwd: .
+        argv: ["bun", ".workbench/actions/read-logs.ts"]
+    runtime:
+      logs:
+        action: read-logs
+        read_only_guarantee: ro-rbac
+        timeout_ms: 15000
+        max_bytes: 32768
+        max_lines: 200
+
+Supply your adapter at the given path. The configured argv runs directly in cwd.
+The adapter, its endpoint and its credentials determine physical read-only access.
+Guarantees: ro-credential, ro-rbac, ro-endpoint, fixed-ro-subcommand, unverified
+(default). Inspect effective bindings and write-risk warnings with rt list and doctor.
+Timeout, byte and line limits default to the values shown; hard caps are 60000 ms,
+131072 bytes and 1000 lines. Stdout and stderr share the capture budget.
+
+Adapter inputs are environment variables with the FORGE_RT_ prefix:
+  PRIMITIVE, ENV, SERVICE, TARGET, LEVEL, TRACE, GREP, METRIC, EXPR, LIMIT,
+  FROM_UNIX, TO_UNIX, FROM_ISO, TO_ISO, PARAMS_JSON, TIMEOUT_MS, MAX_BYTES, MAX_LINES.
+Repeated --param key=value entries form one JSON object. A later duplicate wins.
+Return JSON on stdout for structured data or text for output. Stderr supplies
+diagnostics. Exit 0 for success; a nonzero adapter exit makes the CLI fail.
+The envelope reports redacted results, timeout and truncation.
+
+Logs and metrics default to the last 15 minutes. --minutes accepts 1..1440.
+An end alone looks back; a start alone ends now, or advances by explicit minutes.
+Supply ISO timestamps with timezones or integer Unix seconds. --limit accepts 1..500
+(default 100). changes reads local Git and ledger evidence; --live queries status
+for data.git_sha and --with-adapter requests a supplemental changes observation.`;
 
 type Failure = "parameter" | "configuration" | "unconfigured" | "recursion" | "startup" | "timeout" |
   "adapter_exit" | "partial_failure" | "git";
@@ -59,6 +95,7 @@ function show(result: Envelope, json: boolean) {
     if (result.output) console.log(result.output);
     if (result.data !== null) console.log(JSON.stringify(result.data));
   }
+  if (!json && result.truncated) console.log("  WARN Output was truncated.");
   if (!json) for (const warning of result.warnings) console.log(`  WARN ${warning}`);
   process.exitCode = result.ok ? 0 : 1;
 }
@@ -72,7 +109,7 @@ async function runAdapter(primitive: RuntimePrimitive, binding: RuntimeBinding |
   inputs: RuntimeInputs, secrets: readonly string[] = []): Promise<{ result: Envelope; gitSha?: string }> {
   const result = envelope(primitive, inputs, secrets);
   const fail = (error: Failure, warning: string) => ({ result: failed(result, error, warning) });
-  if (!binding) return fail("unconfigured", `Configure extensions.runtime.${primitive} in workbench.yaml to bind an observe action.`);
+  if (!binding) return fail("unconfigured", `Configure extensions.runtime.${primitive} in workbench.yaml to bind an observe action. See forge rt --help for the binding and adapter protocol.`);
   result.read_only_guarantee = binding.read_only_guarantee;
   result.warnings = runtimeWarnings(new Map([[primitive, binding]]));
   const execution = await executeAdapter(binding, primitive, inputs);

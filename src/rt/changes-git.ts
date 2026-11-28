@@ -1,10 +1,10 @@
 import { spawnSync } from "node:child_process";
-import { realpathSync, statSync } from "node:fs";
-import { resolve } from "node:path";
-import { canonicalRepoPath } from "../config";
+import { lstatSync, readFileSync, realpathSync, type Stats } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { isOid, offlineGitInvocation } from "../git";
+import { registeredRepoName } from "./changes-repo";
 
-export type ChangesRepo = { repo: string; cwd: string };
+export type ChangesRepo = { repo: string; cwd: string; root: string; identity: string };
 
 export class ChangesError extends Error {
   constructor(readonly kind: "parameter" | "git", message: string) {
@@ -38,25 +38,93 @@ function line(result: GitResult): string | null {
   catch { return null; }
 }
 
-export function selectChangesRepo(root: string, repos: readonly string[], requested?: string): ChangesRepo {
-  const registered = new Set(repos);
-  if (requested === undefined && registered.size !== 1) {
-    throw new ChangesError("parameter", "Select a registered repository with --repo.");
+const identityKey = (entry: Stats) => entry.dev + ":" + entry.ino;
+
+function realDirectory(path: string): Stats {
+  const entry = lstatSync(path);
+  if (!entry.isDirectory() || realpathSync(path) !== path) throw Error();
+  return entry;
+}
+
+function checkMetadata(path: string) {
+  for (const entry of ["HEAD", "config", "config.worktree", "shallow", "index", "refs", "packed-refs", "objects", "objects/info", "objects/pack"]) {
+    const mode = lstatSync(join(path, entry), { throwIfNoEntry: false });
+    if (mode && (["refs", "objects", "objects/info", "objects/pack"].includes(entry) ? !mode.isDirectory() : !mode.isFile())) {
+      throw Error();
+    }
   }
-  let repo: string;
-  try { repo = requested === undefined ? [...registered][0] : canonicalRepoPath(root, requested); }
-  catch { throw new ChangesError("parameter", "--repo must identify a registered repository."); }
-  if (!registered.has(repo)) throw new ChangesError("parameter", "--repo must identify a registered repository.");
+  if (lstatSync(join(path, "commondir"), { throwIfNoEntry: false })) throw Error();
+}
+
+function submoduleMetadata(root: string, repo: string, cwd: string, marker: string, entry: Stats): string {
+  if (repo === "." || !entry.isFile() || !(entry.mode & 0o444) || entry.size > 4096) throw Error();
+  const destination = /^gitdir: ([^\r\n]+)\r?\n?$/.exec(utf8.decode(readFileSync(marker)))?.[1];
+  if (!destination) throw Error();
+  const modules = join(root, ".git", "modules");
+  const metadata = resolve(cwd, destination);
+  const name = relative(modules, metadata);
+  if (!name || name === ".." || name.startsWith("../") || isAbsolute(name)) throw Error();
+  if (destination !== metadata && destination !== relative(cwd, metadata)) throw Error();
+  const parentMetadata = join(root, ".git");
+  realDirectory(parentMetadata);
+  checkMetadata(parentMetadata);
+  if (!matchesMetadata(root, parentMetadata)) throw Error();
+  realDirectory(metadata);
+  checkMetadata(metadata);
+  // Git files legitimately point to absorbed submodules. Require the parent Gitlink
+  // and the metadata's reciprocal worktree binding before trusting the indirection.
+  const worktree = line(git(root, ["config", "--file", join(metadata, "config"), "--no-includes", "--get", "core.worktree"]));
+  const index = line(git(root, ["ls-files", "--stage", "-z", "--", repo]));
+  if (!worktree || resolve(metadata, worktree) !== cwd ||
+      !index?.split("\0").some(record => /^160000 [a-f0-9]+ 0$/.test(record.split("\t", 1)[0]) &&
+        record.slice(record.indexOf("\t") + 1) === repo)) throw Error();
+  return metadata;
+}
+
+function matchesMetadata(cwd: string, metadata: string) {
+  const location = line(git(cwd, ["rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"]));
+  const paths = location?.split("\n").map(path => resolve(cwd, path));
+  return paths?.length === 3 && paths[0] === metadata && paths[1] === metadata && paths[2] === cwd;
+}
+
+function checkoutIdentity(root: string, repo: string, cwd: string) {
   try {
-    const cwd = realpathSync(resolve(root, repo));
-    const marker = statSync(resolve(cwd, ".git"));
-    if (!statSync(cwd).isDirectory() || !(marker.isDirectory() || marker.isFile())) throw Error();
-    const top = line(git(cwd, ["rev-parse", "--show-toplevel"]));
-    if (top && realpathSync(top) === cwd) return { repo, cwd };
+    const checkout = realDirectory(cwd);
+    const marker = join(cwd, ".git");
+    const entry = lstatSync(marker);
+    const metadata = entry.isDirectory() ? marker : submoduleMetadata(root, repo, cwd, marker, entry);
+    const directory = realDirectory(metadata);
+    checkMetadata(metadata);
+    if (matchesMetadata(cwd, metadata)) {
+      return [checkout, entry, directory].map(identityKey).join("/");
+    }
   } catch {
     // Git and filesystem diagnostics may include absolute paths.
   }
-  throw new ChangesError("git", "The registered repository has no accessible Git checkout at its configured root.");
+  throw new ChangesError("git", "The registered repository has no accessible Git checkout with its own metadata at the configured root.");
+}
+
+function checkIdentity({ root, repo, cwd, identity }: ChangesRepo) {
+  if (checkoutIdentity(root, repo, cwd) !== identity) {
+    throw new ChangesError("git", "The registered repository changed during local observation.");
+  }
+}
+
+export function selectChangesRepo(root: string, repos: readonly string[], requested?: string): ChangesRepo {
+  const names = repos.map(repo => registeredRepoName(root, repo));
+  if (names.includes(null)) {
+    throw new ChangesError("parameter", "Registered repositories must be the workbench root or a direct child.");
+  }
+  const registered = new Set(names);
+  if (requested === undefined && registered.size !== 1) {
+    throw new ChangesError("parameter", "Select a registered repository with --repo.");
+  }
+  const repo = requested === undefined ? [...registered][0] : registeredRepoName(root, requested);
+  if (!repo || !registered.has(repo)) throw new ChangesError("parameter", "--repo must identify a registered repository.");
+  const workspace = realpathSync(root);
+  const cwd = resolve(workspace, repo);
+  const identity = checkoutIdentity(workspace, repo, cwd);
+  return { repo, cwd, root: workspace, identity };
 }
 
 function resolveCommit(cwd: string, ref: string): string | null {
@@ -120,7 +188,9 @@ function summarize(cwd: string, from: string, to: string): Summary | null {
 
 type RefOptions = { fromSha?: string; toRef?: string };
 
-export function resolveChangesRefs({ cwd }: ChangesRepo, options: RefOptions) {
+export function resolveChangesRefs(repo: ChangesRepo, options: RefOptions) {
+  checkIdentity(repo);
+  const { cwd } = repo;
   const explicit = options.fromSha === undefined ? null : resolveCommit(cwd, options.fromSha);
   if (options.fromSha !== undefined && !explicit) {
     throw new ChangesError("parameter", "--from-sha must resolve to a locally available commit.");
@@ -141,6 +211,7 @@ type GitOptions = RefOptions & {
 export function readChangesGit(repo: ChangesRepo, options: GitOptions) {
   const { cwd } = repo;
   const warnings: string[] = [];
+  if (options.refs) checkIdentity(repo);
   const { explicit, to_sha } = options.refs ?? resolveChangesRefs(repo, options);
   const liveOid = typeof options.liveSha === "string" ? options.liveSha.toLowerCase() : "";
   const live = options.live && isOid(liveOid) && resolveCommit(cwd, liveOid) === liveOid ? liveOid : null;
@@ -175,5 +246,6 @@ export function readChangesGit(repo: ChangesRepo, options: GitOptions) {
     gitResult.coverage = "partial";
     warnings.push("Git change summary is unavailable for the selected history.");
   }
+  checkIdentity(repo);
   return { git: gitResult, live_anchored: Boolean(live), warnings, truncated: history.truncated };
 }

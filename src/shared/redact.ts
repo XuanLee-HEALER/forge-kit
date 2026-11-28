@@ -47,7 +47,7 @@ const auditPatterns: Array<[RegExp, string]> = [
   [/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/?#"<>]+@/gi, "$1***@"],
   [/\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]+\b/g, "***"],
   [/\b(?:gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|(?:AKIA|ASIA|AIDA|AROA)[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{35}|(?:LTAI|AKID)[A-Za-z0-9]{12,})\b/g, "***"],
-  [/(?<![\w./+-])[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w-]|\.[\w-])/gi, "[redacted email]"],
+  [/(?<![A-Z0-9.!#$%&'*+/=?^_`{|}~-])[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w-]|\.[\w-])/gi, "[redacted email]"],
   [labeledPhone, "$1[redacted phone]"],
   [standalonePhone, "[redacted phone]"],
   [/\b([A-Z0-9_]*(?:ACCESS_KEY|PRIVATE_KEY|CREDENTIAL|AUTHORIZATION)[A-Z0-9_]*)=(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'[^']*(?:'|$)|[^ \t-\r]+)/g, "$1=***"],
@@ -59,15 +59,62 @@ export function redactAuditText(text: string): string {
   return redactSecrets(redactWithPatterns(text, auditPatterns));
 }
 
-const runtimeInvocation = /(?:^|[^\w.-])(?:forge|src\/bin\/cli\.ts|dist\/cli\.js|\.workbench\/bin\/cli\.js)(?:["']?\s+(?:--\s+)?["']?|["']\s*,\s*["'])rt(?:["']?\s+["']?|["']\s*,\s*["'])query\b[\s\S]*?(?<![\w-])--(?:expr|param)(?=$|[=\s"'\\])/;
+const runtimeQuery = /(?:^|[^\w.-])(?:forge|src\/bin\/cli\.ts|dist\/cli\.js|\.workbench\/bin\/cli\.js)(?:["']?\s+(?:--\s+)?["']?|["']\s*,\s*["'])rt(?:["']?\s+["']?|["']\s*,\s*["'])query\b/;
+const queryOption = /(?<![\w-])--(?:expr|param)(?=$|[=\s"'\\])/;
 
+function containsQueryArguments(text: string): boolean {
+  if (!queryOption.test(text)) return false;
+  const invocation = runtimeQuery.exec(text);
+  return invocation !== null && queryOption.test(text.slice(invocation.index + invocation[0].length));
+}
+
+// Audit messages can contain prose before and after a shell example. Consume
+// its complete logical line, including quoted or escaped multiline arguments.
 export function redactAuditRuntimeCommand(text: string): string {
   const normalized = text.replace(/\\(?:\r?\n|["'])/g, "");
-  return runtimeInvocation.test(normalized) ? "[runtime query arguments omitted]" : text;
+  if (!containsQueryArguments(normalized)) return text;
+  // Keep opaque serialized argument arrays and shell expansions on the conservative path.
+  // Their values may span lines without a shell quote surrounding the option value.
+  if (/["']\s*,\s*["']rt["']|\$\(|<<|\\["']/.test(text)) return "[runtime query arguments omitted]";
+  const lines = text.split("\n");
+  const kept: string[] = [];
+  let omitted = false;
+  for (let i = 0; i < lines.length; i++) {
+    const begin = i;
+    while (i + 1 < lines.length && /\\\r?$/.test(lines[i])) i++;
+    let command = lines.slice(begin, i + 1).join("\n");
+    const invocation = runtimeQuery.exec(command.replace(/\\\r?\n/g, ""));
+    if (invocation) {
+      let quote = "";
+      let line = command;
+      for (;;) {
+        for (let offset = 0; offset < line.length; offset++) {
+          const ch = line[offset];
+          if (ch === "\\" && quote !== "'") offset++;
+          else if (quote) { if (ch === quote) quote = ""; }
+          else if (ch === "'" || ch === '"') quote = ch;
+        }
+        if (!quote || i + 1 === lines.length) break;
+        line = lines[++i];
+      }
+      command = lines.slice(begin, i + 1).join("\n");
+      if (queryOption.test(command)) {
+        kept.push("[runtime query arguments omitted]");
+        omitted = true;
+        continue;
+      }
+    }
+    kept.push(command);
+  }
+  const result = kept.join("\n");
+  // Encoded commands and pretty-printed argument arrays may span other
+  // boundaries. Suppress ambiguous remnants instead of publishing raw inputs.
+  if (!omitted || containsQueryArguments(result.replace(/\\(?:\r?\n|["'])/g, ""))) return "[runtime query arguments omitted]";
+  return result;
 }
 
 export function redactAuditArguments(argv: string[]) {
-  const queryCommand = runtimeInvocation.test(argv.join(" "));
+  const queryCommand = containsQueryArguments(argv.join(" "));
   return redactArguments(argv).map((arg, index) => {
     const previous = argv[index - 1] ?? "";
     if (auditOption.test(previous) || queryCommand && /^--(?:expr|param)$/.test(previous)) return "***";

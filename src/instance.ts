@@ -6,7 +6,7 @@ import { accessSync, constants, existsSync, lstatSync, readFileSync, statSync, w
 import { basename, isAbsolute, join, normalize, relative } from "node:path";
 import { parse, parseDocument } from "yaml";
 import { locateRepo } from "./git";
-import { canonicalRepoPath, deliverySettings, decodeModelsConfig, loadShipPolicy, loadWorkbenchConfig } from "./config";
+import { deliverySettings, decodeModelsConfig, loadShipPolicy, loadWorkbenchConfig } from "./config";
 import { decodeRuntime, RuntimeConfigError } from "./rt/config";
 
 export const CORE_SKILLS = [
@@ -197,7 +197,7 @@ function resolveRuntimeBindings(root: string, repos: string[], ext: Record<strin
 export function resolveRuntimeInstance(root: string) {
   try {
     const { cfg, ext } = readInstanceConfig(root);
-    const repos = (cfg.repos as string[] | undefined)?.map(repo => canonicalRepoPath(root, repo)) ?? [];
+    const repos = (cfg.repos as string[] | undefined) ?? [];
     return { repos, runtime: resolveRuntimeBindings(root, repos, ext) };
   } catch (error) {
     if (error instanceof RuntimeConfigError) throw error;

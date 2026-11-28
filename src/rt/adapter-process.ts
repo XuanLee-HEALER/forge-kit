@@ -98,21 +98,22 @@ export function executeAdapter(binding: RuntimeBinding, primitive: RuntimePrimit
     // A descendant can retain a pipe after the group leader exits. Wait for close
     // and kill the group at the deadline even when the leader has already exited.
     let settled = false;
-    const expire = () => {
+    const finish = (timedOut: boolean) => {
+      if (settled) return;
       settled = true;
-      if (child.pid !== undefined) {
+      if ((timedOut || exitCode !== 0) && child.pid !== undefined) {
         try { process.kill(-child.pid, "SIGKILL"); }
-        catch { /* The group can disappear while the deadline callback runs. */ }
+        catch { /* The group can disappear before cleanup. */ }
       }
-      const outcome = result(true, false);
+      const outcome = result(timedOut, startupFailure);
       child.stdout.destroy();
       child.stderr.destroy();
       resolve(outcome);
     };
-    const timer = setTimeout(expire, Math.max(0, binding.timeout_ms - (performance.now() - started)));
+    const timer = setTimeout(() => finish(!startupFailure), Math.max(0, binding.timeout_ms - (performance.now() - started)));
     child.once("close", () => {
       clearTimeout(timer);
-      if (!settled) resolve(result(!startupFailure && performance.now() - started >= binding.timeout_ms, startupFailure));
+      finish(!startupFailure && performance.now() - started >= binding.timeout_ms);
     });
   });
 }

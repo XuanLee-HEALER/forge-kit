@@ -2,6 +2,7 @@ import { statSync } from "node:fs";
 import { isOid } from "../git";
 import { Ledger } from "../ledger/store";
 import { ledgerDbPath } from "../ledger/types";
+import { registeredRepoName } from "./changes-repo";
 
 type HistoryType = "HANDOFF_RECORDED" | "RELEASE" | "deploy" | "prod" | "TASK_CLOSED";
 type HistoryRecord = {
@@ -23,7 +24,7 @@ const handoffItems = `CASE WHEN json_type((${payload}), '$.items') = 'array'
   THEN json_extract((${payload}), '$.items') END`;
 const handoffItem = "CASE WHEN item.type = 'object' THEN item.value END";
 const releaseId = `json_extract((${payload}), '$.release_id')`;
-const repoMatches = (column: string) => `(${column} = ?1 OR canonical_repo(${column}) = ?1)`;
+const repoMatches = (column: string) => `(${column} = ?1 OR rt_registered_repo(${column}) = ?1)`;
 const recent = "ORDER BY time DESC, record_id DESC, item DESC LIMIT ?2";
 const closedFields = `'TASK_CLOSED' AS type, e.ts, e.task_id, 'CLOSED' AS status,
   CASE WHEN ${repoMatches("e.repo")} THEN e.sha END AS sha,
@@ -138,6 +139,7 @@ export function readChangesLedger(root: string, repo: string, limit: number) {
   try {
     ledger = new Ledger(root, { dbPath, readonly: true });
     const { db } = ledger;
+    db.function("rt_registered_repo", value => registeredRepoName(root, value));
     const { rows, completed, gaps } = db.transaction(() => {
       const rows: HistoryRow[] = [];
       let completed = 0;

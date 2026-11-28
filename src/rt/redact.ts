@@ -3,7 +3,7 @@ import type { AdapterExecution, CapturedStream } from "./adapter-process";
 
 export function sensitiveRuntimeKey(key: string): boolean {
   const compact = key.replace(/[-_. \t]/g, "");
-  return auditSecretKey.test(compact) || /(?:email|phone|mobile|telephone|passphrase|authheader|mysqlpwd|rediscliauth)/i.test(compact);
+  return auditSecretKey.test(compact) || /(?:email|phone|mobile|telephone|passphrase|authheader|mysqlpwd|rediscliauth|cookies?$)/i.test(compact);
 }
 
 function visibleText(text: string): string {
@@ -21,12 +21,12 @@ export function runtimeSecrets(params: ReadonlyMap<string, string>): string[] {
     .filter(Boolean).sort((a, b) => b.length - a.length);
 }
 
-function redactTextFields(text: string): string {
-  const fields = /(^|[^\w.-])(["']?)([\w.-]+(?:[ \t]+(?:key|token|number|secret|header))?)\2[ \t]*[:=][ \t]*/gim;
+function redactTextFields(text: string) {
+  const fields = /(?<![\w.-])(["']?)([\w.-]+(?:[ \t]+(?:key|token|number|secret|header))?)\1[ \t]*[:=][ \t]*/gi;
   let start = 0;
   let output = "";
   for (let field = fields.exec(text); field; field = fields.exec(text)) {
-    const [, , , key] = field;
+    const [, , key] = field;
     if (!sensitiveRuntimeKey(key)) continue;
     const valueStart = fields.lastIndex;
     const endOfLine = text.indexOf("\n", valueStart);
@@ -36,29 +36,67 @@ function redactTextFields(text: string): string {
     // An unclosed value or block can extend past this record. Its safe boundary is unknown.
     if (!value || /^[|>{\[]/.test(value) || /\\$/.test(value) ||
         value.startsWith('"') && !/^"(?:\\.|[^"\\])*"/.test(value) ||
-        value.startsWith("'") && !/^'[^']*'/.test(value)) return output;
+        value.startsWith("'") && !/^'[^']*'/.test(value)) return { text: output, uncertainTail: true };
     start = end;
     while (/^[ \t]/.test(text[start + 1] ?? "")) {
       const next = text.indexOf("\n", start + 1);
-      if (next < 0) return output;
+      if (next < 0) return { text: output, uncertainTail: false };
       start = next;
     }
     fields.lastIndex = start;
   }
-  return output + text.slice(start);
+  return { text: output + text.slice(start), uncertainTail: false };
 }
 
-export function safeRuntimeText(raw: string, secrets: readonly string[] = []): string {
+function projectText(raw: string, secrets: readonly string[]) {
   let text = raw;
   for (const secret of secrets) text = text.replaceAll(secret, "***");
   text = visibleText(text);
   for (const secret of secrets) text = text.replaceAll(secret, "***");
-  return redactAuditText(redactTextFields(text));
+  const projected = redactTextFields(text);
+  return { ...projected, text: redactAuditText(projected.text) };
+}
+
+export function safeRuntimeText(raw: string, secrets: readonly string[] = []): string {
+  return projectText(raw, secrets).text;
+}
+
+// Bun exposes the original number spelling to the reviver. Keep it through the
+// safe projection so JSON encoding cannot round large integers or decimals.
+type RawJson = { readonly rawJSON: string };
+type JsonWithSource = typeof JSON & {
+  parse(text: string, reviver: (key: string, value: unknown, context?: { source?: string }) => unknown): unknown;
+  rawJSON?(text: string): RawJson;
+  isRawJSON?(value: unknown): value is RawJson;
+};
+const preciseJson: JsonWithSource = JSON;
+
+function parseRuntimeJson(text: string, secrets: readonly string[]): { value: unknown; omitted: boolean } | undefined {
+  try {
+    let omitted = false;
+    const value: unknown = preciseJson.parse(text, (_key: string, item: unknown, context?: { source?: string }) => {
+      if (typeof item !== "number") return item;
+      const source = context?.source;
+      if (sensitiveNumber(source ?? String(item), secrets)) return "***";
+      if (source && JSON.stringify(item) === source) return item;
+      if (source && preciseJson.rawJSON && preciseJson.isRawJSON) return preciseJson.rawJSON(source);
+      omitted = true;
+      return "[number omitted]";
+    });
+    return { value, omitted };
+  } catch { return undefined; }
+}
+
+function sensitiveNumber(source: string, secrets: readonly string[]): boolean {
+  const normalized = String(Number(source));
+  return secrets.includes(source) || secrets.includes(normalized) ||
+    redactAuditText(source) !== source || redactAuditText(normalized) !== normalized;
 }
 
 export function safeRuntimeValue(value: unknown, secrets: readonly string[] = [], depth = 0): unknown {
   if (depth >= 64) return "[omitted]";
   if (typeof value === "string") return safeRuntimeText(value, secrets);
+  if (preciseJson.isRawJSON?.(value)) return value;
   if (Array.isArray(value)) return value.map(item => safeRuntimeValue(item, secrets, depth + 1));
   if (value !== null && typeof value === "object") {
     const projected = new Map<string, unknown>();
@@ -85,7 +123,7 @@ function reportedGitSha(data: unknown): string | undefined {
 function looksStructured(text: string): boolean {
   const trimmed = text.trimStart();
   return trimmed.startsWith("{") || trimmed.startsWith('"') || trimmed.startsWith("[") &&
-    !/^\[(?:TRACE|DEBUG|INFO|NOTICE|WARN(?:ING)?|ERROR|CRITICAL|FATAL)\](?:\s|$)/i.test(trimmed);
+    !/^\[(?:TRACE|DEBUG|INFO|NOTICE|WARN(?:ING)?|ERROR|CRITICAL|FATAL|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))\]/i.test(trimmed);
 }
 
 function decodeRecords(bytes: Buffer, decoder: TextDecoder): string {
@@ -97,6 +135,30 @@ function decodeRecords(bytes: Buffer, decoder: TextDecoder): string {
     start = newline + 1;
   }
   return records.join("");
+}
+
+function projectRecords(text: string, secrets: readonly string[]): { text: string; omitted: boolean } {
+  const safe = [];
+  let plain = "";
+  let omitted = false;
+  for (const line of visibleText(text).match(/[^\n]*\n|[^\n]+$/g) ?? []) {
+    const index = looksStructured(line) ? 0 : line.search(/\{\s*"[^"\n]+"\s*:/);
+    if (index < 0) {
+      plain += line;
+      continue;
+    }
+    const prefix = projectText(plain + line.slice(0, index), secrets);
+    safe.push(prefix.text);
+    const parsed = parseRuntimeJson(line.slice(index), secrets);
+    if (prefix.uncertainTail || !parsed) return { text: safe.join(""), omitted: true };
+    omitted ||= parsed.omitted;
+    safe.push(JSON.stringify(safeRuntimeValue(parsed.value, secrets)));
+    if (line.endsWith("\n")) safe.push("\n");
+    plain = "";
+  }
+  const tail = projectText(plain, secrets);
+  safe.push(tail.text);
+  return { text: safe.join(""), omitted: omitted || tail.uncertainTail };
 }
 
 function projectStream(stream: CapturedStream, secrets: readonly string[]): Projection {
@@ -112,18 +174,11 @@ function projectStream(stream: CapturedStream, secrets: readonly string[]): Proj
     incomplete = true;
   }
   if (!incomplete) {
-    try {
-      const data: unknown = JSON.parse(text);
-      return { data: safeRuntimeValue(data, secrets), omitted: false, gitSha: reportedGitSha(data) };
-    } catch { /* Only structurally independent text can fall back to text output. */ }
+    const parsed = parseRuntimeJson(text, secrets);
+    if (parsed) return { data: safeRuntimeValue(parsed.value, secrets), omitted: parsed.omitted, gitSha: reportedGitSha(parsed.value) };
   }
-  text = visibleText(text);
-  if (looksStructured(text)) return { omitted: true };
-  // Prevent an embedded damaged JSON block from falling through as naked text.
-  const lines = text.split("\n");
-  const block = lines.findIndex(line => looksStructured(line) || /\{\s*["'][^"'\n]+["']\s*:/.test(line));
-  return { text: safeRuntimeText((block < 0 ? lines : lines.slice(0, block)).join("\n"), secrets),
-    omitted: block >= 0 || incomplete };
+  const records = projectRecords(text, secrets);
+  return { ...records, omitted: records.omitted || incomplete };
 }
 
 export function safeAdapterOutput(execution: AdapterExecution, limits: { max_bytes: number; max_lines: number },
