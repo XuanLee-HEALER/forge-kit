@@ -3,7 +3,7 @@ import { dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { checkoutEnvironment, isOid, runProcess } from "../git";
 
 export type ApplyRepo = { repo: string; dir: string; slug: string; boundaries: string[] };
-export type ApplyCatalog = { repos: ApplyRepo[]; registered: string[]; warnings: string[]; boundaries: string[] };
+export type ApplyCatalog = { repos: ApplyRepo[]; registered: string[]; warnings: string[] };
 
 export const scanExclusions = new Set([".git", "node_modules", "vendor", "dist", "build", "target", ".venv", ".workbench"]);
 export const byPath = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
@@ -175,12 +175,15 @@ export function loadApplyCatalog(input: string): ApplyCatalog {
     .map(entry => entry.name).sort(byPath);
   const links = rootRepo ? gitlinks(root, warnings) : new Set<string>();
   const repos: ApplyRepo[] = [];
-  const add = (repo: string, dir: string) => repos.push({ repo, dir, slug: repo === "." ? "root" : repo, boundaries: [] });
+  const boundaries = new Set([...links].map(name => join(root, name)));
+  const add = (repo: string, dir: string, boundaries: string[] = []) =>
+    repos.push({ repo, dir, slug: repo === "." ? "root" : repo, boundaries });
   for (const name of children) {
     const dir = join(root, name);
     try {
       if (relativeApplyPath(name) !== name) continue;
       const marker = lstatSync(join(dir, ".git"), { throwIfNoEntry: false });
+      if (marker?.isFile() || marker?.isDirectory()) boundaries.add(dir);
       if (!marker?.isDirectory() && !links.has(name)) continue;
       const gitDir = gitSetup(dir, name, root);
       if (gitDir && identifyCheckout(dir, gitDir)) add(name, dir);
@@ -188,10 +191,8 @@ export function loadApplyCatalog(input: string): ApplyCatalog {
   }
   for (const name of [...links].sort(byPath))
     if (!repos.some(repo => repo.repo === name)) warnings.push("Submodule is unavailable locally: " + JSON.stringify(name));
-  if (!links.size && !repos.length && rootRepo) add(".", root);
-  const boundaries = [...new Set([...links].map(name => join(root, name))
-    .concat(repos.filter(repo => repo.repo !== ".").map(repo => repo.dir)))].sort(byPath);
-  return { repos, registered: registeredRepos(root, repos, warnings), warnings, boundaries };
+  if (!links.size && !repos.length && rootRepo) add(".", root, [...boundaries].sort(byPath));
+  return { repos, registered: registeredRepos(root, repos, warnings), warnings };
 }
 
 export function selectApplyRepo(catalog: ApplyCatalog, input: string): ApplyRepo {
