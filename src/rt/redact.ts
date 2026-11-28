@@ -123,7 +123,7 @@ function reportedGitSha(data: unknown): string | undefined {
 function looksStructured(text: string): boolean {
   const trimmed = text.trimStart();
   return trimmed.startsWith("{") || trimmed.startsWith('"') || trimmed.startsWith("[") &&
-    !/^\[(?:TRACE|DEBUG|INFO|NOTICE|WARN(?:ING)?|ERROR|CRITICAL|FATAL|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))\]/i.test(trimmed);
+    !/^\[[\p{L}\p{N} ._:+/\-]+\](?:\s|\[|$)/u.test(trimmed);
 }
 
 function decodeRecords(bytes: Buffer, decoder: TextDecoder): string {

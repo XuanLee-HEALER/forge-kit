@@ -6,16 +6,17 @@ test("audit messages retain the diagnosis and follow-up around a multiline runti
   const text = [
     "Queue backlog confirmed.",
     "",
-    "forge rt query --expr 'first fixture line",
-    "second fixture line' --param scope=private-fixture",
+    "Here's the command: forge rt query --expr 'first fixture line",
+    "second fixture line' " + String.fromCharCode(92),
+    "  --param scope=private-fixture",
     "",
-    "Owner will verify recovery.",
+    "Owner will verify recovery with $(date).",
   ].join("\n");
   for (const role of ["user", "assistant"]) {
     const { trace } = createTrace([{ type: "response_item", ts: null, ordinal: 1,
       payload: { type: "message", role, phase: "final_answer", content: text } }], "fixture-session", role);
     expect(trace).toHaveLength(1);
-    expect(trace[0].text).toBe("Queue backlog confirmed.\n\n[runtime query arguments omitted]\n\nOwner will verify recovery.");
+    expect(trace[0].text).toBe("Queue backlog confirmed.\n\n[runtime query arguments omitted]\n\nOwner will verify recovery with $(date).");
   }
   expect(redactAuditArguments(["forge", "rt", "query", "--expr", "first fixture line", "--param=scope=private-fixture"]))
     .toEqual(["forge", "rt", "query", "--expr", "***", "--param=***"]);

@@ -189,7 +189,6 @@ function summarize(cwd: string, from: string, to: string): Summary | null {
 type RefOptions = { fromSha?: string; toRef?: string };
 
 export function resolveChangesRefs(repo: ChangesRepo, options: RefOptions) {
-  checkIdentity(repo);
   const { cwd } = repo;
   const explicit = options.fromSha === undefined ? null : resolveCommit(cwd, options.fromSha);
   if (options.fromSha !== undefined && !explicit) {
@@ -211,7 +210,7 @@ type GitOptions = RefOptions & {
 export function readChangesGit(repo: ChangesRepo, options: GitOptions) {
   const { cwd } = repo;
   const warnings: string[] = [];
-  if (options.refs) checkIdentity(repo);
+  if (options.refs && options.live) checkIdentity(repo);
   const { explicit, to_sha } = options.refs ?? resolveChangesRefs(repo, options);
   const liveOid = typeof options.liveSha === "string" ? options.liveSha.toLowerCase() : "";
   const live = options.live && isOid(liveOid) && resolveCommit(cwd, liveOid) === liveOid ? liveOid : null;

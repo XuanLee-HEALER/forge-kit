@@ -15,6 +15,11 @@ function output(stdout: string, stderr = "", secrets: string[] = [], clipped = f
     exit_code: 0, duration_ms: 1, startup_failure: false, timed_out: false }, limits, secrets);
 }
 
+test("bracketed application log labels are independent of CLI time window syntax", () => {
+  const text = "[2026-11-28 12:00:00] INFO ready\n[worker-2] WARN backlog";
+  expect(output(text).output).toBe(text);
+});
+
 test("timestamped logs and complete NDJSON records survive malformed suffixes and are redacted", () => {
   const result = output([
     "[2026-11-28T09:30:00+08:00] first log message",

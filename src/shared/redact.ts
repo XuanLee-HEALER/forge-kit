@@ -68,49 +68,58 @@ function containsQueryArguments(text: string): boolean {
   return invocation !== null && queryOption.test(text.slice(invocation.index + invocation[0].length));
 }
 
-// Audit messages can contain prose before and after a shell example. Consume
-// its complete logical line, including quoted or escaped multiline arguments.
+// Keep unrelated report lines. A newline ends a direct command only outside
+// quotes and continuations; quoted data can span any number of report lines.
+function commandEnd(lines: string[], start: number, offset: number) {
+  let quote = "";
+  let expansion = 0;
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i];
+    let continued = false;
+    for (let k = i === start ? offset : 0; k < line.length; k++) {
+      const ch = line[k];
+      if (ch === "\\" && quote !== "'") {
+        continued = ++k === line.length || line[k] === "\r" && k + 1 === line.length;
+      } else if (quote) {
+        if (ch === quote) quote = "";
+      } else if (ch === "'" || ch === '"' || ch === "`") quote = ch;
+      else if (ch === "(") expansion++;
+      else if (ch === ")" && expansion) expansion--;
+    }
+    if (!quote && !continued && !expansion) return i;
+  }
+  return lines.length - 1;
+}
+
 export function redactAuditRuntimeCommand(text: string): string {
-  const normalized = text.replace(/\\(?:\r?\n|["'])/g, "");
-  if (!containsQueryArguments(normalized)) return text;
-  // Keep opaque serialized argument arrays and shell expansions on the conservative path.
-  // Their values may span lines without a shell quote surrounding the option value.
-  if (/["']\s*,\s*["']rt["']|\$\(|<<|\\["']/.test(text)) return "[runtime query arguments omitted]";
+  const normalize = (value: string) => value.replace(/\\(?:\r?\n|["'])/g, "");
+  if (!containsQueryArguments(normalize(text))) return text;
   const lines = text.split("\n");
   const kept: string[] = [];
-  let omitted = false;
   for (let i = 0; i < lines.length; i++) {
     const begin = i;
     while (i + 1 < lines.length && /\\\r?$/.test(lines[i])) i++;
-    let command = lines.slice(begin, i + 1).join("\n");
-    const invocation = runtimeQuery.exec(command.replace(/\\\r?\n/g, ""));
-    if (invocation) {
-      let quote = "";
-      let line = command;
-      for (;;) {
-        for (let offset = 0; offset < line.length; offset++) {
-          const ch = line[offset];
-          if (ch === "\\" && quote !== "'") offset++;
-          else if (quote) { if (ch === quote) quote = ""; }
-          else if (ch === "'" || ch === '"') quote = ch;
-        }
-        if (!quote || i + 1 === lines.length) break;
-        line = lines[++i];
-      }
-      command = lines.slice(begin, i + 1).join("\n");
-      if (queryOption.test(command)) {
+    let block = lines.slice(begin, i + 1).join("\n");
+    if (runtimeQuery.test(normalize(block))) {
+      const head = runtimeQuery.exec(lines[begin]);
+      // A split/encoded invocation can have quoting outside this display line.
+      if (!head) return [...kept, "[runtime query arguments omitted]"].join("\n");
+      let argsStart = head.index + head[0].length;
+      if (/["']/.test(lines[begin].charAt(argsStart))) argsStart++;
+      i = commandEnd(lines, begin, argsStart);
+      block = lines.slice(begin, i + 1).join("\n");
+      if (queryOption.test(block)) {
+        // Serialized argv and heredocs can continue independently of shell quotes.
+        if (/["']\s*,\s*["']rt["']|<<|\\["']/.test(block))
+          return [...kept, "[runtime query arguments omitted]"].join("\n");
         kept.push("[runtime query arguments omitted]");
-        omitted = true;
         continue;
       }
     }
-    kept.push(command);
+    kept.push(block);
   }
   const result = kept.join("\n");
-  // Encoded commands and pretty-printed argument arrays may span other
-  // boundaries. Suppress ambiguous remnants instead of publishing raw inputs.
-  if (!omitted || containsQueryArguments(result.replace(/\\(?:\r?\n|["'])/g, ""))) return "[runtime query arguments omitted]";
-  return result;
+  return containsQueryArguments(normalize(result)) ? "[runtime query arguments omitted]" : result;
 }
 
 export function redactAuditArguments(argv: string[]) {
