@@ -68,26 +68,59 @@ function containsQueryArguments(text: string): boolean {
   return invocation !== null && queryOption.test(text.slice(invocation.index + invocation[0].length));
 }
 
-// Keep unrelated report lines. A newline ends a direct command only outside
-// quotes and continuations; quoted data can span any number of report lines.
+// Markdown code spans close at the next delimiter of the same length. Skip
+// completed neighboring spans before looking for the one containing this call.
+function inlineCodeEnd(line: string, position: number): number | undefined {
+  const marks = [...line.matchAll(/`+/g)];
+  const following = new Map<number, number>();
+  const partners = new Map<number, number>();
+  for (let i = marks.length - 1; i >= 0; i--) {
+    const width = marks[i][0].length;
+    const next = following.get(width);
+    if (next !== undefined) partners.set(i, next);
+    following.set(width, i);
+  }
+  for (let i = 0; i < marks.length && marks[i].index! < position; i++) {
+    const end = partners.get(i);
+    if (end === undefined) continue;
+    if (position < marks[end].index!) return marks[end].index! + marks[end][0].length;
+    i = end;
+  }
+}
+
+// Consume literal words, quotes, named variables and line continuations. More
+// complex shell syntax can carry data over newlines and requires no execution.
 function commandEnd(lines: string[], start: number, offset: number) {
   let quote = "";
-
+  const parameter = /\$\{[^{}\\'"`$\r\n]*\}/y;
+  const simpleCommand = /\$\((?:[^()\"'`\\$#<>\r\n]|\\[^\r\n]|'[^'\r\n]*'|"(?:[^"\\`$\r\n]|\\[^\r\n])*")*\)/y;
   for (let i = start; i < lines.length; i++) {
     const line = lines[i];
     let continued = false;
     for (let k = i === start ? offset : 0; k < line.length; k++) {
       const ch = line[k];
-      // Shell substitutions and heredocs can introduce their own quoting grammar.
-      // Withhold the remainder when the end of their data cannot be established.
-      const substitution = ch === "$" && ["(", "{", "'"].includes(line[k + 1]);
-      if (quote !== "'" && (substitution || ch === "`" || !quote && line.startsWith("<<", k)))
-        return lines.length - 1;
-      if (ch === "\\" && quote !== "'") {
+      if (quote === "'") {
+        if (ch === quote) quote = "";
+      } else if (ch === "\\") {
         continued = ++k === line.length || line[k] === "\r" && k + 1 === line.length;
+      } else if (ch === "$" && line[k + 1] === "{") {
+        parameter.lastIndex = k;
+        if (!parameter.test(line)) return lines.length - 1;
+        k = parameter.lastIndex - 1;
+      } else if (line.startsWith("$(", k)) {
+        simpleCommand.lastIndex = k;
+        if (!simpleCommand.test(line)) return lines.length - 1;
+        k = simpleCommand.lastIndex - 1;
+      } else if (ch === "`" || ch === "$" && line[k + 1] === "'" ||
+          !quote && (line.startsWith("<<", k) || (ch === "<" || ch === ">") && line[k + 1] === "(")) {
+        return lines.length - 1;
       } else if (quote) {
         if (ch === quote) quote = "";
-      } else if (ch === "'" || ch === '"') quote = ch;
+      } else if (ch === "'" || ch === '"') {
+        quote = ch;
+      } else if ((ch === "|" || ch === "&" && line[k - 1] === "&") && !line.slice(k + 1).trim()) {
+        continued = true;
+      }
     }
     if (!quote && !continued) return i;
   }
@@ -109,10 +142,11 @@ export function redactAuditRuntimeCommand(text: string): string {
       if (!head) return [...kept, "[runtime query arguments omitted]"].join("\n");
       let argsStart = head.index + head[0].length;
       if (/["']/.test(lines[begin].charAt(argsStart))) argsStart++;
-      const marks = [...lines[begin].matchAll(/`+/g)];
-      const inlineExample = marks.length === 2 && marks[0].index! < argsStart && marks[1].index! >= argsStart
-        && marks[0][0] === marks[1][0] && !/\\\s*$/.test(lines[begin]);
-      i = inlineExample ? begin : commandEnd(lines, begin, argsStart);
+      const inline = inlineCodeEnd(lines[begin], argsStart - 1);
+      // A second command or a continuation after an example may introduce more data.
+      const endOfExample = inline !== undefined && !/\\\s*$/.test(lines[begin]) &&
+        !runtimeQuery.test(lines[begin].slice(inline)) && !queryOption.test(lines[begin].slice(inline));
+      i = endOfExample ? begin : commandEnd(lines, begin, argsStart);
       block = lines.slice(begin, i + 1).join("\n");
       if (queryOption.test(block)) {
         // Serialized argv and heredocs can continue independently of shell quotes.

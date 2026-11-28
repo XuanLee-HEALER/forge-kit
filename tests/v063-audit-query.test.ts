@@ -39,3 +39,20 @@ test("query examples retain Markdown handoff paragraphs and suppress opaque nest
     if (!command.includes("$(")) expect(trace[0].text).toContain(end);
   }
 });
+
+test("neighboring Markdown spans and simple variable references retain the independent handoff", () => {
+  const invocation = 'forge rt query --env "${ENV}" --expr "a private query"';
+  for (const line of [invocation, "Inspect `jobs` with ``" + invocation + "``.",
+    "Inspect `" + invocation + "` on `jobs`."]) {
+    const text = "Diagnosis.\n\n" + line + "\n\nOwner will verify recovery.";
+    const { trace } = createTrace([{ type: "response_item", ts: null, ordinal: 1,
+      payload: { type: "message", role: "assistant", phase: "final_answer", content: text } }], "test", "assistant");
+    expect(trace[0].text).toBe("Diagnosis.\n\n[runtime query arguments omitted]\n\nOwner will verify recovery.");
+  }
+  for (const operator of ["<(", ">("]) {
+    const text = "Diagnosis.\nforge rt query --expr " + operator + "printf x;\nprintf hidden-fixture)";
+    const { trace } = createTrace([{ type: "response_item", ts: null, ordinal: 1,
+      payload: { type: "message", role: "user", content: text } }], "test", "user");
+    expect(trace[0].text).toBe("Diagnosis.\n[runtime query arguments omitted]");
+  }
+});
