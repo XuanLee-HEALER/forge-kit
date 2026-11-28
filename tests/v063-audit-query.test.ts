@@ -28,6 +28,7 @@ test("query examples retain Markdown handoff paragraphs and suppress opaque nest
   for (const command of [
     "Example: `forge rt query --expr 'SCAN 0' --param scope=opaque-value`.",
     String.raw`forge rt query --expr "SELECT \"status\" FROM jobs"`,
+    'forge rt query --expr "$(case x in x) printf foo "first field\nsensitive continuation";; esac)"',
     'forge rt query --expr "$(printf \'%s\' "first field\nsensitive continuation")"',
   ]) {
     const text = [begin, "", command, "", end].join("\n");

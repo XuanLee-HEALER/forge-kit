@@ -93,7 +93,6 @@ function inlineCodeEnd(line: string, position: number): number | undefined {
 function commandEnd(lines: string[], start: number, offset: number) {
   let quote = "";
   const parameter = /\$\{[^{}\\'"`$\r\n]*\}/y;
-  const simpleCommand = /\$\((?:[^()\"'`\\$#<>\r\n]|\\[^\r\n]|'[^'\r\n]*'|"(?:[^"\\`$\r\n]|\\[^\r\n])*")*\)/y;
   for (let i = start; i < lines.length; i++) {
     const line = lines[i];
     let continued = false;
@@ -107,11 +106,7 @@ function commandEnd(lines: string[], start: number, offset: number) {
         parameter.lastIndex = k;
         if (!parameter.test(line)) return lines.length - 1;
         k = parameter.lastIndex - 1;
-      } else if (line.startsWith("$(", k)) {
-        simpleCommand.lastIndex = k;
-        if (!simpleCommand.test(line)) return lines.length - 1;
-        k = simpleCommand.lastIndex - 1;
-      } else if (ch === "`" || ch === "$" && line[k + 1] === "'" ||
+      } else if (ch === "`" || line.startsWith("$(", k) || line.startsWith("$'", k) ||
           !quote && (line.startsWith("<<", k) || (ch === "<" || ch === ">") && line[k + 1] === "(")) {
         return lines.length - 1;
       } else if (quote) {
