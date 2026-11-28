@@ -149,52 +149,53 @@ test("INV-01/02/03 single project focus is local and read-only, with correct Git
   symlinkSync(outside, join(s.work, "src/escaping"));
   const protectedSubtree = join(s.work, "src/private-subtree");
   mkdirSync(protectedSubtree, { mode: 0 });
-  const before = snapshots(s.work);
+  try {
+    const before = snapshots(s.work);
 
-  const full = apply(s);
-  contains(full, ['"repo":"."', "src/service/current.ts", "src/outside-focus.ts"]);
-  contains(full.repos[0].warnings, ["src/private-subtree"]);
-  omits(full, ["FILTERED_FILE", outsideMarker]);
-  const focus = apply(s, "--focus", "src/service", "--days", "7");
-  expect(focus.repos[0].hotspots).toEqual([{ path: "src/service/current.ts", count: 2 }]);
-  expect(focus.repos[0].cochanges).toEqual([{ paths: ["src/friend.ts", "src/service/current.ts"], count: 2 }]);
-  expect(focus.repos[0].cochange_neighbors).toEqual([{ path: "src", count: 2 }]);
-  contains(focus.repos[0].tree, ["src/service/current.ts"]);
-  omits(focus.repos[0].tree, ["src/friend.ts", "src/outside-focus.ts", "src/private-subtree"]);
-  omits(focus, ["src/outside-focus.ts", "src/private-subtree", outsideMarker, "FILTERED_FILE"]);
-  // The older window facts and the stable order use committed Git history, independent of the skeleton.
-  expect(s.git(s.work, "log", "--format=%s", "--since=7 days ago", "--", "src/service"))
-    .toContain("cross-focal baseline");
-  const ninety = apply(s, "--focus", "src/service", "--days", "90");
-  expect(ninety.repos[0].hotspots).toEqual([
-    { path: "src/service/current.ts", count: 2 }, { path: "src/service/ninety-day.ts", count: 1 },
-  ]);
-  const automatic = apply(s, "--focus", "src/service");
-  expect(automatic).toEqual(ninety);
-  expect(apply(s, "--focus", "src/service", "--days", "7")).toEqual(focus);
-  contains(apply(s, "--focus", "src/service", "--focus", "src/outside-focus.ts"),
-    ["src/service/current.ts", "src/outside-focus.ts"]);
-  expect(apply(s, "--focus", "src/empty")).toBeDefined();
+    const full = apply(s);
+    contains(full, ['"repo":"."', "src/service/current.ts", "src/outside-focus.ts"]);
+    contains(full.repos[0].warnings, ["src/private-subtree"]);
+    omits(full, ["FILTERED_FILE", outsideMarker]);
+    const focus = apply(s, "--focus", "src/service", "--days", "7");
+    expect(focus.repos[0].hotspots).toEqual([{ path: "src/service/current.ts", count: 2 }]);
+    expect(focus.repos[0].cochanges).toEqual([{ paths: ["src/friend.ts", "src/service/current.ts"], count: 2 }]);
+    expect(focus.repos[0].cochange_neighbors).toEqual([{ path: "src", count: 2 }]);
+    contains(focus.repos[0].tree, ["src/service/current.ts"]);
+    omits(focus.repos[0].tree, ["src/friend.ts", "src/outside-focus.ts", "src/private-subtree"]);
+    omits(focus, ["src/outside-focus.ts", "src/private-subtree", outsideMarker, "FILTERED_FILE"]);
+    // The older window facts and the stable order use committed Git history, independent of the skeleton.
+    expect(s.git(s.work, "log", "--format=%s", "--since=7 days ago", "--", "src/service"))
+      .toContain("cross-focal baseline");
+    const ninety = apply(s, "--focus", "src/service", "--days", "90");
+    expect(ninety.repos[0].hotspots).toEqual([
+      { path: "src/service/current.ts", count: 2 }, { path: "src/service/ninety-day.ts", count: 1 },
+    ]);
+    const automatic = apply(s, "--focus", "src/service");
+    expect(automatic).toEqual(ninety);
+    expect(apply(s, "--focus", "src/service", "--days", "7")).toEqual(focus);
+    contains(apply(s, "--focus", "src/service", "--focus", "src/outside-focus.ts"),
+      ["src/service/current.ts", "src/outside-focus.ts"]);
+    expect(apply(s, "--focus", "src/empty")).toBeDefined();
 
-  for (const invalid of ["0", "-1", "1.5", "nope"]) {
-    const result = s.run([s.forge, "apply", "--days", invalid, "--json"]);
-    expect(result.code).not.toBe(0);
-    expect(result.out + result.err).toMatch(/days|positive|整数/i);
-  }
-  for (const path of [outside, "../outside", "src/escaping"]) {
-    for (const args of [["--focus", "src/service", "--focus", path], ["check", "--path", "src/service", "--path", path]]) {
-      const result = s.run([s.forge, "apply", ...args, "--json"]);
+    for (const invalid of ["0", "-1", "1.5", "nope"]) {
+      const result = s.run([s.forge, "apply", "--days", invalid, "--json"]);
       expect(result.code).not.toBe(0);
-      expect(result.out + result.err).toMatch(/path|relative|escape|outside|路径|越界/i);
-      expect(result.out + result.err).not.toContain(outsideMarker);
+      expect(result.out + result.err).toMatch(/days|positive|整数/i);
     }
-  }
-  expect(apply(s, "--focus", "src/service", "--days", "7")).toEqual(focus);
-  contains(apply(s, "check", "--path", "src/service"), ["UNMAPPED"]);
-  expect(apply(s, "status")).toBeDefined();
-  expect(s.git(s.work, "rev-parse", "HEAD").trim()).toBe(head);
-  expect(snapshots(s.work)).toEqual(before);
-  chmodSync(protectedSubtree, 0o755);
+    for (const path of [outside, "../outside", "src/escaping"]) {
+      for (const args of [["--focus", "src/service", "--focus", path], ["check", "--path", "src/service", "--path", path]]) {
+        const result = s.run([s.forge, "apply", ...args, "--json"]);
+        expect(result.code).not.toBe(0);
+        expect(result.out + result.err).toMatch(/path|relative|escape|outside|路径|越界/i);
+        expect(result.out + result.err).not.toContain(outsideMarker);
+      }
+    }
+    expect(apply(s, "--focus", "src/service", "--days", "7")).toEqual(focus);
+    contains(apply(s, "check", "--path", "src/service"), ["UNMAPPED"]);
+    expect(apply(s, "status")).toBeDefined();
+    expect(s.git(s.work, "rev-parse", "HEAD").trim()).toBe(head);
+    expect(snapshots(s.work)).toEqual(before);
+  } finally { chmodSync(protectedSubtree, 0o755); }
   expect(existsSync(s.probeLog)).toBe(false);
 }), 30_000);
 
@@ -424,6 +425,11 @@ test("INV-05 doctor diagnoses map structure without reporting ordinary Git drift
   expect(oversized.code).toBe(0);
   expect(issue(oversized, "warn", "root-repo.md")).toBe(true);
   expect(issue(oversized, "warn", "border.md")).toBe(true);
+
+  // The doctor length warning has no effect on the card's committed-change state.
+  const oversizedCheck = apply(s, "check", "--domain", "border");
+  expect(oversizedCheck.cards[0]).toMatchObject({ domain: "border", status: "CHANGED" });
+  omits(oversizedCheck, ["STALE"]);
 
   s.privateFile(warehouse, initialCard + "\n## Domain Index\n\n- [focus](domains/root/focus.md) — fixture coverage\n");
   expect(issue(doctor(), "warn", "focus.md")).toBe(false);

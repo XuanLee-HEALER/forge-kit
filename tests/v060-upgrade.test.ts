@@ -29,7 +29,7 @@ test("T17 0.5.7 ledger, chain, Markdown and private model settings survive sync"
     const candidate = releaseCLI(s);
     for (let pass = 0; pass < 2; pass += 1) {
       s.ok([candidate, "sync", s.work]);
-      expect(JSON.parse(s.read(".workbench/kit-lock.json")).kit_version).toBe("0.6.1");
+      expect(JSON.parse(s.read(".workbench/kit-lock.json")).kit_version).toBe("0.6.2");
       expect(s.read(".workbench/models.toml")).toBe(models);
       expect(s.read(".codex/agents/implementer.toml")).toContain("fixture-tier-model");
       expect(s.read(".codex/hooks.json")).toContain("UserPromptSubmit");
@@ -96,7 +96,7 @@ test("INV-08/09 sync preserves a 0.6.0 map-free workspace and reads old and new 
     const candidate = releaseCLI(s);
     for (let pass = 0; pass < 2; pass += 1) {
       s.ok([candidate, "sync", s.work]);
-      expect(JSON.parse(s.read(".workbench/kit-lock.json")).kit_version).toBe("0.6.1");
+      expect(JSON.parse(s.read(".workbench/kit-lock.json")).kit_version).toBe("0.6.2");
       expect(s.read("AGENTS.local.md")).toBe(privateFile);
       expect(s.read(".workbench/root-repo.md")).toBe(oldCard);
       expect(JSON.parse(s.ok([s.forge, "instance", "show", "skill", "apply", "--json"])).source).toBe("core");
