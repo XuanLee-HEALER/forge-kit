@@ -1,5 +1,8 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
+import { autoAudit } from "../audit/files";
+import { auditRoot, validAuditTask } from "../audit/files-path";
+import { restoreStagedAudit, stageTaskAudit, type StagedAudit } from "../audit/files-staging";
+import { auditPruneWarning, reconcileStagedAudits, retryPruneItems } from "../audit/prune";
 import { isOid, runGit } from "../git";
 import { installedInstance } from "../workflow-config";
 import { prRemoteRefs, reachableFromRefs, resolveTaskCheckout } from "./checkout";
@@ -10,9 +13,7 @@ import { removeTaskRunDirectory } from "./task-runs";
 import { appendEventInTx, withImmediateTx } from "./transactions";
 import { isRolloutEndpoint, nowIso, usesV05, type LedgerReader, type TaskRecord } from "./types";
 
-interface ArchiveLedger extends TaskReader {
-  exportArchive(task_id: string, closedTs?: string): string;
-}
+export { exportArchive } from "../audit/files-legacy";
 
 export interface CloseTaskParams {
   task_id: string;
@@ -24,8 +25,8 @@ export interface CloseTaskParams {
   session_id?: string | null;
 }
 
-export function closeTask(ledger: ArchiveLedger, params: CloseTaskParams): { task: TaskRecord; archivePath: string | null } {
-  const ev = withImmediateTx(ledger.db, () => {
+export function closeTask(ledger: TaskReader, params: CloseTaskParams): { task: TaskRecord; archivePath: string | null } {
+  withImmediateTx(ledger.db, () => {
     const task = ledger.getTask(params.task_id);
     if (!task) throw new Error(`Task not found: ${params.task_id}`);
     if (task.status !== "OPEN") {
@@ -114,7 +115,7 @@ export function closeTask(ledger: ArchiveLedger, params: CloseTaskParams): { tas
     }
 
     const ts = nowIso();
-    const closedEv = appendEventInTx(ledger.db, {
+    appendEventInTx(ledger.db, {
       task_id: params.task_id,
       event_type: "TASK_CLOSED",
       actor: params.actor ?? "agent",
@@ -130,57 +131,11 @@ export function closeTask(ledger: ArchiveLedger, params: CloseTaskParams): { tas
     ledger.db
       .query("UPDATE tasks SET status = 'CLOSED', closed_at = ?, updated_at = ? WHERE task_id = ?")
       .run(ts, ts, params.task_id);
-    return closedEv;
   });
 
   const task = ledger.getTask(params.task_id)!;
-  let archivePath: string | null = null;
-  if (params.archive !== false) {
-    archivePath = ledger.exportArchive(task.task_id, ev.ts);
-  }
+  const archivePath = params.archive === false ? null : autoAudit(ledger, task.task_id);
   return { task, archivePath };
-}
-
-export function exportArchive(ledger: LedgerReader & { readonly dbPath: string }, task_id: string, closedTs?: string): string {
-  const task = ledger.getTask(task_id);
-  if (!task) throw new Error(`Task not found: ${task_id}`);
-  const ts = closedTs ?? task.closed_at ?? task.updated_at;
-  const month = ts.slice(0, 7);
-  const dir = join(dirname(ledger.dbPath), "archive", month);
-  mkdirSync(dir, { recursive: true });
-  const outPath = join(dir, `${task.task_id}.md`);
-  const repos = ledger.getTaskRepos(task.task_id);
-  const events = ledger.getTaskEvents(task.task_id);
-
-  const lines: string[] = [
-    `# Task Ledger Archive: ${task.task_id}`,
-    "",
-    `- **Title**: ${task.title}`,
-    `- **Status**: ${task.status}`,
-    `- **Endpoint / Depth**: ${task.endpoint} / ${task.verification_depth}`,
-    `- **Created / Closed**: ${task.created_at} → ${task.closed_at ?? "-"}`,
-    `- **Chain Tip Hash**: \`${task.tip_hash}\``,
-    "",
-    "## Repositories",
-    "",
-  ];
-  if (repos.length === 0) {
-    lines.push("- (none)");
-  } else {
-    for (const r of repos) {
-      lines.push(
-        `- \`${r.repo}\` (${r.branch}): base=\`${r.base_sha ?? "-"}\`, head=\`${r.head_sha ?? "-"}\``,
-      );
-    }
-  }
-  lines.push("", "## Event Chain", "");
-  for (const ev of events) {
-    lines.push(
-      `- \`#${ev.seq}\` [${ev.ts}] **${ev.event_type}** (${ev.actor}${ev.repo ? `, ${ev.repo}` : ""}${ev.sha ? `@${ev.sha.slice(0, 8)}` : ""}) \`${ev.entry_hash}\`: ${ev.payload_json}`,
-    );
-  }
-  writeFileSync(outPath, lines.join("\n") + "\n", "utf8");
-  return outPath;
 }
 
 export interface CancelTaskParams {
@@ -219,6 +174,7 @@ export function prune(ledger: LedgerReader, params: PruneParams): {
   cutoff: string;
   candidates: string[];
   deleted: string[];
+  warnings?: string[];
 } {
   const cutoff = new Date(
     Date.now() - params.beforeDays * 86400_000,
@@ -229,17 +185,52 @@ export function prune(ledger: LedgerReader, params: PruneParams): {
       .all(cutoff) as Array<{ task_id: string }>;
     return rows.map((row) => row.task_id);
   };
-  if (!params.apply) return { cutoff, candidates: selectCandidates(), deleted: [] };
-  const result = withImmediateTx(ledger.db, () => {
-    const candidates = selectCandidates();
-    const remove = ledger.db.query(`DELETE FROM tasks WHERE task_id = ? AND ${eligible}`);
-    const deleted = candidates.filter(id => {
-      removeTaskRunDirectory(ledger.workbenchRoot, id);
-      return remove.run(id, cutoff).changes > 0;
+  const getAuditRoot = () => {
+    try {
+      return auditRoot(ledger.workbenchRoot, false, !params.apply);
+    } catch {
+      throw Error("Audit prune could not access the audit directory safely. Retry with forge ledger prune --before <days>.");
+    }
+  };
+  if (!params.apply) {
+    const warnings = reconcileStagedAudits(ledger, getAuditRoot(), false);
+    return { cutoff, candidates: selectCandidates(), deleted: [], ...(warnings.length ? { warnings } : {}) };
+  }
+  if (ledger.db.inTransaction) throw Error("Prune requires its own ledger transaction");
+  const staged: StagedAudit[] = [];
+  let failure = "apply ledger changes";
+  let failedTask = "pending audits";
+  let result;
+  try {
+    result = withImmediateTx(ledger.db, () => {
+      const root = getAuditRoot();
+      const warnings = reconcileStagedAudits(ledger, root, true);
+      const candidates = selectCandidates();
+      const remove = ledger.db.query(`DELETE FROM tasks WHERE task_id = ? AND ${eligible}`);
+      const deleted: string[] = [];
+      for (const id of candidates) {
+        failedTask = id;
+        failure = "stage";
+        const item = root && validAuditTask(id) ? stageTaskAudit(ledger.db, root, id) : null;
+        if (item) staged.push(item);
+        failure = "delete";
+        removeTaskRunDirectory(ledger.workbenchRoot, id);
+        if (remove.run(id, cutoff).changes > 0) deleted.push(id);
+        else if (item) {
+          restoreStagedAudit(item);
+          staged.pop();
+        }
+      }
+      failure = "commit changes for";
+      ledger.db.query("DELETE FROM exemptions WHERE expires_at IS NOT NULL AND expires_at < ?").run(nowIso());
+      return { cutoff, candidates, deleted, warnings };
     });
-    ledger.db.query("DELETE FROM exemptions WHERE expires_at IS NOT NULL AND expires_at < ?").run(nowIso());
-    return { cutoff, candidates, deleted };
-  });
+  } catch {
+    const warnings = retryPruneItems(ledger, staged);
+    throw Error([auditPruneWarning(failedTask, failure), ...warnings].join("\n"));
+  }
+  result.warnings.push(...retryPruneItems(ledger, staged));
   if (result.deleted.length) ledger.db.exec("VACUUM;");
-  return result;
+  const { warnings, ...counts } = result;
+  return { ...counts, ...(warnings.length ? { warnings } : {}) };
 }

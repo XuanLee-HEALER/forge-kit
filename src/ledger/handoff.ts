@@ -1,3 +1,4 @@
+import { autoAudit } from "../audit/files";
 import { createHash } from "node:crypto";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, relative } from "node:path";
@@ -11,7 +12,11 @@ import type { Ledger } from "./store";
 import { appendEventInTx, withImmediateTx } from "./transactions";
 import { evidenceSource, isRolloutEndpoint, nowIso } from "./types";
 
-export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback?: string, callbacks?:{verifyTarget:(repo:string,branch:string,oid:string,state:string)=>void; beforeRecord:(items:HandoffItem[])=>void; afterRecord:()=>void}) {
+export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback?: string, callbacks?: {
+  verifyTarget: (repo: string, branch: string, oid: string, state: string) => void;
+  beforeRecord: (items: HandoffItem[]) => void;
+  afterRecord: () => void;
+}, session_id?: string) {
   function candidates() {
     const task = ledger.getTask(task_id);
     if (task?.status !== "OPEN" || (task.endpoint !== "pr" && !isRolloutEndpoint(task.endpoint)))
@@ -87,7 +92,7 @@ export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback
       throw Error(hint + ": " + err);
     }
   });
-  return withImmediateTx(ledger.db, () => {
+  const result = withImmediateTx(ledger.db, () => {
     if (JSON.stringify(candidates()) !== JSON.stringify(initial))
       throw Error("Handoff changed; repeat forge ledger pr-sync");
     callbacks?.beforeRecord(items);
@@ -129,6 +134,7 @@ export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback
     const event = appendEventInTx(ledger.db, {
       task_id,
       event_type: "HANDOFF_RECORDED",
+      session_id,
       actor: "agent",
       payload: { ...snapshot },
     });
@@ -155,6 +161,8 @@ export function handoff(ledger: Ledger, task_id: string, sql: string[], rollback
       ),
     };
   });
+  autoAudit(ledger, task_id, { legacy: false });
+  return result;
 }
 
 function invalidateTaskReleases(ledger: Ledger, task_id: string) {

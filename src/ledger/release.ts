@@ -1,3 +1,4 @@
+import { autoAudit } from "../audit/files";
 import { canonicalJson, isRolloutEndpoint, sha256String, usesV05, type ReleaseObserver } from "./types";
 import { stagePin } from "./ship-actions";
 import { observeStage } from "../stage-observation";
@@ -238,7 +239,7 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
     ["verify", "runbook", "complete"].includes(cmd) && rest[0]
       ? observe(ledger, detail(ledger, rest[0]))
       : new Map();
-  return withImmediateTx(ledger.db, () => {
+  const result = withImmediateTx(ledger.db, () => {
     if (cmd === "create") return create(ledger, rest);
     const [id, ...args] = rest;
     if (!id || !["verify", "runbook", "complete", "cancel"].includes(cmd))
@@ -338,4 +339,8 @@ export function releaseCommand(ledger: Ledger, argv: string[]) {
       sweepable: checked.items.map(({ repo, branch }) => ({ repo, branch })),
     };
   });
+  if ("task_ids" in result && result.task_ids) {
+    for (const id of result.task_ids) autoAudit(ledger, id);
+  }
+  return result;
 }

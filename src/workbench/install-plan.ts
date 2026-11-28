@@ -1,6 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { loadModelsConfig, loadWorkbenchConfig, parseTomlFile, reviewRoleModel, reviewRoles } from "../config";
+import { ensureAuditIgnored } from "../shared/audit-ignore";
 import { runGit } from "../git";
 import { localPath, readRequired, resolveInstance } from "../instance";
 import { installAssets, wrapper, type Asset, type InstallLock } from "../managed-assets";
@@ -126,6 +127,7 @@ export function install(root: string, kitRoot: string, previous?: InstallLock, f
     skill_overrides,
     updated_at: new Date().toISOString(),
   };
+  ensureAuditIgnored(root);
   const preserved = installAssets(root, assets, lock, previous, force);
   return { root, lock, preserved };
 }

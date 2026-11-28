@@ -1,9 +1,18 @@
+import { auditTask } from "../audit/files";
+import { pruneAuditTraces } from "../audit/prune";
+import { lifecycleSession } from "./session";
+import { redactAuditText } from "../shared/redact";
 import { parseArgs } from "node:util";
 import { loadWorkbenchConfig } from "../config";
 import { handedOffOwner } from "./queries";
 import type { Ledger } from "./store";
 import { pruneTaskRuns } from "./task-runs";
 import { evidenceSource } from "./types";
+
+function printArchiveResult(result: unknown) {
+  console.log(JSON.stringify(result, (_key, value) =>
+    typeof value === "string" ? redactAuditText(value) : value, 2));
+}
 
 export const queryCommands = {
   status(ledger, rest) {
@@ -101,6 +110,7 @@ export const queryCommands = {
       args: rest.slice(1),
       options: {
         summary: { type: "string" },
+        "session-id": { type: "string" },
         "no-archive": { type: "boolean", default: false },
         "force-incomplete": { type: "boolean", default: false },
         reason: { type: "string" },
@@ -111,19 +121,24 @@ export const queryCommands = {
     const res = ledger.closeTask({
       task_id,
       summary: values.summary,
+      session_id: lifecycleSession(values["session-id"]),
       archive: !values["no-archive"],
       forceIncomplete: Boolean(values["force-incomplete"]),
       forceReason: values.reason,
       actor: values.actor,
     });
-    console.log(JSON.stringify(res, null, 2));
+    printArchiveResult(res);
   },
 
   archive(ledger, rest) {
-    const task_id = rest[0];
-    if (!task_id) throw new Error("Usage: forge ledger archive <task_id>");
-    const archivePath = ledger.exportArchive(task_id);
-    console.log(JSON.stringify({ task_id, archivePath }, null, 2));
+    const { positionals, values } = parseArgs({
+      args: rest, allowPositionals: true,
+      options: { session: { type: "string" }, "no-trace": { type: "boolean" } },
+    });
+    if (positionals.length !== 1) throw Error("Expected one task ID");
+    const [task_id] = positionals;
+    const result = auditTask(ledger, task_id, { session: values.session, noTrace: values["no-trace"] });
+    printArchiveResult({ task_id, ...result });
   },
 
   cancel(ledger, rest) {
@@ -151,10 +166,17 @@ export const queryCommands = {
       args: rest,
       options: {
         before: { type: "string" },
+        "audit-traces-only": { type: "boolean" },
         "runs-only": { type: "boolean" },
         apply: { type: "boolean", default: false },
       },
     });
+    if (values["audit-traces-only"]) {
+      if (values.before !== undefined || values["runs-only"]) throw Error("Choose one prune mode");
+      const days = loadWorkbenchConfig(ledger.workbenchRoot).ledger.retention_days;
+      printArchiveResult(pruneAuditTraces(ledger, days, Boolean(values.apply)));
+      return;
+    }
     if (values["runs-only"]) {
       if (values.before) throw Error("--runs-only uses the configured ledger.retention_days");
       const days = loadWorkbenchConfig(ledger.workbenchRoot).ledger.retention_days;

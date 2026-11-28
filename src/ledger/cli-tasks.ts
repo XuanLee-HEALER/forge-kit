@@ -1,3 +1,4 @@
+import { lifecycleSession } from "./session";
 import { parseArgs } from "node:util";
 import { installedInstance } from "../workflow-config";
 import type { Ledger } from "./store";
@@ -8,6 +9,7 @@ export const taskCommands = {
     const { values } = parseArgs({
       args: rest,
       options: {
+        "session-id": { type: "string" },
         id: { type: "string" },
         title: { type: "string" },
         endpoint: { type: "string" },
@@ -34,6 +36,7 @@ export const taskCommands = {
       base_sha: values.base,
       head_sha: values.head,
       actor: values.actor,
+      session_id: lifecycleSession(values["session-id"]),
     });
     console.log(JSON.stringify(res.task, null, 2));
   },
@@ -95,6 +98,7 @@ export const taskCommands = {
     const { values } = parseArgs({
       args: rest.slice(1),
       options: {
+        "session-id": { type: "string" },
         endpoint: { type: "string" },
         depth: { type: "string" },
         reason: { type: "string" },
@@ -112,6 +116,7 @@ export const taskCommands = {
       depth: values.depth as VerificationDepth | undefined,
       reason: values.reason,
       actor: values.actor,
+      session_id: lifecycleSession(values["session-id"]),
     });
     console.log(JSON.stringify(res, null, 2));
   },

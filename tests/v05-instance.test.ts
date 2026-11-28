@@ -6,6 +6,7 @@ import { parse, stringify } from "yaml";
 import { runInstanceStage } from "../src/instance";
 import { locateRepo } from "../src/git";
 import { kit, sandbox, type Sandbox } from "./v05-sandbox";
+import { message, rollout } from "./helpers/audit-cli";
 
 let s: Sandbox;
 beforeEach(() => { s = sandbox(); });
@@ -234,8 +235,24 @@ test("T05/T12 portable distribution self-bootstraps outside the checkout", () =>
     cpSync(input, output, {verbatimSymlinks: true});
   }
   symlinkSync(join(kit, "node_modules"), join(source, "node_modules"));
-  mkdirSync(join(source, ".workbench"));
-  writeFileSync(join(source, ".workbench/private-marker"), "synthetic instance file");
+  const sourceCli = join(source, "bin/forge");
+  s.ok([sourceCli, "init", source], s.root);
+  const session = "private-pack-rollout-session";
+  const privateText = "synthetic private pack audit body";
+  const sensitive = "fixture-only-pack-secret";
+  rollout(s, "../distribution-source/fixture-sessions/rollout-pack.jsonl", session,
+    [message(1, "user", privateText + "\nAuthorization: Bearer " + sensitive)]);
+  s.env.FORGE_CODEX_SESSIONS_DIR = join(source, "fixture-sessions");
+  s.ok([sourceCli, "ledger", "open", "--id", "private-pack-task", "--title", "pack fixture",
+    "--endpoint", "investigation", "--session-id", session], source);
+  s.ok([sourceCli, "ledger", "close", "private-pack-task"], source);
+  const privateAudit = join(source, ".workbench/audit/private-pack-task");
+  const trace = readFileSync(join(privateAudit, "trace.jsonl"), "utf8");
+  expect(trace).toContain(privateText);
+  expect(trace.includes(sensitive)).toBe(false);
+  for (const artifact of ["summary.json", "summary.md", "trace.jsonl"]) {
+    expect(existsSync(join(privateAudit, artifact))).toBe(true);
+  }
   s.ok(["bun", "run", "build"], source);
   s.ok(["bun", "pm", "pack", "--quiet", "--ignore-scripts", "--filename", archive], source);
   const files = s.ok(["tar", "-tzf", archive], s.root).trim().split("\n");
@@ -246,6 +263,12 @@ test("T05/T12 portable distribution self-bootstraps outside the checkout", () =>
     expect(path).not.toMatch(/(?:^package\/AGENTS\.local\.md|v0\.5-requirements\.md|work-communication|form-ux\/|qa-polling)/);
   }
   s.ok(["tar", "-xzf", archive], s.root);
+  for (const path of files.filter(file => !file.endsWith("/"))) {
+    const candidate = readFileSync(join(s.root, path));
+    for (const privateMarker of [session, privateText, sensitive, ".workbench/audit/private-pack-task"]) {
+      expect(candidate.includes(privateMarker), path).toBe(false);
+    }
+  }
   s.git(s.root, "clone", "--local", "--", kit, s.work);
   expect(s.git(s.work, "status", "--porcelain")).toBe("");
   const forge = join(s.root, "package/bin/forge");

@@ -1,3 +1,5 @@
+import { costCli } from "../audit/cost";
+import { lifecycleSession } from "./session";
 import { existsSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { findWorkbenchRoot } from "../config";
@@ -23,10 +25,10 @@ export async function runLedgerCli(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   const USAGE = `Usage: forge ledger <command> [options]
 Commands:
-  open         --id <id> --title <title> --endpoint <investigation|local|pr|prod|instance-endpoint> --depth <targeted|full> [--repo <r> --branch <b> --base <sha> --head <sha> --worktree <p>]
+  open         [--session-id <id>] --id <id> --title <title> --endpoint <investigation|local|pr|prod|instance-endpoint> --depth <targeted|full> [--repo <r> --branch <b> --base <sha> --head <sha> --worktree <p>]
   attach       <task_id> --repo <r> --branch <b> [--base <sha> --head <sha> --worktree <p>]
   detach       <task_id> --repo <r> --branch <b> [--reason <text>]
-  reopen       <task_id> [--endpoint <ep>] [--depth <d>] [--reason <text>]
+  reopen       <task_id> [--session-id <id>] [--endpoint <ep>] [--depth <d>] [--reason <text>]
   set-endpoint <task_id> --endpoint <ep> [--reason <text>]
   freeze      <task_id> [--spec-dir <dir>] [--lock-tests <glob>]...
   amend       <task_id> --scope <requirement|invariant|tech_spec|test_spec> --reason <text>
@@ -46,7 +48,7 @@ Commands:
   fast-track revoke <id> [--reason <reason>] (PENDING)
   ACTIVE: send "快轨撤销 <id>" as the entire message in the approving root session.
           Inspect the receipt and target for any claimed action.
-  handoff   <task_id> [--sql host:path ...] [--rollback note]
+  handoff   <task_id> [--session-id <id>] [--sql host:path ...] [--rollback note]
   resume    <task_id> [--reason note]
   release   create --title text [--from-handoffs | --tasks ids | --prs repo#num,...] [--order repos]\n            PR selectors include every attachment of the selected handoff.
   release   verify|runbook|observe|complete|cancel <release_id> | status [release_id]
@@ -58,10 +60,11 @@ Commands:
   tip       <task_id>
   verify-tip <task_id>@<hash> | --task <id> --tip <hash>
   verify    [--task <id>] [--json]
-  close     <task_id> [--summary <text>] [--no-archive] [--force-incomplete --reason <text>]
-  archive   <task_id>
+  close     <task_id> [--session-id <id>] [--summary <text>] [--no-archive] [--force-incomplete --reason <text>]
+  archive   <task_id> [--session <id>] [--no-trace]
+  cost      [<task_id>] [--days N] [--json]
   cancel    <task_id> --reason <text>
-  prune     --before <days> [--apply] | --runs-only [--apply]
+  prune     --before <days> [--apply] | --runs-only [--apply] | --audit-traces-only [--apply]
   runbook   <create|show|list|complete|revoke> [options]`;
 
   const runbookHelp = cmd === "runbook" && (!rest[0] || ["--help", "-h"].includes(rest[0]) ||
@@ -72,6 +75,7 @@ Commands:
   }
 
   const root = findWorkbenchRoot();
+  if (cmd === "cost") return costCli(root, rest);
   const telemetry = ["stats","tip","verify-tip"].includes(cmd);
   const releaseStatus = (cmd === "release" || cmd === "fast-track") && rest[0] === "status";
   if (releaseStatus && !existsSync(ledgerDbPath(root))) {
@@ -99,8 +103,16 @@ Commands:
       const result = cmd === "resume"
         ? resume(ledger,id,parseArgs({args,options:{reason:{type:"string"}}}).values.reason)
         : (() => {
-            const {values} = parseArgs({args,options:{sql:{type:"string",multiple:true},rollback:{type:"string"}}});
-            return handoff(ledger,id,values.sql ?? [],values.rollback);
+            const { values } = parseArgs({
+              args,
+              options: {
+                "session-id": { type: "string" },
+                sql: { type: "string", multiple: true },
+                rollback: { type: "string" },
+              },
+            });
+            return handoff(ledger, id, values.sql ?? [], values.rollback, undefined,
+              lifecycleSession(values["session-id"]));
           })();
       console.log(JSON.stringify(result,null,2));
       return;

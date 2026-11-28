@@ -43,9 +43,16 @@ export const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"] as con
 export const reviewRoles = ["business", "quality", "simplify", "comments"] as const;
 export type ReviewRole = typeof reviewRoles[number];
 
+export interface ModelPrice {
+  input_per_1m: number;
+  cached_input_per_1m: number;
+  output_per_1m: number;
+}
+
 export interface ModelsConfig {
   tiers: Record<string, { model: string; effort: typeof efforts[number] }>;
   review: { roles: Record<ReviewRole | "performance", string> };
+  pricing?: Record<string, ModelPrice>;
 }
 
 export interface DbCredentialPair {
@@ -364,7 +371,7 @@ export function decodeModelsConfig(parsed: object, file: string): ModelsConfig {
     deep: { model: "gpt-6.2-astra", effort: "high" },
   };
   for (const key of Object.keys(parsed))
-    if (key !== "tiers" && key !== "review") throw Error(file + ": Unknown field " + key);
+    if (key !== "tiers" && key !== "review" && key !== "pricing") throw Error(file + ": Unknown field " + key);
   const overrides = "tiers" in parsed ? parsed.tiers : {};
   if (!overrides || typeof overrides !== "object" || Array.isArray(overrides))
     throw Error(file + ": tiers must be a mapping");
@@ -394,7 +401,24 @@ export function decodeModelsConfig(parsed: object, file: string): ModelsConfig {
       }
     }
   }
-  return { tiers, review: { roles: mapping } };
+  const result: ModelsConfig = { tiers, review: { roles: mapping } };
+  if (Object.hasOwn(parsed, "pricing")) {
+    const pricing = (parsed as { pricing: unknown }).pricing;
+    if (!pricing || typeof pricing !== "object" || Array.isArray(pricing))
+      throw Error(file + ": pricing must be a mapping");
+    const prices: Record<string, ModelPrice> = Object.create(null);
+    const fields = ["input_per_1m", "cached_input_per_1m", "output_per_1m"] as const;
+    for (const [name, entry] of Object.entries(pricing)) {
+      if (!name.trim() || !entry || typeof entry !== "object" || Array.isArray(entry) ||
+          Object.keys(entry).length !== fields.length ||
+          fields.some(field => !Object.hasOwn(entry, field) || typeof entry[field] !== "number" ||
+            !Number.isFinite(entry[field]) || entry[field] < 0))
+        throw Error(file + ": invalid model price");
+      prices[name] = Object.fromEntries(fields.map(field => [field, entry[field]])) as unknown as ModelPrice;
+    }
+    result.pricing = prices;
+  }
+  return result;
 }
 
 export function reviewRoleModel(models: ModelsConfig, role: ReviewRole) {
