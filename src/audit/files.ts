@@ -19,6 +19,18 @@ interface AuditOptions {
   noTrace?: boolean;
 }
 
+function retryCommand(task: string, options: AuditOptions = {}) {
+  const visible = redactAuditText(task) === task && !task.startsWith("-") ? task : "<task_id>";
+  const parts = ["forge ledger archive", visible];
+  if (options.session) {
+    const id = options.session;
+    parts.push("--session", /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(id) && redactAuditText(id) === id
+      ? id : "<original-session-id>");
+  }
+  if (options.noTrace) parts.push("--no-trace");
+  return parts.join(" ");
+}
+
 function publishAudit(ledger: LedgerReader, task: string, root: string, draft: string, publishLegacy?: () => void) {
   if (auditRoot(ledger.workbenchRoot) !== root || !inspectBatch(draft)) throw Error("Audit draft is unavailable");
   restoreOwnedAudit(ledger.db, root, task);
@@ -85,7 +97,7 @@ function writeAudit(ledger: ArchiveLedger, taskId: string, options: AuditOptions
   } catch (error) {
     const reason = error instanceof Error && error.message === "task changed during archive"
       ? "task changed during archive" : "archive files could not be prepared or published safely";
-    throw Error(`Audit archive failed for ${redactAuditText(taskId)} (${reason}). Check the archive destination, then retry forge ledger archive ${redactAuditText(taskId)} with the original options.`);
+    throw Error(`Audit archive failed for ${redactAuditText(taskId)} (${reason}). Check the archive destination, then retry ${retryCommand(taskId, options)}.`);
   } finally {
     // Each failed publication leaves the previous batch in its destination or the marked backup.
     try {
@@ -113,7 +125,7 @@ export function autoAudit(ledger: ArchiveLedger, taskId: string, options: { lega
     return result.archivePath;
   } catch {
     const state = ledger.getTask(taskId)?.status ?? "unavailable";
-    console.error(`Audit archive failed for ${redactAuditText(taskId)} after task status ${state}. Check the archive destination, then retry forge ledger archive ${redactAuditText(taskId)}.`);
+    console.error(`Audit archive failed for ${redactAuditText(taskId)} after task status ${state}. Check the archive destination, then retry ${retryCommand(taskId)}.`);
     return null;
   }
 }

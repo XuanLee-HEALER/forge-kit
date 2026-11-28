@@ -58,7 +58,11 @@ function comparable(a: RolloutUsage | null, b: RolloutUsage | null) {
   return a !== null && b !== null &&
     ["input_tokens", "output_tokens", "total_tokens"].every(key =>
       a[key as TokenField] !== null && a[key as TokenField] === b[key as TokenField]) &&
-    tokenFields.every(key => a[key] === null || b[key] === null || a[key] === b[key]);
+    sharedCountersAgree(a, b);
+}
+
+function sharedCountersAgree(a: RolloutUsage, b: RolloutUsage) {
+  return tokenFields.every(key => a[key] === null || b[key] === null || a[key] === b[key]);
 }
 
 function withMissing(primary: RolloutUsage, other: RolloutUsage | null) {
@@ -96,9 +100,21 @@ type Sample = {
 function mirrors(a: Sample, b: Sample) {
   if (a.native === b.native || (a.id && b.id && a.id !== b.id)) return false;
   if (comparable(a.total, b.total) && (!a.last || !b.last || comparable(a.last, b.last))) return true;
-  // Legacy last-only mirrors lack a request identifier. Pair adjacent
-  // representations of the same observed request within a turn.
-  return !a.total && !b.total && a.turn === b.turn && comparable(a.last, b.last);
+  if (!comparable(a.last, b.last)) return false;
+  if (!a.total && !b.total) return a.turn === b.turn;
+  // A compatibility record may omit the cumulative snapshot. Within the same
+  // known instant, pair it with the native request unless the turns disagree.
+  return Boolean(a.total) !== Boolean(b.total) && a.ts !== null && a.ts === b.ts &&
+    (!a.turn || !b.turn || a.turn === b.turn);
+}
+
+function mergeSample(target: Sample, source: Sample) {
+  const preferred = source.native && !target.native ? source : target;
+  const alternate = preferred === target ? source : target;
+  const total = preferred.total ? withMissing(preferred.total, alternate.total) : alternate.total;
+  const last = preferred.last ? withMissing(preferred.last, alternate.last) : alternate.last;
+  const model = preferred.model ?? (preferred.turn === alternate.turn ? alternate.model : null);
+  Object.assign(target, { ...preferred, id: preferred.id ?? alternate.id, total, last, model });
 }
 
 export function rolloutUsage(
@@ -161,23 +177,20 @@ export function rolloutUsage(
     const previous = samples.at(-1);
     if (id && requests.has(id)) {
       const first = requests.get(id)!;
-      if ((first.total && total && !comparable(first.total, total)) ||
-        (first.last && last && !comparable(first.last, last))) note("Conflicting duplicate usage record");
+      if ((first.total && total && !sharedCountersAgree(first.total, total)) ||
+        (first.last && last && !sharedCountersAgree(first.last, last))) note("Conflicting duplicate usage record");
       else {
-        first.total = first.total ? withMissing(first.total, total) : total;
-        first.last = first.last ? withMissing(first.last, last) : last;
-        first.model ??= model;
+        mergeSample(first, sample);
+        if (previous && previous !== first && mirrors(previous, sample)) {
+          mergeSample(first, previous);
+          samples.pop();
+        }
       }
-      if (previous && previous !== first && mirrors(previous, sample)) samples.pop();
       continue;
     }
     if (previous && mirrors(previous, sample)) {
-      const preferred = native ? sample : previous;
-      const mirror = native ? previous : sample;
-      preferred.total = preferred.total ? withMissing(preferred.total, mirror.total) : mirror.total;
-      preferred.last = preferred.last ? withMissing(preferred.last, mirror.last) : mirror.last;
-      samples[samples.length - 1] = preferred;
-      if (id) requests.set(id, preferred);
+      mergeSample(previous, sample);
+      if (id) requests.set(id, previous);
       continue;
     }
     samples.push(sample);

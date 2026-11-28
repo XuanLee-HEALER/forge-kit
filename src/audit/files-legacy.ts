@@ -1,29 +1,30 @@
 import { mkdtempSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { ledgerDbPath, type EventRecord, type LedgerReader, type TaskRecord, type TaskRepoRecord } from "../ledger/types";
-import { redactAuditText } from "../shared/redact";
+import { redactAuditArguments, redactAuditText } from "../shared/redact";
 import { auditChild, auditDirectory, auditFile, auditStat, requireAuditTask, tempPrefix, writePrivateFile } from "./files-path";
 
 export type ArchiveLedger = LedgerReader & { readonly dbPath?: string };
 
 function safePayload(raw: string): string {
-  const redacted = redactAuditText(raw);
-  if (redacted === raw) return raw;
   try {
-    JSON.parse(redacted);
-    return redacted;
+    // Decode JSON escaping before applying CLI, PEM and contact rules to string fields.
+    let changed = false;
+    const result = JSON.stringify(JSON.parse(raw), (key, value) => {
+      if (Array.isArray(value) && value.every(arg => typeof arg === "string")) {
+        const safe = redactAuditArguments(value);
+        changed ||= safe.some((arg, i) => arg !== value[i]);
+        return safe;
+      }
+      if (typeof value !== "string") return value;
+      const field = JSON.stringify({ [key]: "" });
+      const safe = redactAuditText(field) === field ? redactAuditText(value) : "***";
+      changed ||= safe !== value;
+      return safe;
+    });
+    return changed ? result : raw;
   } catch {
-    // Environment values inside a JSON string can consume its closing quote.
-    // Apply the same rules to decoded values to preserve the event payload's shape.
-    try {
-      return JSON.stringify(JSON.parse(raw, (key, value) => {
-        if (typeof value !== "string") return value;
-        const field = JSON.stringify({ [key]: "" });
-        return redactAuditText(field) === field ? redactAuditText(value) : "***";
-      }));
-    } catch {
-      return redacted;
-    }
+    return "[unreadable ledger payload]";
   }
 }
 
