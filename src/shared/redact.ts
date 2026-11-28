@@ -102,6 +102,8 @@ function commandEnd(lines: string[], start: number, offset: number) {
         if (ch === quote) quote = "";
       } else if (ch === "\\") {
         continued = ++k === line.length || line[k] === "\r" && k + 1 === line.length;
+        // Only a separate, unquoted continuation leaves neighboring shell tokens intact.
+        if (continued && (quote || k < 2 || !/[ \t]/.test(line[k - 2]))) return lines.length - 1;
       } else if (ch === "$" && line[k + 1] === "{") {
         parameter.lastIndex = k;
         if (!parameter.test(line)) return lines.length - 1;

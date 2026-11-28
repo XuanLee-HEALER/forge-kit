@@ -57,3 +57,16 @@ test("neighboring Markdown spans and simple variable references retain the indep
     expect(trace[0].text).toBe("Diagnosis.\n[runtime query arguments omitted]");
   }
 });
+
+test("token fragments joined by a shell continuation keep the rest of the query private", () => {
+  const splice = String.fromCharCode(92, 10);
+  for (const expression of ['"$' + splice + '(printf "first line\nprivate-tail")"',
+    "$" + splice + "(printf first;\nprintf private-tail)", "<" + splice + "(printf first;\nprintf private-tail)"]) {
+    for (const role of ["user", "assistant"]) {
+      const content = "Diagnosis.\nforge rt query --expr " + expression;
+      const { trace } = createTrace([{ type: "response_item", ts: null, ordinal: 1,
+        payload: { type: "message", role, phase: "final_answer", content } }], "fixture-session", role);
+      expect(trace[0].text).toBe("Diagnosis.\n[runtime query arguments omitted]");
+    }
+  }
+});
