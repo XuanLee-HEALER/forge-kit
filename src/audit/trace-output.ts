@@ -203,8 +203,12 @@ function excerpts(text: string, { allowsProse, sourceOnly, commandEcho, fileRead
     const line = raw.trim();
     const branchStatus = gitStatus && gitBranchStatus.test(line);
     if (!body && !fence && !structuredDepth && /^TAP version \d+$/i.test(line)) tap = true;
-    if (tap && !body && !fence && !structuredDepth && /^# (?:Subtest:|(?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) \d)/i.test(line)) {
-      if (!sourceOnly) ordinary.push(line);
+    // TAP allows arbitrary diagnostic comments between test points. Keep the protocol
+    // active across comments, but copy only subtest and numeric summary records.
+    if (tap && !body && !fence && !structuredDepth && line.startsWith("#")) {
+      if (!sourceOnly && /^# (?:Subtest:|(?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) \d)/i.test(line))
+        ordinary.push(line);
+      else skipped = true;
       continue;
     }
     if (body === "document" || markdownHeading.test(line) && !branchStatus && !body && !fence && !structuredDepth) {

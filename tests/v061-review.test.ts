@@ -44,7 +44,16 @@ test("review regression: close retains a long tool log failure and filters ordin
   const actual = f.s.run([f.s.forge, ...command]);
   expect(actual.code).not.toBe(0);
   expect(actual.err + actual.out).toMatch(/--days must be a positive integer/);
-  const tap = ["TAP version 13", "# Subtest: arithmetic", "not ok 1 - arithmetic", "1..1", "# fail 1"];
+  const tap = [
+    "TAP version 13",
+    "# Subtest: formatting",
+    "ok 1 - formatting",
+    "# setup ready",
+    "# Subtest: arithmetic",
+    "not ok 2 - arithmetic",
+    "1..2",
+    "# fail 1",
+  ];
   const inputs = [
     { name: "exec_command", args: { cmd: "bun run print-notes" }, output: document("PACKAGE_SCRIPT_BODY_MARKER") },
     { name: "read_file", args: { path: "notes.md" }, output: document("FILE_VIEWER_BODY_MARKER") },
@@ -76,7 +85,8 @@ test("review regression: close retains a long tool log failure and filters ordin
   expect(invalidDays?.output_summary).toContain("Exit code " + actual.code);
   expect(invalidDays?.output_summary).toContain("--days must be a positive integer");
   const tapSummary = outputs.find(event => event.ts === timestamp(10))?.output_summary;
-  for (const line of [tap[0], tap[1], tap[2], tap[4]]) expect(tapSummary).toContain(line);
+  for (const line of ["TAP version 13", "# Subtest: arithmetic", "not ok 2 - arithmetic", "# fail 1"])
+    expect(tapSummary).toContain(line);
 }), 30_000);
 
 test("review regression: apply finds static Make, Python and just entrypoints", () => {
