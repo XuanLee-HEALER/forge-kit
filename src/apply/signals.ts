@@ -59,7 +59,7 @@ function bounded(rows: Signal[], label: string, warnings: string[]) {
   return [...new Set([...representatives.values(), ...ordered])].slice(0, maxSignals).sort(orderSignal);
 }
 
-function safeFixedPath(repo: ApplyRepo, path: string, kind: "directory" | "file", label: string, warnings: string[]) {
+function safeFixedPath(repo: Pick<ApplyRepo, "dir" | "boundaries">, path: string, kind: "directory" | "file", label: string, warnings: string[]) {
   try {
     const { stat, inaccessible } = inspectScanPath(repo, path);
     if (inaccessible) throw Error();
@@ -72,7 +72,7 @@ function safeFixedPath(repo: ApplyRepo, path: string, kind: "directory" | "file"
   }
 }
 
-function githubWorkflows(repo: ApplyRepo, warnings: string[]): Signal[] {
+export function githubWorkflows(repo: Pick<ApplyRepo, "dir" | "boundaries">, warnings: string[]): Signal[] {
   const directory = ".github/workflows";
   if (!safeFixedPath(repo, directory, "directory", "workflow directory", warnings)) return [];
   let names: string[];

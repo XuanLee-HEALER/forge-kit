@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { githubWorkflows } from "../apply/signals";
 import { inspectApplyPath } from "../apply/catalog";
 import { readApplyManifest } from "../apply/facts";
 import { findWorkbenchRoot, repoCardPath } from "../config";
@@ -18,7 +19,6 @@ function detectRepoCommands(repoDir: string): {
   };
   const stack: string[] = [];
   const commands: string[] = [];
-  let workflowCount: number | undefined = 0;
 
   if (exists("go.mod")) {
     stack.push("Go");
@@ -56,14 +56,9 @@ function detectRepoCommands(repoDir: string): {
       commands.push(...targets.map((target) => "\`make " + target + "\`"));
     } catch { /* An unreadable makefile supplies no verified commands. */ }
   }
-  const workflowPath = ".github/workflows";
-  try {
-    const safe = inspectApplyPath(repoDir, workflowPath);
-    if (safe.path === join(repoDir, workflowPath) && safe.stat?.isDirectory()) {
-      workflowCount = readdirSync(safe.path, { withFileTypes: true })
-        .filter(entry => entry.isFile() && /\.ya?ml$/i.test(entry.name)).length;
-    }
-  } catch { workflowCount = undefined; }
+  const warnings: string[] = [];
+  const workflows = githubWorkflows({ dir: repoDir, boundaries: [] }, warnings);
+  const workflowCount = warnings.length ? undefined : workflows.length;
   return { stack, commands: [...new Set(commands)], workflowCount };
 }
 
@@ -140,7 +135,7 @@ export function addRepo(opts: { repoPath: string; workbenchDir?: string; force?:
       "## 技术栈与本地命令",
       "",
       `- **技术栈**：${info.stack.join(" / ") || "待核实"}`,
-      `- **仓库路径**：\`${rel || repoName}\`\``,
+      "- **仓库路径**：`" + repoName + "`",
       ...(info.commands.length ? info.commands.map((c) => `- ${c}`) : ["- 待补充构建、测试与生成命令"]),
       "",
       "## 代码风格与偏好",

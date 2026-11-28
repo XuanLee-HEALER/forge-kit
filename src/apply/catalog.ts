@@ -82,7 +82,7 @@ export function inspectApplyPath(root: string, path: string, boundaries?: string
     pending = [...target.split("/").filter(Boolean), ...pending];
     stat = lstatSync(at);
   }
-  return { path: at, stat };
+  return { path: at, stat, ...(links && { symbolicLink: true as const }) };
 }
 
 export function inspectScanPath(repo: Pick<ApplyRepo, "dir" | "boundaries">, path: string,

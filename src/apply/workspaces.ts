@@ -8,25 +8,33 @@ type Workspace = { source: string; kind: Kind; members: Member[] };
 const maxProbes = 3000;
 
 function goQuotedPath(text: string) {
-  // Go's quoted strings permit octal and hexadecimal escapes in addition to Unicode.
-  return text.replace(/\\([0-7]{3}|x[\dA-Fa-f]{2}|u[\dA-Fa-f]{4}|U[\dA-Fa-f]{8}|.)/g, (_, escape: string) => {
-    if (/^[0-7]{3}$/.test(escape)) {
-      const code = parseInt(escape, 8);
-      if (code > 255) throw Error();
-      return String.fromCodePoint(code);
+  // Go's octal and hexadecimal escapes append individual bytes. Unicode
+  // escapes and unescaped characters append UTF-8 sequences.
+  const bytes: number[] = [];
+  const encoder = new TextEncoder();
+  const simpleEscapes: Record<string, string> = {
+    a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\x0b", '"': '"', "\\": "\\",
+  };
+  for (const [part, escape] of text.matchAll(/[^\\]+|\\([0-7]{3}|x[\dA-Fa-f]{2}|u[\dA-Fa-f]{4}|U[\dA-Fa-f]{8}|.)/g)) {
+    if (escape?.length === 3) {
+      const byte = escape.startsWith("x") ? parseInt(escape.slice(1), 16) : parseInt(escape, 8);
+      if (byte > 255) throw Error();
+      bytes.push(byte);
+      continue;
     }
-    if (escape.length > 1) return String.fromCodePoint(parseInt(escape.slice(1), 16));
-    const controls: Record<string, string> = { a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\x0b" };
-    if (Object.hasOwn(controls, escape)) return controls[escape];
-    if (escape === '"' || escape === "\\") return escape;
-    throw Error();
-  });
+    const characters = escape === undefined ? part : escape.length > 1
+      ? String.fromCodePoint(parseInt(escape.slice(1), 16))
+      : simpleEscapes[escape];
+    if (characters === undefined || /\p{Cs}/u.test(characters)) throw Error();
+    for (const byte of encoder.encode(characters)) bytes.push(byte);
+  }
+  return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Uint8Array.from(bytes));
 }
 
 function goUseTargets(source: string) {
   const targets: unknown[] = [];
   let block: "use" | "skip" | undefined;
-  const operand = /^(?:"((?:[^"\\]|\\.)*)"|`([^`]*)`|([^"'`\s]+))(?:\s*\/\/.*|\s*)$/;
+  const operand = /^(?:"((?:[^"\\]|\\.)*)"|`([^`]*)`|((?:[^/"'`\s]|\/(?!\/))+))(?:\s*\/\/.*|\s*)$/;
   for (const line of source.split(/\r?\n/)) {
     const text = line.trim();
     if (!text || text.startsWith("//")) continue;

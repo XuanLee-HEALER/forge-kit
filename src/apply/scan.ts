@@ -1,5 +1,6 @@
 import { realpathSync } from "node:fs";
-import { addScanGitlinks, applyHead, byPath, inspectScanPath, loadApplyCatalog, relativeApplyPath, scanExcluded, selectApplyRepo } from "./catalog";
+import { relative } from "node:path";
+import { addScanGitlinks, applyHead, byPath, inspectScanPath, loadApplyCatalog, relativeApplyPath, selectApplyRepo } from "./catalog";
 import { scanFacts } from "./facts";
 import { scanHistory } from "./history";
 
@@ -16,9 +17,19 @@ export function scanApply(input: string, options: { repos: string[]; focus: stri
     const { head, available } = applyHead(selectedRepo.dir);
     const warnings: string[] = [];
     const repo = addScanGitlinks(selectedRepo, head, warnings);
-    const focus = requested.filter(path => !scanExcluded(path) &&
-      !inspectScanPath(repo, path, { followSymlinks: true }).excluded);
-    if (focus.length < requested.length) warnings.push("Excluded focus paths were skipped.");
+    const accepted = new Set<string>();
+    let skipped = false;
+    for (const path of requested) {
+      const checked = inspectScanPath(repo, path, { followSymlinks: true });
+      if (checked.excluded) {
+        skipped = true;
+        continue;
+      }
+      // Use the worktree spelling for Git's literal, case-sensitive pathspec.
+      accepted.add(checked.inaccessible || checked.symbolicLink ? path : relative(repo.dir, checked.path) || ".");
+    }
+    if (skipped) warnings.push("Excluded focus paths were skipped.");
+    const focus = [...accepted].sort(byPath);
     const focusRequested = requested.length > 0;
     const { packageDirs, discoveredBoundaries, ...facts } = scanFacts(repo, focus, { focusRequested });
     const historical = scanHistory({ ...repo, boundaries: discoveredBoundaries }, head, available, focus, since, packageDirs, focusRequested);
