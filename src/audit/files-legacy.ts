@@ -1,7 +1,7 @@
 import { mkdtempSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { ledgerDbPath, type EventRecord, type LedgerReader, type TaskRecord, type TaskRepoRecord } from "../ledger/types";
-import { redactAuditArguments, redactAuditText } from "../shared/redact";
+import { auditSecretKey, redactAuditArguments, redactAuditText } from "../shared/redact";
 import { auditChild, auditDirectory, auditFile, auditStat, requireAuditTask, tempPrefix, writePrivateFile } from "./files-path";
 
 export type ArchiveLedger = LedgerReader & { readonly dbPath?: string };
@@ -10,18 +10,32 @@ function safePayload(raw: string): string {
   try {
     // Decode JSON escaping before applying CLI, PEM and contact rules to string fields.
     let changed = false;
-    const result = JSON.stringify(JSON.parse(raw), (key, value) => {
-      if (Array.isArray(value) && value.every(arg => typeof arg === "string")) {
+    function clean(value: unknown): unknown {
+      if (typeof value === "string") {
+        const safe = redactAuditText(value);
+        changed ||= safe !== value;
+        return safe;
+      }
+      if (Array.isArray(value)) {
+        if (!value.every(arg => typeof arg === "string")) return value.map(clean);
         const safe = redactAuditArguments(value);
         changed ||= safe.some((arg, i) => arg !== value[i]);
         return safe;
       }
-      if (typeof value !== "string") return value;
-      const field = JSON.stringify({ [key]: "" });
-      const safe = redactAuditText(field) === field ? redactAuditText(value) : "***";
-      changed ||= safe !== value;
-      return safe;
-    });
+      if (value === null || typeof value !== "object") return value;
+      const result: Record<string, unknown> = Object.create(null);
+      for (const [name, entry] of Object.entries(value)) {
+        const safe = redactAuditText(name);
+        let key = safe;
+        for (let n = 2; Object.hasOwn(result, key); n++) key = safe + " #" + n;
+        const count = typeof entry === "number" && /(?:^|_)tokens?(?:_count)?$/i.test(name);
+        const secret = auditSecretKey.test(name) && !count && typeof entry !== "boolean";
+        changed ||= key !== name || secret;
+        result[key] = secret ? "***" : clean(entry);
+      }
+      return result;
+    }
+    const result = JSON.stringify(clean(JSON.parse(raw)));
     return changed ? result : raw;
   } catch {
     return "[unreadable ledger payload]";

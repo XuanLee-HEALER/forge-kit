@@ -30,6 +30,8 @@ export function redactArguments(argv: string[]) {
   });
 }
 
+export const auditSecretKey = /(?:secret|token|password|passwd|api[-_]?key|authorization|credential|access[-_]?key|private[-_]?key)/i;
+
 const auditOptionName = "(?:access[-_]key(?:[-_]id)?|private[-_]key|credentials?|authorization|" +
   "(?:access|bearer|refresh|oauth|id)[-_]token|client[-_]secret)";
 const auditOption = new RegExp("^--" + auditOptionName + "$", "i");

@@ -1,5 +1,5 @@
 import { extractGitSubcommand } from "../shared/git-cmd";
-import { redactAuditArguments, redactAuditText } from "../shared/redact";
+import { auditSecretKey, redactAuditArguments, redactAuditText } from "../shared/redact";
 import { tokenizeSimpleShellCommand } from "../shared/shell-tokens";
 import { object, string, turnId, type RolloutRecord } from "./rollout-record";
 
@@ -38,11 +38,10 @@ function removeToolBodies(text: string) {
   );
 }
 
-const sensitiveKey = /(?:secret|token|password|passwd|api[-_]?key|authorization|credential|access[-_]?key|private[-_]?key)/i;
 const bodyKey = /^(?:file_?contents?|content|text|body|instructions|output|stdout|stderr|diff|patch)$/i;
 
 function toolParameters(value: unknown, key = "", depth = 0): unknown {
-  if (sensitiveKey.test(key)) return "***";
+  if (auditSecretKey.test(key)) return "***";
   if (bodyKey.test(key) || depth >= 8) return "[omitted]";
   if (typeof value === "string") {
     if (depth < 7 && /^\s*[\[{]/.test(value)) {

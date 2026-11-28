@@ -388,7 +388,7 @@ export function readRollouts(anchors: string[], roles: Record<string, string>, i
     const time = sessionTime(records, note);
     const usage = rolloutUsage(records, id, role, (message) => {
       note(message);
-      usage_incomplete = true;
+      if (message !== "Actual model is missing for usage") usage_incomplete = true;
     });
     const display = (values: string[]) => values.length ? redactAuditText(values.join(", ")) : null;
     if (!usage.model.length) note("Session model is missing");

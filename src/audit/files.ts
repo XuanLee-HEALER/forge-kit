@@ -20,14 +20,16 @@ interface AuditOptions {
 }
 
 function retryCommand(task: string, options: AuditOptions = {}) {
-  const visible = redactAuditText(task) === task && !task.startsWith("-") ? task : "<task_id>";
-  const parts = ["forge ledger archive", visible];
+  const visible = redactAuditText(task) === task ? task : "<task_id>";
+  const parts = ["forge ledger archive"];
+  if (!task.startsWith("-")) parts.push(visible);
   if (options.session) {
     const id = options.session;
     parts.push("--session", /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(id) && redactAuditText(id) === id
       ? id : "<original-session-id>");
   }
   if (options.noTrace) parts.push("--no-trace");
+  if (task.startsWith("-")) parts.push("--", visible);
   return parts.join(" ");
 }
 
