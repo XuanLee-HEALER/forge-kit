@@ -1,136 +1,38 @@
-import { openSync, closeSync, constants, fstatSync, lstatSync, readFileSync, readdirSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
-import { byPath, hasRepositoryMarker, inspectApplyPath, scanExclusions, type ApplyRepo } from "./catalog";
+import { basename, dirname } from "node:path";
+import { byPath, inspectScanPath, type ApplyRepo } from "./catalog";
+import { childPath, focusApplyTree, inventoryApplyRepo, readApplyManifest, skeletonApplyTree } from "./inventory";
+import { compactForbiddenPaths, scanSignals } from "./signals";
+import { collectWorkspaces } from "./workspaces";
 
-const maxDepth = 4;
-const maxPaths = 400;
-const maxEntries = 3000;
-const maxEntriesPerDirectory = 3000;
-const maxManifestBytes = 256 * 1024;
-const names = ["check", "lint", "typecheck", "test", "build", "generate"] as const;
+export { scanExcluded } from "./catalog";
+export { pathIsIn, readApplyManifest } from "./inventory";
+
+const names = ["check", "lint", "typecheck", "test", "build", "generate", "migrate", "e2e", "integration", "codegen"] as const;
 type Task = typeof names[number];
 type Entry = { name: Task; source: string; cwd: string; argv?: string[]; declared: boolean };
+type RankedEntry = Entry & { priority: number };
 type Stack = { name: string; sources: string[]; manager?: string };
-type TreeEntry = { path: string; type: "directory" | "file" | "symlink" };
 
 const manifestNames = [
   "go.mod", "go.work", "package.json", "bun.lock", "bun.lockb", "package-lock.json",
-  "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json",
+  "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "pnpm-workspace.yaml", "tsconfig.json",
   "pyproject.toml", "requirements.txt", "Pipfile", "Pipfile.lock", "poetry.lock", "uv.lock", "pytest.ini",
   "Cargo.toml", "Cargo.lock", "pom.xml", "mvnw", "build.gradle", "build.gradle.kts", "gradlew",
   "Makefile", "makefile", "GNUmakefile", "justfile", ".justfile",
 ];
-const fixedFiles = [
-  ".gitlab-ci.yml", ".circleci/config.yml", "Jenkinsfile", "azure-pipelines.yml",
+const fixedCi = [".gitlab-ci.yml", ".circleci/config.yml", "Jenkinsfile", "azure-pipelines.yml"];
+const recognizedMetadata = new Set(manifestNames);
+const rootFiles = new Set([
+  ...manifestNames, ...fixedCi.filter(path => !path.includes("/")),
   "Dockerfile", "Containerfile", "compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml", "Chart.yaml",
-];
+  "README", "README.md", "README.rst", "README.txt", "CONTRIBUTING", "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md",
+  ".golangci.yml", ".golangci.yaml", ".golangci.toml", ".golangci.json", "biome.json", "biome.jsonc",
+  ".prettierrc", ".prettierrc.json", ".prettierrc.yml", ".prettierrc.yaml", "prettier.config.js", "prettier.config.mjs",
+  ".eslintrc", ".eslintrc.json", "eslint.config.js", "eslint.config.mjs", "ruff.toml", ".ruff.toml",
+  "mypy.ini", ".mypy.ini", "setup.cfg", "rustfmt.toml", ".rustfmt.toml", ".editorconfig",
+]);
 const deployDirs = new Set(["deploy", "deployment", "deployments", "helm", "charts", "k8s", "kubernetes", "terraform", "infra"]);
 const riskDirs = new Set([...deployDirs, "migration", "migrations", "secrets", "security"]);
-
-export const pathIsIn = (parent: string, path: string) => parent === "." || parent === path || path.startsWith(parent + "/");
-export const scanExcluded = (path: string) => path.split("/").some(segment => scanExclusions.has(segment));
-
-function childPath(dir: string, path: string) {
-  return dir === "." ? path : dir + "/" + path;
-}
-
-export function readApplyManifest(repo: Pick<ApplyRepo, "dir" | "boundaries">, path: string) {
-  const present = inspectApplyPath(repo.dir, path, repo.boundaries);
-  if (scanExcluded(present.path.slice(repo.dir.length + 1)) || !present.stat?.isFile() || !(present.stat.mode & 0o444) || present.stat.size > maxManifestBytes)
-    throw Error("Manifest is inaccessible or exceeds the read limit.");
-  const fd = openSync(present.path, constants.O_NOFOLLOW | constants.O_NONBLOCK | constants.O_RDONLY);
-  try {
-    const stat = fstatSync(fd);
-    if (!stat.isFile() || stat.size > maxManifestBytes) throw Error("Manifest changed before it could be read.");
-    return readFileSync(fd, "utf8");
-  } finally { closeSync(fd); }
-}
-
-function listPaths(repo: ApplyRepo, focus: string[], warnings: string[]) {
-  const tree = new Map<string, TreeEntry>();
-  const files = new Set<string>();
-  const dirs = new Set<string>();
-  const visibleManifestNames = new Map<string, string[]>();
-  let inspected = 0;
-  let truncated = false;
-  const kind = (path: string) => {
-    if (scanExcluded(path)) return;
-    const abs = join(repo.dir, path);
-    if (repo.boundaries.includes(abs)) return;
-    const st = lstatSync(abs, { throwIfNoEntry: false });
-    if (st?.isDirectory()) return path === "." || !hasRepositoryMarker(abs) ? "directory" : undefined;
-    if (st?.isFile()) return "file";
-    if (st?.isSymbolicLink()) return "symlink";
-  };
-  const addFile = (path: string) => {
-    if (scanExcluded(path)) return;
-    try {
-      const current = inspectApplyPath(repo.dir, path, repo.boundaries);
-      if (!current.stat?.isFile() || scanExcluded(current.path.slice(repo.dir.length + 1))) return;
-      files.add(path);
-      if (!(current.stat.mode & 0o444)) warnings.push("Could not read metadata path: " + JSON.stringify(path));
-    } catch { warnings.push("Skipped unsafe metadata path: " + JSON.stringify(path)); }
-  };
-  const entries = (parent: string) => {
-    const scan = inspectApplyPath(repo.dir, parent, repo.boundaries);
-    if (!scan.stat?.isDirectory()) return [];
-    if (scan.path !== join(repo.dir, parent) && scanExcluded(scan.path.slice(repo.dir.length + 1))) return [];
-    if (!(scan.stat.mode & 0o444) || !(scan.stat.mode & 0o111))
-      throw Error("Directory permissions prevent scanning.");
-    const found = readdirSync(scan.path).sort(byPath);
-    if (found.length > maxEntriesPerDirectory) truncated = true;
-    else visibleManifestNames.set(parent, found.filter(name => manifestNames.includes(name)));
-    return found.slice(0, maxEntriesPerDirectory);
-  };
-  const checkedEntries = (path: string) => {
-    try { return entries(path); }
-    catch { warnings.push("Could not scan directory: " + JSON.stringify(path)); return []; }
-  };
-  const visit = (path: string, remaining: number, followed?: "directory" | "file") => {
-    if (++inspected > maxEntries) { truncated = true; return; }
-    let type: TreeEntry["type"] | undefined;
-    try { type = followed ?? kind(path); }
-    catch { warnings.push("Could not inspect path: " + JSON.stringify(path)); return; }
-    if (!type) return;
-    if (path !== "." && tree.size < maxPaths) tree.set(path, { path, type });
-    else if (path !== ".") truncated = true;
-    if (type === "file") files.add(path);
-    if (type !== "directory") return;
-    dirs.add(path);
-    if (remaining === 0) { truncated = true; return; }
-    const found = checkedEntries(path);
-    for (const name of found) {
-      if (inspected >= maxEntries) { truncated = true; break; }
-      visit(childPath(path, name), remaining - 1);
-    }
-    return found.length;
-  };
-  const ancestors = new Set(["."]);
-  for (const path of focus.length ? focus : ["."]) {
-    if (scanExcluded(path)) {
-      warnings.push("Focus is excluded from scanning: " + JSON.stringify(path));
-      continue;
-    }
-    const inspectedPath = inspectApplyPath(repo.dir, path, repo.boundaries);
-    const followed = inspectedPath.stat?.isDirectory() ? "directory" : inspectedPath.stat?.isFile() ? "file" : undefined;
-    if (scanExcluded(inspectedPath.path.slice(repo.dir.length + 1))) {
-      warnings.push("Focus resolves to an excluded path: " + JSON.stringify(path));
-      continue;
-    }
-    const count = visit(path, maxDepth, followed);
-    if (!inspectedPath.stat) warnings.push("Focus path is absent from the worktree: " + JSON.stringify(path));
-    else if (count === 0 && (focus.length || path === ".")) warnings.push("Empty directory: " + JSON.stringify(path));
-    for (let parent = dirname(path); parent !== "."; parent = dirname(parent)) ancestors.add(parent);
-  }
-  for (const dir of new Set([...dirs, ...ancestors]))
-    for (const path of visibleManifestNames.get(dir) ?? manifestNames) addFile(childPath(dir, path));
-  for (const path of fixedFiles) addFile(path);
-  for (const path of checkedEntries(".github/workflows").filter(path => /\.ya?ml$/i.test(path)))
-    addFile(".github/workflows/" + path);
-  if (truncated) warnings.push("Directory skeleton was truncated at the scan depth or entry limit.");
-  return { tree: [...tree.values()].sort((a, b) => byPath(a.path, b.path)), files: [...files].sort(byPath), dirs, truncated };
-}
-
 const managers = {
   bun: ["bun.lock", "bun.lockb"],
   npm: ["package-lock.json", "npm-shrinkwrap.json"],
@@ -139,27 +41,68 @@ const managers = {
 } as const;
 type Manager = keyof typeof managers;
 const managerNames = Object.keys(managers) as Manager[];
+const packageScripts: [Task, string][] = [...names.map((name): [Task, string] => [name, name]),
+  ["migrate", "db:migrate"], ["e2e", "test:e2e"], ["integration", "test:integration"]];
 
 function forbidPattern(path: string, directory: boolean) {
   // Ship policy consumes globs. A filename containing glob syntax cannot be copied literally.
   return /[*?\[\]{}\\]/.test(path) ? undefined : directory ? path + "/**" : path;
 }
 
-export function scanFacts(repo: ApplyRepo, focus: string[]) {
+function declaredTargets(text: string, runner: "just" | "make") {
+  const targets = new Map<string, boolean>();
+  for (const line of text.split("\n")) {
+    const declaration = runner === "make"
+      ? /^ *([\w./-]+(?:[ \t]+[\w./-]+)*)[ \t]*:(?![:]*=)/.exec(line)
+      : /^([\w-]+)(?:[ \t]+((?:"(?:[^"\\]|\\.)*"|'[^']*'|[^:#"'\r\n])+?))?[ \t]*:(?!=)/.exec(line);
+    if (!declaration) continue;
+    // Accept clear defaults and zero-or-more rest parameters in a just recipe.
+    const optional = /^(?:(?:\*[\w-]+|\$?[\w-]+=(?:"(?:[^"\\]|\\.)*"|'[^']*'|[\w./-]+))(?:[ \t]+|$))+$/;
+    const requiresArgs = Boolean(declaration[2]?.trim() && !optional.test(declaration[2].trim()));
+    for (const target of declaration[1].split(/[ \t]+/))
+      targets.set(target, Boolean(targets.get(target)) || requiresArgs);
+  }
+  return targets;
+}
+
+export function scanFacts(repo: ApplyRepo, focus: string[], options = { focusRequested: focus.length > 0 }) {
   const warnings: string[] = [];
-  const { tree, files, dirs, truncated } = listPaths(repo, focus, warnings);
+  const inventory = inventoryApplyRepo(repo, rootFiles, warnings, !options.focusRequested);
+  const { files, dirs, boundaries } = inventory;
+  const scope = { ...repo, boundaries: [...boundaries].sort(byPath) };
+  let tree;
+  if (options.focusRequested) {
+    const { tree: entries, tree_truncated, ...observed } =
+      focusApplyTree(scope, focus, boundaries, recognizedMetadata, warnings);
+    for (const key of ["files", "dirs", "symlinks", "unreadableFiles"] as const)
+      for (const path of observed[key]) inventory[key].add(path);
+    tree = { tree: entries, tree_truncated };
+  } else tree = skeletonApplyTree(inventory, rootFiles, warnings);
+  const scopedRepo = { ...scope, boundaries: [...boundaries].sort(byPath) };
   const byDir = new Map<string, Set<string>>();
-  for (const path of files) {
+  for (const path of [...files].sort(byPath)) {
     const dir = dirname(path);
     const names = byDir.get(dir) ?? new Set<string>();
     names.add(basename(path));
     byDir.set(dir, names);
   }
   const stack: Stack[] = [];
-  const entrypoints: Entry[] = [];
+  const ranked: RankedEntry[] = [];
   const workflows: { path: string; kind: string }[] = [];
   const deployment_signals: { path: string; kind: string }[] = [];
   const forbidden = new Set<string>();
+  const packageDirs = new Set<string>();
+  const workspace = collectWorkspaces(scopedRepo, dirs, warnings);
+  for (const path of inventory.unreadableFiles)
+    if (recognizedMetadata.has(basename(path))) warnings.push("Could not safely read " + JSON.stringify(path));
+  const readManifest = (path: string) => readApplyManifest(scopedRepo, path);
+  const parse = <T>(source: string, parseText: (text: string) => T): T | undefined => {
+    let text: string;
+    try { text = readManifest(source); }
+    catch { warnings.push("Could not safely read " + JSON.stringify(source)); return; }
+    try { return parseText(text); }
+    catch { warnings.push("Invalid manifest: " + JSON.stringify(source)); }
+  };
 
   for (const [dir, present] of byDir) {
     const first = (...names: string[]) => names.find(name => present.has(name));
@@ -168,12 +111,19 @@ export function scanFacts(repo: ApplyRepo, focus: string[]) {
       const evidence = sources(...files);
       if (evidence.length) stack.push({ name, sources: evidence });
     };
-    const add = (name: Task, source: string, argv: string[] | undefined, declared = false) => {
-      entrypoints.push({ name, source: childPath(dir, source), cwd: dir === "." ? repo.repo : childPath(repo.repo, dir), ...(argv && { argv }), declared });
+    const add = (name: Task, source: string, argv: string[] | undefined, declared = false, priority = 3) => {
+      const cwd = dir === "." ? repo.repo : childPath(repo.repo, dir);
+      ranked.push({ name, source: childPath(dir, source), cwd, ...(argv && { argv }), declared, priority });
     };
-    const read = (path: string) => {
-      try { return readApplyManifest(repo, childPath(dir, path)); }
-      catch { warnings.push("Could not safely read " + JSON.stringify(childPath(dir, path))); return ""; }
+    const read = <T>(path: string, parseText: (text: string) => T) => parse(childPath(dir, path), parseText);
+    const runner = (wrapper: string, command: string) => {
+      const path = childPath(dir, wrapper);
+      if (!present.has(wrapper) && !inventory.symlinks.has(path)) return command;
+      try {
+        const stat = inspectScanPath(scopedRepo, path).stat;
+        if (stat?.isFile() && (stat.mode & 0o111)) return "./" + wrapper;
+      } catch { /* The unverified wrapper leaves the command unavailable. */ }
+      warnings.push("Could not verify executable wrapper: " + JSON.stringify(path));
     };
 
     const go = first("go.mod", "go.work");
@@ -182,17 +132,20 @@ export function scanFacts(repo: ApplyRepo, focus: string[]) {
       add("test", go, ["go", "test", "./..."]);
       add("build", go, ["go", "build", "./..."]);
       add("generate", go, ["go", "generate", "./..."]);
+      if (present.has("go.mod")) packageDirs.add(dir);
+      if (present.has("go.work")) read("go.work", text => workspace.go(childPath(dir, "go.work"), text));
     }
 
     if (present.has("package.json")) {
+      packageDirs.add(dir);
       const evidence = sources("package.json", "tsconfig.json");
-      let pkg: { packageManager?: unknown; scripts?: Record<string, unknown> } = {};
-      try {
-        const parsed = JSON.parse(read("package.json"));
+      const pkg = read("package.json", text => {
+        const parsed = JSON.parse(text);
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw Error();
-        pkg = parsed;
-      } catch { warnings.push("Invalid package.json: " + JSON.stringify(childPath(dir, "package.json"))); }
-      const explicit = typeof pkg.packageManager === "string" ? pkg.packageManager.split("@")[0] : undefined;
+        return parsed as { packageManager?: unknown; scripts?: Record<string, unknown>; workspaces?: unknown };
+      });
+      workspace.packageJson(childPath(dir, "package.json"), pkg?.workspaces);
+      const explicit = typeof pkg?.packageManager === "string" ? pkg.packageManager.split("@")[0] : undefined;
       let lockEvidence: string[] = [];
       for (let parent = dir; ; parent = dirname(parent)) {
         const present = byDir.get(parent);
@@ -205,94 +158,89 @@ export function scanFacts(repo: ApplyRepo, focus: string[]) {
       const manager = conflicted ? undefined : explicit ? known || undefined : locked[0];
       if (!manager) warnings.push((conflicted ? "Conflicting" : "Unknown") + " package manager: " + JSON.stringify(childPath(dir, "package.json")));
       stack.push({ name: "JavaScript/TypeScript", sources: [...evidence, ...lockEvidence].sort(byPath), ...(manager && { manager }) });
-      for (const name of names)
-        if (pkg.scripts && Object.hasOwn(pkg.scripts, name) && typeof pkg.scripts[name] === "string")
-          add(name, "package.json", manager ? [manager, "run", name] : undefined, true);
+      for (const [name, script] of packageScripts)
+        if (pkg?.scripts && Object.hasOwn(pkg.scripts, script) && typeof pkg.scripts[script] === "string")
+          add(name, "package.json", manager ? [manager, "run", script] : undefined, true, 2);
     }
+    if (present.has("pnpm-workspace.yaml"))
+      read("pnpm-workspace.yaml", text => workspace.pnpm(childPath(dir, "pnpm-workspace.yaml"), text));
 
     const python = first("pyproject.toml", "requirements.txt", "Pipfile", "pytest.ini", "uv.lock", "poetry.lock", "Pipfile.lock");
     if (python) {
       language("Python", "pyproject.toml", "requirements.txt", "Pipfile", "pytest.ini", "uv.lock", "poetry.lock", "Pipfile.lock");
       if (present.has("pyproject.toml")) {
-        try {
-          const manifest = Bun.TOML.parse(read("pyproject.toml")) as { project?: { scripts?: Record<string, unknown> } };
-          for (const name of names) {
-            if (typeof manifest.project?.scripts?.[name] === "string")
-              add(name, "pyproject.toml", present.has("uv.lock") ? ["uv", "run", name] : undefined, true);
-          }
-        } catch { warnings.push("Invalid pyproject.toml: " + JSON.stringify(childPath(dir, "pyproject.toml"))); }
+        packageDirs.add(dir);
+        const manifest = read("pyproject.toml", text =>
+          Bun.TOML.parse(text) as { project?: { scripts?: Record<string, unknown> } });
+        for (const [name, script] of packageScripts)
+          if (typeof manifest?.project?.scripts?.[script] === "string")
+            add(name, "pyproject.toml", present.has("uv.lock") ? ["uv", "run", script] : undefined, true, 2);
       }
       add("test", python, ["python", "-m", "pytest"], present.has("pytest.ini"));
     }
 
     if (present.has("Cargo.toml")) {
+      packageDirs.add(dir);
       language("Rust", "Cargo.toml", "Cargo.lock");
+      read("Cargo.toml", text => workspace.cargo(childPath(dir, "Cargo.toml"), text));
       for (const name of ["check", "test", "build"] as const) add(name, "Cargo.toml", ["cargo", name]);
     }
 
     if (present.has("pom.xml")) {
+      packageDirs.add(dir);
       language("Java", "pom.xml", "mvnw");
-      const runner = present.has("mvnw") ? "./mvnw" : "mvn";
-      add("test", "pom.xml", [runner, "test"]);
-      add("build", "pom.xml", [runner, "package"]);
+      const command = runner("mvnw", "mvn");
+      add("test", "pom.xml", command ? [command, "test"] : undefined);
+      add("build", "pom.xml", command ? [command, "package"] : undefined);
     }
     const gradle = first("build.gradle", "build.gradle.kts");
     if (gradle) {
+      packageDirs.add(dir);
       language("Java", gradle, "gradlew");
-      const runner = present.has("gradlew") ? "./gradlew" : "gradle";
-      for (const name of ["check", "test", "build"] as const) add(name, gradle, [runner, name]);
-      const text = read(gradle);
-      for (const name of ["lint", "typecheck", "generate"] as const)
-        if (new RegExp("(?:tasks\\.(?:register|create)\\s*\\(\\s*['\"]" + name + "['\"]|^\\s*task\\s+" + name + "\\b)", "m").test(text))
-          add(name, gradle, [runner, name], true);
+      const command = runner("gradlew", "gradle");
+      for (const name of ["check", "test", "build"] as const) add(name, gradle, command ? [command, name] : undefined);
+      const text = read(gradle, value => value);
+      for (const name of ["lint", "typecheck", "generate", "migrate", "e2e", "integration", "codegen"] as const)
+        if (text && new RegExp("(?:tasks\\.(?:register|create)\\s*\\(\\s*['\"]" + name + "['\"]|^\\s*task\\s+" + name + "\\b)", "m").test(text))
+          add(name, gradle, command ? [command, name] : undefined, true, 2);
     }
 
-    for (const [name, file, runner] of [
-      ["Make", first("GNUmakefile", "makefile", "Makefile"), "make"],
-      ["just", first("justfile", ".justfile"), "just"],
+    for (const [name, file, command, priority] of [
+      ["Make", first("GNUmakefile", "makefile", "Makefile"), "make", 1],
+      ["just", first("justfile", ".justfile"), "just", 0],
     ] as const) {
       if (!file) continue;
       language(name, file);
-      const text = read(file);
-      const targets = new Set<string>();
-      const needsArguments = new Set<string>();
-      for (const line of text.split("\n")) {
-        const declaration = runner === "make"
-          ? /^ *([\w./-]+(?:[ \t]+[\w./-]+)*)[ \t]*:(?![:]*=)/.exec(line)
-          : /^([\w-]+)(?:[ \t]+([^:#]+?))?[ \t]*:(?!=)/.exec(line);
-        if (runner === "just" && declaration?.[2]?.trim()) {
-          // Offer a zero-argument action only for parameters with clear defaults or a zero-or-more rest.
-          const optional = /^(?:(?:\*[\w-]+|\$?[\w-]+=(?:"[^"]*"|'[^']*'|[\w./-]+))(?:[ \t]+|$))+$/;
-          if (!optional.test(declaration[2].trim())) needsArguments.add(declaration[1]);
-        }
-        for (const target of declaration?.[1].split(/[ \t]+/) ?? []) targets.add(target);
+      const text = read(file, value => value);
+      if (!text) continue;
+      const targets = declaredTargets(text, command);
+      for (const task of names) {
+        const parameterized = targets.get(task);
+        if (parameterized === undefined) continue;
+        add(task, file, parameterized ? undefined : [command, task], true, priority);
+        if (parameterized) warnings.push("Check recipe arguments before running " + childPath(dir, file) + ": " + task);
       }
-      for (const task of names)
-        if (targets.has(task)) {
-          const parameterized = needsArguments.has(task);
-          add(task, file, parameterized ? undefined : [runner, task], true);
-          if (parameterized) warnings.push("Check recipe arguments before running " + childPath(dir, file) + ": " + task);
-        }
       if (/^ *(?:-?include|sinclude|import|mod)\s|\$[({]|\{\{/m.test(text))
         warnings.push("Dynamic build definitions were not evaluated: " + JSON.stringify(childPath(dir, file)));
     }
 
     for (const filename of present) {
       const path = childPath(dir, filename);
-      if (/^\.github\/workflows\/[^/]+\.ya?ml$/i.test(path))
-        workflows.push({ path, kind: "github-actions" });
-      else if ([".gitlab-ci.yml", ".circleci/config.yml", "Jenkinsfile", "azure-pipelines.yml"].includes(path))
-        workflows.push({ path, kind: "ci" });
       if (/^(?:Dockerfile|Containerfile)(?:\.|$)/.test(filename))
         deployment_signals.push({ path, kind: "container" });
       else if (/^(?:docker-)?compose\.ya?ml$/.test(filename)) deployment_signals.push({ path, kind: "compose" });
       else if (filename === "Chart.yaml") deployment_signals.push({ path, kind: "helm" });
       else if (/\.(?:tf|tfvars)$/.test(filename)) deployment_signals.push({ path, kind: "terraform" });
-      if (/^(?:\.github\/workflows\/|\.gitlab-ci\.yml$|\.circleci\/config\.yml$)/.test(path)) {
-        const pattern = forbidPattern(path, false);
-        if (pattern) forbidden.add(pattern);
-      }
     }
+  }
+  for (const path of fixedCi) {
+    try {
+      const item = inspectScanPath(scopedRepo, path);
+      if (item.inaccessible) throw Error();
+      if (!item.stat?.isFile()) continue;
+      workflows.push({ path, kind: "ci" });
+      if (path === ".gitlab-ci.yml" || path === ".circleci/config.yml") forbidden.add(path);
+    } catch { warnings.push("Could not inspect CI path: " + JSON.stringify(path)); }
   }
   for (const path of dirs) {
     const name = basename(path);
@@ -302,12 +250,31 @@ export function scanFacts(repo: ApplyRepo, focus: string[]) {
       if (pattern) forbidden.add(pattern);
     }
   }
-  const sortSource = (a: Entry, b: Entry) => byPath(a.source, b.source) || byPath(a.name, b.name);
+
+  const { workflows: githubWorkflows, ...signals } = scanSignals(scopedRepo, { files, dirs }, focus, warnings, readManifest, options.focusRequested);
+  if (githubWorkflows.length) forbidden.add(".github/workflows/**");
+
+  const sortSource = (a: Entry, b: Entry) => byPath(a.source, b.source) || byPath(a.name, b.name) ||
+    byPath(a.argv?.join("\0") ?? "", b.argv?.join("\0") ?? "");
+  const best = new Map<string, RankedEntry>();
+  for (const entry of ranked.sort(sortSource)) {
+    if (!entry.argv || entry.name === "migrate") continue;
+    const key = entry.cwd + "\0" + entry.name;
+    const previous = best.get(key);
+    if (!previous || entry.priority < previous.priority) best.set(key, entry);
+  }
+  const verification_actions = [...best.values()].sort(sortSource)
+    .map(({ argv, cwd, source }) => ({ cwd, argv: argv!, purpose: "verify" as const, inputs: [basename(source)] }));
   const sortSignal = (a: { path: string }, b: { path: string }) => byPath(a.path, b.path);
-  entrypoints.sort(sortSource);
-  const verification_actions = entrypoints.flatMap(({ argv, cwd, source }) =>
-    argv ? [{ cwd, argv, purpose: "verify" as const, inputs: [basename(source)] }] : []);
-  return { stack: stack.sort((a, b) => byPath(a.sources[0], b.sources[0]) || byPath(a.name, b.name)),
-    entrypoints, workflows: workflows.sort(sortSignal), deployment_signals: deployment_signals.sort(sortSignal),
-    tree, tree_truncated: truncated, verification_actions, forbidden_paths: [...forbidden].sort(byPath), warnings: [...new Set(warnings)].sort(byPath) };
+  return { ...tree, ...signals,
+    stack: stack.sort((a, b) => byPath(a.sources[0], b.sources[0]) || byPath(a.name, b.name)),
+    entrypoints: ranked.map(({ priority: _, ...entry }) => entry),
+    workflows: [...workflows, ...githubWorkflows].sort(sortSignal),
+    workspaces: workspace.workspaces.sort((a, b) => byPath(a.source, b.source)),
+    deployment_signals: deployment_signals.sort(sortSignal),
+    verification_actions, forbidden_paths: compactForbiddenPaths(forbidden),
+    warnings: [...new Set(warnings)].sort(byPath),
+    packageDirs: [...packageDirs].sort(byPath),
+    discoveredBoundaries: [...boundaries].sort(byPath),
+  };
 }

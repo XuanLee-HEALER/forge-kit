@@ -10,7 +10,7 @@ import { withConfigWriteLock } from "./config-lock";
 function detectRepoCommands(repoDir: string): {
   stack: string[];
   commands: string[];
-  workflows: string[];
+  workflowCount: number | undefined;
 } {
   const exists = (path: string) => {
     try { return inspectApplyPath(repoDir, path).stat?.isFile() ?? false; }
@@ -18,7 +18,7 @@ function detectRepoCommands(repoDir: string): {
   };
   const stack: string[] = [];
   const commands: string[] = [];
-  const workflows: string[] = [];
+  let workflowCount: number | undefined = 0;
 
   if (exists("go.mod")) {
     stack.push("Go");
@@ -57,19 +57,14 @@ function detectRepoCommands(repoDir: string): {
     } catch { /* An unreadable makefile supplies no verified commands. */ }
   }
   const workflowPath = ".github/workflows";
-  let wfDir: string | undefined;
   try {
     const safe = inspectApplyPath(repoDir, workflowPath);
-    if (safe.stat?.isDirectory()) wfDir = safe.path;
-  } catch { /* Invalid workflow paths remain outside the card template. */ }
-  if (wfDir) {
-    for (const f of readdirSync(wfDir)) {
-      if (/\.ya?ml$/.test(f) && exists(workflowPath + "/" + f)) {
-        workflows.push(`.github/workflows/${f}`);
-      }
+    if (safe.path === join(repoDir, workflowPath) && safe.stat?.isDirectory()) {
+      workflowCount = readdirSync(safe.path, { withFileTypes: true })
+        .filter(entry => entry.isFile() && /\.ya?ml$/i.test(entry.name)).length;
     }
-  }
-  return { stack, commands: [...new Set(commands)], workflows };
+  } catch { workflowCount = undefined; }
+  return { stack, commands: [...new Set(commands)], workflowCount };
 }
 
 function updateReposInWorkbenchYaml(yamlPath: string, repoName: string): boolean {
@@ -142,20 +137,25 @@ export function addRepo(opts: { repoPath: string; workbenchDir?: string; force?:
     const md = [
       `# ${repoName}`,
       "",
-      `- **技术栈**：${info.stack.join(" / ") || "待补充"}`,
-      `- **仓库路径**：\`${rel || repoName}\``,
+      "## 技术栈与本地命令",
       "",
-      "## 本地命令",
-      "",
+      `- **技术栈**：${info.stack.join(" / ") || "待核实"}`,
+      `- **仓库路径**：\`${rel || repoName}\`\``,
       ...(info.commands.length ? info.commands.map((c) => `- ${c}`) : ["- 待补充构建、测试与生成命令"]),
       "",
-      "## CI / 部署",
+      "## 代码风格与偏好",
       "",
-      ...(info.workflows.length ? info.workflows.map((w) => `- \`${w}\``) : ["- 暂无 `.github/workflows`"]),
+      "- 结合近期样板路径记录分层命名、数据访问、错误处理与最小测试闭环。",
       "",
-      "## 仓库专属边界与约定",
+      "## CI 与分支约束",
       "",
-      "- 遵循工作台 `AGENTS.md`；如本仓有更严格的分支、数据库或发布限制，补充于此。",
+      info.workflowCount === undefined ? "- GitHub Actions 清单待核实。" :
+        `- GitHub Actions 有效 workflow 共 ${info.workflowCount} 个。运行 \`forge apply --json\` 查看路径。`,
+      "- 待核实长期分支、发布标签及必需检查。",
+      "",
+      "## 禁区与历史旧范式",
+      "",
+      "- 记录经确认的敏感路径、勿照抄的旧写法及其替代样板。",
       "",
       "## Domain Index",
       "",

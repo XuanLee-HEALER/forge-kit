@@ -1,11 +1,14 @@
-import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, type Stats } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { checkoutEnvironment, isOid, runProcess } from "../git";
 
 export type ApplyRepo = { repo: string; dir: string; slug: string; boundaries: string[] };
 export type ApplyCatalog = { repos: ApplyRepo[]; registered: string[]; warnings: string[] };
 
-export const scanExclusions = new Set([".git", "node_modules", "vendor", "dist", "build", "target", ".venv", ".workbench"]);
+const scanExclusions = new Set([".git", "node_modules", "vendor", "dist", "build", "target", ".venv", ".workbench",
+  ".DS_Store", ".claude", ".codex", ".agents"]);
+export const scanExcluded = (path: string) => path.split(/[\\/]/).some(segment =>
+  scanExclusions.has(segment) || (/^\.env(?:\.|$)/.test(segment) && !/^\.env(?:\..+)?\.example$/.test(segment)));
 export const byPath = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 
 export function containsPath(parent: string, child: string): boolean {
@@ -20,12 +23,14 @@ export function relativeApplyPath(input: string): string {
   return input.split("/").filter(segment => segment && segment !== ".").join("/") || ".";
 }
 
-export function hasRepositoryMarker(dir: string): boolean {
+export function hasRepositoryMarker(dir: string, includeLinks = false): boolean {
   const marker = lstatSync(join(dir, ".git"), { throwIfNoEntry: false });
-  return Boolean(marker?.isFile() || marker?.isDirectory());
+  return Boolean(marker?.isFile() || marker?.isDirectory() || (includeLinks && marker?.isSymbolicLink()));
 }
 
-export function inspectApplyPath(root: string, path: string, boundaries?: string[]) {
+type ApplyPath = { path: string; stat?: Stats; excluded?: true; inaccessible?: true; symbolicLink?: true };
+export function inspectApplyPath(root: string, path: string, boundaries?: string[],
+  scan?: { followSymlinks?: boolean }): ApplyPath {
   let at = root;
   let pending = path.split("/").filter(Boolean);
   let links = 0;
@@ -40,16 +45,26 @@ export function inspectApplyPath(root: string, path: string, boundaries?: string
       else stat = undefined;
       continue;
     }
-    const next = join(at, segment);
+    let next = join(at, segment);
     if (boundaries?.some(boundary => containsPath(boundary, next)))
       throw Error("Path crosses a repository boundary: " + JSON.stringify(path));
+    if (scan && stat?.isDirectory() && !(stat.mode & 0o111))
+      return { path: next, inaccessible: true };
     stat = stat?.isDirectory() ? lstatSync(next, { throwIfNoEntry: false }) : undefined;
     if (!stat?.isSymbolicLink()) {
-      if (boundaries && stat?.isDirectory() && hasRepositoryMarker(next))
+      if (scan && stat) {
+        next = realpathSync(next);
+        if (!containsPath(root, next)) throw Error("Path escapes repository: " + JSON.stringify(path));
+        if (scanExcluded(relative(root, next))) return { path: root, excluded: true };
+        if (boundaries?.some(boundary => containsPath(boundary, next)))
+          throw Error("Path crosses a repository boundary: " + JSON.stringify(path));
+      }
+      if (boundaries && stat?.isDirectory() && (!scan || (stat.mode & 0o111)) && hasRepositoryMarker(next, Boolean(scan)))
         throw Error("Path crosses a repository boundary: " + JSON.stringify(path));
       at = next;
       continue;
     }
+    if (scan && !scan.followSymlinks) return { path: next, symbolicLink: true };
     if (++links > 40) throw Error("Too many symbolic links: " + JSON.stringify(path));
     let target = readlinkSync(next);
     if (isAbsolute(target)) {
@@ -59,10 +74,28 @@ export function inspectApplyPath(root: string, path: string, boundaries?: string
       target = target.slice(prefix.length);
       at = root;
     }
+    if (scan) {
+      if (scanExcluded(target)) return { path: next, excluded: true };
+      if (/[\\\p{Cc}]/u.test(target) || /^[a-z]:/i.test(target))
+        throw Error("Unsafe symbolic link target for path: " + JSON.stringify(path));
+    }
     pending = [...target.split("/").filter(Boolean), ...pending];
     stat = lstatSync(at);
   }
   return { path: at, stat };
+}
+
+export function inspectScanPath(repo: Pick<ApplyRepo, "dir" | "boundaries">, path: string,
+  options: { followSymlinks?: boolean } = {}): ApplyPath {
+  if (scanExcluded(path)) return { path: repo.dir, excluded: true };
+  if (relativeApplyPath(path) !== path) throw Error("Expected a canonical scan path.");
+  try {
+    return inspectApplyPath(repo.dir, path, repo.boundaries, options);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") return { path: join(repo.dir, path), inaccessible: true };
+    throw error;
+  }
 }
 
 export function validateApplyPath(repo: ApplyRepo, input: string): string {
@@ -142,13 +175,33 @@ function gitlinks(root: string, warnings: string[]) {
     if (result.code) continue;
     for (const entry of result.stdout.split("\0")) {
       const match = /^160000 [^\t]+\t([^/]+)$/s.exec(entry);
-      if (!match || scanExclusions.has(match[1])) continue;
+      if (!match || scanExcluded(match[1])) continue;
       try {
         if (relativeApplyPath(match[1]) === match[1]) paths.add(match[1]);
       } catch { warnings.push("Ignored an unsafe submodule path."); }
     }
   }
   return paths;
+}
+
+export function addScanGitlinks(repo: ApplyRepo, head: string | null, warnings: string[]): ApplyRepo {
+  const boundaries = new Set(repo.boundaries);
+  const results = [applyGit(repo.dir, ["ls-files", "--stage", "-z"])];
+  if (head) results.push(applyGit(repo.dir, ["ls-tree", "-r", "-z", head]));
+  for (const result of results) {
+    if (result.code) {
+      warnings.push("Could not read local Git paths for submodule boundaries.");
+      continue;
+    }
+    for (const entry of result.stdout.split("\0")) {
+      const match = /^160000 [^\t]+\t(.+)$/s.exec(entry);
+      if (!match || scanExcluded(match[1])) continue;
+      try {
+        if (relativeApplyPath(match[1]) === match[1]) boundaries.add(join(repo.dir, match[1]));
+      } catch { warnings.push("Ignored an unsafe submodule path."); }
+    }
+  }
+  return { ...repo, boundaries: [...boundaries].sort(byPath) };
 }
 
 function registeredRepos(root: string, repos: ApplyRepo[], warnings: string[]): string[] {
@@ -166,6 +219,10 @@ function registeredRepos(root: string, repos: ApplyRepo[], warnings: string[]): 
     throw Error("Expected a repository list in .workbench/workbench.yaml");
   const selected = new Set<string>();
   for (const entry of registered) {
+    if (scanExcluded(entry)) {
+      warnings.push("Ignored an excluded registered repository.");
+      continue;
+    }
     let canonical: string;
     try { canonical = relativeApplyPath(entry); }
     catch { warnings.push("Ignored unsafe registered repository: " + JSON.stringify(entry)); continue; }
@@ -181,7 +238,7 @@ export function loadApplyCatalog(input: string): ApplyCatalog {
   const rootGit = gitSetup(root, root);
   const rootRepo = rootGit && identifyCheckout(root, rootGit) ? rootGit : null;
   const children = readdirSync(root, { withFileTypes: true })
-    .filter(entry => entry.isDirectory() && !scanExclusions.has(entry.name))
+    .filter(entry => entry.isDirectory() && !scanExcluded(entry.name))
     .map(entry => entry.name).sort(byPath);
   const links = rootRepo ? gitlinks(root, warnings) : new Set<string>();
   const candidates: { repo: string; dir: string }[] = [];
@@ -213,6 +270,7 @@ export function loadApplyCatalog(input: string): ApplyCatalog {
 }
 
 export function selectApplyRepo(catalog: ApplyCatalog, input: string): ApplyRepo {
+  if (scanExcluded(input)) throw Error("Repository path is excluded from mapping.");
   const repo = relativeApplyPath(input);
   const result = catalog.repos.find(candidate => candidate.repo === repo);
   if (!result) throw Error("Repository is unavailable for mapping: " + JSON.stringify(input));
