@@ -97,6 +97,26 @@ for (const [manifest, disabled] of [
   }));
 }
 
+test("INV-03 Gradle recognizes explicitly qualified tasks on the current project", () => withRepo(s => {
+  const manifest = "build.gradle";
+  s.privateFile(manifest, [
+    'this.tasks.register("e2e") {}',
+    'other.tasks.register("integration") {}',
+    'project.tasks.register("codegen") {}',
+    "",
+  ].join("\n"));
+  const report = apply(s);
+  const entrypoints: Entry[] = report.entrypoints;
+  const actions: Action[] = report.verification_actions;
+
+  for (const name of ["e2e", "codegen"]) {
+    expect(entrypoints).toContainEqual(expect.objectContaining({ name, cwd: ".", source: manifest, argv: ["gradle", name] }));
+    expect(actions).toContainEqual(expect.objectContaining({ cwd: ".", argv: ["gradle", name], inputs: [manifest] }));
+  }
+  expect(entrypoints.some(entry => entry.name === "integration")).toBe(false);
+  expect(actions.some(action => action.argv.includes("integration"))).toBe(false);
+}));
+
 test("INV-03 Gradle dynamic arguments with inline comments leave both following literal registrations visible", () => withRepo(s => {
   const manifest = "build.gradle.kts";
   s.privateFile(manifest, [

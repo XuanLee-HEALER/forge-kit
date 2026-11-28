@@ -150,7 +150,8 @@ export function gradleTasks(source: string, groovy: boolean): Set<string> {
     }
     if (token.kind === "symbol" && (token.text === ")" || token.text === ",")) {
       const [receiver, operator, container, dot, method, opening, name] = recent;
-      const knownContainer = operator?.text !== "." || receiver?.text === "project" || receiver?.text === "rootProject";
+      const knownContainer = operator?.text !== "." || receiver?.text === "this" ||
+        receiver?.text === "project" || receiver?.text === "rootProject";
       if (knownContainer && container?.kind === "word" && container.text === "tasks" && dot?.text === "." &&
           method?.kind === "word" && (method.text === "register" || method.text === "create") &&
           opening?.text === "(" && name?.kind === "literal") {
