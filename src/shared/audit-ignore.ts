@@ -1,8 +1,8 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
-// Preserve instance rules and give the private audit directory the final matching rule.
-export function ensureAuditIgnored(root: string): void {
+// Append instance exclusions after user rules so an earlier negation cannot expose private files.
+export function ensurePrivateIgnored(root: string, directories: readonly string[]): void {
   const dir = join(root, ".workbench");
   if (!lstatSync(dir).isDirectory()) throw Error("Expected a workbench directory");
   const file = join(dir, ".gitignore");
@@ -12,8 +12,9 @@ export function ensureAuditIgnored(root: string): void {
     const stat = fstatSync(fd);
     if (!stat.isFile() || stat.nlink !== 1) throw Error("Invalid workbench .gitignore");
     const previous = readFileSync(fd, "utf8");
-    if (previous.trimEnd().split("\n").at(-1) === "/audit/") return;
-    writeSync(fd, (previous && !previous.endsWith("\n") ? "\n" : "") + "/audit/\n");
+    const suffix = directories.map(name => "/" + name + "/").join("\n");
+    if (previous.trimEnd().split("\n").slice(-directories.length).join("\n") === suffix) return;
+    writeSync(fd, (previous && !previous.endsWith("\n") ? "\n" : "") + suffix + "\n");
   } finally {
     closeSync(fd);
   }

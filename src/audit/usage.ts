@@ -10,7 +10,7 @@ export const tokenFields = [
 
 export type TokenField = typeof tokenFields[number];
 export type Usage = Record<TokenField, number | null> & { cache_hit_rate: number | null };
-export const roles = ["main", "implementer", "reviewer-business", "reviewer-quality", "reviewer-simplify", "reviewer-comments", "analyst", "scanner", "other"] as const;
+export const roles = ["main", "implementer", "reviewer", "reviewer-business", "reviewer-quality", "reviewer-simplify", "reviewer-comments", "analyst", "scanner", "other"] as const;
 export type Role = typeof roles[number];
 export const stages = ["grill", "impl", "review", "verify", "ship", "unclassified"] as const;
 export type Stage = typeof stages[number];

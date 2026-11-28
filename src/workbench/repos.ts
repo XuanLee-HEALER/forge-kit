@@ -1,5 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { inspectApplyPath } from "../apply/catalog";
+import { readApplyManifest } from "../apply/facts";
 import { findWorkbenchRoot, repoCardPath } from "../config";
 import { localPath } from "../instance";
 import { checkMigration } from "../managed-assets";
@@ -10,22 +12,26 @@ function detectRepoCommands(repoDir: string): {
   commands: string[];
   workflows: string[];
 } {
+  const exists = (path: string) => {
+    try { return inspectApplyPath(repoDir, path).stat?.isFile() ?? false; }
+    catch { return false; }
+  };
   const stack: string[] = [];
   const commands: string[] = [];
   const workflows: string[] = [];
 
-  if (existsSync(join(repoDir, "go.mod"))) {
+  if (exists("go.mod")) {
     stack.push("Go");
     commands.push("`go test ./...`");
   }
-  if (existsSync(join(repoDir, "pyproject.toml"))) {
+  if (exists("pyproject.toml")) {
     stack.push("Python");
     commands.push("`pytest tests/ -q`");
   }
-  if (existsSync(join(repoDir, "package.json"))) {
+  if (exists("package.json")) {
     stack.push("JavaScript/TypeScript (Bun)");
     try {
-      const pkg = JSON.parse(readFileSync(join(repoDir, "package.json"), "utf8")) as {
+      const pkg = JSON.parse(readApplyManifest({ dir: repoDir, boundaries: [] }, "package.json")) as {
         scripts?: Record<string, string>;
       };
       const runner = "bun run";
@@ -36,23 +42,29 @@ function detectRepoCommands(repoDir: string): {
       // Ignore invalid package.json
     }
   }
-  if (existsSync(join(repoDir, "justfile"))) {
+  if (exists("justfile")) {
     stack.push("just");
     commands.push("`just --list`");
   }
-  if (existsSync(join(repoDir, "Makefile"))) {
-    const mk = readFileSync(join(repoDir, "Makefile"), "utf8");
-    const targets = ["build", "test", "lint", "generate", "api", "dal"].filter((t) =>
-      new RegExp(`^${t}:`, "m").test(mk),
-    );
-    if (targets.length) {
-      commands.push(...targets.map((t) => `\`make ${t}\``));
-    }
+  const makefile = ["GNUmakefile", "makefile", "Makefile"].find(exists);
+  if (makefile) {
+    try {
+      const mk = readApplyManifest({ dir: repoDir, boundaries: [] }, makefile);
+      const targets = ["build", "test", "lint", "generate", "api", "dal"].filter((target) =>
+        new RegExp(`^${target}:`, "m").test(mk),
+      );
+      commands.push(...targets.map((target) => "\`make " + target + "\`"));
+    } catch { /* An unreadable makefile supplies no verified commands. */ }
   }
-  const wfDir = join(repoDir, ".github", "workflows");
-  if (existsSync(wfDir)) {
+  const workflowPath = ".github/workflows";
+  let wfDir: string | undefined;
+  try {
+    const safe = inspectApplyPath(repoDir, workflowPath);
+    if (safe.stat?.isDirectory()) wfDir = safe.path;
+  } catch { /* Invalid workflow paths remain outside the card template. */ }
+  if (wfDir) {
     for (const f of readdirSync(wfDir)) {
-      if (f.endsWith(".yml") || f.endsWith(".yaml")) {
+      if (/\.ya?ml$/.test(f) && exists(workflowPath + "/" + f)) {
         workflows.push(`.github/workflows/${f}`);
       }
     }
@@ -144,6 +156,8 @@ export function addRepo(opts: { repoPath: string; workbenchDir?: string; force?:
       "## 仓库专属边界与约定",
       "",
       "- 遵循工作台 `AGENTS.md`；如本仓有更严格的分支、数据库或发布限制，补充于此。",
+      "",
+      "## Domain Index",
       "",
     ].join("\n");
     mkdirSync(dirname(cardPath), { recursive: true });

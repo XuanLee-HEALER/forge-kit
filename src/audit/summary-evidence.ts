@@ -92,9 +92,14 @@ export function captureEvidence(ledger: LedgerReader, taskId: string, explicitSe
         if (!(source === "subagent" && typeof meta.report_sha256 === "string" ||
           (source === "tool" || source === "hook") && (meta.backend || Array.isArray(meta.attempts) && meta.attempts.length))) continue;
         if (reviewSession && typeof meta.role === "string") {
-          const role = meta.role.startsWith("reviewer-") ? meta.role : "reviewer-" + normalizeReviewRole(meta.role);
-          if (auditRoles.some(candidate => candidate === role))
-            roles[reviewSession] = role;
+          const normalized = normalizeReviewRole(meta.role);
+          const role = normalized.startsWith("reviewer-") || normalized === "reviewer"
+            ? normalized : "reviewer-" + normalized;
+          if (auditRoles.some(candidate => candidate === role)) {
+            const previous = roles[reviewSession];
+            if (previous?.startsWith("reviewer") && previous !== role) warnings.push("Conflicting rollout roles");
+            if (role !== "reviewer" || !previous?.startsWith("reviewer-")) roles[reviewSession] = role;
+          }
         }
         reviews.push({ event, session: reviewSession, meta });
         rework.review_records++;

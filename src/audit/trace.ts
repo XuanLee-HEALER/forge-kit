@@ -1,7 +1,6 @@
-import { extractGitSubcommand } from "../shared/git-cmd";
 import { auditSecretKey, redactAuditArguments, redactAuditText } from "../shared/redact";
-import { tokenizeSimpleShellCommand } from "../shared/shell-tokens";
 import { object, string, turnId, type RolloutRecord } from "./rollout-record";
+import { summarizeOutput, type OutputCall } from "./trace-output";
 
 export type TraceEntry = {
   ts: string | null;
@@ -62,63 +61,6 @@ function toolParameters(value: unknown, key = "", depth = 0): unknown {
   return value;
 }
 
-function utf8Limit(text: string, limit = 2048) {
-  if (Buffer.byteLength(text) <= limit) return text;
-  const suffix = "…";
-  let size = 0, end = 0;
-  for (const character of text) {
-    size += Buffer.byteLength(character);
-    if (size > limit - Buffer.byteLength(suffix)) break;
-    end += character.length;
-  }
-  return text.slice(0, end) + suffix;
-}
-
-type Call = { name: string; namespace: string | null; parameters: unknown };
-
-const shellTools = new Set([
-  "exec", "exec_command", "shell_command", "run_command", "functions.exec", "functions.exec_command",
-]);
-const shellNamespaces = new Set(["functions", "shell", "terminal"]);
-const summaryCommands = new Set(["echo", "false", "ls", "printf", "pwd", "stat", "true", "wc"]);
-const summaryGitCommands = new Set(["ls-files", "rev-parse", "status"]);
-const summaryTools = new Set(["calculate", "calculator", "get_weather", "weather"]);
-
-function allowsExcerpt({ name, namespace, parameters }: Call) {
-  if (summaryTools.has(name)) return true;
-  if (!shellTools.has(name) || (namespace && !shellNamespaces.has(namespace))) return false;
-  const args = object(parameters);
-  const command = args.cmd ?? args.command ?? args.argv ?? parameters;
-  const argv = typeof command === "string" ? tokenizeSimpleShellCommand(command) :
-    Array.isArray(command) && command.every(value => typeof value === "string") ? command : null;
-  const program = argv?.[0]?.split("/").at(-1);
-  if (!argv || !program) return false;
-  if (program === "git") return summaryGitCommands.has(extractGitSubcommand(argv)?.subcmd ?? "");
-  return summaryCommands.has(program);
-}
-
-function summarizeOutput(call: Call, output: unknown) {
-  const data = object(output);
-  const text = content(output) ?? content(data.content) ?? content(data.output) ?? content(data.stdout) ?? content(data.summary);
-  const exit = data.exit_code ?? data.exitCode;
-  const status = data.status;
-  const metadata = [
-    typeof exit === "number" && Number.isSafeInteger(exit) ? "Exit code " + exit : "",
-    typeof status === "string" && /^(?:ok|success|failed|completed|timeout|error|pass)$/i.test(status) ? status : "",
-  ].filter(Boolean);
-  if (text) {
-    const observed = text.match(/(?:Process exited with (?:code|status)|Exit code:)\s*(-?\d+)/i)?.[1];
-    if (observed !== undefined && !metadata.some(entry => entry.startsWith("Exit code"))) metadata.push("Exit code " + observed);
-    if (allowsExcerpt(call) && !/^diff --git |^\*\*\* Begin Patch|^\s*\d+\s*\|/m.test(text)) {
-      const excerpt = removeToolBodies(text);
-      if (excerpt.trim()) metadata.push(excerpt);
-    } else metadata.push("Output body omitted");
-  } else if (output !== undefined && output !== null) {
-    metadata.push("Structured output");
-  }
-  return utf8Limit(redactAuditText(metadata.join("\n") || "Output unavailable"));
-}
-
 type Message = {
   ts: string | null;
   role: "user" | "assistant";
@@ -148,7 +90,7 @@ export function createTrace(records: RolloutRecord[], session: string, role: str
   const session_id = redactAuditText(session);
   const entries = new Map<number, TraceEntry>();
   const messages = new Map<number, Message>();
-  const calls = new Map<string, Call>();
+  const calls = new Map<string, OutputCall>();
   const outputs: { index: number; ts: string | null; id: string; value: unknown }[] = [];
   const outputIds = new Set<string>();
   let latestTurn: string | null = null;

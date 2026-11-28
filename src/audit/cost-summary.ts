@@ -8,6 +8,8 @@ const reworkFields = [
 ] as const;
 const statuses = ["OPEN", "HANDED_OFF", "CLOSED", "CANCELLED"];
 const archiveStatuses = ["complete", "partial", "no_rollout"];
+const legacyRoles = roles.filter(role => role !== "reviewer");
+type ReadSummary = Omit<Summary, "by_role"> & { by_role: Omit<Summary["by_role"], "reviewer"> & { reviewer?: Usage } };
 
 function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -37,7 +39,7 @@ function safeString(value: unknown) {
   return typeof value === "string" && redactAuditText(value) === value;
 }
 
-export function validateSummary(value: unknown, id: string): Summary {
+export function validateSummary(value: unknown, id: string): ReadSummary {
   if (!record(value) || value.schema_version !== 1 || value.task_id !== redactAuditText(id) ||
       !timestamp(value.created_at) || !timestamp(value.captured_at) ||
       !(value.closed_at === null || timestamp(value.closed_at)) ||
@@ -47,7 +49,8 @@ export function validateSummary(value: unknown, id: string): Summary {
       ![value.wall_clock_ms, value.active_ms].every(field => field === null || count(field)) ||
       !Array.isArray(value.usage_missing) || !value.usage_missing.every(field => tokenFields.includes(field)) ||
       typeof value.billing_usage_incomplete !== "boolean" ||
-      !validUsage(value.usage) || !validBuckets(value.by_role, value.usage, roles) ||
+      !validUsage(value.usage) || !validBuckets(value.by_role, value.usage,
+        record(value.by_role) && Object.hasOwn(value.by_role, "reviewer") ? roles : legacyRoles) ||
       !validBuckets(value.by_stage, value.usage, stages) || !validBuckets(value.by_model, value.usage) ||
       !Object.keys(value.by_model as object).every(safeString) ||
       !record(value.rework) || !reworkFields.every(field => count((value.rework as Rework)[field]) ||
@@ -70,7 +73,7 @@ export function validateSummary(value: unknown, id: string): Summary {
     usage: projectUsage(value.usage), usage_missing: value.usage_missing, billing_usage_incomplete: value.billing_usage_incomplete,
     by_role: projectBuckets(value.by_role), by_stage: projectBuckets(value.by_stage), by_model: projectBuckets(value.by_model),
     rework: Object.fromEntries(reworkFields.map(key => [key, (value.rework as Rework)[key]])),
-  } as Summary;
+  } as ReadSummary;
 }
 
 function projectUsage(value: Usage) {

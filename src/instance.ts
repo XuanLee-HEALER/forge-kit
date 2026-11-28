@@ -10,6 +10,7 @@ import { deliverySettings, decodeModelsConfig, loadShipPolicy, loadWorkbenchConf
 
 export const CORE_SKILLS = [
   "ready",
+  "apply",
   "grill",
   "feature",
   "bugfix",

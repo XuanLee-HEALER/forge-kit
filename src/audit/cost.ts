@@ -4,8 +4,10 @@ import { loadModelsConfig, type ModelsConfig } from "../config";
 import { redactAuditText } from "../shared/redact";
 import { validateSummary } from "./cost-summary";
 import { listAuditTasks, readAuditDatabase, readAuditSummary } from "./files";
-import type { Rework, Summary } from "./summary";
+import type { Rework } from "./summary";
 import { roles, stages, sumUsage, tokenFields, type Usage } from "./usage";
+
+type Summary = ReturnType<typeof validateSummary>;
 
 function taskDates(root: string, warnings: string[]) {
   const dates = new Map<string, number>();
@@ -48,12 +50,16 @@ function aggregate(summaries: Summary[]) {
   const average_usage = Object.fromEntries(tokenFields.map(field =>
     [field, usage[field] === null ? null : usage[field] / average_usage_denominators[field]]));
   const groups = (key: "by_role" | "by_stage", names: readonly string[]) =>
-    Object.fromEntries(names.map(name => [name, sumUsage(summaries.map(summary =>
-      (summary[key] as Record<string, Usage>)[name]), true)]));
+    Object.fromEntries(names.map(name => [name, sumUsage(summaries.flatMap(summary => {
+      const bucket = (summary[key] as Record<string, Usage | undefined>)[name];
+      return bucket ? [bucket] : [];
+    }), true)]));
   const by_role = groups("by_role", roles);
   const by_stage = groups("by_stage", stages);
   const shares = (buckets: Record<string, Usage>) => Object.fromEntries(Object.entries(buckets)
-    .map(([key, value]) => [key, usage.total_tokens ? (value.total_tokens ?? 0) / usage.total_tokens : null]));
+    .map(([key, value]) => [key,
+      usage.total_tokens && !(key === "reviewer" && value.total_tokens === null)
+        ? (value.total_tokens ?? 0) / usage.total_tokens : null]));
   const rework_top = summaries.map(({ task_id, rework }) => ({ task_id, rework, score: reworkScore(rework) }))
     .sort((a, b) => b.score - a.score || (a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0));
   return {

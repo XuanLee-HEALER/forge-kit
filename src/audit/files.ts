@@ -3,7 +3,7 @@ import { mkdtempSync, readdirSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { withImmediateTx } from "../ledger/transactions";
 import { ledgerDbPath, type LedgerReader } from "../ledger/types";
-import { ensureAuditIgnored } from "../shared/audit-ignore";
+import { ensurePrivateIgnored } from "../shared/audit-ignore";
 import { redactAuditText } from "../shared/redact";
 import { legacyArchiveText, prepareLegacyArchive, type ArchiveLedger } from "./files-legacy";
 import {
@@ -71,7 +71,7 @@ function writeAudit(ledger: ArchiveLedger, taskId: string, options: AuditOptions
     if (!root) throw Error("Audit directory is unavailable");
     withImmediateTx(ledger.db, () => {
       if (auditRoot(ledger.workbenchRoot) !== root) throw Error("Audit directory changed");
-      ensureAuditIgnored(ledger.workbenchRoot);
+      ensurePrivateIgnored(ledger.workbenchRoot, ["audit"]);
     });
     draft = mkdtempSync(join(root, tempPrefix));
     auditDirectory(draft, true);

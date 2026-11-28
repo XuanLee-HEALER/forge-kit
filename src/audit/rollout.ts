@@ -155,7 +155,7 @@ function sessionMeta(payload: Record<string, unknown>, path: string) {
     alias: string(payload.session_id),
     parent: string(payload.parent_thread_id) ?? string(spawn.parent_thread_id) ??
       string(subagent.parent_thread_id) ?? string(source.parent_thread_id) ?? string(threadSource.parent_thread_id),
-    role: string(payload.agent_role) ?? string(spawn.agent_role) ?? string(payload.role),
+    roles: [string(payload.agent_role), string(spawn.agent_role)],
     subagent: payload.source === "subagent" || payload.thread_source === "subagent" ||
       Object.hasOwn(source, "subagent") || Object.hasOwn(threadSource, "subagent"),
     path,
@@ -372,13 +372,18 @@ export function readRollouts(anchors: string[], roles: Record<string, string>, i
   }
   const groups = indexRollouts(note);
   for (const { id, files, canonical } of sessionTree(groups, anchors, note)) {
-    const explicitRoles = files.map(file => roleBucket(file.role)).filter(role => role !== null);
-    const ledgerRole = Object.entries(roles).find(([key]) => canonical(key) === id)?.[1] ?? null;
-    const role = explicitRoles[0] ?? roleBucket(ledgerRole) ??
+    const explicitRoles = files.flatMap(file => file.roles).map(roleBucket).filter(role => role !== null);
+    const ledgerRoles = Object.entries(roles).flatMap(([key, value]) => {
+      const role = canonical(key) === id ? roleBucket(value) : null;
+      return role ? [role] : [];
+    });
+    const observed = [...explicitRoles, ...ledgerRoles];
+    const conflicting = new Set(observed);
+    if (conflicting.size > 1) note("Conflicting rollout roles");
+    const first = observed[0];
+    const role = (first === "reviewer" ? observed.find(value => value.startsWith("reviewer-")) ?? first : first) ??
       (files.some(file => file.parent || file.subagent) ? "other" : "main");
-    if (new Set(explicitRoles).size > 1) note("Conflicting rollout roles");
-    const genericRole = files.some(file => file.role?.toLowerCase().trim() === "reviewer");
-    if (role === "other" && !explicitRoles.length && !roleBucket(ledgerRole) && !genericRole)
+    if (role === "other" && !observed.length)
       note(`Session role is missing or unknown: ${redactAuditText(id)}`);
     const records = mergedRecords(files, (message) => {
       note(message);

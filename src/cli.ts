@@ -20,12 +20,19 @@ Usage:
   forge add-repo <repo-path> [--workbench <dir>] [--force]
   forge sync [<dir>]
   forge doctor [<dir>] [--json]
+  forge apply [<dir>] [--repo <path>...] [--focus <rel-path>...] [--days N] [--json]
+  forge apply check [--repo <r>] [--domain <d> | --path <rel-path>...] [--json]
+  forge apply status [--repo <r>] [--json]
   forge instance list [--json]
   forge instance show <kind> <id> [--json]
   forge instance run <stage-id>
   forge verify --task <task-id> --cwd <checkout> --mode all   Run the configured verification stages
   forge ship | ledger | git | guard | ledger-hook | dbcred | cmdfmt | lang-check`);
     return;
+  }
+
+  if (cmd === "apply") {
+    return (await import("./apply/cli")).runApplyCli(rest);
   }
 
   if (cmd === "instance") {
