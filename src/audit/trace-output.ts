@@ -48,7 +48,7 @@ function exitCode(value: unknown, parts: OutputParts) {
 }
 
 const closingHeader = /^(?:Final output|Output|Original output):$/i;
-const execHeader = /^(?:Chunk ID:|Wall time:|Process (?:exited with |running with session ID )|Exit code:|Script (?:completed|running with cell ID)\b|Warning: truncated output\b|Total (?:output )?lines: \d+\s*$)/i;
+const execHeader = /^(?:Chunk ID:|Wall time(?:[: ]|$)|Process (?:exited with |running with session ID )|Exit code:|Script (?:completed|running with cell ID)\b|Warning: truncated output\b|Total (?:output )?lines: \d+\s*$)/i;
 
 function readExecEnvelope(lines: string[], parts: OutputParts) {
   let start = 0;
@@ -144,7 +144,7 @@ function promiseResult(data: Record<string, unknown>, depth = 0) {
 }
 
 const strongDiagnostic = /^(?:[a-z][\w.]*(?:Error|Exception)|Error|Exception|error(?:\[[A-Z]\d+\])?|fatal(?: error)?|warning|warn|panic|Traceback|Caused by|FAIL(?:ED)?|not ok)\s*[:!]|^(?:.+?:\d+(?::\d+|\(\d+\))?\)?\s*(?:[: -]\s*)?(?:error|warning)\b)|^\[?(?:ERROR|WARN|FATAL)\]\s+|^(?:npm (?:ERR!|error|warn)|bun error|[\w-]+(?:\.sh)?: (?:line \d+:|command not found|permission denied|no such file))\b/i;
-const cliError = /^(?:[\w.-]+:\s+)?(?:unknown (?:command|option|argument|flag)|invalid (?:command|option|argument|flag)|(?:--[\w-]+ )?(?:requires|expects)\s+(?:an? |\d+)|unexpected (?:argument|option)|missing required (?:argument|option))\b/i;
+const cliError = /^--[\w-]+ must be (?:a |an )?[\w -]+[.!]?$|^(?:[\w.-]+:\s+)?(?:unknown (?:command|option|argument|flag)|invalid (?:command|option|argument|flag)|(?:--[\w-]+ )?(?:requires|expects)\s+(?:an? |\d+)|unexpected (?:argument|option)|missing required (?:argument|option))\b/i;
 const failure = /^(?:(?:\(fail\)|✗|✖|×|❌)|(?:FAIL(?:ED)?|not ok|Build failed)\b|[1-9]\d* (?:tests? )?(?:fail(?:ed|ures?)?|errors?)\b)/i;
 const stackFrame = /^(?:at\s+[\w$.[\]<> -]+(?:\s+\([^)]*:\d+:\d+\)|:\d+:\d+)|at\s+[^\s]+:\d+:\d+|File "[^"]+", line \d+(?:, in [\w.<>]+)?|-->\s+[^\s]+:\d+:\d+)$/;
 const progress = /^(?:\(pass\)|\(fail\)|✓|✗|✔|✖|√|×|✅|❌|PASS\b|FAIL\b|FAILED\b|ok(?:\s|$)|not ok(?:\s|$)|=== RUN\b|--- (?:PASS|FAIL|SKIP):|test .+ \.\.\. (?:ok|FAILED|ignored)$|tests? result:|(?:Test Suites|Tests|Snapshots|Time|Duration)\s*:|\d+\s+(?:tests?\b|pass(?:ed)?\b|fail(?:ed|ures?)?\b|skip(?:ped)?\b|error(?:s)?\b|assertions?\b)|(?:Ran|Running|Collected|collecting|collected)\s+(?:\d+\s+(?:tests?|items?|specs?)|tests?\b)|bun test v\d|tap version\b|(?:Compiling|Compiled|Building|Built|Bundled|Bundling|Build (?:completed|failed|succeeded)|Finished|Successfully (?:built|compiled)|Checking|Transforming)\s+\S)/i;
@@ -196,11 +196,17 @@ function excerpts(text: string, { allowsProse, sourceOnly, commandEcho, fileRead
   let body: "diff" | "file" | "document" | null = null;
   let boundary = false;
   let structuredDepth = 0;
+  let tap = false;
   let sourceFrame = false;
   let skipped = false;
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     const branchStatus = gitStatus && gitBranchStatus.test(line);
+    if (!body && !fence && !structuredDepth && /^TAP version \d+$/i.test(line)) tap = true;
+    if (tap && !body && !fence && !structuredDepth && /^# (?:Subtest:|(?:tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) \d)/i.test(line)) {
+      if (!sourceOnly) ordinary.push(line);
+      continue;
+    }
     if (body === "document" || markdownHeading.test(line) && !branchStatus && !body && !fence && !structuredDepth) {
       body = documentEnd.test(line) ? null : "document";
       skipped = true;

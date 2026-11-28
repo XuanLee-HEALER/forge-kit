@@ -40,10 +40,19 @@ test("review regression: close retains a long tool log failure and filters ordin
     "Error: " + marker,
     "Keep this document in the example folder.",
   ].join("\n");
+  const command = ["apply", "--days", "0"];
+  const actual = f.s.run([f.s.forge, ...command]);
+  expect(actual.code).not.toBe(0);
+  expect(actual.err + actual.out).toMatch(/--days must be a positive integer/);
+  const tap = ["TAP version 13", "# Subtest: arithmetic", "not ok 1 - arithmetic", "1..1", "# fail 1"];
   const inputs = [
     { name: "exec_command", args: { cmd: "bun run print-notes" }, output: document("PACKAGE_SCRIPT_BODY_MARKER") },
     { name: "read_file", args: { path: "notes.md" }, output: document("FILE_VIEWER_BODY_MARKER") },
     { name: "exec_command", args: { cmd: "bun test" }, output: rawFailure },
+    { name: "exec_command", args: { cmd: "forge " + command.join(" ") },
+      output: { exit_code: actual.code, stdout: actual.out, stderr: actual.err } },
+    { name: "exec_command", args: { cmd: "node --test arithmetic.test.js" },
+      output: { exit_code: 1, stdout: tap.join("\n") } },
   ];
   f.put(id, inputs.flatMap(({ name, args, output }, index) => [
     row(index * 2 + 1, "response_item", {
@@ -62,9 +71,15 @@ test("review regression: close retains a long tool log failure and filters ordin
   expect(failure?.output_summary).toContain("FAIL: ran contract checks and received an invalid status");
   expect(failure?.output_summary).toContain("test result expected ready");
   expect(Buffer.byteLength(failure!.output_summary, "utf8")).toBeLessThanOrEqual(2048);
+  const outputs = f.trace(id).filter(event => event.kind === "tool_output");
+  const invalidDays = outputs.find(event => event.ts === timestamp(8));
+  expect(invalidDays?.output_summary).toContain("Exit code " + actual.code);
+  expect(invalidDays?.output_summary).toContain("--days must be a positive integer");
+  const tapSummary = outputs.find(event => event.ts === timestamp(10))?.output_summary;
+  for (const line of [tap[0], tap[1], tap[2], tap[4]]) expect(tapSummary).toContain(line);
 }), 30_000);
 
-test("review regression: apply finds static multi-target Make rules and Python console scripts", () => {
+test("review regression: apply finds static Make, Python and just entrypoints", () => {
   const s = sandbox();
   try {
     s.fresh();
@@ -87,6 +102,7 @@ test("review regression: apply finds static multi-target Make rules and Python c
       'generate = ["fixture"]',
     ].join("\n") + "\n");
     s.privateFile("uv.lock", "# fixture lock\n");
+    s.privateFile("justfile", "test profile:\n    @echo {{profile}}\nbuild:\n    @echo build\n");
     const out = apply(s);
     expect(names(out)).toEqual(["."]);
     const declared = out.repos[0].entrypoints.filter((entry: { declared: boolean }) => entry.declared);
@@ -99,6 +115,11 @@ test("review regression: apply finds static multi-target Make rules and Python c
       ]));
     expect(declared.filter((entry: { source: string }) => entry.source === "pyproject.toml")
       .map((entry: { name: string }) => entry.name).sort()).toEqual(["test", "typecheck"]);
+    const recipes = declared.filter((entry: { source: string }) => entry.source === "justfile");
+    expect(recipes).toContainEqual(expect.objectContaining({ name: "test", declared: true }));
+    expect(recipes.find((entry: { name: string }) => entry.name === "test")?.argv).toBeUndefined();
+    expect(out.repos[0].verification_actions).toContainEqual(expect.objectContaining({ argv: ["just", "build"] }));
+    expect(out.repos[0].verification_actions).not.toContainEqual(expect.objectContaining({ argv: ["just", "test"] }));
     expect(existsSync(s.probeLog)).toBe(false);
   } finally { s.cleanup(); }
 }, 30_000);

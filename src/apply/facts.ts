@@ -255,14 +255,24 @@ export function scanFacts(repo: ApplyRepo, focus: string[]) {
       language(name, file);
       const text = read(file);
       const targets = new Set<string>();
+      const needsArguments = new Set<string>();
       for (const line of text.split("\n")) {
         const declaration = runner === "make"
           ? /^ *([\w./-]+(?:[ \t]+[\w./-]+)*)[ \t]*:(?![:]*=)/.exec(line)
-          : /^([\w-]+)(?:[ \t]+[^:#]+)?[ \t]*:(?!=)/.exec(line);
+          : /^([\w-]+)(?:[ \t]+([^:#]+?))?[ \t]*:(?!=)/.exec(line);
+        if (runner === "just" && declaration?.[2]?.trim()) {
+          // Offer a zero-argument action only for parameters with clear defaults or a zero-or-more rest.
+          const optional = /^(?:(?:\*[\w-]+|\$?[\w-]+=(?:"[^"]*"|'[^']*'|[\w./-]+))(?:[ \t]+|$))+$/;
+          if (!optional.test(declaration[2].trim())) needsArguments.add(declaration[1]);
+        }
         for (const target of declaration?.[1].split(/[ \t]+/) ?? []) targets.add(target);
       }
       for (const task of names)
-        if (targets.has(task)) add(task, file, [runner, task], true);
+        if (targets.has(task)) {
+          const parameterized = needsArguments.has(task);
+          add(task, file, parameterized ? undefined : [runner, task], true);
+          if (parameterized) warnings.push("Check recipe arguments before running " + childPath(dir, file) + ": " + task);
+        }
       if (/^ *(?:-?include|sinclude|import|mod)\s|\$[({]|\{\{/m.test(text))
         warnings.push("Dynamic build definitions were not evaluated: " + JSON.stringify(childPath(dir, file)));
     }
