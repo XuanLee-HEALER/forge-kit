@@ -137,7 +137,7 @@ for (const version of ["0.5.0", "0.5.1", "0.5.2", "0.5.3", "0.5.4", "0.5.5", "0.
     for (let i = 0; i < 3; i++) {
       if (i === 1) writeFileSync(models, renderModels(true));
       s.ok([bootstrap, "sync", s.work]);
-      expect(lockVersion()).toBe("0.6.2");
+      expect(lockVersion()).toBe("0.6.3");
       expect(readFileSync(models, "utf8")).toBe(renderModels(i > 0));
       const roles = Object.entries(roleTiers).map(([role, tier]) => {
         const path = join(s.work, ".codex/agents/reviewer-" + role + ".toml");

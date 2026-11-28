@@ -59,7 +59,19 @@ export function redactAuditText(text: string): string {
   return redactSecrets(redactWithPatterns(text, auditPatterns));
 }
 
+const runtimeInvocation = /(?:^|[^\w.-])(?:forge|src\/bin\/cli\.ts|dist\/cli\.js|\.workbench\/bin\/cli\.js)(?:["']?\s+(?:--\s+)?["']?|["']\s*,\s*["'])rt(?:["']?\s+["']?|["']\s*,\s*["'])query\b[\s\S]*?(?<![\w-])--(?:expr|param)(?=$|[=\s"'\\])/;
+
+export function redactAuditRuntimeCommand(text: string): string {
+  const normalized = text.replace(/\\(?:\r?\n|["'])/g, "");
+  return runtimeInvocation.test(normalized) ? "[runtime query arguments omitted]" : text;
+}
+
 export function redactAuditArguments(argv: string[]) {
-  return redactArguments(argv).map((arg, index) =>
-    index > 0 && auditOption.test(argv[index - 1]) ? "***" : redactAuditText(arg));
+  const queryCommand = runtimeInvocation.test(argv.join(" "));
+  return redactArguments(argv).map((arg, index) => {
+    const previous = argv[index - 1] ?? "";
+    if (auditOption.test(previous) || queryCommand && /^--(?:expr|param)$/.test(previous)) return "***";
+    if (queryCommand && /^--(?:expr|param)=/.test(arg)) return arg.slice(0, arg.indexOf("=") + 1) + "***";
+    return redactAuditText(redactAuditRuntimeCommand(arg));
+  });
 }

@@ -1,6 +1,6 @@
 [kit]
 name = "forge-kit"
-version = "0.6.2"
+version = "0.6.3"
 runtime = "codex"
 
 [managed]

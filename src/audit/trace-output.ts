@@ -1,5 +1,5 @@
 import { extractGitSubcommand } from "../shared/git-cmd";
-import { redactAuditText } from "../shared/redact";
+import { redactAuditRuntimeCommand, redactAuditText } from "../shared/redact";
 import { tokenizeSimpleShellCommand } from "../shared/shell-tokens";
 import { object, string } from "./rollout-record";
 
@@ -30,7 +30,7 @@ function removeOutputBodies(text: string) {
 }
 
 function safeOutputText(text: string) {
-  return redactAuditText(text)
+  return redactAuditText(redactAuditRuntimeCommand(text))
     .replace(/\b(Authorization:\s*Basic\s+)\S+/gi, "$1***")
     .replace(/\b([\w.-]*(?:password|passwd|token|secret|api[-_]?key|credentials?)):\s+[^\n]+/gi, "$1: ***")
     .replace(/(["'])(?:file:\/\/\/|\/(?!\/)|~\/|[A-Z]:[\\/]|\\\\)[^"'\n]*\1/gi, "$1[redacted path]$1")

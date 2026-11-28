@@ -1,7 +1,7 @@
 import { mkdtempSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { ledgerDbPath, type EventRecord, type LedgerReader, type TaskRecord, type TaskRepoRecord } from "../ledger/types";
-import { auditSecretKey, redactAuditArguments, redactAuditText } from "../shared/redact";
+import { auditSecretKey, redactAuditArguments, redactAuditRuntimeCommand, redactAuditText } from "../shared/redact";
 import { auditChild, auditDirectory, auditFile, auditStat, requireAuditTask, tempPrefix, writePrivateFile } from "./files-path";
 
 import { tokenFields } from "./usage";
@@ -16,7 +16,7 @@ function safePayload(raw: string): string {
     let changed = false;
     function clean(value: unknown): unknown {
       if (typeof value === "string") {
-        const safe = redactAuditText(value);
+        const safe = redactAuditText(redactAuditRuntimeCommand(value));
         changed ||= safe !== value;
         return safe;
       }

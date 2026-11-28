@@ -6,6 +6,7 @@ import { findWorkbenchRoot, isProductionDb, loadDbEnvironments, loadModelsConfig
 import { localPath, readRequired, resolveInstance, isProjectVerification } from "../instance";
 import { Ledger } from "../ledger/store";
 import { hash, checkMigration, missingLockRecovery, type InstallLock } from "../managed-assets";
+import { runtimeWarnings } from "../rt/config";
 import { visitSkillFiles } from "./install-plan";
 
 export interface DoctorIssue {
@@ -105,6 +106,8 @@ function inspectWorkbench(root: string, issues: DoctorIssue[]) {
   try {
     checkMigration(root);
     const effective = resolveInstance(root);
+    for (const message of runtimeWarnings(effective.runtime))
+      issues.push({ level: "warn", check: "runtime", message });
     const projectChecks = [...effective.actions.values()].filter(({value}) =>
       isProjectVerification(value, effective.repos) && (value.inputs?.length ||
         (value.argv[0].includes("/") && !isAbsolute(value.argv[0]))));

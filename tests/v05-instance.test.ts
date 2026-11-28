@@ -20,7 +20,7 @@ function configure(extensions: object) {
 
 test("T04/T05/T12 clean installation discovers exactly the core catalog under Bun", () => {
   s.fresh();
-  const skills = ["apply", "bugfix", "feature", "grill", "pr-triage", "ready", "review", "ship", "verify"];
+  const skills = ["apply", "bugfix", "feature", "grill", "pr-triage", "ready", "review", "ship", "triage", "verify"];
   expect(readdirSync(join(s.work, ".agents/skills")).sort()).toEqual(skills);
   expect(readdirSync(join(s.work, ".codex/agents")).sort()).toEqual(
     ["analyst", "implementer", "reviewer", "reviewer-business", "reviewer-quality", "reviewer-simplify", "reviewer-comments", "scanner"].map(name => name + ".toml").sort(),

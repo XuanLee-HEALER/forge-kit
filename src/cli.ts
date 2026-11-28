@@ -26,6 +26,7 @@ Usage:
   forge instance list [--json]
   forge instance show <kind> <id> [--json]
   forge instance run <stage-id>
+  forge rt <list|status|changes|logs|query|metrics> [--json]
   forge verify --task <task-id> --cwd <checkout> --mode all   Run the configured verification stages
   forge ship | ledger | git | guard | ledger-hook | dbcred | cmdfmt | lang-check`);
     return;
@@ -33,6 +34,9 @@ Usage:
 
   if (cmd === "apply") {
     return (await import("./apply/cli")).runApplyCli(rest);
+  }
+  if (cmd === "rt") {
+    return (await import("./rt/cli")).runRuntimeCli(rest);
   }
 
   if (cmd === "instance") {

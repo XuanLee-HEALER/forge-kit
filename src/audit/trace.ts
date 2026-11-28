@@ -1,4 +1,4 @@
-import { auditSecretKey, redactAuditArguments, redactAuditText } from "../shared/redact";
+import { auditSecretKey, redactAuditArguments, redactAuditRuntimeCommand, redactAuditText } from "../shared/redact";
 import { object, string, turnId, type RolloutRecord } from "./rollout-record";
 import { summarizeOutput, type OutputCall } from "./trace-output";
 
@@ -48,7 +48,7 @@ function toolParameters(value: unknown, key = "", depth = 0): unknown {
       catch { /* An ordinary string can start with a bracket. */ }
     }
     if (/\*\*\* Begin Patch|^diff --git |<<-?\s*['"]?[A-Za-z_]/m.test(value)) return "[file content omitted]";
-    return redactAuditText(removeToolBodies(value));
+    return redactAuditText(redactAuditRuntimeCommand(removeToolBodies(value)));
   }
   if (Array.isArray(value)) {
     const entries = value.every(entry => typeof entry === "string") ? redactAuditArguments(value) : value;
@@ -150,7 +150,7 @@ export function createTrace(records: RolloutRecord[], session: string, role: str
   const messageKey = (message: Message) => JSON.stringify([message.role, message.turn, removeTemplates(message.text)]);
   for (const message of messages.values()) if (!message.mirror) primary.add(messageKey(message));
   for (const [index, message] of messages) {
-    const text = redactAuditText(removeTemplates(message.text));
+    const text = redactAuditText(redactAuditRuntimeCommand(removeTemplates(message.text)));
     if (!text.trim() || (message.id && ids.has(message.id))) continue;
     const key = messageKey(message);
     if (message.mirror && (primary.has(key) || emittedMirrors.has(key))) continue;

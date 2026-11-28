@@ -121,7 +121,7 @@ function gitFlow(repo: ApplyRepo, warnings: string[]) {
   const prefixes = tags.code ? [] : tags.stdout.split("\n").flatMap(tag => versionTag.exec(tag)?.[1] ?? []);
   const tag_prefixes = [...new Set(prefixes)].sort(byPath);
   const hook_paths = [
-    ...[".husky", "scripts/hooks"].filter(path => safeFixedPath(repo, path, "directory", "hook directory", warnings)),
+    ...[".githooks", ".husky", "scripts/hooks"].filter(path => safeFixedPath(repo, path, "directory", "hook directory", warnings)),
     ...hookManifests.filter(path => safeFixedPath(repo, path, "file", "hook configuration", warnings)),
   ].sort(byPath);
   const codeowners_paths = [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"]
@@ -139,6 +139,7 @@ export function scanSignals(
 ) {
   const convention: Signal[] = [];
   const entry: Signal[] = [];
+  const interfacePaths = new Map<string, string>();
   const persistence: Signal[] = [];
   const matchesFocus = (path: string) => !focusRequested || focus.some(scope => pathIsIn(scope, path) || pathIsIn(path, scope));
   for (const [sources, directory] of [[paths.files, false], [paths.dirs, true]] as const) {
@@ -151,8 +152,13 @@ export function scanSignals(
       }
       if (!directory && documentFile.test(name)) continue;
       if (matchesFocus(path)) {
-        if (/^(?:api|proto|routes|handlers|controllers)$/.test(stem) || /\.proto$/.test(name) || /^openapi/.test(name))
+        const interfaceName = name.endsWith(".proto") || name.startsWith("openapi");
+        const parent = dirname(path);
+        if (!directory && interfaceName && /(?:^|\/)(?:api|proto)(?:\/|$)/i.test(parent)) {
+          interfacePaths.set(parent, interfacePaths.has(parent) ? parent : path);
+        } else if (/^(?:api|proto|routes|handlers|controllers)$/.test(stem) || interfaceName) {
           entry.push({ path, kind: "http-rpc" });
+        }
         if (/^(?:consumers|workers|jobs)$/.test(stem) || /^cron/.test(name))
           entry.push({ path, kind: "async" });
         if (/^(?:cmd|bin)$/.test(stem) || (!directory && /(?:^|\/)server\/index\.[^/]+$/i.test(path)))
@@ -161,7 +167,8 @@ export function scanSignals(
         if (/^migrations?$/.test(stem)) persistence.push({ path, kind: "migration" });
         if (stem === "prisma" || (!directory && name.endsWith(".prisma"))) persistence.push({ path, kind: "prisma" });
         if (/^schemas?$/.test(stem)) persistence.push({ path, kind: "schema" });
-        if (/^(?:orm|models)$/.test(stem)) persistence.push({ path, kind: "orm" });
+        const pageModels = directory && /(?:^|\/)(?:app|pages|routes)\/(?:[^/]+\/)+models$/i.test(path);
+        if (/^(?:orm|models)$/.test(stem) && !pageModels) persistence.push({ path, kind: "orm" });
       }
       if (!directory && (matchesFocus(path) || dirname(path) === ".")) {
         if (environmentTemplate.test(name)) persistence.push({ path, kind: "env-template" });
@@ -169,6 +176,7 @@ export function scanSignals(
       }
     }
   }
+  for (const path of interfacePaths.values()) entry.push({ path, kind: "http-rpc" });
   return {
     convention_files: bounded(convention, "Convention", warnings),
     entry_signals: bounded(entry, "Entry signal", warnings),

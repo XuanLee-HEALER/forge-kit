@@ -1,6 +1,6 @@
 import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, type Stats } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
-import { checkoutEnvironment, isOid, runProcess } from "../git";
+import { isOid, offlineGitInvocation, runProcess } from "../git";
 
 export type ApplyRepo = { repo: string; dir: string; slug: string; boundaries: string[] };
 export type ApplyCatalog = { repos: ApplyRepo[]; registered: string[]; warnings: string[] };
@@ -105,17 +105,8 @@ export function validateApplyPath(repo: ApplyRepo, input: string): string {
 }
 
 export function applyGit(dir: string, args: string[]) {
-  const env = checkoutEnvironment();
-  for (const key of Object.keys(env))
-    if (/^GIT_(?:CONFIG(?:_|$)|TRACE|REDIRECT_|TEST_)/.test(key) ||
-        ["GIT_EXTERNAL_DIFF", "GIT_ALLOW_PROTOCOL"].includes(key)) delete env[key];
-  Object.assign(env, {
-    GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1",
-    GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
-    GIT_TERMINAL_PROMPT: "0", GIT_ALLOW_PROTOCOL: "", GIT_ATTR_NOSYSTEM: "1", LC_ALL: "C",
-  });
-  return runProcess(["git", "-C", dir, "--no-pager", "--literal-pathspecs",
-    "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never", ...args], { env });
+  const { argv, env } = offlineGitInvocation(dir, args);
+  return runProcess(argv, { env });
 }
 
 export function applyHead(dir: string) {

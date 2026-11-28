@@ -4,9 +4,10 @@ import { createHash } from "node:crypto";
 import { findKitRoot } from "./kit-root";
 import { accessSync, constants, existsSync, lstatSync, readFileSync, statSync, writeSync } from "node:fs";
 import { basename, isAbsolute, join, normalize, relative } from "node:path";
-import { parse } from "yaml";
+import { parse, parseDocument } from "yaml";
 import { locateRepo } from "./git";
-import { deliverySettings, decodeModelsConfig, loadShipPolicy, loadWorkbenchConfig } from "./config";
+import { canonicalRepoPath, deliverySettings, decodeModelsConfig, loadShipPolicy, loadWorkbenchConfig } from "./config";
+import { decodeRuntime, RuntimeConfigError } from "./rt/config";
 
 export const CORE_SKILLS = [
   "ready",
@@ -14,6 +15,7 @@ export const CORE_SKILLS = [
   "grill",
   "feature",
   "bugfix",
+  "triage",
   "review",
   "verify",
   "pr-triage",
@@ -106,6 +108,103 @@ interface Effective<T> {
   source: string;
 }
 
+function readInstanceConfig(root: string) {
+  let file: string;
+  let cfg: Record<string, unknown>;
+  try {
+    file = localPath(root, ".workbench/workbench.yaml");
+    const document = parseDocument(readRequired(file).toString(), { logLevel: "silent", prettyErrors: false });
+    if (document.errors.length) throw document.errors[0];
+    cfg = record(document.toJS(), "workbench");
+  } catch {
+    throw new RuntimeConfigError("Cannot load .workbench/workbench.yaml. Use a readable local file with a valid YAML mapping");
+  }
+  if ("name" in cfg) str(cfg.name, file + " name");
+  if ("git_org" in cfg && typeof cfg.git_org !== "string") throw Error(file + " git_org must be a string");
+  if ("repos" in cfg && (!Array.isArray(cfg.repos) || !cfg.repos.every((repo) => typeof repo === "string")))
+    throw new RuntimeConfigError(".workbench/workbench.yaml repos must be a string list");
+  const loc = `${file} extensions`;
+  const ext = record(cfg.extensions === undefined ? {} : cfg.extensions, loc);
+  known(ext, ["actions", "stages", "verification", "delivery", "skills", "runtime"], loc);
+  function section(name: string) {
+    return record(ext[name] === undefined ? {} : ext[name], loc + "." + name);
+  }
+  return { file, cfg, ext, loc, section };
+}
+
+function decodeAction(root: string, repos: string[], value: unknown, path: string): Action {
+  const a = record(value, path);
+  known(a, ["argv", "cwd", "purpose", "inputs"], path);
+  const argv = strings(a.argv, path + ".argv");
+  const cwd = str(a.cwd === undefined ? "." : a.cwd, path + ".cwd");
+  const purpose = str(a.purpose, path + ".purpose");
+  const project = isProjectVerification({ purpose, cwd }, repos);
+  const dir = project ? root : localPath(root, cwd);
+  if (!project && !statSync(dir, { throwIfNoEntry: false })?.isDirectory())
+    throw Error(`${path}.cwd directory missing: ${cwd}`);
+  if (project && argv[0].includes("/") && !isAbsolute(argv[0])) {
+    relativePath(argv[0]);
+  } else {
+    const executable = Bun.which(argv[0], { cwd: dir });
+    const mode = executable && statSync(executable, { throwIfNoEntry: false });
+    if (!mode || !mode.isFile() || !(mode.mode & 0o111))
+      throw Error(`${path}.argv[0] is not executable: ${argv[0]}; install the program or correct its path`);
+  }
+  if (basename(argv[0]) === "forge" && ["instance", "verify", "ship"].includes(argv[1]))
+    throw Error(`${path}.argv recursively invokes a workflow; configure the underlying program`);
+  const action: Action = { argv, cwd, purpose };
+  if (a.inputs !== undefined) {
+    if (!Array.isArray(a.inputs)) throw Error(path + ".inputs must be a list of relative files");
+    action.inputs = a.inputs.map((value, index) => {
+      const field = path + ".inputs[" + index + "]";
+      const input = str(value, field);
+      try {
+        if (project) return relativePath(input);
+        const path = localPath(dir, input),
+          st = statSync(path);
+        if (!st.isFile() || !(st.mode & 0o444)) throw Error("Expected a readable regular file: " + path);
+        accessSync(path, constants.R_OK);
+      } catch (error) {
+        throw Error(field + ": " + String(error));
+      }
+      return normalize(input);
+    });
+    if (new Set(action.inputs).size !== action.inputs.length) throw Error(path + ".inputs repeats a file");
+  }
+  return action;
+}
+
+function resolveRuntimeBindings(root: string, repos: string[], ext: Record<string, unknown>, decoded = new Map<string, Action>()) {
+  return decodeRuntime(ext.runtime, (id, field) => {
+    let actions: Record<string, unknown>;
+    try { actions = record(ext.actions === undefined ? {} : ext.actions, "extensions.actions"); }
+    catch { throw new RuntimeConfigError("extensions.actions must be a mapping"); }
+    if (!Object.hasOwn(actions, id))
+      throw new RuntimeConfigError(`${field} must name a registered extensions.actions entry`);
+    const raw = actions[id];
+    if (!raw || typeof raw !== "object" || !("purpose" in raw) || raw.purpose !== "observe")
+      throw new RuntimeConfigError(`${field} must reference an action with purpose observe`);
+    try {
+      const action = decoded.get(id) ?? decodeAction(root, repos, raw, field);
+      decoded.set(id, action);
+      return { argv: action.argv, cwd: localPath(root, action.cwd) };
+    } catch {
+      throw new RuntimeConfigError(`${field} references an invalid extensions.actions entry. Check argv, cwd, purpose, and inputs`);
+    }
+  });
+}
+
+export function resolveRuntimeInstance(root: string) {
+  try {
+    const { cfg, ext } = readInstanceConfig(root);
+    const repos = (cfg.repos as string[] | undefined)?.map(repo => canonicalRepoPath(root, repo)) ?? [];
+    return { repos, runtime: resolveRuntimeBindings(root, repos, ext) };
+  } catch (error) {
+    if (error instanceof RuntimeConfigError) throw error;
+    throw new RuntimeConfigError("Invalid .workbench/workbench.yaml. Check its instance and extensions settings");
+  }
+}
+
 // An explicit release is an installer input. An installed command uses the projections
 // published together with its lock, even when the releasing checkout moves or advances.
 export function resolveInstance(root: string, kitRoot?: string) {
@@ -115,27 +214,20 @@ export function resolveInstance(root: string, kitRoot?: string) {
         const lock = record(JSON.parse(bytes.toString()), "kit-lock");
         return {
           managed_files: record(lock.managed_files, "managed_files"),
+          kit_version: lock.kit_version,
           skill_overrides: lock.skill_overrides === undefined ? undefined : record(lock.skill_overrides, "skill_overrides"),
         };
       })
     : undefined;
   if (!installed && !kitRoot) kitRoot = findKitRoot();
-  const file = localPath(root, ".workbench/workbench.yaml");
-  const cfg = load(file, (bytes) => record(parse(bytes.toString(), {prettyErrors:false}), "workbench"));
-  if ("name" in cfg) str(cfg.name, file + " name");
-  if ("git_org" in cfg && typeof cfg.git_org !== "string") throw Error(file + " git_org must be a string");
-  if ("repos" in cfg && (!Array.isArray(cfg.repos) || !cfg.repos.every((r) => typeof r === "string")))
-    throw Error(`${file} repos must be a string list`);
-  const modelFile = process.env.FORGE_MODELS_TOML || localPath(root, ".workbench/models.toml");
-  load(modelFile, bytes => decodeModelsConfig(Bun.TOML.parse(bytes.toString()), modelFile));
-  load(localPath(root, ".workbench/ship-policy.yaml"), () => loadShipPolicy(root));
-  const { repos } = load(file, () => loadWorkbenchConfig(root));
-  const loc = `${file} extensions`;
-  const ext = record(cfg.extensions === undefined ? {} : cfg.extensions, loc);
-  known(ext, ["actions", "stages", "verification", "delivery", "skills"], loc);
-  function section(name: string) {
-    return record(ext[name] === undefined ? {} : ext[name], loc + "." + name);
-  }
+  const { file, ext, loc, section } = readInstanceConfig(root);
+  const { repos } = load(file, () => {
+    try { return loadWorkbenchConfig(root); }
+    catch (error) {
+      if (ext.runtime === undefined) throw error;
+      throw new RuntimeConfigError("Invalid .workbench/workbench.yaml. Check its instance and policy settings");
+    }
+  });
   function values<T>(name: string, decode: (v: unknown, id: string) => T) {
     const map = new Map<string, Effective<T>>();
     for (const [id, v] of Object.entries(section(name))) {
@@ -144,48 +236,14 @@ export function resolveInstance(root: string, kitRoot?: string) {
     }
     return map;
   }
-  const actions = values<Action>("actions", (v, id) => {
-    const path = `${loc}.actions.${id}`,
-      a = record(v, path);
-    known(a, ["argv", "cwd", "purpose", "inputs"], path);
-    const argv = strings(a.argv, path + ".argv");
-    const cwd = str(a.cwd === undefined ? "." : a.cwd, path + ".cwd");
-    const purpose = str(a.purpose, path + ".purpose");
-    const project = isProjectVerification({ purpose, cwd }, repos);
-    const dir = project ? root : localPath(root, cwd);
-    if (!project && !statSync(dir, { throwIfNoEntry: false })?.isDirectory())
-      throw Error(`${path}.cwd directory missing: ${cwd}`);
-    if (project && argv[0].includes("/") && !isAbsolute(argv[0])) {
-      relativePath(argv[0]);
-    } else {
-      const executable = Bun.which(argv[0], { cwd: dir });
-      const mode = executable && statSync(executable, { throwIfNoEntry: false });
-      if (!mode || !mode.isFile() || !(mode.mode & 0o111))
-        throw Error(`${path}.argv[0] is not executable: ${argv[0]}; install the program or correct its path`);
-    }
-    if (basename(argv[0]) === "forge" && ["instance", "verify", "ship"].includes(argv[1]))
-      throw Error(`${path}.argv recursively invokes a workflow; configure the underlying program`);
-    const action: Action = { argv, cwd, purpose };
-    if (a.inputs !== undefined) {
-      if (!Array.isArray(a.inputs)) throw Error(path + ".inputs must be a list of relative files");
-      action.inputs = a.inputs.map((value, index) => {
-        const field = path + ".inputs[" + index + "]";
-        const input = str(value, field);
-        try {
-          if (project) return relativePath(input);
-          const path = localPath(dir, input),
-            st = statSync(path);
-          if (!st.isFile() || !(st.mode & 0o444)) throw Error("Expected a readable regular file: " + path);
-          accessSync(path, constants.R_OK);
-        } catch (error) {
-          throw Error(field + ": " + String(error));
-        }
-        return normalize(input);
-      });
-      if (new Set(action.inputs).size !== action.inputs.length) throw Error(path + ".inputs repeats a file");
-    }
-    return action;
-  });
+  const runtimeActions = new Map<string, Action>();
+  const runtime = resolveRuntimeBindings(root, repos, ext, runtimeActions);
+  const actions = values<Action>("actions", (value, id) =>
+    runtimeActions.get(id) ?? decodeAction(root, repos, value, `${loc}.actions.${id}`),
+  );
+  const modelFile = process.env.FORGE_MODELS_TOML || localPath(root, ".workbench/models.toml");
+  load(modelFile, bytes => decodeModelsConfig(Bun.TOML.parse(bytes.toString()), modelFile));
+  load(localPath(root, ".workbench/ship-policy.yaml"), () => loadShipPolicy(root));
   const stages = values<Stage>("stages", (v, id) => {
     const path = `${loc}.stages.${id}`,
       s = record(v, path);
@@ -270,6 +328,11 @@ export function resolveInstance(root: string, kitRoot?: string) {
     const privateFile = privateDir && localPath(privateDir, "SKILL.md");
     const projection = `.agents/skills/${id}/SKILL.md`;
     const path = installed ? localPath(root, projection) : privateFile || localPath(kitRoot!, "core/" + projection);
+    // The pre-triage manifest has no projection for the new skill. Existing entries still require attestation.
+    if (id === "triage" && installed && typeof installed.kit_version === "string" &&
+        /^(?:0\.5\.\d+|0\.6\.[0-2])$/.test(installed.kit_version) && !custom &&
+        !Object.hasOwn(installed.managed_files, projection) &&
+        !Object.hasOwn(installed.skill_overrides ?? {}, id) && !existsSync(path)) continue;
     const value = load(path, (bytes) => {
       if (installed) {
         const digest = createHash("sha256").update(bytes).digest("hex");
@@ -290,7 +353,7 @@ export function resolveInstance(root: string, kitRoot?: string) {
     const source = privateFile || (installed && !installed.skill_overrides ? path : "core");
     skills.set(id, { kind: "skill", id, source, value });
   }
-  return { actions, stages, skills, verification, delivery, repos };
+  return { actions, stages, skills, verification, delivery, repos, runtime };
 }
 
 // Configured paths use the workbench namespace. Only paths belonging to the

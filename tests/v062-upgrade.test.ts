@@ -50,7 +50,7 @@ test("A12/C02 actual v0.6.1 installation keeps existing cards, private files and
     for (let pass = 1; pass <= 2; pass++) {
       const sync = s.run([candidate, "sync", s.work]);
       expect(sync.code, `sync ${pass}: ${sync.out}\n${sync.err}`).toBe(0);
-      expect(kitVersion()).toBe("0.6.2");
+      expect(kitVersion()).toBe("0.6.3");
       const skill = JSON.parse(s.ok([s.forge, "instance", "show", "skill", "apply", "--json"]));
       expect(skill.source).toBe("core");
       expect(skill.value.description).toBe(coreSkill.description);

@@ -1,0 +1,169 @@
+import { auditSecretKey, redactAuditText } from "../shared/redact";
+import type { AdapterExecution, CapturedStream } from "./adapter-process";
+
+export function sensitiveRuntimeKey(key: string): boolean {
+  const compact = key.replace(/[-_. \t]/g, "");
+  return auditSecretKey.test(compact) || /(?:email|phone|mobile|telephone|passphrase|authheader|mysqlpwd|rediscliauth)/i.test(compact);
+}
+
+function visibleText(text: string): string {
+  return text
+    .replace(/(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c|$)/g, "")
+    .replace(/(?:\x1b[P^_X]|[\x90\x98\x9e\x9f])[^\x1b\x9c]*(?:\x1b\\|\x9c|$)/g, "")
+    .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[ -/]*[@-Z\\-~]/g, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, "");
+}
+
+export function runtimeSecrets(params: ReadonlyMap<string, string>): string[] {
+  return [...new Set([...params].filter(([key, value]) => sensitiveRuntimeKey(key) && value)
+    .flatMap(([, value]) => [value, visibleText(value), ...value.split("\n"), ...visibleText(value).split("\n")]))]
+    .filter(Boolean).sort((a, b) => b.length - a.length);
+}
+
+function redactTextFields(text: string): string {
+  const fields = /(^|[^\w.-])(["']?)([\w.-]+(?:[ \t]+(?:key|token|number|secret|header))?)\2[ \t]*[:=][ \t]*/gim;
+  let start = 0;
+  let output = "";
+  for (let field = fields.exec(text); field; field = fields.exec(text)) {
+    const [, , , key] = field;
+    if (!sensitiveRuntimeKey(key)) continue;
+    const valueStart = fields.lastIndex;
+    const endOfLine = text.indexOf("\n", valueStart);
+    const end = endOfLine === -1 ? text.length : endOfLine;
+    const value = text.slice(valueStart, end).trim();
+    output += text.slice(start, valueStart) + "***";
+    // An unclosed value or block can extend past this record. Its safe boundary is unknown.
+    if (!value || /^[|>{\[]/.test(value) || /\\$/.test(value) ||
+        value.startsWith('"') && !/^"(?:\\.|[^"\\])*"/.test(value) ||
+        value.startsWith("'") && !/^'[^']*'/.test(value)) return output;
+    start = end;
+    while (/^[ \t]/.test(text[start + 1] ?? "")) {
+      const next = text.indexOf("\n", start + 1);
+      if (next < 0) return output;
+      start = next;
+    }
+    fields.lastIndex = start;
+  }
+  return output + text.slice(start);
+}
+
+export function safeRuntimeText(raw: string, secrets: readonly string[] = []): string {
+  let text = raw;
+  for (const secret of secrets) text = text.replaceAll(secret, "***");
+  text = visibleText(text);
+  for (const secret of secrets) text = text.replaceAll(secret, "***");
+  return redactAuditText(redactTextFields(text));
+}
+
+export function safeRuntimeValue(value: unknown, secrets: readonly string[] = [], depth = 0): unknown {
+  if (depth >= 64) return "[omitted]";
+  if (typeof value === "string") return safeRuntimeText(value, secrets);
+  if (Array.isArray(value)) return value.map(item => safeRuntimeValue(item, secrets, depth + 1));
+  if (value !== null && typeof value === "object") {
+    const projected = new Map<string, unknown>();
+    for (const [key, item] of Object.entries(value)) {
+      const visibleKey = visibleText(key);
+      const safeKey = safeRuntimeText(visibleKey, secrets);
+      if (projected.has(safeKey)) continue;
+      projected.set(safeKey, sensitiveRuntimeKey(visibleKey) ? "***" : safeRuntimeValue(item, secrets, depth + 1));
+    }
+    return Object.fromEntries(projected);
+  }
+  if (secrets.includes(String(value))) return "***";
+  return value;
+}
+
+type Projection = { data?: unknown; text?: string; omitted: boolean; gitSha?: string };
+
+function reportedGitSha(data: unknown): string | undefined {
+  if (data === null || typeof data !== "object" || !Object.hasOwn(data, "git_sha")) return;
+  const sha = (data as Record<string, unknown>).git_sha;
+  if (typeof sha === "string" && (sha.length === 40 || sha.length === 64) && /^[a-fA-F0-9]+$/.test(sha)) return sha;
+}
+
+function looksStructured(text: string): boolean {
+  const trimmed = text.trimStart();
+  return trimmed.startsWith("{") || trimmed.startsWith('"') || trimmed.startsWith("[") &&
+    !/^\[(?:TRACE|DEBUG|INFO|NOTICE|WARN(?:ING)?|ERROR|CRITICAL|FATAL)\](?:\s|$)/i.test(trimmed);
+}
+
+function decodeRecords(bytes: Buffer, decoder: TextDecoder): string {
+  const records = [];
+  let start = 0;
+  for (let newline = bytes.indexOf(10); newline >= 0; newline = bytes.indexOf(10, start)) {
+    try { records.push(decoder.decode(bytes.subarray(start, newline + 1))); }
+    catch { break; }
+    start = newline + 1;
+  }
+  return records.join("");
+}
+
+function projectStream(stream: CapturedStream, secrets: readonly string[]): Projection {
+  const { bytes } = stream;
+  if (bytes.length === 0) return { omitted: false };
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let incomplete = stream.incomplete;
+  let text: string;
+  const prefix = incomplete ? bytes.subarray(0, bytes.lastIndexOf(10) + 1) : bytes;
+  try { text = decoder.decode(prefix); }
+  catch {
+    text = decodeRecords(prefix, decoder);
+    incomplete = true;
+  }
+  if (!incomplete) {
+    try {
+      const data: unknown = JSON.parse(text);
+      return { data: safeRuntimeValue(data, secrets), omitted: false, gitSha: reportedGitSha(data) };
+    } catch { /* Only structurally independent text can fall back to text output. */ }
+  }
+  text = visibleText(text);
+  if (looksStructured(text)) return { omitted: true };
+  // Prevent an embedded damaged JSON block from falling through as naked text.
+  const lines = text.split("\n");
+  const block = lines.findIndex(line => looksStructured(line) || /\{\s*["'][^"'\n]+["']\s*:/.test(line));
+  return { text: safeRuntimeText((block < 0 ? lines : lines.slice(0, block)).join("\n"), secrets),
+    omitted: block >= 0 || incomplete };
+}
+
+export function safeAdapterOutput(execution: AdapterExecution, limits: { max_bytes: number; max_lines: number },
+  secrets: readonly string[]) {
+  const stdout = projectStream(execution.stdout, secrets);
+  const stderr = projectStream(execution.stderr, secrets);
+  let bytes = limits.max_bytes;
+  let lines = limits.max_lines;
+  let truncated = stdout.omitted || stderr.omitted || execution.stdout.clipped || execution.stderr.clipped;
+
+  function reserve(text: string, lineCount: number) {
+    const size = Buffer.byteLength(text);
+    if (size > bytes || lineCount > lines) {
+      truncated = true;
+      return false;
+    }
+    bytes -= size;
+    lines -= lineCount;
+    return true;
+  }
+
+  function boundedText(text: string): string {
+    const records = text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+    const kept = [];
+    for (const record of records) {
+      if (!reserve(JSON.stringify(record).slice(1, -1), 1)) break;
+      kept.push(record);
+    }
+    return kept.join("").trimEnd();
+  }
+
+  let data: unknown = null;
+  if (stdout.data !== undefined) {
+    if (reserve(JSON.stringify(stdout.data), 1)) data = stdout.data;
+  }
+  const output = stdout.text === undefined ? null : boundedText(stdout.text) || null;
+  let warning;
+  if (stderr.data !== undefined) {
+    const json = JSON.stringify(stderr.data);
+    if (reserve(JSON.stringify(json).slice(1, -1), 1)) warning = json;
+  } else if (stderr.text !== undefined) warning = boundedText(stderr.text) || undefined;
+  return { data, output, warning, truncated, gitSha: reportedGitSha(data) === stdout.gitSha ? stdout.gitSha : undefined };
+}

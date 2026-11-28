@@ -674,3 +674,62 @@ test("A10 shallow and unreadable local history declare uncertainty then recover"
   expect(selected("history", "--days", "7").history)
     .toMatchObject({ available: true, commits_in_window: gitWindow("history", 7), has_older_commits: true });
 }, 30_000);
+
+test("A01 v0.6.3 aggregates RPC subdomains before spending the signal budget", () => {
+  const name = "rpc-subdomains";
+  repo(name);
+  const fileNames = Array.from({ length: 34 }, (_, index) => "api/proto/accounts/consumer-" + index + ".proto");
+  commit(name, "Several files for one RPC subdomain", copies(source, [
+    ...fileNames, "api/proto/pay/pay.proto", "api/proto/user/user.proto",
+  ]), 1);
+  const grouped = selected(name);
+  const rpc = grouped.entry_signals.filter(entry => /rpc/.test(entry.kind));
+  expect(rpc.length).toBeLessThan(24);
+  for (const domain of ["accounts", "pay", "user"])
+    expect(rpc.filter(entry => entry.path.split("/").includes(domain))).toHaveLength(1);
+  expect(grouped.warnings.join("\n")).not.toMatch(/entry[^\n]*(?:limit|truncat)/i);
+
+  commit(name, "Genuine extra RPC subdomains", copies(source, Array.from({ length: 30 }, (_, index) =>
+    "api/proto/area-" + String(index).padStart(2, "0") + "/service.proto")), 0);
+  const oversized = selected(name);
+  expect(oversized.entry_signals).toHaveLength(24);
+  expect(oversized.warnings.join("\n")).toMatch(/entry[^\n]*(?:limit|truncat)|入口[^\n]*截断/i);
+}, 30_000);
+
+test("A02 v0.6.3 excludes page models and generated sources while retaining ORM and business files", () => {
+  const name = "real-models";
+  repo(name);
+  const front = ["frontend/app/users/models/item.ts", "frontend/pages/orders/models/item.ts", "frontend/routes/cart/models/item.ts"];
+  const generated = [
+    "src/proto/payment.pb.validate.go", "src/proto/search.pb.http.go", "src/code/type.gen.mts",
+    "src/db/user_gen.go", "src/proto/payment.pb.go",
+  ];
+  const business = ["src/models/entity.go", "src/service/payment.go", "src/worker/refresh.go"];
+  commit(name, "Initial page, generated and business files", copies(source, [...front, ...generated, ...business]), 4);
+  for (const age of [3, 2, 1]) commit(name, "Repeated generation " + age, copies(source + "\n".repeat(age), generated), age);
+  const result = selected(name);
+  expectSignal(result.persistence_signals, "src/models/entity.go", /orm|model/);
+  for (const directory of ["frontend/app", "frontend/pages", "frontend/routes"])
+    expect(result.persistence_signals.some(entry => entry.path.startsWith(directory))).toBe(false);
+  const sampled = paths(result.style_samples);
+  for (const path of business) expect(sampled).toContain(path);
+  for (const path of generated) expect(sampled).not.toContain(path);
+}, 30_000);
+
+test("A03 v0.6.3 only lists repository-controlled .githooks directories", () => {
+  const names = ["hook-dir", "hook-file", "hook-outside"];
+  for (const name of names) repo(name);
+  commit("hook-dir", "Supported hook paths", copies(source, [".githooks/pre-commit", ".husky/pre-commit", "scripts/hooks/pre-push", "lefthook.yml"]), 1);
+  commit("hook-file", "A regular .githooks file", { ".githooks": source }, 1);
+  const external = join(s.root, "external-hook-dir");
+  mkdirSync(external);
+  s.privateFile("../external-hook-dir/pre-commit", source);
+  symlinkSync(external, join(s.work, "hook-outside", ".githooks"));
+  const scanHooks = (name: string) => selected(name).git_flow.hook_paths;
+  for (const path of [".githooks", ".husky", "scripts/hooks", "lefthook.yml"])
+    expect(scanHooks("hook-dir")).toContain(path);
+  for (const name of ["hook-file", "hook-outside"]) expect(scanHooks(name)).not.toContain(".githooks");
+  rmSync(join(s.work, "hook-file", ".githooks"));
+  write("hook-file", { ".githooks/pre-commit": source });
+  expect(scanHooks("hook-file")).toContain(".githooks");
+}, 30_000);

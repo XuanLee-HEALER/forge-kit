@@ -81,6 +81,22 @@ export function checkoutEnvironment(source = process.env) {
   return env;
 }
 
+export function offlineGitInvocation(dir: string, args: string[]) {
+  const env = checkoutEnvironment();
+  for (const key of Object.keys(env)) {
+    if (/^GIT_(?:CONFIG(?:_|$)|TRACE|REDIRECT_|TEST_)/.test(key) ||
+        ["GIT_EXTERNAL_DIFF", "GIT_ALLOW_PROTOCOL"].includes(key)) delete env[key];
+  }
+  Object.assign(env, {
+    GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_TERMINAL_PROMPT: "0", GIT_ALLOW_PROTOCOL: "", GIT_ATTR_NOSYSTEM: "1", LC_ALL: "C",
+  });
+  const argv: [string, ...string[]] = ["git", "-C", dir, "--no-pager", "--literal-pathspecs",
+    "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never", ...args];
+  return { argv, env };
+}
+
 export function runGit(
   dir: string,
   args: string[],

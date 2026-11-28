@@ -47,9 +47,9 @@ test("current distribution removes stale JS bundles and retired protocol configu
     }
     symlinkSync(join(kit, "node_modules"), join(temp, "node_modules"));
     const manifest = JSON.parse(readFileSync(join(temp, "package.json"), "utf8"));
-    expect(manifest.version).toBe("0.6.2");
+    expect(manifest.version).toBe("0.6.3");
     expect(JSON.stringify(manifest)).not.toContain("review-agents");
-    expect(readFileSync(join(kit, "kit.toml"), "utf8")).toMatch(/^version = "0\.6\.2"$/m);
+    expect(readFileSync(join(kit, "kit.toml"), "utf8")).toMatch(/^version = "0\.6\.3"$/m);
     mkdirSync(join(temp, "dist"));
     writeFileSync(join(temp, "dist/stale.js"), "stale");
     const result = Bun.spawnSync([process.execPath, "run", "build"], { cwd: temp });

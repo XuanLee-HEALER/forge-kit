@@ -9,7 +9,7 @@ description: 收到 QA 缺陷、生产缺陷或报警时，先在对应环境只
 
 按目标仓和拟改路径运行 `forge apply check --repo <repo> --path <path> --json`：UNCHANGED 可直接读卡了解已提交版本，涉及未提交改动时核对工作树差异，CHANGED 或 BROKEN 交给 apply 复核，UNMAPPED 的长期关注域或复杂陌生域用 focus 快绘，一次性小修可跳过建卡。工程约定记录一次；仅在核心实体、入口、边界变化或发现未记录禁区时回写实例卡并更新已核验 SHA。
 
-1. 用 `forge instance list --json` 查找该环境的只读诊断阶段，核对来源后以 `forge instance run <stage-id>` 收集可复核事实。缺入口或权限时报告环境、缺失事实及需要的只读能力。避免跨环境推断或取得写凭据。
+1. 优先用 `forge rt list --json` 核对可用原语和只读保障并在该环境取证，或用 `forge instance list --json` 查找实例只读诊断阶段、核对来源后运行 `forge instance run <stage-id>`。缺入口或权限时报告环境、缺失事实及需要的只读能力。避免跨环境推断或取得写凭据。
 2. 重建触发路径，界定影响、既有承诺和可恢复性。若需改变用户权益或业务承诺，交给 grill 裁决后按 feature 的完整流程推进。
 3. 对既有承诺内的缺陷，核对任务和冻结范围。定位技术方案、用例或实现中的具体违反项。存在已冻结产物的实质变化时，经人工确认后执行 `forge ledger amend`，回写遗漏的不变量与回归场景，按影响重冻。新增正式修复任务按 feature 的完整或轻量条件建账。
 4. 独立编写复现及修复后的契约检查，按范围修正实现。派发原生评审角色前查 `forge ledger reviews <task-id>`，用 review 复核受影响角色，再用 verify 运行适用环境的回归与集成验证。按 ship 完成授权交付。
