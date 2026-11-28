@@ -4,6 +4,10 @@ import { ledgerDbPath, type EventRecord, type LedgerReader, type TaskRecord, typ
 import { auditSecretKey, redactAuditArguments, redactAuditText } from "../shared/redact";
 import { auditChild, auditDirectory, auditFile, auditStat, requireAuditTask, tempPrefix, writePrivateFile } from "./files-path";
 
+import { tokenFields } from "./usage";
+
+const usageCounters: ReadonlySet<string> = new Set(tokenFields);
+
 export type ArchiveLedger = LedgerReader & { readonly dbPath?: string };
 
 function safePayload(raw: string): string {
@@ -28,8 +32,8 @@ function safePayload(raw: string): string {
         const safe = redactAuditText(name);
         let key = safe;
         for (let n = 2; Object.hasOwn(result, key); n++) key = safe + " #" + n;
-        const count = typeof entry === "number" && /(?:^|_)tokens?(?:_count)?$/i.test(name);
-        const secret = auditSecretKey.test(name) && !count && typeof entry !== "boolean";
+        const count = typeof entry === "number" && usageCounters.has(name);
+        const secret = auditSecretKey.test(name) && !count;
         changed ||= key !== name || secret;
         result[key] = secret ? "***" : clean(entry);
       }

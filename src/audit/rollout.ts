@@ -404,14 +404,14 @@ export function readRollouts(anchors: string[], roles: Record<string, string>, i
       session_id, role, model: display(usage.model), effort: display(usage.effort),
       started_at: time.started_at, ended_at: time.ended_at, tool_calls: projected.tool_calls, usage: usage.usage,
     });
-    increments.push(...usage.increments.map(increment => {
+    for (const increment of usage.increments) {
       const model = increment.model;
-      return { ...increment, session_id,
-        model: model && redactAuditText(model) === model ? model : null };
-    }));
-    intervals.push(...time.intervals);
+      increments.push({ ...increment, session_id,
+        model: model && redactAuditText(model) === model ? model : null });
+    }
+    for (const interval of time.intervals) intervals.push(interval);
     session_intervals[session_id] = time.intervals;
-    trace.push(...projected.trace);
+    for (const entry of projected.trace) trace.push(entry);
   }
   if (includeTrace)
     trace.sort((a, b) => (a.ts ?? "\uffff").localeCompare(b.ts ?? "\uffff") || a.session_id.localeCompare(b.session_id));

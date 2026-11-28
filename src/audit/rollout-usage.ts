@@ -265,6 +265,9 @@ export function rolloutUsage(
   }
 
   const increments: RolloutIncrement[] = [];
+  function append(entries: RolloutIncrement[]) {
+    for (const entry of entries) increments.push(entry);
+  }
   let baseline: Sample | undefined;
   let pending: RolloutIncrement[] = [];
   for (const sample of samples) {
@@ -284,14 +287,15 @@ export function rolloutUsage(
         // An unchanged cumulative snapshot can repeat the previous last record.
         if (positiveUsage(budget) || pending.length) {
           if (request && from && (!request.from_ts || request.from_ts < from)) request.from_ts = from;
-          increments.push(...reconcileSpan(budget, candidates, span, note));
+          append(reconcileSpan(budget, candidates, span, note));
         } else if (!request) {
           increments.push(span);
         }
       } else if (request && comparable(sample.total, request.usage)) {
-        increments.push(...pending, { ...request, usage: withMissing(sample.total, request.usage) });
+        append(pending);
+        increments.push({ ...request, usage: withMissing(sample.total, request.usage) });
       } else {
-        increments.push(...candidates);
+        append(candidates);
         note("Cumulative token counter reset without recoverable baseline");
       }
     } else {
@@ -299,17 +303,17 @@ export function rolloutUsage(
       const exactlyCovered = coreFields.every(key => sample.total![key] !== null && sample.total![key] === observed[key]);
       if (exactlyCovered || (!candidates.length && sample.fresh)) {
         const span = { ...common, from_ts: sample.turnStart, usage: sample.total };
-        increments.push(...reconcileSpan(sample.total, candidates, span, note));
+        append(reconcileSpan(sample.total, candidates, span, note));
       } else {
         // A last record remains usable even if an initial cumulative baseline is missing.
-        increments.push(...(pending.length ? pending : candidates));
+        append(pending.length ? pending : candidates);
         note("Missing cumulative token baseline");
       }
     }
     baseline = sample;
     pending = [];
   }
-  increments.push(...pending);
+  append(pending);
   for (const increment of increments)
     if (!increment.model && positiveUsage(increment.usage)) note("Actual model is missing for usage");
   if (!increments.length) note("Token usage is missing");
