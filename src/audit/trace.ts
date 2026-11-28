@@ -1,4 +1,6 @@
-import { redactArguments, redactAuditText } from "../shared/redact";
+import { extractGitSubcommand } from "../shared/git-cmd";
+import { redactAuditArguments, redactAuditText } from "../shared/redact";
+import { tokenizeSimpleShellCommand } from "../shared/shell-tokens";
 import { object, string, turnId, type RolloutRecord } from "./rollout-record";
 
 export type TraceEntry = {
@@ -37,9 +39,7 @@ function removeToolBodies(text: string) {
 }
 
 const sensitiveKey = /(?:secret|token|password|passwd|api[-_]?key|authorization|credential|access[-_]?key|private[-_]?key)/i;
-const auditArgument = /^--(?:access[-_]key(?:[-_]id)?|private[-_]key|credentials?|authorization|bearer[-_]token)$/i;
 const bodyKey = /^(?:file_?contents?|content|text|body|instructions|output|stdout|stderr|diff|patch)$/i;
-const fileReader = /(?:^|[.\/\s"';|&(])(?:cat|bat|head|tail|sed|awk|rg|grep|read_file|view_file|view_image|readFile(?:Sync)?|apply_patch)(?=$|[.\/\s"';|&(])/;
 
 function toolParameters(value: unknown, key = "", depth = 0): unknown {
   if (sensitiveKey.test(key)) return "***";
@@ -53,9 +53,7 @@ function toolParameters(value: unknown, key = "", depth = 0): unknown {
     return redactAuditText(removeToolBodies(value));
   }
   if (Array.isArray(value)) {
-    const entries = value.every(entry => typeof entry === "string")
-      ? redactArguments(value).map((entry, index) => index > 0 && auditArgument.test(value[index - 1]) ? "***" : entry)
-      : value;
+    const entries = value.every(entry => typeof entry === "string") ? redactAuditArguments(value) : value;
     return entries.map(entry => toolParameters(entry, key, depth + 1));
   }
   if (value !== null && typeof value === "object") {
@@ -77,27 +75,45 @@ function utf8Limit(text: string, limit = 2048) {
   return text.slice(0, end) + suffix;
 }
 
-function summarizeOutput(name: string, parameters: unknown, output: unknown) {
+type Call = { name: string; namespace: string | null; parameters: unknown };
+
+const shellTools = new Set([
+  "exec", "exec_command", "shell_command", "run_command", "functions.exec", "functions.exec_command",
+]);
+const shellNamespaces = new Set(["functions", "shell", "terminal"]);
+const summaryCommands = new Set(["echo", "false", "ls", "printf", "pwd", "stat", "true", "wc"]);
+const summaryGitCommands = new Set(["ls-files", "rev-parse", "status"]);
+const summaryTools = new Set(["calculate", "calculator", "get_weather", "weather"]);
+
+function allowsExcerpt({ name, namespace, parameters }: Call) {
+  if (summaryTools.has(name)) return true;
+  if (!shellTools.has(name) || (namespace && !shellNamespaces.has(namespace))) return false;
+  const args = object(parameters);
+  const command = args.cmd ?? args.command ?? args.argv ?? parameters;
+  const argv = typeof command === "string" ? tokenizeSimpleShellCommand(command) :
+    Array.isArray(command) && command.every(value => typeof value === "string") ? command : null;
+  const program = argv?.[0]?.split("/").at(-1);
+  if (!argv || !program) return false;
+  if (program === "git") return summaryGitCommands.has(extractGitSubcommand(argv)?.subcmd ?? "");
+  return summaryCommands.has(program);
+}
+
+function summarizeOutput(call: Call, output: unknown) {
   const data = object(output);
-  const text = content(output) ?? content(data.content) ?? content(data.output) ?? content(data.stdout);
+  const text = content(output) ?? content(data.content) ?? content(data.output) ?? content(data.stdout) ?? content(data.summary);
   const exit = data.exit_code ?? data.exitCode;
   const status = data.status;
   const metadata = [
     typeof exit === "number" && Number.isSafeInteger(exit) ? "Exit code " + exit : "",
     typeof status === "string" && /^(?:ok|success|failed|completed|timeout|error|pass)$/i.test(status) ? status : "",
   ].filter(Boolean);
-  const input = JSON.stringify(parameters) ?? "";
-  const restricted = fileReader.test(name) || fileReader.test(input) ||
-    /file content omitted|\bgit\s+(?:cat-file\b|show\s+[^\s"]+:)/.test(input) ||
-    (!!text && /^diff --git |^\*\*\* Begin Patch|^\s*\d+\s*\|/m.test(text));
   if (text) {
     const observed = text.match(/(?:Process exited with (?:code|status)|Exit code:)\s*(-?\d+)/i)?.[1];
     if (observed !== undefined && !metadata.some(entry => entry.startsWith("Exit code"))) metadata.push("Exit code " + observed);
-    if (restricted) metadata.push("File content omitted");
-    else {
+    if (allowsExcerpt(call) && !/^diff --git |^\*\*\* Begin Patch|^\s*\d+\s*\|/m.test(text)) {
       const excerpt = removeToolBodies(text);
       if (excerpt.trim()) metadata.push(excerpt);
-    }
+    } else metadata.push("Output body omitted");
   } else if (output !== undefined && output !== null) {
     metadata.push("Structured output");
   }
@@ -113,11 +129,27 @@ type Message = {
   mirror: boolean;
 };
 
-export function createTrace(records: RolloutRecord[], session: string, role: string) {
+function toolKind({ type, payload }: RolloutRecord) {
+  return type === "response_item" ? string(payload.type) : type;
+}
+
+function toolCallId({ payload }: RolloutRecord, index: number) {
+  return string(payload.call_id) ?? string(payload.id) ?? String(index);
+}
+
+export function createTrace(records: RolloutRecord[], session: string, role: string, includeTrace = true) {
+  if (!includeTrace) {
+    const ids = new Set<string>();
+    for (const [index, record] of records.entries()) {
+      const type = toolKind(record);
+      if (type === "function_call" || type === "custom_tool_call") ids.add(toolCallId(record, index));
+    }
+    return { tool_calls: ids.size, trace: [] };
+  }
   const session_id = redactAuditText(session);
   const entries = new Map<number, TraceEntry>();
   const messages = new Map<number, Message>();
-  const calls = new Map<string, { name: string; parameters: unknown }>();
+  const calls = new Map<string, Call>();
   const outputs: { index: number; ts: string | null; id: string; value: unknown }[] = [];
   const outputIds = new Set<string>();
   let latestTurn: string | null = null;
@@ -153,15 +185,13 @@ export function createTrace(records: RolloutRecord[], session: string, role: str
         messages.set(index, { ts, role: item.type === "UserMessage" ? "user" : "assistant",
           id: string(item.id), turn, text, mirror: true });
     }
-    if (type !== "response_item" && !["function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output"].includes(type))
-      continue;
-    const toolType = type === "response_item" ? kind : type;
+    const toolType = toolKind(record);
     if (toolType === "function_call" || toolType === "custom_tool_call") {
-      const callId = string(payload.call_id) ?? id ?? String(index);
+      const callId = toolCallId(record, index);
       if (calls.has(callId)) continue;
       const name = string(payload.name) ?? "unknown";
       const parameters = toolParameters(payload.arguments ?? payload.input);
-      calls.set(callId, { name, parameters });
+      calls.set(callId, { name, namespace: string(payload.namespace), parameters });
       entries.set(index, { ts, session_id, role, kind: "tool_call", tool: redactAuditText(name),
         call_id: redactAuditText(callId), parameters });
     }
@@ -194,7 +224,7 @@ export function createTrace(records: RolloutRecord[], session: string, role: str
     entries.set(output.index, { ts: output.ts, session_id, role, kind: "tool_output", tool: redactAuditText(name),
       ...(output.id ? { call_id: redactAuditText(output.id) } : {}),
       output_summary: call && name !== "unknown"
-        ? summarizeOutput(name, call.parameters, output.value) : "Unmatched tool output" });
+        ? summarizeOutput(call, output.value) : "Unmatched tool output" });
   }
   return { tool_calls: calls.size, trace: [...entries.entries()].sort(([a], [b]) => a - b).map(([, entry]) => entry) };
 }

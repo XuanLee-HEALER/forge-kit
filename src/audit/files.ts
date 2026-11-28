@@ -11,6 +11,7 @@ import {
   requireAuditTask, tempPrefix, validAuditTask, writePrivateFile,
 } from "./files-path";
 import { auditOwner, findStagedAudit, listStagedAudits, restoreOwnedAudit } from "./files-staging";
+import { captureEvidence } from "./summary-evidence";
 import { buildAudit, summaryMarkdown } from "./summary";
 
 interface AuditOptions {
@@ -46,19 +47,12 @@ function publishAudit(ledger: LedgerReader, task: string, root: string, draft: s
 
 function writeAudit(ledger: ArchiveLedger, taskId: string, options: AuditOptions, legacy: boolean) {
   requireAuditTask(taskId);
-  if (ledger.db.inTransaction) throw Error("Audit publication requires a committed ledger state. Retry with forge ledger archive.");
-  const snapshot = ledger.db.transaction(() => {
-    const task = ledger.getTask(taskId);
-    if (!task || task.task_id !== taskId) throw Error("Task not found");
-    return {
-      task,
-      oldMarkdown: legacy ? legacyArchiveText(task, ledger.getTaskRepos(taskId), ledger.getTaskEvents(taskId)) : null,
-    };
-  })();
+  if (ledger.db.inTransaction) throw Error("Audit publication requires a committed ledger state. Retry with forge ledger archive <task_id>.");
+  const snapshot = captureEvidence(ledger, taskId, options.session);
   let draft: string | undefined;
   let legacyDraft: ReturnType<typeof prepareLegacyArchive> | undefined;
   try {
-    const { summary, trace } = buildAudit(ledger, taskId, options.session);
+    const { summary, trace } = buildAudit(snapshot, !options.noTrace);
     const root = auditRoot(ledger.workbenchRoot, true);
     if (!root) throw Error("Audit directory is unavailable");
     withImmediateTx(ledger.db, () => {
@@ -73,9 +67,10 @@ function writeAudit(ledger: ArchiveLedger, taskId: string, options: AuditOptions
       const lines = trace.map((record: unknown) => JSON.stringify(record));
       writePrivateFile(join(draft, "trace.jsonl"), lines.length ? lines.join("\n") + "\n" : "");
     }
-    if (snapshot.oldMarkdown !== null) {
+    if (legacy) {
       legacyDraft = prepareLegacyArchive(
-        ledger, taskId, snapshot.task.closed_at ?? snapshot.task.updated_at, snapshot.oldMarkdown,
+        ledger, taskId, snapshot.task.closed_at ?? snapshot.task.updated_at,
+        legacyArchiveText(snapshot.task, snapshot.repos, snapshot.events),
       );
     }
     const pending = withImmediateTx(ledger.db, () => {
@@ -90,7 +85,7 @@ function writeAudit(ledger: ArchiveLedger, taskId: string, options: AuditOptions
   } catch (error) {
     const reason = error instanceof Error && error.message === "task changed during archive"
       ? "task changed during archive" : "archive files could not be prepared or published safely";
-    throw Error(`Audit archive failed for ${redactAuditText(taskId)} (${reason}). Retry with forge ledger archive.`);
+    throw Error(`Audit archive failed for ${redactAuditText(taskId)} (${reason}). Check the archive destination, then retry forge ledger archive ${redactAuditText(taskId)} with the original options.`);
   } finally {
     // Each failed publication leaves the previous batch in its destination or the marked backup.
     try {
@@ -118,7 +113,7 @@ export function autoAudit(ledger: ArchiveLedger, taskId: string, options: { lega
     return result.archivePath;
   } catch {
     const state = ledger.getTask(taskId)?.status ?? "unavailable";
-    console.error(`Audit archive failed for ${redactAuditText(taskId)} after task status ${state}. Retry with forge ledger archive.`);
+    console.error(`Audit archive failed for ${redactAuditText(taskId)} after task status ${state}. Check the archive destination, then retry forge ledger archive ${redactAuditText(taskId)}.`);
     return null;
   }
 }

@@ -90,7 +90,7 @@ export function stageClassifier(
   }
   return (ts: unknown, fromTs: unknown): Stage => {
     const end = time(ts);
-    const start = fromTs == null ? end : time(fromTs);
+    const start = time(fromTs);
     if (!Number.isFinite(start) || !Number.isFinite(end) || start > end) return "unclassified";
     const overlapping = merged.filter(window => start === end
       ? window.start <= start && window.end >= end

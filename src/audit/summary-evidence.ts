@@ -114,7 +114,7 @@ export function captureEvidence(ledger: LedgerReader, taskId: string, explicitSe
     }
     rework.review_rounds = missingRound ? null : rounds.size;
     if (missingRound) warnings.push("Some recorded reviews lack a candidate range.");
-    return { task, events, approvalRows, anchors: [...anchors].sort(), roles, reviews, receipts, rework, warnings };
+    return { task, repos: ledger.getTaskRepos(taskId), events, approvalRows, anchors: [...anchors].sort(), roles, reviews, receipts, rework, warnings };
   }).deferred();
 }
 

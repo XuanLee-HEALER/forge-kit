@@ -1,7 +1,6 @@
-import type { LedgerReader } from "../ledger/types";
 import { redactAuditText } from "../shared/redact";
 import { readRollouts } from "./rollout";
-import { captureEvidence, time } from "./summary-evidence";
+import { time, type Evidence } from "./summary-evidence";
 import { stageClassifier } from "./summary-stages";
 import { roles, stages, sumUsage, tokenFields, usageBuckets, type Usage } from "./usage";
 
@@ -16,11 +15,10 @@ function activeDuration(intervals: [number, number][]) {
   return valid.length ? duration : null;
 }
 
-export function buildAudit(ledger: LedgerReader, taskId: string, session?: string) {
+export function buildAudit(evidence: Evidence, includeTrace: boolean) {
   const captured = Date.now();
-  const evidence = captureEvidence(ledger, taskId, session);
   const { task } = evidence;
-  const rollout = readRollouts(evidence.anchors, evidence.roles);
+  const rollout = readRollouts(evidence.anchors, evidence.roles, includeTrace);
   const classify = stageClassifier(evidence, rollout.sessions, rollout.session_intervals, captured);
   const increments = rollout.increments;
   const values = increments.map(increment => increment.usage);

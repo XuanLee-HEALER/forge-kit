@@ -136,6 +136,7 @@ export function rolloutUsage(
       if (turn) {
         latestTurn = turn;
         if (ts && !turnStarts.has(turn)) turnStarts.set(turn, ts);
+        if (!contexts.has(turn)) contexts.set(turn, context);
       }
     }
     const native = type === "token_usage_record" || (type === "event_msg" && kind === "token_usage_record");
@@ -148,7 +149,7 @@ export function rolloutUsage(
       : info.last_token_usage ?? payload.last_token_usage, note);
     if (!total && !last) continue;
     const sampleTurn = turn ?? latestTurn;
-    const model = string(payload.model) ?? (sampleTurn && contexts.get(sampleTurn)?.model) ?? context.model;
+    const model = string(payload.model) ?? (sampleTurn ? contexts.get(sampleTurn)?.model ?? null : context.model);
     const effort = string(payload.effort);
     if (model) models.add(model);
     if (effort) efforts.add(effort);
@@ -185,7 +186,7 @@ export function rolloutUsage(
 
   const increments: RolloutIncrement[] = [];
   let baseline: Sample | undefined;
-  let pending: RolloutUsage[] = [];
+  let pending: RolloutIncrement[] = [];
   for (const sample of samples) {
     let usage = sample.last;
     let from = sample.turnStart;
@@ -197,10 +198,25 @@ export function rolloutUsage(
           if (sample.last && comparable(sample.total, sample.last)) usage = withMissing(sample.total, sample.last);
           else note("Cumulative token counter reset without recoverable baseline");
         } else if (pending.length) {
-          // Last-only events already account for part of this cumulative span.
-          // Accept only the distinct final request and disclose any remaining difference.
-          if (!comparable(diff, sumUsage([...pending, ...(sample.last ? [sample.last] : [])])))
+          const covered = sumUsage(pending.map(item => item.usage));
+          const remaining = difference(diff, covered);
+          if (!remaining) {
+            // The native span supersedes contradictory last-only records.
+            increments.splice(increments.length - pending.length);
+            usage = diff;
+            model = null;
+            from = baseline.ts ?? undefined;
+            note("Cumulative usage conflicts with last-only records");
+          } else if (comparable(diff, covered)) {
+            usage = null;
+          } else if (comparable(remaining, sample.last)) {
+            usage = withMissing(remaining, sample.last);
+          } else {
+            usage = remaining;
+            model = null;
+            from = baseline.ts ?? undefined;
             note("Cumulative usage overlaps last-only records");
+          }
         } else {
           const sameRequest = comparable(diff, sample.last);
           usage = sameRequest ? withMissing(diff, sample.last) : diff;
@@ -213,19 +229,26 @@ export function rolloutUsage(
             note("Usage spans models without request breakdown");
           }
         }
-      } else if (!pending.length && sample.fresh && (!sample.last || comparable(sample.total, sample.last))) {
-        usage = withMissing(sample.total, sample.last);
-      } else if (!pending.length || !comparable(sample.total, sumUsage([...pending, ...(sample.last ? [sample.last] : [])]))) {
-        note("Missing cumulative token baseline");
+      } else {
+        const covered = sumUsage(pending.map(item => item.usage));
+        if (pending.length && comparable(sample.total, covered)) usage = null;
+        else if (!pending.length && sample.fresh && (!sample.last || comparable(sample.total, sample.last)))
+          usage = withMissing(sample.total, sample.last);
+        else if (!pending.length || !sample.last ||
+            !comparable(sample.total, sumUsage([covered, sample.last]))) {
+          // Without a baseline, the last batch could mirror an already counted record.
+          if (pending.length) usage = null;
+          note("Missing cumulative token baseline");
+        }
       }
       baseline = sample;
       pending = [];
-    } else if (sample.last) {
-      pending.push(sample.last);
     }
     if (usage && tokenFields.some(key => usage[key] !== null)) {
       if (!model && tokenFields.some(key => (usage[key] ?? 0) > 0)) note("Actual model is missing for usage");
-      increments.push({ session_id, role, model, ts: sample.ts, ...(from ? { from_ts: from } : {}), usage });
+      const increment = { session_id, role, model, ts: sample.ts, ...(from ? { from_ts: from } : {}), usage };
+      increments.push(increment);
+      if (!sample.total) pending.push(increment);
     }
   }
   if (!increments.length) note("Token usage is missing");

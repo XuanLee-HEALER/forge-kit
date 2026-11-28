@@ -62,6 +62,7 @@ Commands:
   verify    [--task <id>] [--json]
   close     <task_id> [--session-id <id>] [--summary <text>] [--no-archive] [--force-incomplete --reason <text>]
   archive   <task_id> [--session <id>] [--no-trace]
+              --no-trace replaces the archive with summaries only and removes its existing trace.
   cost      [<task_id>] [--days N] [--json]
   cancel    <task_id> --reason <text>
   prune     --before <days> [--apply] | --runs-only [--apply] | --audit-traces-only [--apply]

@@ -30,18 +30,34 @@ export function redactArguments(argv: string[]) {
   });
 }
 
+const auditOptionName = "(?:access[-_]key(?:[-_]id)?|private[-_]key|credentials?|authorization|" +
+  "(?:access|bearer|refresh|oauth|id)[-_]token|client[-_]secret)";
+const auditOption = new RegExp("^--" + auditOptionName + "$", "i");
+const auditOptionValue = new RegExp(
+  String.raw`(--${auditOptionName}(?:=|[ \t]+))(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'[^']*(?:'|$)|[^ \t-\r]+)`, "gi",
+);
+const phoneNumber = String.raw`(?:(?:\+?86[ -]?)?1[3-9]\d{9}|(?:\+?1[ .-]?)?(?:(?:\(\d{3}\)[ .-]?|\d{3}[ .-])\d{3}[ .-]\d{4}|[2-9]\d{2}[2-9]\d{6})|\+(?:\d[ -]?){8,14}\d)(?![\w/-]|\.[\w-])`;
+const standalonePhone = new RegExp(String.raw`(?<![\w/.:+-])` + phoneNumber, "g");
+const labeledPhone = new RegExp(String.raw`(?<![\p{L}\p{N}./_-])([\p{L}]+[:：][ \t]*)` + phoneNumber, "gu");
+
 const auditPatterns: Array<[RegExp, string]> = [
   [/-----BEGIN ([A-Z0-9 ]+(?:PRIVATE KEY|CERTIFICATE)|PRIVATE KEY|CERTIFICATE)-----[\s\S]*?(?:-----END \1-----|$)/g, "[redacted PEM]"],
   [/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/?#"<>]+@/gi, "$1***@"],
   [/\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]+\b/g, "***"],
   [/\b(?:gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|(?:AKIA|ASIA|AIDA|AROA)[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{35}|(?:LTAI|AKID)[A-Za-z0-9]{12,})\b/g, "***"],
   [/(?<![\w./+-])[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w-]|\.[\w-])/gi, "[redacted email]"],
-  [/(?<![\w/.:+-])(?:\+?86[ -]?)?1[3-9]\d{9}(?![\w/-]|\.[\w-])|(?<![\w/.:+-])(?:\+?1[ .-]?)?(?:(?:\(\d{3}\)[ .-]?|\d{3}[ .-])\d{3}[ .-]\d{4}|[2-9]\d{2}[2-9]\d{6})(?![\w/-]|\.[\w-])|(?<![\w/.:+-])\+(?:\d[ -]?){8,14}\d(?![\w/-]|\.[\w-])/g, "[redacted phone]"],
+  [labeledPhone, "$1[redacted phone]"],
+  [standalonePhone, "[redacted phone]"],
   [/\b([A-Z0-9_]*(?:ACCESS_KEY|PRIVATE_KEY|CREDENTIAL|AUTHORIZATION)[A-Z0-9_]*)=(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'[^']*(?:'|$)|[^ \t-\r]+)/g, "$1=***"],
-  [/(--(?:access[-_]key(?:[-_]id)?|private[-_]key|credentials?|authorization|bearer[-_]token)(?:=|[ \t]+))(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'[^']*(?:'|$)|[^ \t-\r]+)/gi, "$1***"],
+  [auditOptionValue, "$1***"],
   [/((?:["'])(?:[\w.-]*(?:secret|token|password|passwd|api[_-]?key|authorization|credential|access[_-]?key|private[_-]?key)[\w.-]*)(?:["'])\s*:\s*)(?:"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*')/gi, '$1"***"'],
 ];
 
 export function redactAuditText(text: string): string {
   return redactSecrets(redactWithPatterns(text, auditPatterns));
+}
+
+export function redactAuditArguments(argv: string[]) {
+  return redactArguments(argv).map((arg, index) =>
+    index > 0 && auditOption.test(argv[index - 1]) ? "***" : redactAuditText(arg));
 }

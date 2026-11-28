@@ -356,7 +356,7 @@ function sessionTime(records: RolloutRecord[], note: Note) {
   return { started_at, ended_at, intervals };
 }
 
-export function readRollouts(anchors: string[], roles: Record<string, string>) {
+export function readRollouts(anchors: string[], roles: Record<string, string>, includeTrace = true) {
   const warnings = new Set<string>();
   const sessions: RolloutSession[] = [];
   const increments: RolloutIncrement[] = [];
@@ -398,7 +398,7 @@ export function readRollouts(anchors: string[], roles: Record<string, string>) {
       note("Usage billing fields are incomplete");
       usage_incomplete = true;
     }
-    const projected = createTrace(records, id, role);
+    const projected = createTrace(records, id, role, includeTrace);
     const session_id = redactAuditText(id);
     sessions.push({
       session_id, role, model: display(usage.model), effort: display(usage.effort),
@@ -413,7 +413,8 @@ export function readRollouts(anchors: string[], roles: Record<string, string>) {
     session_intervals[session_id] = time.intervals;
     trace.push(...projected.trace);
   }
-  trace.sort((a, b) => (a.ts ?? "\uffff").localeCompare(b.ts ?? "\uffff") || a.session_id.localeCompare(b.session_id));
+  if (includeTrace)
+    trace.sort((a, b) => (a.ts ?? "\uffff").localeCompare(b.ts ?? "\uffff") || a.session_id.localeCompare(b.session_id));
   if (encrypted) note(`Rollout skipped ${encrypted} encrypted record(s)`);
   usage_incomplete ||= !sessions.length || [...warnings].some(message =>
     /^(?:Session anchor|Missing parent|Conflicting rollout parent|Cycle in rollout)/.test(message));
