@@ -72,27 +72,30 @@ function containsQueryArguments(text: string): boolean {
 // quotes and continuations; quoted data can span any number of report lines.
 function commandEnd(lines: string[], start: number, offset: number) {
   let quote = "";
-  let expansion = 0;
+
   for (let i = start; i < lines.length; i++) {
     const line = lines[i];
     let continued = false;
     for (let k = i === start ? offset : 0; k < line.length; k++) {
       const ch = line[k];
+      // Shell substitutions and heredocs can introduce their own quoting grammar.
+      // Withhold the remainder when the end of their data cannot be established.
+      const substitution = ch === "$" && ["(", "{", "'"].includes(line[k + 1]);
+      if (quote !== "'" && (substitution || ch === "`" || !quote && line.startsWith("<<", k)))
+        return lines.length - 1;
       if (ch === "\\" && quote !== "'") {
         continued = ++k === line.length || line[k] === "\r" && k + 1 === line.length;
       } else if (quote) {
         if (ch === quote) quote = "";
-      } else if (ch === "'" || ch === '"' || ch === "`") quote = ch;
-      else if (ch === "(") expansion++;
-      else if (ch === ")" && expansion) expansion--;
+      } else if (ch === "'" || ch === '"') quote = ch;
     }
-    if (!quote && !continued && !expansion) return i;
+    if (!quote && !continued) return i;
   }
   return lines.length - 1;
 }
 
 export function redactAuditRuntimeCommand(text: string): string {
-  const normalize = (value: string) => value.replace(/\\(?:\r?\n|["'])/g, "");
+  const normalize = (value: string) => value.replace(/\\\r?\n/g, "").replace(/\\(["'])/g, "$1");
   if (!containsQueryArguments(normalize(text))) return text;
   const lines = text.split("\n");
   const kept: string[] = [];
@@ -106,11 +109,14 @@ export function redactAuditRuntimeCommand(text: string): string {
       if (!head) return [...kept, "[runtime query arguments omitted]"].join("\n");
       let argsStart = head.index + head[0].length;
       if (/["']/.test(lines[begin].charAt(argsStart))) argsStart++;
-      i = commandEnd(lines, begin, argsStart);
+      const marks = [...lines[begin].matchAll(/`+/g)];
+      const inlineExample = marks.length === 2 && marks[0].index! < argsStart && marks[1].index! >= argsStart
+        && marks[0][0] === marks[1][0] && !/\\\s*$/.test(lines[begin]);
+      i = inlineExample ? begin : commandEnd(lines, begin, argsStart);
       block = lines.slice(begin, i + 1).join("\n");
       if (queryOption.test(block)) {
         // Serialized argv and heredocs can continue independently of shell quotes.
-        if (/["']\s*,\s*["']rt["']|<<|\\["']/.test(block))
+        if (/["']\s*,\s*["']rt["']/.test(block))
           return [...kept, "[runtime query arguments omitted]"].join("\n");
         kept.push("[runtime query arguments omitted]");
         continue;

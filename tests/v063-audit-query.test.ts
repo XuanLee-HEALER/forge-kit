@@ -21,3 +21,21 @@ test("audit messages retain the diagnosis and follow-up around a multiline runti
   expect(redactAuditArguments(["forge", "rt", "query", "--expr", "first fixture line", "--param=scope=private-fixture"]))
     .toEqual(["forge", "rt", "query", "--expr", "***", "--param=***"]);
 });
+
+test("query examples retain Markdown handoff paragraphs and suppress opaque nested shell data", () => {
+  const begin = "Observed backlog.";
+  const end = "Retry owner is assigned.";
+  for (const command of [
+    "Example: `forge rt query --expr 'SCAN 0' --param scope=opaque-value`.",
+    String.raw`forge rt query --expr "SELECT \"status\" FROM jobs"`,
+    'forge rt query --expr "$(printf \'%s\' "first field\nsensitive continuation")"',
+  ]) {
+    const text = [begin, "", command, "", end].join("\n");
+    const { trace } = createTrace([{ type: "response_item", ts: null, ordinal: 1,
+      payload: { type: "message", role: "assistant", phase: "final_answer", content: text } }], "test", "assistant");
+    expect(trace[0].text).toContain(begin);
+    expect(trace[0].text).toContain("[runtime query arguments omitted]");
+    expect(trace[0].text).not.toMatch(/opaque-value|SCAN 0|SELECT|first field|sensitive continuation/);
+    if (!command.includes("$(")) expect(trace[0].text).toContain(end);
+  }
+});

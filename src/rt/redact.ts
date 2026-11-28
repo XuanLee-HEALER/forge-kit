@@ -142,14 +142,16 @@ function projectRecords(text: string, secrets: readonly string[]): { text: strin
   let plain = "";
   let omitted = false;
   for (const line of visibleText(text).match(/[^\n]*\n|[^\n]+$/g) ?? []) {
-    const index = looksStructured(line) ? 0 : line.search(/\{\s*"[^"\n]+"\s*:/);
+    // A complete JSON array is a record even when its contents resemble a log label.
+    const array = line.trimStart().startsWith("[") ? parseRuntimeJson(line, secrets) : undefined;
+    const index = array || looksStructured(line) ? 0 : line.search(/\{\s*"[^"\n]+"\s*:/);
     if (index < 0) {
       plain += line;
       continue;
     }
     const prefix = projectText(plain + line.slice(0, index), secrets);
     safe.push(prefix.text);
-    const parsed = parseRuntimeJson(line.slice(index), secrets);
+    const parsed = array ?? parseRuntimeJson(line.slice(index), secrets);
     if (prefix.uncertainTail || !parsed) return { text: safe.join(""), omitted: true };
     omitted ||= parsed.omitted;
     safe.push(JSON.stringify(safeRuntimeValue(parsed.value, secrets)));
