@@ -3,6 +3,7 @@ import { byPath, inspectScanPath, type ApplyRepo } from "./catalog";
 import { childPath, focusApplyTree, inventoryApplyRepo, readApplyManifest, skeletonApplyTree } from "./inventory";
 import { compactForbiddenPaths, scanSignals } from "./signals";
 import { collectWorkspaces } from "./workspaces";
+import { gradleTasks } from "./gradle";
 
 export { scanExcluded } from "./catalog";
 export { pathIsIn, readApplyManifest } from "./inventory";
@@ -47,23 +48,6 @@ const packageScripts: [Task, string][] = [...names.map((name): [Task, string] =>
 function forbidPattern(path: string, directory: boolean) {
   // Ship policy consumes globs. A filename containing glob syntax cannot be copied literally.
   return /[*?\[\]{}\\]/.test(path) ? undefined : directory ? path + "/**" : path;
-}
-
-function gradleTasks(text: string) {
-  // Consume comments and strings as whole tokens so their contents cannot declare tasks.
-  const comment = String.raw`//[^\r\n]*|/\*[\s\S]*?(?:\*/|(?![\s\S]))`;
-  const gap = String.raw`(?:\s|//[^\r\n]*|/\*[\s\S]*?\*/)*`;
-  const strings = String.raw`"""[\s\S]*?(?:"""|(?![\s\S]))|'''[\s\S]*?(?:'''|(?![\s\S]))|"(?:[^"\\\r\n]|\\[\s\S])*"|'(?:[^'\\\r\n]|\\[\s\S])*'`;
-  const register = String.raw`\btasks\.(?:register|create)\s*\(` + gap +
-    String.raw`(?<quote>['"])(?<quoted>[\w-]+)\k<quote>(?=` + gap + "[,)])";
-  const classic = String.raw`^[ \t]*task[ \t]+(?<bare>[\w-]+)(?![\w-])`;
-  const tokens = new RegExp([comment, strings, register, classic].join("|"), "gm");
-  const tasks = new Set<string>();
-  for (const { groups } of text.matchAll(tokens)) {
-    const name = groups?.quoted ?? groups?.bare;
-    if (name) tasks.add(name);
-  }
-  return tasks;
 }
 
 function declaredTargets(text: string, runner: "just" | "make") {
@@ -216,7 +200,7 @@ export function scanFacts(repo: ApplyRepo, focus: string[], options = { focusReq
       language("Java", gradle, "gradlew");
       const command = runner("gradlew", "gradle");
       for (const name of ["check", "test", "build"] as const) add(name, gradle, command ? [command, name] : undefined);
-      const tasks = read(gradle, gradleTasks);
+      const tasks = read(gradle, value => gradleTasks(value, gradle === "build.gradle"));
       for (const name of ["lint", "typecheck", "generate", "migrate", "e2e", "integration", "codegen"] as const)
         if (tasks?.has(name))
           add(name, gradle, command ? [command, name] : undefined, true, 2);

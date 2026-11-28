@@ -66,6 +66,76 @@ test("INV-03 Gradle comments and string literals add no entries or suggestions",
   }
 }));
 
+for (const [manifest, disabled] of [
+  ["build.gradle.kts", [
+    "/*",
+    "/* TODO */",
+    'tasks.register("integration") {}',
+    "*/",
+    "/*",
+    "/* CI 说明 */",
+    'tasks.register("e2e") {}',
+    "*/",
+  ]],
+  ["build.gradle", [
+    'def usage = /tasks.register("integration")/',
+    'def dollarSlashyUsage = $/tasks.register("e2e")/$',
+  ]],
+] as const) {
+  test(`INV-03 ${manifest} only offers the real task after disabled declarations`, () => withRepo(s => {
+    s.privateFile(manifest, [...disabled, 'tasks.register("codegen") {}', ""].join("\n"));
+    const report = apply(s);
+    const entrypoints: Entry[] = report.entrypoints;
+    const actions: Action[] = report.verification_actions;
+
+    expect(entrypoints).toContainEqual(expect.objectContaining({ name: "codegen", source: manifest, argv: ["gradle", "codegen"] }));
+    expect(actions).toContainEqual(expect.objectContaining({ cwd: ".", argv: ["gradle", "codegen"], inputs: [manifest] }));
+    for (const name of ["integration", "e2e"]) {
+      expect(entrypoints.some(entry => entry.name === name), name).toBe(false);
+      expect(actions.some(action => action.argv.includes(name)), name).toBe(false);
+    }
+  }));
+}
+
+test("INV-03 Gradle dynamic arguments with inline comments leave both following literal registrations visible", () => withRepo(s => {
+  const manifest = "build.gradle.kts";
+  s.privateFile(manifest, [
+    'val taskName = "buildExample"',
+    'tasks.register(/* explanation */ taskName) {}',
+    'tasks.register("lint") {}',
+    'tasks.register(/* verified */ "codegen" /* retained */) {}',
+    "",
+  ].join("\n"));
+  const report = apply(s);
+  const entrypoints: Entry[] = report.entrypoints;
+  const actions: Action[] = report.verification_actions;
+
+  for (const name of ["lint", "codegen"]) {
+    expect(entrypoints).toContainEqual(expect.objectContaining({ name, source: manifest, argv: ["gradle", name] }));
+    expect(actions).toContainEqual(expect.objectContaining({ cwd: ".", argv: ["gradle", name], inputs: [manifest] }));
+  }
+  expect(entrypoints.some(entry => entry.name === "buildExample")).toBe(false);
+  expect(actions.some(action => action.argv.includes("buildExample"))).toBe(false);
+}));
+
+test("INV-03 Gradle scanning completes on comment-heavy dynamic calls and finds a following static task", () => withRepo(s => {
+  const manifest = "build.gradle.kts";
+  const gap = "/* gap */ ".repeat(300);
+  const dynamic = "tasks.register(" + gap + "dynamicTaskName) {}\n";
+  // A bounded manifest with 9000 short comments exercises the dynamic-argument path.
+  const text = 'val dynamicTaskName = "integration"\n' + dynamic.repeat(30)
+    + 'tasks.register(/* verified */ "codegen" /* retained */) {}\n';
+  s.privateFile(manifest, text);
+  const report = apply(s);
+  const entrypoints: Entry[] = report.entrypoints;
+  const actions: Action[] = report.verification_actions;
+
+  expect(entrypoints).toContainEqual(expect.objectContaining({ name: "codegen", source: manifest, argv: ["gradle", "codegen"] }));
+  expect(actions).toContainEqual(expect.objectContaining({ cwd: ".", argv: ["gradle", "codegen"], inputs: [manifest] }));
+  expect(entrypoints.some(entry => entry.name === "integration")).toBe(false);
+  expect(actions.some(action => action.argv.includes("integration"))).toBe(false);
+}), 60_000);
+
 test("INV-02 Go workspace accepts UTF-8 byte escapes and adjacent comments in use declarations", () => withRepo(s => {
   s.privateFile("go.work", 'go 1.22\nuse (\n  ' + String.raw`"./caf\xc3\xa9"` + '\n  ./src//checkout\n)\n');
   s.privateFile("café/go.mod", "module example.invalid/cafe\ngo 1.22\n");

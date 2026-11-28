@@ -152,7 +152,14 @@ test("review regression: a separate Git directory still identifies a primary che
     const out = apply(s);
     expect(names(out)).toEqual(["primary"]);
     expect(out.repos[0]).toMatchObject({ head });
-    expect(out.repos[0].tree).toContainEqual(expect.objectContaining({ path: "src/facts.ts" }));
+    expect(out.repos[0].tree).toContainEqual(expect.objectContaining({
+      path: "src", type: "directory", direct_files: 1, recursive_files: 1, counts_complete: true,
+    }));
+    expect(out.repos[0].tree).not.toContainEqual(expect.objectContaining({ path: "src/facts.ts" }));
+    const focus = apply(s, "--focus", "src");
+    expect(names(focus)).toEqual(["primary"]);
+    expect(focus.repos[0]).toMatchObject({ head });
+    expect(focus.repos[0].tree).toContainEqual(expect.objectContaining({ path: "src/facts.ts" }));
   } finally { s.cleanup(); }
 }, 30_000);
 
