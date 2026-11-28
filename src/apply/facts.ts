@@ -50,6 +50,7 @@ function listPaths(repo: ApplyRepo, focus: string[], warnings: string[]) {
   const tree = new Map<string, TreeEntry>();
   const files = new Set<string>();
   const dirs = new Set<string>();
+  const visibleManifestNames = new Map<string, string[]>();
   let inspected = 0;
   let truncated = false;
   const kind = (path: string) => {
@@ -78,6 +79,7 @@ function listPaths(repo: ApplyRepo, focus: string[], warnings: string[]) {
       throw Error("Directory permissions prevent scanning.");
     const found = readdirSync(scan.path).sort(byPath);
     if (found.length > maxEntriesPerDirectory) truncated = true;
+    else visibleManifestNames.set(parent, found.filter(name => manifestNames.includes(name)));
     return found.slice(0, maxEntriesPerDirectory);
   };
   const checkedEntries = (path: string) => {
@@ -121,7 +123,7 @@ function listPaths(repo: ApplyRepo, focus: string[], warnings: string[]) {
     for (let parent = dirname(path); parent !== "."; parent = dirname(parent)) ancestors.add(parent);
   }
   for (const dir of new Set([...dirs, ...ancestors]))
-    for (const path of manifestNames) addFile(childPath(dir, path));
+    for (const path of visibleManifestNames.get(dir) ?? manifestNames) addFile(childPath(dir, path));
   for (const path of fixedFiles) addFile(path);
   for (const path of checkedEntries(".github/workflows").filter(path => /\.ya?ml$/i.test(path)))
     addFile(".github/workflows/" + path);
@@ -211,7 +213,16 @@ export function scanFacts(repo: ApplyRepo, focus: string[]) {
     const python = first("pyproject.toml", "requirements.txt", "Pipfile", "pytest.ini", "uv.lock", "poetry.lock", "Pipfile.lock");
     if (python) {
       language("Python", "pyproject.toml", "requirements.txt", "Pipfile", "pytest.ini", "uv.lock", "poetry.lock", "Pipfile.lock");
-      add("test", python, ["python", "-m", "pytest"], python === "pytest.ini");
+      if (present.has("pyproject.toml")) {
+        try {
+          const manifest = Bun.TOML.parse(read("pyproject.toml")) as { project?: { scripts?: Record<string, unknown> } };
+          for (const name of names) {
+            if (typeof manifest.project?.scripts?.[name] === "string")
+              add(name, "pyproject.toml", present.has("uv.lock") ? ["uv", "run", name] : undefined, true);
+          }
+        } catch { warnings.push("Invalid pyproject.toml: " + JSON.stringify(childPath(dir, "pyproject.toml"))); }
+      }
+      add("test", python, ["python", "-m", "pytest"], present.has("pytest.ini"));
     }
 
     if (present.has("Cargo.toml")) {
@@ -243,9 +254,15 @@ export function scanFacts(repo: ApplyRepo, focus: string[]) {
       if (!file) continue;
       language(name, file);
       const text = read(file);
-      const syntax = runner === "just" ? "[ \\t]*:" : "[ \\t]*:(?!=)";
+      const targets = new Set<string>();
+      for (const line of text.split("\n")) {
+        const declaration = runner === "make"
+          ? /^ *([\w./-]+(?:[ \t]+[\w./-]+)*)[ \t]*:(?![:]*=)/.exec(line)
+          : /^([\w-]+)(?:[ \t]+[^:#]+)?[ \t]*:(?!=)/.exec(line);
+        for (const target of declaration?.[1].split(/[ \t]+/) ?? []) targets.add(target);
+      }
       for (const task of names)
-        if (new RegExp("^" + task + syntax, "m").test(text)) add(task, file, [runner, task], true);
+        if (targets.has(task)) add(task, file, [runner, task], true);
       if (/^ *(?:-?include|sinclude|import|mod)\s|\$[({]|\{\{/m.test(text))
         warnings.push("Dynamic build definitions were not evaluated: " + JSON.stringify(childPath(dir, file)));
     }

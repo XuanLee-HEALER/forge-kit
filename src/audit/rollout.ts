@@ -265,7 +265,7 @@ function sessionTree(groups: Map<string, SessionFile[]>, anchors: string[], note
     if (!remaining) independent.push(child);
   }
   if (independent.length < selected.size) note("Cycle in rollout parent threads");
-  return [...selected].sort().map(id => ({ id, files: groups.get(id)!, canonical }));
+  return { sessions: [...selected].sort().map(id => ({ id, files: groups.get(id)! })), canonical };
 }
 
 function mergedRecords(files: SessionFile[], note: Note, onEncrypted: (count: number) => void) {
@@ -370,14 +370,19 @@ export function readRollouts(anchors: string[], roles: Record<string, string>, i
     note("No session anchors");
     return { sessions, increments, intervals, session_intervals, trace, warnings: [...warnings], usage_incomplete: true };
   }
-  const groups = indexRollouts(note);
-  for (const { id, files, canonical } of sessionTree(groups, anchors, note)) {
+  const { sessions: selected, canonical } = sessionTree(indexRollouts(note), anchors, note);
+  const rolesBySession = new Map<string, string[]>();
+  for (const [key, value] of Object.entries(roles)) {
+    const role = roleBucket(value);
+    if (!role) continue;
+    const id = canonical(key);
+    const observed = rolesBySession.get(id) ?? [];
+    observed.push(role);
+    rolesBySession.set(id, observed);
+  }
+  for (const { id, files } of selected) {
     const explicitRoles = files.flatMap(file => file.roles).map(roleBucket).filter(role => role !== null);
-    const ledgerRoles = Object.entries(roles).flatMap(([key, value]) => {
-      const role = canonical(key) === id ? roleBucket(value) : null;
-      return role ? [role] : [];
-    });
-    const observed = [...explicitRoles, ...ledgerRoles];
+    const observed = [...explicitRoles, ...(rolesBySession.get(id) ?? [])];
     const conflicting = new Set(observed);
     if (conflicting.size > 1) note("Conflicting rollout roles");
     const first = observed[0];

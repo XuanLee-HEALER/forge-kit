@@ -8,10 +8,11 @@ export type OutputCall = { name: string; namespace: string | null; parameters: u
 const statusPattern = /^(?:ok|success|failed|completed|timeout|error|pass)$/i;
 const textTypes = new Set(["text", "input_text", "output_text"]);
 const shellTools = /(?:^|[.])(?:exec|exec_command|write_stdin|wait|shell|shell_command|run_command|terminal)$/i;
-const scriptTools = /(?:^|[._-])(?:eval|node_repl|python|run_code|execute_code)(?:$|[._-])/i;
-const fileTools = /(?:^|[._-])(?:read|list|search|find|fetch|open|view|edit|patch|diff|file|resource|browse|query|screenshot)(?:$|[._-])/i;
-const bodyCommand = /(?:^|[\s/;&|])(?:cat|sed|awk|head|tail|more|less|nl|cut|sort|tee|tr|strings|base64|find|rg|grep|diff|printenv|env|xargs|curl|wget|perl|python[23]?|ruby|jq|yq|sqlite3)(?=$|[\s;&|])|\bgit\b[^\n]*(?:\b(?:diff|show|log|grep|cat-file|blame)\b)|\b(?:node|deno|bun)\s+(?:-e|--eval|eval|print)\b|\b(?:printf|echo)\b|[<>][<>]|\n/;
-const sourceReader = /^(?:cat|sed|awk|head|tail|more|less|nl|cut|sort|tee|tr|strings|base64|find|rg|grep|printenv|env|curl|wget|jq|yq|sqlite3|printf|echo)$/;
+// Retain prose from tools whose normal reply is a short informational value.
+// Other tools use output syntax to distinguish diagnostics from arbitrary stdout.
+const proseTools = /^(?:weather|get_weather|calculate|calculator)$/i;
+const sourceReader = /^(?:cat|bat|batcat|sed|awk|head|tail|more|less|nl|cut|sort|tee|tr|strings|base64|hexdump|xxd|find|rg|grep|printenv|env|curl|wget|jq|yq|sqlite3|printf|echo)$/;
+const fileReaderTool = /(?:^|\.|__)(?:read_file|read_files|read_text_file|read_multiple_files|get_file_contents|read_resource)$/i;
 
 function stripTerminal(text: string) {
   return text
@@ -39,15 +40,35 @@ function safeOutputText(text: string) {
     .replace(/(?<![\w/-])(?:\.\/)?\.(?:codex|workbench|ssh|aws|gnupg|config|env)(?:[\\/][^\s"'<>()[\]{},;:]*)?/g, "[redacted path]");
 }
 
-type OutputParts = { metadata: Set<string>; text: string[]; omitted: boolean; structured: boolean };
+type OutputChannel = "text" | "stderr";
+type OutputParts = Record<OutputChannel, string[]> & { metadata: Set<string>; omitted: boolean; structured: boolean };
 
 function exitCode(value: unknown, parts: OutputParts) {
   if (typeof value === "number" && Number.isSafeInteger(value)) parts.metadata.add("Exit code " + value);
 }
 
-function addResult(value: unknown, parts: OutputParts, explicit: boolean, depth = 0) {
+const closingHeader = /^(?:Final output|Output|Original output):$/i;
+const execHeader = /^(?:Chunk ID:|Wall time:|Process (?:exited with |running with session ID )|Exit code:|Script (?:completed|running with cell ID)\b|Warning: truncated output\b|Total (?:output )?lines: \d+\s*$)/i;
+
+function readExecEnvelope(lines: string[], parts: OutputParts) {
+  let start = 0;
+  for (; start < lines.length; start++) {
+    const line = lines[start].trim();
+    if (closingHeader.test(line)) return lines.slice(start + 1).join("\n");
+    if (!line || /^Original token count: \d+$/i.test(line)) continue;
+    if (!execHeader.test(line)) break;
+    const exit = /^(?:Process exited with (?:code|status)|Exit code:)\s*(-?\d+)$/i.exec(line);
+    if (exit) exitCode(Number(exit[1]), parts);
+    else if (/^Script completed\b/i.test(line)) parts.metadata.add("completed");
+    else if (/^Warning: truncated output\b/i.test(line)) parts.omitted = true;
+  }
+  return lines.slice(start).join("\n");
+}
+
+function addResult(value: unknown, parts: OutputParts, explicit: boolean, depth = 0, channel: OutputChannel = "text") {
   if (value === null || value === undefined) return;
   if (depth >= 5) { parts.omitted = true; return; }
+  const add = (child: unknown, target = channel) => addResult(child, parts, explicit, depth + 1, target);
   if (typeof value === "string") {
     const text = stripTerminal(value).trim();
     if (!text) return;
@@ -57,46 +78,24 @@ function addResult(value: unknown, parts: OutputParts, explicit: boolean, depth 
         const decoded: unknown = JSON.parse(text);
         if (explicit && (execResult(object(decoded)) || Array.isArray(decoded) &&
           decoded.length && decoded.every(entry => promiseResult(object(entry)))))
-          addResult(decoded, parts, true, depth + 1);
+          add(decoded);
         else parts.structured = true;
         return;
       } catch { /* Ordinary text can start with a bracket. */ }
     }
-    const lines = text.split("\n");
-    if (explicit && /^Script (?:completed|running with cell ID)\b/.test(lines[0])) {
-      const start = lines.findIndex(line => line === "Output:" || line === "Final output:");
-      if (lines[0].startsWith("Script completed")) parts.metadata.add("completed");
-      if (start >= 0) addResult(lines.slice(start + 1).join("\n"), parts, true, depth + 1);
-      else if (lines.length > 1) parts.omitted = true;
+    if (explicit && execHeader.test(text.split("\n", 1)[0])) {
+      add(readExecEnvelope(text.split("\n"), parts));
       return;
     }
-    if (explicit && /^Warning: truncated output\b/.test(lines[0])) {
-      parts.omitted = true;
-      const start = lines.findIndex(line => /^Total lines: \d+$/.test(line));
-      if (start >= 0) addResult(lines.slice(start + 1).join("\n"), parts, true, depth + 1);
-      return;
-    }
-    if (explicit && /^(?:Chunk ID:|Wall time:|Process exited with |Exit code:)/.test(lines[0])) {
-      let i = 0;
-      for (; i < lines.length; i++) {
-        const line = lines[i].trim();
-        const exit = /^(?:Process exited with (?:code|status)|Exit code:)\s*(-?\d+)\s*$/i.exec(line);
-        if (exit) exitCode(Number(exit[1]), parts);
-        else if (/^(?:Final output|Output|Original output):$/i.test(line)) { i++; break; }
-        else if (!/^(?:Chunk ID:|Wall time:|Process running with session ID |Original token count:|$)/.test(line)) break;
-      }
-      addResult(lines.slice(i).join("\n"), parts, true, depth + 1);
-      return;
-    }
-    parts.text.push(text);
+    parts[channel].push(text);
     return;
   }
   if (Array.isArray(value)) {
     for (const block of value) {
       const data = object(block);
       if (textTypes.has(string(data.type) ?? "") && typeof data.text === "string")
-        addResult(data.text, parts, explicit, depth + 1);
-      else if (explicit && promiseResult(data)) addResult(data.value, parts, true, depth + 1);
+        add(data.text);
+      else if (explicit && promiseResult(data)) add(data.value);
       else parts.structured = true;
     }
     if (!value.length) parts.structured = true;
@@ -104,7 +103,7 @@ function addResult(value: unknown, parts: OutputParts, explicit: boolean, depth 
   }
   const data = object(value);
   if (explicit && promiseResult(data)) {
-    addResult(data.value, parts, true, depth + 1);
+    add(data.value);
     return;
   }
   exitCode(data.exit_code ?? data.exitCode, parts);
@@ -113,20 +112,20 @@ function addResult(value: unknown, parts: OutputParts, explicit: boolean, depth 
   if (data.isError === true) parts.metadata.add("error");
   if (data.type !== undefined) {
     if (textTypes.has(string(data.type) ?? "") && typeof data.text === "string")
-      addResult(data.text, parts, explicit, depth + 1);
+      add(data.text);
     else parts.structured = true;
     return;
   }
   if (typeof data.stdout === "string" || typeof data.stderr === "string") {
-    if (typeof data.stdout === "string") addResult(data.stdout, parts, explicit, depth + 1);
-    if (typeof data.stderr === "string") addResult(data.stderr, parts, explicit, depth + 1);
-  } else if (Array.isArray(data.content)) addResult(data.content, parts, explicit, depth + 1);
+    if (typeof data.stdout === "string") add(data.stdout);
+    if (typeof data.stderr === "string") add(data.stderr, "stderr");
+  } else if (Array.isArray(data.content)) add(data.content);
   else if (explicit && (execResult(data) || execResult(object(data.output)))) {
     if (typeof data.output === "string" || Array.isArray(data.output))
-      addResult(data.output, parts, explicit, depth + 1);
-    else addResult(data.result ?? data.output, parts, true, depth + 1);
+      add(data.output);
+    else add(data.result ?? data.output);
   } else if (explicit && typeof data.output === "string" && Object.keys(data).length === 1)
-    addResult(data.output, parts, true, depth + 1);
+    add(data.output);
   else parts.structured = true;
 }
 
@@ -145,25 +144,24 @@ function promiseResult(data: Record<string, unknown>, depth = 0) {
 }
 
 const strongDiagnostic = /^(?:[a-z][\w.]*(?:Error|Exception)|Error|Exception|error(?:\[[A-Z]\d+\])?|fatal(?: error)?|warning|warn|panic|Traceback|Caused by|FAIL(?:ED)?|not ok)\s*[:!]|^(?:.+?:\d+(?::\d+|\(\d+\))?\)?\s*(?:[: -]\s*)?(?:error|warning)\b)|^\[?(?:ERROR|WARN|FATAL)\]\s+|^(?:npm (?:ERR!|error|warn)|bun error|[\w-]+(?:\.sh)?: (?:line \d+:|command not found|permission denied|no such file))\b/i;
+const cliError = /^(?:[\w.-]+:\s+)?(?:unknown (?:command|option|argument|flag)|invalid (?:command|option|argument|flag)|(?:--[\w-]+ )?(?:requires|expects)\s+(?:an? |\d+)|unexpected (?:argument|option)|missing required (?:argument|option))\b/i;
+const failure = /^(?:(?:\(fail\)|✗|✖|×|❌)|(?:FAIL(?:ED)?|not ok|Build failed)\b|[1-9]\d* (?:tests? )?(?:fail(?:ed|ures?)?|errors?)\b)/i;
 const stackFrame = /^(?:at\s+[\w$.[\]<> -]+(?:\s+\([^)]*:\d+:\d+\)|:\d+:\d+)|at\s+[^\s]+:\d+:\d+|File "[^"]+", line \d+(?:, in [\w.<>]+)?|-->\s+[^\s]+:\d+:\d+)$/;
 const progress = /^(?:\(pass\)|\(fail\)|✓|✗|✔|✖|√|×|✅|❌|PASS\b|FAIL\b|FAILED\b|ok(?:\s|$)|not ok(?:\s|$)|=== RUN\b|--- (?:PASS|FAIL|SKIP):|test .+ \.\.\. (?:ok|FAILED|ignored)$|tests? result:|(?:Test Suites|Tests|Snapshots|Time|Duration)\s*:|\d+\s+(?:tests?\b|pass(?:ed)?\b|fail(?:ed|ures?)?\b|skip(?:ped)?\b|error(?:s)?\b|assertions?\b)|(?:Ran|Running|Collected|collecting|collected)\s+(?:\d+\s+(?:tests?|items?|specs?)|tests?\b)|bun test v\d|tap version\b|(?:Compiling|Compiled|Building|Built|Bundled|Bundling|Build (?:completed|failed|succeeded)|Finished|Successfully (?:built|compiled)|Checking|Transforming)\s+\S)/i;
 const diffStart = /^(?:diff --(?:git|cc|combined)\b|\*\*\* (?:Begin Patch|Add File|Update File|Delete File)|@@|Index: |--- [ab]\/|\+\+\+ [ab]\/)/;
 const bodyStart = /^(?:(?:FILE|SOURCE|FILE CONTENTS?|SOURCE CODE|CONTENTS?)\s*:|(?:contents|source|file body) of\b|[-=_]{3,}.*\b(?:file|source|captured (?:stdout|stderr))\b)/i;
 const sourceLine = /^(?:(?:\d+[:\s]+[|:]|>\s*\d+\s*\||\|\s*(?:\^|[A-Za-z\d])|\^+\s*$)|(?:\$ |>>> |[+]{1,2}\s|[>%#]\s+(?:bun|npm|yarn|pnpm|git|node|cd|export)\b)|(?:import|export|const|let|var|function|class|interface|type|def|package|use|fn|return)\s+\S|\/\*|\*\/|\/\/|<\/?[a-z][\w.-]*(?:[ >]|$)|[\]}][;,]?\s*$|[\w.$()[\]"'-]+\s*(?:=|=>|:=)|[\w.$]+\([^)]*\)\s*(?:[;{.]|$)|[^\s:]+:\d+:\S)/i;
-const cliStatus = /^(?:On branch [\w./-]+$|Your branch is (?:up to date|ahead|behind)\b|nothing to commit\b|working tree clean$|(?:Changes not staged|Changes to be committed|Untracked files):$|No (?:changes|matches|results|tasks|commits|files|issues)\b|(?:[\w./-]+\.)?(?:test|spec)\.[a-z\d]+:$)/i;
+const cliStatus = /^(?:On branch [\w./-]+$|Your branch is (?:up to date|ahead|behind)\b|nothing to commit\b|working tree clean$|(?:Changes not staged|Changes to be committed|Untracked files):$|No (?:changes|matches|results|tasks|commits|files|issues)(?: found| detected| to report)?[.!]?$|(?:[\w./-]+\.)?(?:test|spec)\.[a-z\d]+:$|(?:Configuration |Health )?checks? (?:succeeded|passed|completed)[.!]?$)/i;
+const gitBranchStatus = /^## [\w./-]+(?:\.\.\.[\w./-]+)?(?: \[(?:ahead|behind) \d+(?:, (?:ahead|behind) \d+)?\])?$/;
+const markdownHeading = /^#{1,6}\s+\S/;
+const documentEnd = /^[-=_]{3,} END (?:FILE|SOURCE|DOCUMENT) [-=_]{3,}$/i;
 
 function wrappedCommand(input: string) {
-  // A single literal exec call is enough context for ordinary CLI output. JavaScript
-  // expressions and mixed calls remain opaque and receive diagnostic-only filtering.
+  // A single literal exec call can identify a body-producing subprocess. Opaque
+  // or mixed invocations still undergo the same content-based filtering.
   if ((input.match(/\btools\.[a-z_]+\b/g) ?? []).length !== 1) return "";
-  const match = /^\s*(?:(?:const|let)\s+([\w$]+)\s*=\s*|text\(\s*)await\s+tools\.exec_command\(\s*\{\s*(?:"cmd"|cmd)\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\s*(?:,\s*(?:"?\w+"?)\s*:\s*(?:\d+|true|false|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))*\s*,?\s*\}\s*\)/.exec(input);
-  if (!match) return "";
-  const rest = input.slice(match[0].length);
-  if (match[1]) {
-    const reference = /^\s*;?\s*text\(\s*(?:JSON\.stringify\(\s*)?([\w$]+)(?:\.output)?\s*\)?\s*\)\s*;?\s*$/.exec(rest);
-    if (reference?.[1] !== match[1]) return "";
-  } else if (!/^\s*\)\s*;?\s*$/.test(rest)) return "";
-  const literal = match[2];
+  const literal = /\btools\.exec_command\(\s*\{\s*(?:"cmd"|'cmd'|cmd)\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\s*(?=[,}])/.exec(input)?.[1];
+  if (!literal) return "";
   if (literal.startsWith("'")) return literal.includes("\\") ? "" : literal.slice(1, -1);
   try { return JSON.parse(literal) as string; }
   catch { return ""; }
@@ -172,7 +170,7 @@ function wrappedCommand(input: string) {
 function context(call: OutputCall) {
   const execution = shellTools.test(call.name) || /^(?:shell|terminal)$/i.test(call.namespace ?? "");
   const args = object(call.parameters);
-  const command = args.cmd ?? args.command ?? args.argv ?? call.parameters;
+  const command = args.cmd ?? args.command ?? args.argv ?? args.code ?? call.parameters;
   const input = Array.isArray(command) && command.every(arg => typeof arg === "string") ? command.join(" ") :
     typeof command === "string" ? command : "";
   const commandText = /\btools\./.test(input) ? wrappedCommand(input) : input;
@@ -180,27 +178,34 @@ function context(call: OutputCall) {
     ? command : tokenizeSimpleShellCommand(commandText);
   const executable = argv?.[0] ?? "";
   const program = executable.split(/[\\/]/).at(-1) ?? "";
+  const gitCommand = program === "git" ? extractGitSubcommand(argv ?? [])?.subcmd : undefined;
   const sourceOnly = execution && (sourceReader.test(program) ||
-    program === "git" && /^(?:show|log|grep|cat-file|blame)$/.test(extractGitSubcommand(argv ?? [])?.subcmd ?? "") ||
+    /^(?:show|log|grep|cat-file|blame)$/.test(gitCommand ?? "") ||
     /^(?:node|deno|bun|perl|python[23]?|ruby)$/.test(program) &&
     argv?.some(arg => /^(?:-e|-c|--eval|eval|print)$/.test(arg))) ? program : "";
-  const diagnosticsOnly = call.name === "unknown" || fileTools.test(call.name) || scriptTools.test(call.name) ||
-    execution && (!executable || bodyCommand.test(commandText) || /^(?:\.\.?\/|\/tmp\/)/.test(executable) ||
-      /^\b(?:sh|bash|zsh|fish|node|bun|deno)\b.+\.[cm]?[jt]sx?(?:\s|$)/.test(commandText));
-  return { execution, diagnosticsOnly, sourceOnly, commandEcho: commandText && safeOutputText(commandText.trim()) };
+  return { execution, allowsProse: !execution && proseTools.test(call.name), sourceOnly,
+    fileReader: fileReaderTool.test(call.name), gitStatus: gitCommand === "status",
+    commandEcho: commandText && safeOutputText(commandText.trim()) };
 }
 
-function excerpts(text: string, { diagnosticsOnly, sourceOnly, commandEcho }: ReturnType<typeof context>) {
+function excerpts(text: string, { allowsProse, sourceOnly, commandEcho, fileReader, gitStatus }: ReturnType<typeof context>) {
   const priority: string[] = [];
   const ordinary: string[] = [];
+  if (fileReader) return { priority, ordinary, skipped: !!text.trim() };
   let fence: string | null = null;
-  let body: "diff" | "file" | null = null;
+  let body: "diff" | "file" | "document" | null = null;
   let boundary = false;
   let structuredDepth = 0;
   let sourceFrame = false;
   let skipped = false;
   for (const raw of text.split("\n")) {
     const line = raw.trim();
+    const branchStatus = gitStatus && gitBranchStatus.test(line);
+    if (body === "document" || markdownHeading.test(line) && !branchStatus && !body && !fence && !structuredDepth) {
+      body = documentEnd.test(line) ? null : "document";
+      skipped = true;
+      continue;
+    }
     const mark = /^(`{3,}|~{3,})/.exec(line)?.[1];
     if (mark) {
       if (!fence) fence = mark;
@@ -219,11 +224,11 @@ function excerpts(text: string, { diagnosticsOnly, sourceOnly, commandEcho }: Re
     if (!line) { boundary ||= raw === ""; sourceFrame = false; continue; }
     if (diffStart.test(line)) { body = "diff"; boundary = false; skipped = true; continue; }
     if (bodyStart.test(line)) { body = "file"; boundary = false; skipped = true; continue; }
-    if (/^(?:\*\*\* End Patch|[-=_]{3,} END (?:FILE|SOURCE) [-=_]{3,})$/i.test(line)) {
+    if (line === "*** End Patch" || documentEnd.test(line)) {
       body = null; boundary = true; skipped = true; continue;
     }
-    const diagnostic = strongDiagnostic.test(line) || stackFrame.test(line);
-    const status = progress.test(line) || stackFrame.test(line) || cliStatus.test(line);
+    const diagnostic = strongDiagnostic.test(line) || stackFrame.test(line) || cliError.test(line) || failure.test(line);
+    const status = branchStatus || progress.test(line) || cliStatus.test(line);
     if (sourceOnly) {
       if (line.startsWith(sourceOnly + ":") &&
         /(?:permission denied|no such file or directory|invalid option|usage:|command not found)\b/i.test(line))
@@ -245,7 +250,7 @@ function excerpts(text: string, { diagnosticsOnly, sourceOnly, commandEcho }: Re
     } else if (status) {
       ordinary.push(line);
       sourceFrame = false;
-    } else if (diagnosticsOnly || sourceFrame || /^\s/.test(raw) || /^\d+\s+\S/.test(line)) skipped = true;
+    } else if (!allowsProse || sourceFrame || /^\s/.test(raw) || /^\d+\s+\S/.test(line)) skipped = true;
     else ordinary.push(line);
   }
   return { priority, ordinary, skipped };
@@ -266,14 +271,18 @@ function utf8Limit(text: string) {
 
 export function summarizeOutput(call: OutputCall, output: unknown) {
   const policy = context(call);
-  const parts: OutputParts = { metadata: new Set(), text: [], omitted: false, structured: false };
+  const parts: OutputParts = { metadata: new Set(), text: [], stderr: [], omitted: false, structured: false };
   addResult(output, parts, policy.execution);
-  const joined = parts.text.join("\n");
-  const cleaned = removeOutputBodies(stripTerminal(joined));
-  const safe = safeOutputText(cleaned);
-  const { priority, ordinary, skipped } = excerpts(safe, policy);
-  const omitted = parts.omitted || skipped || cleaned !== joined;
-  return utf8Limit([...parts.metadata, ...priority, ...ordinary,
+  const extract = (chunks: string[], sourcePolicy: typeof policy) => {
+    const joined = chunks.join("\n");
+    const cleaned = removeOutputBodies(stripTerminal(joined));
+    const { priority, ordinary, skipped } = excerpts(safeOutputText(cleaned), sourcePolicy);
+    return { priority, ordinary, omitted: skipped || cleaned !== joined };
+  };
+  const stdout = extract(parts.text, policy);
+  const stderr = extract(parts.stderr, { ...policy, allowsProse: false, sourceOnly: "" });
+  const omitted = parts.omitted || stderr.omitted || stdout.omitted;
+  return utf8Limit([...parts.metadata, ...stderr.priority, ...stdout.priority, ...stdout.ordinary, ...stderr.ordinary,
     omitted ? "Output body omitted" : "", parts.structured ? "Structured output" : "",
   ].filter(Boolean).join("\n") || "Output unavailable");
 }

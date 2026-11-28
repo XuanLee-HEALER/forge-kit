@@ -111,14 +111,15 @@ Guard 为受保护分支、敏感操作和审批节点提供薄安全带。实�
 
 ## 本地开始
 
-在工具源码目录构建 CLI：
+在工具源码目录构建 CLI，将当前版本的入口加入本次 shell 的 PATH：
 
 ```bash
 bun install --frozen-lockfile
 bun run build
+export PATH="$PWD/bin:$PATH"
 ```
 
-在已有单仓初始化工作台并登记该项目（下例中的 forge 是构建后的 CLI）：
+在同一 shell 中切换到要管理的 Git 项目根目录，初始化单仓工作台并登记该项目：
 
 ```bash
 forge init . --name my-workbench

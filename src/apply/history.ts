@@ -97,7 +97,7 @@ export function scanHistory(repo: ApplyRepo, head: string | null, headAvailable:
       const selected = commits.slice(0, commitLimit);
       for (let offset = 0; offset < selected.length; offset += batchSize) {
         const batch = selected.slice(offset, offset + batchSize);
-        const changes = applyGit(repo.dir, ["log", "--no-walk=unsorted", "--format=%x00%H", "--name-status", "-z",
+        const changes = applyGit(repo.dir, ["log", "--no-show-signature", "--no-notes", "--no-walk=unsorted", "--format=%x00%H", "--name-status", "-z",
           "--no-ext-diff", "--no-textconv", "--find-renames", "--root", ...batch, "--"]);
         try {
           if (changes.code) throw Error();

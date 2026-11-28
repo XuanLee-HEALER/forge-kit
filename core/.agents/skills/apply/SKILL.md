@@ -11,7 +11,7 @@ description: 接入现有仓库、接手陌生模块或复核已变更领域卡�
 
 - **冷启动**。运行 `forge apply --json`，用清单、命令和 Git 热区定位操作者关注的 1~3 个域。只读抽样入口、实体和边界，起草或增补仓卡和这些域的卡。向操作者展示验证动作及 `forbidden_paths` 草案，取得确认后才写入相应实例配置。
 - **局部接手**。运行 `forge apply --repo <repo> --focus <path> --json`，结合局部骨架及共改邻居，核对关键入口与调用方。长期关注或复杂模块可建一张领域卡，并在仓卡索引登记；一次性小修可直接使用扫描结果。
-- **语义复核**。运行 `forge apply check --repo <repo> --path <path> --json`。UNCHANGED 时沿用；UNMAPPED 时按需局部接手。CHANGED 时读卡、摘要和必要 diff，可请 scanner 只读核实。格式化、测试或内部调整可沿用旧卡并按需推进 SHA；局部字段、入口或约束变化可微调 1~3 行；核心实体、状态机或边界重构以及 BROKEN 时按当前代码重建。已退出关注范围的卡可标 archived 或删除，并维护索引。
+- **语义复核**。运行 `forge apply check --repo <repo> --path <path> --json`。UNCHANGED 表示锚点的已提交快照一致，可沿用旧卡；任务涉及未提交改动时，结合工作树差异核实相关边界。UNMAPPED 时按需局部接手。CHANGED 时读卡、摘要和必要 diff，可请 scanner 只读核实。格式化、测试或内部调整可沿用旧卡并按需推进 SHA；局部字段、入口或约束变化可微调 1~3 行；核心实体、状态机或边界重构以及 BROKEN 时按当前代码重建。已退出关注范围的卡可标 archived 或删除，并维护索引。
 
 ## 卡片契约
 

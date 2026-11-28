@@ -7,7 +7,7 @@ description: 收到 QA 缺陷、生产缺陷或报警时，先在对应环境只
 
 **输入**为报告、问题发生的环境和版本、实际与预期行为、适用的任务和规格。
 
-按目标仓和拟改路径运行 `forge apply check --repo <repo> --path <path> --json`：UNCHANGED 直接读卡，CHANGED 或 BROKEN 交给 apply 复核，UNMAPPED 的长期关注域或复杂陌生域用 focus 快绘，一次性小修可跳过建卡。工程约定记录一次；仅在核心实体、入口、边界变化或发现未记录禁区时回写实例卡并更新已核验 SHA。
+按目标仓和拟改路径运行 `forge apply check --repo <repo> --path <path> --json`：UNCHANGED 可直接读卡了解已提交版本，涉及未提交改动时核对工作树差异，CHANGED 或 BROKEN 交给 apply 复核，UNMAPPED 的长期关注域或复杂陌生域用 focus 快绘，一次性小修可跳过建卡。工程约定记录一次；仅在核心实体、入口、边界变化或发现未记录禁区时回写实例卡并更新已核验 SHA。
 
 1. 用 `forge instance list --json` 查找该环境的只读诊断阶段，核对来源后以 `forge instance run <stage-id>` 收集可复核事实。缺入口或权限时报告环境、缺失事实及需要的只读能力。避免跨环境推断或取得写凭据。
 2. 重建触发路径，界定影响、既有承诺和可恢复性。若需改变用户权益或业务承诺，交给 grill 裁决后按 feature 的完整流程推进。

@@ -74,7 +74,8 @@ export function validateApplyPath(repo: ApplyRepo, input: string): string {
 export function applyGit(dir: string, args: string[]) {
   const env = checkoutEnvironment();
   for (const key of Object.keys(env))
-    if (key === "GIT_CONFIG" || key.startsWith("GIT_CONFIG_") || ["GIT_EXTERNAL_DIFF", "GIT_ALLOW_PROTOCOL"].includes(key)) delete env[key];
+    if (/^GIT_(?:CONFIG(?:_|$)|TRACE|REDIRECT_|TEST_)/.test(key) ||
+        ["GIT_EXTERNAL_DIFF", "GIT_ALLOW_PROTOCOL"].includes(key)) delete env[key];
   Object.assign(env, {
     GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1",
     GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
@@ -104,27 +105,36 @@ function identifyCheckout(dir: string, gitDirectory: string): boolean {
   const result = applyGit(dir, ["rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"]);
   if (result.code) return false;
   const [gitDir, commonDir, top] = result.stdout.replace(/\n$/, "").split("\n");
-  return Boolean(gitDir && commonDir && top && resolve(dir, gitDir) === gitDirectory &&
-    resolve(dir, commonDir) === gitDirectory && resolve(dir, top) === dir);
+  try {
+    return Boolean(gitDir && commonDir && top && realpathSync(resolve(dir, gitDir)) === gitDirectory &&
+      realpathSync(resolve(dir, commonDir)) === gitDirectory && realpathSync(resolve(dir, top)) === dir);
+  } catch { return false; }
 }
 
-function gitSetup(dir: string, name: string, repository: string) {
+function gitSetup(dir: string, workspace: string) {
   const marker = join(dir, ".git");
   const stat = lstatSync(marker, { throwIfNoEntry: false });
   if (stat?.isDirectory()) return marker;
   if (!stat?.isFile() || stat.size > 4096 || !(stat.mode & 0o444)) return null;
   const target = readFileSync(marker, "utf8").match(/^gitdir: ([^\r\n]+)\r?\n?$/)?.[1];
   if (!target) return null;
-  const resolved = resolve(dir, target);
-  if (!containsPath(join(repository, ".git", "modules"), resolved)) return null;
-  const selected = inspectApplyPath(repository, relative(repository, resolved));
-  return selected.path === resolved && selected.stat?.isDirectory() && name !== "." ? resolved : null;
+  // A gitfile may be a primary checkout (separate Git dir or submodule) or a
+  // linked worktree. Validate the local target before Git reads it. Keep raw
+  // components so an escaping symlink cannot disappear through lexical `..`.
+  const prefix = workspace === "/" ? workspace : workspace + "/";
+  if (isAbsolute(target) && !target.startsWith(prefix)) return null;
+  const path = isAbsolute(target) ? target.slice(prefix.length) : (relative(workspace, dir) || ".") + "/" + target;
+  try {
+    const selected = inspectApplyPath(workspace, path);
+    return selected.stat?.isDirectory() && selected.path !== workspace ? selected.path : null;
+  } catch { return null; }
 }
 
 function gitlinks(root: string, warnings: string[]) {
   const paths = new Set<string>();
   const results = [
-    applyGit(root, ["ls-files", "--stage", "-z"]),
+    // Only direct gitlinks can change the workspace layout. The glob is internal and fixed.
+    applyGit(root, ["--no-literal-pathspecs", "ls-files", "--stage", "-z", "--", ":(top,glob)*"]),
     applyGit(root, ["ls-tree", "-z", "HEAD"]),
   ];
   if (results[0].code) warnings.push("Could not read root Git index for submodule discovery.");
@@ -168,30 +178,37 @@ function registeredRepos(root: string, repos: ApplyRepo[], warnings: string[]): 
 export function loadApplyCatalog(input: string): ApplyCatalog {
   const root = realpathSync(input);
   const warnings: string[] = [];
-  const rootGit = gitSetup(root, ".", root);
-  const rootRepo = rootGit && identifyCheckout(root, rootGit);
+  const rootGit = gitSetup(root, root);
+  const rootRepo = rootGit && identifyCheckout(root, rootGit) ? rootGit : null;
   const children = readdirSync(root, { withFileTypes: true })
     .filter(entry => entry.isDirectory() && !scanExclusions.has(entry.name))
     .map(entry => entry.name).sort(byPath);
   const links = rootRepo ? gitlinks(root, warnings) : new Set<string>();
-  const repos: ApplyRepo[] = [];
+  const candidates: { repo: string; dir: string }[] = [];
+  const metadata = new Set(rootRepo ? [rootRepo] : []);
   const boundaries = new Set([...links].map(name => join(root, name)));
-  const add = (repo: string, dir: string, boundaries: string[] = []) =>
-    repos.push({ repo, dir, slug: repo === "." ? "root" : repo, boundaries });
   for (const name of children) {
     const dir = join(root, name);
     try {
-      if (relativeApplyPath(name) !== name) continue;
-      const marker = lstatSync(join(dir, ".git"), { throwIfNoEntry: false });
-      if (marker?.isFile() || marker?.isDirectory()) boundaries.add(dir);
-      if (!marker?.isDirectory() && !links.has(name)) continue;
-      const gitDir = gitSetup(dir, name, root);
-      if (gitDir && identifyCheckout(dir, gitDir)) add(name, dir);
+      if (relativeApplyPath(name) !== name || (rootRepo && containsPath(rootRepo, dir))) continue;
+      if (!hasRepositoryMarker(dir)) continue;
+      boundaries.add(dir);
+      const gitDir = gitSetup(dir, root);
+      if (gitDir && identifyCheckout(dir, gitDir)) {
+        candidates.push({ repo: name, dir });
+        metadata.add(gitDir);
+      }
     } catch { warnings.push("Could not inspect repository candidate: " + JSON.stringify(name)); }
   }
+  const projects = candidates.filter(({ dir }) => ![...metadata].some(gitDir => containsPath(gitDir, dir)));
   for (const name of [...links].sort(byPath))
-    if (!repos.some(repo => repo.repo === name)) warnings.push("Submodule is unavailable locally: " + JSON.stringify(name));
-  if (!links.size && !repos.length && rootRepo) add(".", root, [...boundaries].sort(byPath));
+    if (!projects.some(repo => repo.repo === name)) warnings.push("Submodule is unavailable locally: " + JSON.stringify(name));
+  if (!links.size && !projects.length && rootRepo) projects.push({ repo: ".", dir: root });
+  const nested = [...new Set([...boundaries, ...metadata])].sort(byPath);
+  const repos: ApplyRepo[] = projects.map(({ repo, dir }) => ({
+    repo, dir, slug: repo === "." ? "root" : repo,
+    boundaries: nested.filter(path => path !== dir && containsPath(dir, path)),
+  }));
   return { repos, registered: registeredRepos(root, repos, warnings), warnings };
 }
 
