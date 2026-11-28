@@ -4,11 +4,12 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { parse, stringify } from "yaml";
+import { historicalKit } from "./helpers/historical-kit";
 import { kit, sandbox } from "./v05-sandbox";
 
 test("README preserves content outside the approved review and installation changes", () => {
   // SHA-256 of the same protected text at 0e252c19, usable in shallow offline checkouts.
-  const readme = readFileSync(join(kit, "README.md"), "utf8");
+  const readme = historicalReadme();
   const protectedText = readme
     .replace(/^\| \*\*L2 .*\n/m, "")
     .replace(/(?<=^- \*\*统一入口[^\n]*\n)[\s\S]*?(?=^- \*\*任务账本)/m, "")
@@ -19,7 +20,7 @@ test("README preserves content outside the approved review and installation chan
 });
 
 test("T12 README changes only the approved v0.5.7 delivery sentence", () => {
-  const readme = readFileSync(join(kit, "README.md"), "utf8");
+  const readme = historicalReadme();
   const approved = "交付前，至少有一个角色沿提交链无空洞覆盖任务基线至交付 HEAD，且所有已启动角色均无未解除的评审失败";
   const previous = "交付 HEAD 至少有一份从任务基线审起的通过报告";
   expect(readme.split("\n")[100]).toContain(approved);
@@ -27,6 +28,13 @@ test("T12 README changes only the approved v0.5.7 delivery sentence", () => {
   expect(createHash("sha256").update(readme.replace(approved, previous)).digest("hex"))
     .toBe("1732e1bcfbbb0837019e367fcf5a0c142abce11b50e0a0e311b36dd306bee8a4");
 });
+
+function historicalReadme() {
+  const s = sandbox();
+  try {
+    return readFileSync(join(historicalKit(s, "0.6.0"), "README.md"), "utf8");
+  } finally { s.cleanup(); }
+}
 
 test("current distribution removes stale JS bundles and retired protocol configuration", () => {
   const temp = mkdtempSync(join(tmpdir(), "forge-dist-contract-"));
@@ -39,9 +47,9 @@ test("current distribution removes stale JS bundles and retired protocol configu
     }
     symlinkSync(join(kit, "node_modules"), join(temp, "node_modules"));
     const manifest = JSON.parse(readFileSync(join(temp, "package.json"), "utf8"));
-    expect(manifest.version).toBe("0.6.0");
+    expect(manifest.version).toBe("0.6.1");
     expect(JSON.stringify(manifest)).not.toContain("review-agents");
-    expect(readFileSync(join(kit, "kit.toml"), "utf8")).toMatch(/^version = "0\.6\.0"$/m);
+    expect(readFileSync(join(kit, "kit.toml"), "utf8")).toMatch(/^version = "0\.6\.1"$/m);
     mkdirSync(join(temp, "dist"));
     writeFileSync(join(temp, "dist/stale.js"), "stale");
     const result = Bun.spawnSync([process.execPath, "run", "build"], { cwd: temp });
